@@ -1,0 +1,11 @@
+{
+  "model": { "id": "claude-sonnet-4-6", "display_name": "Claude Sonnet 4.6" },
+  "session_id": "test-session",
+  "cwd": "/home/dev/linesmith",
+  "workspace": {
+    "current_dir": ".",
+    "project_dir": "/home/dev/linesmith",
+    "added_dirs": [],
+    "git_worktree": null
+  }
+}
