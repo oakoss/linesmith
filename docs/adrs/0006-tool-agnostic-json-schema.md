@@ -1,6 +1,6 @@
 # Design the input schema as a union of Claude + Qwen fields with per-tool normalizers
 
-- Status: accepted
+- Status: superseded by [ADR-0008](0008-canonical-type-refinements.md)
 - Date: 2026-04-17
 - Deciders: Jace
 
@@ -18,10 +18,10 @@ Research (`research/cross-tool-statusline-support.md`) shows that the `statusLin
 
 ## Considered Options
 
-- **Claude-only schema** — model exactly Claude's fields; add support for other tools later as forks or branches
-- **Qwen-compatible only** — model Qwen's shape (which is Claude-compatible); works for both
-- **Union schema + thin normalizer** — define a canonical internal model; per-tool normalizers map incoming JSON to it
-- **Plugin-based adapters** — each tool's input handled by a separate adapter plugin
+- **Claude-only schema**: model exactly Claude's fields; add support for other tools later as forks or branches
+- **Qwen-compatible only**: model Qwen's shape (which is Claude-compatible); works for both
+- **Union schema + thin normalizer**: define a canonical internal model; per-tool normalizers map incoming JSON to it
+- **Plugin-based adapters**: each tool's input handled by a separate adapter plugin
 
 ## Decision Outcome
 
@@ -55,14 +55,14 @@ Normalizer responsibility: parse tool-specific JSON into this model. Absent fiel
 
 ### Consequences
 
-- Good, because ~95% of segments are tool-agnostic by default — they render `StatusContext`, not vendor JSON
+- Good, because ~95% of segments are tool-agnostic by default; they render `StatusContext`, not vendor JSON
 - Good, because shipping a Qwen preset alongside Claude is nearly free given the schema overlap
 - Good, because adding Codex/Copilot support when they ship is one normalizer file + a preset
 - Good, because plugins can access tool-specific fields via `raw` when they need to, without forcing the core to handle vendor weirdness
-- Good, because explicit nullability (`Option<T>`) means segments must handle missing fields — no silent rendering of bogus data
-- Bad, because the canonical model must evolve as new tools appear — we'll accumulate optional fields
+- Good, because explicit nullability (`Option<T>`) means segments must handle missing fields; no silent rendering of bogus data
+- Bad, because the canonical model must evolve as new tools appear; we'll accumulate optional fields
 - Bad, because tool detection heuristics may misidentify in edge cases (mitigated by the `--tool` flag and env var)
-- Neutral, because internally the schema is slightly richer than any single vendor's — no tool sees its full payload, just its subset
+- Neutral, because internally the schema is slightly richer than any single vendor's; no tool sees its full payload, just its subset
 
 ### Confirmation
 
@@ -70,7 +70,7 @@ Revisit if:
 
 - Canonical model accumulates more than ~5 tool-specific optional fields (signals abstraction is leaking)
 - A new tool's input diverges enough that the union approach becomes painful
-- Segments begin routinely switching on `ctx.tool` to render — signals that tool-specific normalization is leaking into rendering
+- Segments begin routinely switching on `ctx.tool` to render (signals that tool-specific normalization is leaking into rendering)
 
 ## Pros and Cons of the Options
 
@@ -84,7 +84,7 @@ Revisit if:
 ### Qwen-compatible only
 
 - Good: works for Claude too (schemas overlap)
-- Bad: Qwen's shape is slightly narrower than Claude's — we'd lose access to Claude-specific fields like `rate_limits` detail
+- Bad: Qwen's shape is slightly narrower than Claude's; we'd lose access to Claude-specific fields like `rate_limits` detail
 - Bad: positions Qwen as primary when Claude has dominant market share
 
 ### Union schema + thin normalizer (chosen)
