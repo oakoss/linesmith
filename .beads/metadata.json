@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "linesmith",
+  "project_id": "76e6b9fa-c7e1-40fc-9175-1f765f2747a7"
+}

@@ -1,0 +1,35 @@
+# Rust
+target/
+*.rs.bk
+
+# Editors
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*~
+
+# Claude Code
+.claude/plans/
+
+# Node (managed by mise)
+node_modules/
+
+# Environment
+.env*
+
+# Profiling
+perf.data
+perf.data.old
+flamegraph.svg
+*.profraw
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+
+# OS
+.DS_Store
+Thumbs.db
