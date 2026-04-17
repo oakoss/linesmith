@@ -4,6 +4,8 @@
 
 use crate::input::StatusContext;
 
+pub mod context_window;
+pub mod model;
 pub mod workspace;
 
 /// Output of a successful segment render. Carries only `text` today;

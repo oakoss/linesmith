@@ -32,8 +32,11 @@ pub fn run(mut reader: impl Read, mut writer: impl Write) -> io::Result<()> {
         }
     };
 
-    let built_in: Vec<Box<dyn segments::Segment>> =
-        vec![Box::new(segments::workspace::WorkspaceSegment)];
+    let built_in: Vec<Box<dyn segments::Segment>> = vec![
+        Box::new(segments::model::ModelSegment),
+        Box::new(segments::context_window::ContextWindowSegment),
+        Box::new(segments::workspace::WorkspaceSegment),
+    ];
 
     let parts: Vec<String> = built_in
         .iter()
@@ -57,13 +60,39 @@ mod tests {
     }
 
     #[test]
-    fn valid_json_renders_workspace_with_newline() {
+    fn minimal_payload_renders_model_then_workspace() {
         let json = br#"{
-            "model": { "display_name": "X" },
+            "model": { "display_name": "Claude Test" },
             "workspace": { "project_dir": "/home/dev/linesmith" }
         }"#;
         let mut out = Vec::new();
         run(Cursor::new(json), &mut out).expect("run ok");
-        assert_eq!(String::from_utf8(out).expect("utf8"), "linesmith\n");
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "Claude Test linesmith\n"
+        );
+    }
+
+    #[test]
+    fn full_payload_renders_model_context_workspace() {
+        let json = br#"{
+            "model": { "display_name": "Claude Sonnet 4.6" },
+            "workspace": {
+                "project_dir": "/home/dev/linesmith",
+                "git_worktree": { "name": "feat-auth", "path": "/wt/feat-auth" }
+            },
+            "context_window": {
+                "used_percentage": 42.5,
+                "context_window_size": 200000,
+                "total_input_tokens": 12345,
+                "total_output_tokens": 6789
+            }
+        }"#;
+        let mut out = Vec::new();
+        run(Cursor::new(json), &mut out).expect("run ok");
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "Claude Sonnet 4.6 42% · 200k linesmith/feat-auth\n"
+        );
     }
 }

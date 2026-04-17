@@ -34,11 +34,13 @@ impl Segment for WorkspaceSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::{GitWorktree, ModelInfo, StatusContext, WorkspaceInfo};
+    use crate::input::{GitWorktree, ModelInfo, StatusContext, Tool, WorkspaceInfo};
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     fn ctx(worktree: Option<GitWorktree>) -> StatusContext {
         StatusContext {
+            tool: Tool::ClaudeCode,
             model: ModelInfo {
                 display_name: "Claude Test".into(),
             },
@@ -46,6 +48,8 @@ mod tests {
                 project_dir: PathBuf::from("/home/dev/linesmith"),
                 git_worktree: worktree,
             },
+            context_window: None,
+            raw: Arc::new(serde_json::Value::Null),
         }
     }
 

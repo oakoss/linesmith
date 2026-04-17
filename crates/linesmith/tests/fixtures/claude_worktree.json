@@ -10,5 +10,12 @@
       "name": "feat-segments",
       "path": "/home/dev/linesmith-worktrees/feat-segments"
     }
+  },
+  "context_window": {
+    "used_percentage": 42.5,
+    "remaining_percentage": 57.5,
+    "context_window_size": 200000,
+    "total_input_tokens": 12345,
+    "total_output_tokens": 6789
   }
 }

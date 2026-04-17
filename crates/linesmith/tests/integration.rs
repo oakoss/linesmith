@@ -4,19 +4,22 @@ const CLAUDE_MINIMAL: &str = include_str!("fixtures/claude_minimal.json");
 const CLAUDE_WORKTREE: &str = include_str!("fixtures/claude_worktree.json");
 
 #[test]
-fn renders_workspace_name_when_outside_worktree() {
+fn renders_model_and_workspace_when_outside_worktree() {
     let mut out = Vec::new();
     linesmith::run(Cursor::new(CLAUDE_MINIMAL), &mut out).expect("run ok");
-    assert_eq!(String::from_utf8(out).expect("utf8"), "linesmith\n");
+    assert_eq!(
+        String::from_utf8(out).expect("utf8"),
+        "Claude Sonnet 4.6 linesmith\n"
+    );
 }
 
 #[test]
-fn renders_repo_worktree_hybrid_when_inside_worktree() {
+fn renders_model_context_and_worktree_when_payload_is_full() {
     let mut out = Vec::new();
     linesmith::run(Cursor::new(CLAUDE_WORKTREE), &mut out).expect("run ok");
     assert_eq!(
         String::from_utf8(out).expect("utf8"),
-        "linesmith/feat-segments\n"
+        "Claude Sonnet 4.6 42% · 200k linesmith/feat-segments\n"
     );
 }
 
