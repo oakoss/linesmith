@@ -2,7 +2,16 @@ output:
   - failure
   - execution_out
 
+# Beads integration delegates to .lefthook/bd-hook.sh, which wraps
+# `bd hooks run <event>` with the same exit-code and timeout handling
+# beads uses in its own shim (.beads/hooks/*):
+#   - exit 3   → beads db not initialized; swallow (no-op)
+#   - exit 124 → timeout; swallow (proceed without beads)
+# Env vars per command: BD_GIT_HOOK=1 signals beads it's in a hook;
+# TERM=dumb suppresses TTY escape codes.
+
 pre-commit:
+  parallel: true
   commands:
     cargo-fmt:
       glob: '**/*.rs'
@@ -16,8 +25,46 @@ pre-commit:
       glob: '**/*.{md,json,yaml,yml}'
       run: prettier --write {staged_files}
       stage_fixed: true
+    beads:
+      env:
+        BD_GIT_HOOK: '1'
+        TERM: dumb
+      run: .lefthook/bd-hook.sh pre-commit
 
 commit-msg:
   commands:
     conventional-commit:
       run: cog verify --file {1}
+
+prepare-commit-msg:
+  commands:
+    beads:
+      env:
+        BD_GIT_HOOK: '1'
+        TERM: dumb
+      run: .lefthook/bd-hook.sh prepare-commit-msg {1} {2} {3}
+
+post-merge:
+  commands:
+    beads:
+      env:
+        BD_GIT_HOOK: '1'
+        TERM: dumb
+      run: .lefthook/bd-hook.sh post-merge {1}
+
+post-checkout:
+  commands:
+    beads:
+      env:
+        BD_GIT_HOOK: '1'
+        TERM: dumb
+      run: .lefthook/bd-hook.sh post-checkout {1} {2} {3}
+
+pre-push:
+  parallel: true
+  commands:
+    beads:
+      env:
+        BD_GIT_HOOK: '1'
+        TERM: dumb
+      run: .lefthook/bd-hook.sh pre-push {1} {2}
