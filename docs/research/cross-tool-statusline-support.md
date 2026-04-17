@@ -31,7 +31,7 @@ Is Claude Code the only AI coding CLI that supports a user-customizable status l
 | #   | Tool                      | Custom statusLine?                   | Contract                                                                                                                                                                                                                                            |
 | --- | ------------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1   | **Claude Code**           | Yes (baseline)                       | `statusLine` in `~/.claude/settings.json`; `type: "command"` runs a shell cmd, receives full JSON on stdin, prints text to stdout                                                                                                                   |
-| 2   | **Qwen Code**             | **Yes — Claude-compatible contract** | `ui.statusLine` in `~/.qwen/settings.json`; shell command receives JSON on stdin with `session_id`, `version`, `model.display_name`, `context_window`, `workspace.current_dir`, `git.branch`, metrics, `vim.mode`. Near-identical shape to Claude's |
+| 2   | **Qwen Code**             | **Yes (Claude-compatible contract)** | `ui.statusLine` in `~/.qwen/settings.json`; shell command receives JSON on stdin with `session_id`, `version`, `model.display_name`, `context_window`, `workspace.current_dir`, `git.branch`, metrics, `vim.mode`. Near-identical shape to Claude's |
 | 3   | **OpenAI Codex CLI**      | No (fixed items only)                | `tui.status_line` in `config.toml` is an ordered list of built-in identifiers. Issue #17827 explicitly requests Claude-style custom commands; not yet implemented                                                                                   |
 | 4   | **GitHub Copilot CLI**    | No (requested)                       | Prompt glyph hardcoded; issues #1311, #2329 request it; `avatorl/copilot-cli-statusline` (PowerShell) is an external workaround                                                                                                                     |
 | 5   | **Gemini CLI**            | No                                   | Footer shows a fixed configurable list of item IDs; no stdin-JSON custom command                                                                                                                                                                    |
@@ -49,14 +49,14 @@ Is Claude Code the only AI coding CLI that supports a user-customizable status l
 
 ### Emerging de-facto standard
 
-- **No formal cross-tool spec exists**, but Qwen Code's `ui.statusLine` is a **deliberate clone** of Claude's contract — same `type: "command"` shape, JSON-on-stdin, text-on-stdout. That's two tools with a compatible contract today.
+- **No formal cross-tool spec exists**, but Qwen Code's `ui.statusLine` is a **deliberate clone** of Claude's contract: same `type: "command"` shape, JSON-on-stdin, text-on-stdout. That's two tools with a compatible contract today.
 - **Codex CLI issue #17827** explicitly proposes adopting Claude's shape (`statusLine` in `config.toml`, JSON stdin, ANSI-text stdout). Issues #13660 and #14043 are related. Community project `fwyc0573/codex-hud` emulates it externally.
 - **GitHub Copilot CLI** has parallel requests (#1311, #2329) with `avatorl/copilot-cli-statusline` as out-of-band workaround.
-- **Gemini CLI** has no extensibility point suitable for emulating a custom status line — custom slash commands are prompt-injection TOML files, not stdout renderers.
+- **Gemini CLI** has no extensibility point suitable for emulating a custom status line; custom slash commands are prompt-injection TOML files, not stdout renderers.
 
 ### IDE-based tools are structurally out of scope
 
-Cline, Cursor, Windsurf, Continue, Cody, Roo Code — all are IDE plugins without a stdin-JSON contract and unlikely to grow one. Different category of tool.
+Cline, Cursor, Windsurf, Continue, Cody, Roo Code are IDE plugins without a stdin-JSON contract and unlikely to grow one. Different category of tool.
 
 ## Conclusions
 
@@ -73,8 +73,8 @@ A tool with Claude-specific design locks itself out of half the likely future ma
 
 ## Implications / actions
 
-- Drives [ADR-0002: Name linesmith](../adrs/0002-name-linesmith.md) — standalone tool-agnostic brand, not `cc`-prefixed
-- Drives [ADR-0006: Tool-Agnostic JSON Schema](../adrs/0006-tool-agnostic-json-schema.md) — union of Claude + Qwen fields with thin per-tool normalizer
+- Drives [ADR-0002: Name linesmith](../adrs/0002-name-linesmith.md): standalone tool-agnostic brand, not `cc`-prefixed
+- Drives [ADR-0006: Tool-Agnostic JSON Schema](../adrs/0006-tool-agnostic-json-schema.md): union of Claude + Qwen fields with thin per-tool normalizer
 - Ship Claude preset at v0.1; Qwen preset is nearly free (can ship alongside)
 - Stub Codex / Copilot presets that activate the day those tools ship their APIs
 

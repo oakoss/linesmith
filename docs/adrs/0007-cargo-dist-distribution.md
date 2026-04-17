@@ -20,11 +20,11 @@ Part of linesmith's value proposition ([ADR-0001](0001-use-rust-for-runtime.md))
 
 ## Considered Options
 
-- **`dist` (formerly cargo-dist)** — maintained tool that generates GitHub Actions workflows, builds for all targets, creates releases with installers and formulas
-- **Manual GitHub Actions + `cross`** — hand-write build matrices, package releases ourselves
-- **Homebrew-only** — ship only via brew formula; ignore non-Homebrew users
-- **Cargo install only** — `cargo install linesmith` requires Rust toolchain; loses the single-binary story
-- **Hybrid: cargo-dist + cargo install** — cargo-dist for pre-built binaries, `cargo install` as a fallback for Rust users
+- **`dist` (formerly cargo-dist)**: maintained tool that generates GitHub Actions workflows, builds for all targets, creates releases with installers and formulas
+- **Manual GitHub Actions + `cross`**: hand-write build matrices, package releases ourselves
+- **Homebrew-only**: ship only via brew formula; ignore non-Homebrew users
+- **Cargo install only**: `cargo install linesmith` requires Rust toolchain; loses the single-binary story
+- **Hybrid: cargo-dist + cargo install**: cargo-dist for pre-built binaries, `cargo install` as a fallback for Rust users
 
 ## Decision Outcome
 
@@ -51,9 +51,9 @@ panic = "abort"
 ### Consequences
 
 - Good, because every target platform ships from one command
-- Good, because Homebrew formula is generated automatically — no separate `homebrew-linesmith` repo to maintain manually
+- Good, because Homebrew formula is generated automatically; no separate `homebrew-linesmith` repo to maintain manually
 - Good, because release workflow is declarative; we don't write CI
-- Good, because `cargo install linesmith` works for users with a Rust toolchain — no extra work
+- Good, because `cargo install linesmith` works for users with a Rust toolchain; no extra work
 - Good, because release profile settings shave 30-50% off binary size (~3-5MB target)
 - Bad, because we're locked into `dist`'s release conventions; deviating means opting out of automation
 - Bad, because `dist` version upgrades occasionally require regenerating the GH Actions workflow and reviewing diffs
@@ -81,7 +81,7 @@ Revisit if:
 
 - Good: full control over build matrix, caching, artifact layout
 - Bad: weeks of release engineering to match `dist` baseline
-- Bad: ongoing maintenance burden — cross-compilation edge cases change
+- Bad: ongoing maintenance burden; cross-compilation edge cases change
 - Bad: no generated Homebrew formula; must hand-maintain
 
 ### Homebrew-only
@@ -99,8 +99,8 @@ Revisit if:
 
 ### Hybrid: cargo-dist + cargo install
 
-- Good: cargo install works automatically alongside cargo-dist — no conflict
-- This is effectively what we're doing — `dist` is primary, `cargo install` is automatic fallback
+- Good: cargo install works automatically alongside cargo-dist; no conflict
+- This is effectively what we're doing: `dist` is primary, `cargo install` is automatic fallback
 
 ## More Information
 

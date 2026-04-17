@@ -22,23 +22,23 @@ Reddit was partially bot-blocked; signal summarized via indexed snippets rather 
 
 ### Most-requested features (ranked by signal strength)
 
-1. **Rate-limit / plan-usage quota in statusline JSON** — **the loudest signal in the entire corpus.**
+1. **Rate-limit / plan-usage quota in statusline JSON**: **the loudest signal in the entire corpus.**
    - [anthropics/claude-code#8412](https://github.com/anthropics/claude-code/issues/8412) has **44 thumbs-up reactions**
    - 10+ duplicate issues: #15844 (14 reactions), #22221 (11), #30341, #34074, #35747, #37338, #38946, #48279, #46329, #47574
    - Users want session-5h + weekly-7d % exposed so lines can show `Usage 92% · resets in 2h 13m` ([#41739](https://github.com/anthropics/claude-code/issues/41739))
-   - Today people scrape API response headers or `ccusage` — Anthropic hasn't shipped it, which is the #1 sore spot
+   - Today people scrape API response headers or `ccusage`; Anthropic hasn't shipped it, which is the #1 sore spot
 
-2. **Effort / thinking-mode level in JSON** — **second-highest dupe count.**
+2. **Effort / thinking-mode level in JSON**: **second-highest dupe count.**
    - [#49630](https://github.com/anthropics/claude-code/issues/49630), #49754, #45786, #44842, #41985, #39399, #38392, #37764, #37701, #36187, #31415, #41049, #42016 (13+ separate asks)
    - Users want live `/effort` level (low/medium/high/max/xhigh) visible
-   - ccstatusline has an `Effort` widget but [#239](https://github.com/sirmalloc/ccstatusline/issues/239) shows it doesn't update when user runs `/effort max` — CC never re-emits
+   - ccstatusline has an `Effort` widget but [#239](https://github.com/sirmalloc/ccstatusline/issues/239) shows it doesn't update when user runs `/effort max`; CC never re-emits
 
-3. **Accurate context-window tracking** — repeatedly broken.
+3. **Accurate context-window tracking**: repeatedly broken.
    - ccstatusline #233, #251, #164, #171, #180, #193, #146, #109, #92, #100 all report wrong % for 1M-context Opus/Sonnet, post-`/compact`, post-`/resume`, or during 429s (#97, #204)
    - Users say: "the context %, when it works, is the #1 reason I installed this" ([jeradbitner.com](https://jeradbitner.com/blog/claude-code-statusline), [aihero.dev](https://www.aihero.dev/creating-the-perfect-claude-code-status-line))
 
-4. **Git worktree awareness** — heavily requested, only partially served.
-   - ccstatusline #176 (git detection failed in worktrees), [#190](https://github.com/sirmalloc/ccstatusline/issues/190) (**model leaks across worktrees** — 4 reactions, still open)
+4. **Git worktree awareness**: heavily requested, only partially served.
+   - ccstatusline #176 (git detection failed in worktrees), [#190](https://github.com/sirmalloc/ccstatusline/issues/190) (**model leaks across worktrees**: 4 reactions, still open)
    - [dandoescode.com](https://www.dandoescode.com/blog/claude-code-custom-statusline) and [felipeelias.github.io](https://felipeelias.github.io/2026/03/17/claude-statusline.html) frame worktrees as the core motivating use case
    - Anthropic added `workspace.git_worktree` in 2.1.x but cross-session isolation (per-worktree model, branch, cost) remains broken
 
@@ -64,7 +64,7 @@ Reddit was partially bot-blocked; signal summarized via indexed snippets rather 
 - **`npx -y ccstatusline@latest` is a supply-chain liability AND a CPU hog**
   - [ccstatusline#298](https://github.com/sirmalloc/ccstatusline/issues/298): auto-executing `@latest` with no review (4 reactions)
   - [#103](https://github.com/sirmalloc/ccstatusline/issues/103) + [#22](https://github.com/sirmalloc/ccstatusline/issues/22) + [chongdashu/cc-statusline PR #4](https://github.com/chongdashu/cc-statusline/pull/4): **30+ concurrent node processes, 3GB RAM, 300% CPU** from rapid spawning
-  - Everyone who's been bitten asks for a **persistent daemon** or **native binary** — hence CCometixLine in Rust gaining traction
+  - Everyone who's been bitten asks for a **persistent daemon** or **native binary**; hence CCometixLine in Rust gaining traction
 
 - **Context/usage percentages are wrong more often than right** (see signal #3 above)
 
@@ -76,26 +76,26 @@ Reddit was partially bot-blocked; signal summarized via indexed snippets rather 
   - "No git" shown inside worktrees (#35, #176)
   - Cross-terminal reliability is the **most-filed bug category**
 
-- **TUI depth vs. overwhelm** — reviewers explicitly warn "resist adding excessive widgets." TUI is loved for depth but has no defaults.
+- **TUI depth vs. overwhelm**: reviewers explicitly warn "resist adding excessive widgets." TUI is loved for depth but has no defaults.
 
-- **Doesn't refresh on lifecycle events** — Anthropic-side issues #37163 (after compact), #36683 (during long turns), #40362 (after `/clear`), #48445 (refreshInterval doesn't repaint), #29411 (resumed sessions).
+- **Doesn't refresh on lifecycle events.** Anthropic-side issues #37163 (after compact), #36683 (during long turns), #40362 (after `/clear`), #48445 (refreshInterval doesn't repaint), #29411 (resumed sessions).
 
 ### Under-served use cases
 
-- **Per-worktree isolated state** — no tool survives parallel worktrees on different models
-- **Usage projections with "survive" indicator** — only AndrewTKent's mockup in #43271
+- **Per-worktree isolated state**: no tool survives parallel worktrees on different models
+- **Usage projections with "survive" indicator**: only AndrewTKent's mockup in #43271
 - **Clickable OSC-8 hyperlinks** for branch/PR/plan file (partial in ccstatusline #188; broken in tmux per #37216)
-- **Account/provider indicator** — ccstatusline #47, #64 (API vs Pro vs Max vs Bedrock/Vertex)
-- **Plan-mode file + progress widget** — #41906
-- **Last-task duration** (p10k-style) — ccstatusline #77
+- **Account/provider indicator**: ccstatusline #47, #64 (API vs Pro vs Max vs Bedrock/Vertex)
+- **Plan-mode file + progress widget**: #41906
+- **Last-task duration** (p10k-style): ccstatusline #77
 
 ### Surprising insights
 
 - **Energy/CO2 indicator has real demand** (ccstatusline #247, 2 reactions, cites arXiv paper)
-- **Peak/off-peak usage** ([#243](https://github.com/sirmalloc/ccstatusline/issues/243)) — Anthropic's double-usage off-peak promos created a scheduling-aware widget need no one anticipated
-- **Users actively distrust npx-based installs** — #298 is framed as blocking, not theoretical. Statically-compiled binary (Rust/Go) is now a **competitive moat, not a nice-to-have**
-- **The control channel is one-way** — [#44245](https://github.com/anthropics/claude-code/issues/44245) asks to let the statusline _set_ session color/name back to CC; no tool can do this
-- **"Self-aware" status messages** ([#40453](https://github.com/anthropics/claude-code/issues/40453)) — people use interrupt just to ask "are you stuck?". A heartbeat/what-am-I-doing signal would displace that behavior
+- **Peak/off-peak usage** ([#243](https://github.com/sirmalloc/ccstatusline/issues/243)): Anthropic's double-usage off-peak promos created a scheduling-aware widget need no one anticipated
+- **Users actively distrust npx-based installs**: #298 is framed as blocking, not theoretical. Statically-compiled binary (Rust/Go) is now a **competitive moat, not a nice-to-have**
+- **The control channel is one-way**: [#44245](https://github.com/anthropics/claude-code/issues/44245) asks to let the statusline _set_ session color/name back to CC; no tool can do this
+- **"Self-aware" status messages** ([#40453](https://github.com/anthropics/claude-code/issues/40453)): people use interrupt just to ask "are you stuck?". A heartbeat/what-am-I-doing signal would displace that behavior
 
 ## Conclusions
 
@@ -105,7 +105,7 @@ Supply-chain and resource concerns (npx spawns, RAM) are real enough that users 
 
 ## Implications / actions
 
-- Drives [ADR-0001: Use Rust](../adrs/0001-use-rust-for-runtime.md) — native binary isn't just a perf win, it's trust
+- Drives [ADR-0001: Use Rust](../adrs/0001-use-rust-for-runtime.md): native binary isn't just a perf win, it's trust
 - Drives linesmith's **correctness-first** positioning for v0.1:
   - Context % accurate across 1M, `/compact`, `/resume`, 429s
   - Rate-limit scraping from API headers like ccusage does

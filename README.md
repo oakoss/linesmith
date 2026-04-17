@@ -17,7 +17,7 @@ linesmith is built to close those gaps.
 
 ## Design in one paragraph
 
-A single static Rust binary (~3-5MB, <20ms cold start) that reads Claude Code's status line JSON on stdin and renders a composable line with a rich segment system (priority, width hints, conditional visibility, caching, async, sub-composition). User extensions are written in [rhai](https://rhai.rs/) and loaded from a config directory. Themes are role-based (Catppuccin-compatible). Input schema is tool-agnostic — it works with Claude Code and Qwen Code today, with Codex CLI and GitHub Copilot CLI ready to slot in when they ship compatible APIs.
+A single static Rust binary (~3-5MB, <20ms cold start) reads Claude Code's status line JSON on stdin and renders a composable line with a rich segment system: priority, width hints, conditional visibility, caching, async, and sub-composition. User extensions are written in [rhai](https://rhai.rs/) and loaded from a config directory. Themes are role-based (Catppuccin-compatible). The input schema is tool-agnostic; it works with Claude Code and Qwen Code today, with Codex CLI and GitHub Copilot CLI ready to slot in when they ship compatible APIs.
 
 See [`docs/adrs/`](docs/adrs/) for the decision rationale behind each piece and [`docs/research/`](docs/research/) for the research that drove those decisions.
 

@@ -6,7 +6,7 @@
 
 ## Question
 
-Which Rust crates should linesmith use for JSON parsing, terminal rendering, git operations, config, plugins, async, HTTP, caching, CLI args, TUI, and distribution — such that we meet our performance budget and keep iteration velocity high?
+Which Rust crates should linesmith use for JSON parsing, terminal rendering, git operations, config, plugins, async, HTTP, caching, CLI args, TUI, and distribution, such that we meet our performance budget and keep iteration velocity high?
 
 ## Sources
 
@@ -24,7 +24,7 @@ Which Rust crates should linesmith use for JSON parsing, terminal rendering, git
 | [sonic-rs](https://lib.rs/crates/sonic-rs) 0.5.8       | 679K              | Fastest (~3x serde_json on large), needs `target-cpu=native` |
 | [simd-json](https://lib.rs/crates/simd-json) 0.17.0    | 1.26M             | Fast, higher setup cost                                      |
 
-At 2KB payloads, **cold start and allocator warmup dominate** — parser throughput is irrelevant. SIMD crates have per-call setup overhead that swamps the win.
+At 2KB payloads, **cold start and allocator warmup dominate**; parser throughput is irrelevant. SIMD crates have per-call setup overhead that swamps the win.
 
 **Pick: `serde_json`.**
 
@@ -45,7 +45,7 @@ At 2KB payloads, **cold start and allocator warmup dominate** — parser through
 | --------------------------------------------------- | ------------------------------------------------------------------------------- |
 | [gix](https://lib.rs/crates/gix) 0.81.0 (2.4M/mo)   | Pure Rust, ~4.5MB, **native worktree support** (`.git`-as-file), no C toolchain |
 | [git2](https://lib.rs/crates/git2) 0.20.4 (4.2M/mo) | libgit2 bindings, ~143K lines of C, complicates cross-compile                   |
-| Shelling out to `git`                               | Fork+exec costs 5-15ms per prompt — violates <20ms budget                       |
+| Shelling out to `git`                               | Fork+exec costs 5-15ms per prompt; violates <20ms budget                        |
 
 **Pick: `gix`.** Pure-Rust means painless cross-compilation via `cross`, first-class worktree support, no libgit2 versioning. Use fine-grained sub-crates (`gix-repository`, `gix-status`) to keep binary lean.
 
@@ -54,7 +54,7 @@ At 2KB payloads, **cold start and allocator warmup dominate** — parser through
 | Crate                                            | Monthly downloads | Notes                                               |
 | ------------------------------------------------ | ----------------- | --------------------------------------------------- |
 | [toml](https://lib.rs/crates/toml) 1.1.2         | 41.2M             | Serde-native                                        |
-| [figment](https://lib.rs/crates/figment) 0.10.19 | 1.7M              | Layered providers, last release May 2024 — stagnant |
+| [figment](https://lib.rs/crates/figment) 0.10.19 | 1.7M              | Layered providers, last release May 2024 (stagnant) |
 | [config-rs](https://lib.rs/crates/config)        | -                 | Heavier than needed                                 |
 
 **Pick: `toml` + `serde_json`.** Roll a ~20-line `Config::load()` that reads `~/.config/linesmith/config.toml` and overlays `$LINESMITH_CONFIG` env JSON. Layering is trivial; figment is unmaintained.
@@ -138,10 +138,10 @@ Shaves 30-50% off binary size.
 
 ### 12. Bonus utilities
 
-- **WCAG contrast** — implement inline (~20 lines: relative luminance per sRGB → `(L1+0.05)/(L2+0.05)`). Use [palette](https://lib.rs/crates/palette) if we also want Oklab/HSL transforms.
-- **Terminal width** — **[terminal_size](https://lib.rs/crates/terminal_size) 0.4.4** (8.76M/mo) — tiny, works everywhere.
-- **OSC 8 hyperlinks** — **[supports-hyperlinks](https://lib.rs/crates/supports-hyperlinks) 3.2.0** (1.98M/mo) for detection; emit the escape yourself: `\x1b]8;;URL\x1b\\text\x1b]8;;\x1b\\`.
-- **Nerd Font icons** — no mainstream crate. Generate `const ICONS: &[(&str, char)]` from [nerd-fonts glyphnames.json](https://github.com/ryanoasis/nerd-fonts/blob/master/glyphnames.json) via `build.rs`, or hard-code the dozen we actually render.
+- **WCAG contrast**: implement inline (~20 lines: relative luminance per sRGB → `(L1+0.05)/(L2+0.05)`). Use [palette](https://lib.rs/crates/palette) if we also want Oklab/HSL transforms.
+- **Terminal width**: **[terminal_size](https://lib.rs/crates/terminal_size) 0.4.4** (8.76M/mo); tiny, works everywhere.
+- **OSC 8 hyperlinks**: **[supports-hyperlinks](https://lib.rs/crates/supports-hyperlinks) 3.2.0** (1.98M/mo) for detection; emit the escape yourself: `\x1b]8;;URL\x1b\\text\x1b]8;;\x1b\\`.
+- **Nerd Font icons**: no mainstream crate. Generate `const ICONS: &[(&str, char)]` from [nerd-fonts glyphnames.json](https://github.com/ryanoasis/nerd-fonts/blob/master/glyphnames.json) via `build.rs`, or hard-code the dozen we actually render.
 
 ## Conclusions
 
@@ -157,9 +157,9 @@ supports-hyperlinks, supports-color, dist for release.
 
 ## Implications / actions
 
-- Drives [ADR-0004: Rhai for Plugins](../adrs/0004-rhai-for-plugins.md) — WASM's cold-start blows our budget; rhai is the correct choice
-- Drives [ADR-0007: cargo-dist Distribution](../adrs/0007-cargo-dist-distribution.md) — industry standard for Rust CLI shipping
-- Feature gating is a first-class design concern from day one — keep the minimal `run` binary as small as possible
+- Drives [ADR-0004: Rhai for Plugins](../adrs/0004-rhai-for-plugins.md): WASM's cold-start blows our budget; rhai is the correct choice
+- Drives [ADR-0007: cargo-dist Distribution](../adrs/0007-cargo-dist-distribution.md): industry standard for Rust CLI shipping
+- Feature gating is a first-class design concern from day one; keep the minimal `run` binary as small as possible
 
 ## Open questions
 

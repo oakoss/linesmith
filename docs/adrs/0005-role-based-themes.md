@@ -6,11 +6,11 @@
 
 ## Context and Problem Statement
 
-Users want theme support — specifically, popular palettes like Catppuccin (4 flavors), Dracula, Nord, Gruvbox, Tokyo Night, Rose Pine. Existing tools either hardcode colors per segment (every new theme requires editing every segment) or force users to map colors to individual widgets by hex. How should linesmith structure its theme system so that adding a new theme is a single-file change, and user-authored plugins inherit theme colors automatically?
+Users want theme support, specifically popular palettes like Catppuccin (4 flavors), Dracula, Nord, Gruvbox, Tokyo Night, Rose Pine. Existing tools either hardcode colors per segment (every new theme requires editing every segment) or force users to map colors to individual widgets by hex. How should linesmith structure its theme system so that adding a new theme is a single-file change, and user-authored plugins inherit theme colors automatically?
 
 ## Decision Drivers
 
-- Adding a new theme should be a one-file change — no code edits, no per-segment tweaks
+- Adding a new theme should be a one-file change: no code edits, no per-segment tweaks
 - Users should be able to swap themes with a single config key
 - Plugin-authored segments should inherit theme colors without the plugin author naming any hex values
 - Catppuccin's 4-flavor structure and similar theme families should map cleanly
@@ -18,14 +18,14 @@ Users want theme support — specifically, popular palettes like Catppuccin (4 f
 
 ## Considered Options
 
-- **Hardcoded hex per segment** — every segment names its colors directly
-- **Role-based semantic colors** — themes define roles (primary, success, warning, etc.); segments reference roles
-- **Per-segment theme overrides** (hybrid) — roles by default, with per-segment override capability
-- **Oh My Posh JSON format reuse** — adopt OMP's portable theme schema
+- **Hardcoded hex per segment**: every segment names its colors directly
+- **Role-based semantic colors**: themes define roles (primary, success, warning, etc.); segments reference roles
+- **Per-segment theme overrides** (hybrid): roles by default, with per-segment override capability
+- **Oh My Posh JSON format reuse**: adopt OMP's portable theme schema
 
 ## Decision Outcome
 
-Chosen option: **Role-based semantic colors with optional per-segment overrides** (a hybrid of options 2 and 3), because it's the only design where adding a theme is a one-file change AND users retain the ability to override specific segments when they want. Segments declare which role they want (`role:success bold`); themes map roles to hex. This is how Starship and Helix work, and it's why Catppuccin has 100+ integrations — their contract is role-based.
+Chosen option: **Role-based semantic colors with optional per-segment overrides** (a hybrid of options 2 and 3), because it's the only design where adding a theme is a one-file change AND users retain the ability to override specific segments when they want. Segments declare which role they want (`role:success bold`); themes map roles to hex. This is how Starship and Helix work, and it's why Catppuccin has 100+ integrations: their contract is role-based.
 
 Theme file shape (TOML):
 
@@ -57,13 +57,13 @@ style = "role:accent bold"  # or "role:custom.mygreen" referring to user-defined
 
 ### Consequences
 
-- Good, because adding a new theme is a single TOML file — no code changes
+- Good, because adding a new theme is a single TOML file; no code changes
 - Good, because we can ship 8+ built-in themes with low maintenance cost (Catppuccin 4 flavors + Dracula + Nord + Gruvbox + Tokyo Night + Rose Pine + minimal + default)
 - Good, because user plugins inherit theme colors automatically; plugin authors don't touch hex
-- Good, because the role vocabulary is Catppuccin-compatible — we can submit for official integration
+- Good, because the role vocabulary is Catppuccin-compatible; we can submit for official integration
 - Good, because per-segment overrides give users an escape hatch for specific tweaks
-- Bad, because we must define a role vocabulary up front — too few roles and segments feel cramped; too many and themes become tedious to author
-- Bad, because a segment's visual design is partly dictated by the role vocabulary — if a theme doesn't define a role a segment wants, we need fallback logic
+- Bad, because we must define a role vocabulary up front; too few roles and segments feel cramped; too many and themes become tedious to author
+- Bad, because a segment's visual design is partly dictated by the role vocabulary; if a theme doesn't define a role a segment wants, we need fallback logic
 - Neutral, because this adds a small runtime cost (role lookup per styled emission) but it's negligible relative to our <20ms budget
 
 ### Confirmation
@@ -79,7 +79,7 @@ Revisit if:
 ### Hardcoded hex per segment
 
 - Good: absolute rendering control
-- Bad: every new theme requires editing every segment — doesn't scale
+- Bad: every new theme requires editing every segment (doesn't scale)
 - Bad: plugin authors must pick colors, which looks wrong under non-default themes
 - Bad: no reusability across themes
 
@@ -91,13 +91,13 @@ Revisit if:
 
 ### Role-based + per-segment overrides (chosen)
 
-- Good: best of both worlds — clean defaults, escape hatch when needed
+- Good: best of both worlds; clean defaults, escape hatch when needed
 - Bad: slightly more complex mental model for users
 - Bad: config schema is richer
 
 ### Oh My Posh JSON format reuse
 
-- Good: immediate access to OMP's existing theme library — hundreds of themes
+- Good: immediate access to OMP's existing theme library (hundreds of themes)
 - Good: cross-tool interchangeability with terminal prompts
 - Bad: OMP's format is more complex than we need (prompt-level concepts that don't apply to statuslines)
 - Bad: couples us to OMP's schema decisions

@@ -11,34 +11,34 @@ We need a product name. The obvious candidate (`ccstatusline`) collides with the
 ## Decision Drivers
 
 - No conflict on crates.io, npm, or GitHub repo namespace
-- Tool-agnostic positioning — the statusline contract is becoming a cross-vendor standard
+- Tool-agnostic positioning; the statusline contract is becoming a cross-vendor standard
 - Memorable, pronounceable, searchable as a unique term
-- Narrative fit — "forge/craft your statusline" aligns with our extensibility-first positioning
+- Narrative fit: "forge/craft your statusline" aligns with our extensibility-first positioning
 - Brand room to grow (potential for `linesmith-themes`, `linesmith-plugins`, etc.)
 - GitHub org (`oakoss`) carries the umbrella brand; product name can focus on function
 
 ## Considered Options
 
-- `ccbar`, `ccline`, `cchud` — `cc`-prefixed
-- `statline`, `statsmith` — descriptive standalone
-- `linesmith` — craft-themed standalone
-- `bladeline` — Rust-themed, distinctive but aggressive
-- Other abstract brands (`cairn`, `lumen`, `glyph`, `vantage`) — mostly taken on crates.io
+- `ccbar`, `ccline`, `cchud`: `cc`-prefixed
+- `statline`, `statsmith`: descriptive standalone
+- `linesmith`: craft-themed standalone
+- `bladeline`: Rust-themed, distinctive but aggressive
+- Other abstract brands (`cairn`, `lumen`, `glyph`, `vantage`): mostly taken on crates.io
 - Invented portmanteaus (`ccforge`, `ccink`, `ccstripe`, `ccglimmer`, etc.)
 
 ## Decision Outcome
 
-Chosen option: **`linesmith`** (shipped as `oakoss/linesmith`), because it satisfies every decision driver: it's available across crates.io, npm, and GitHub; the craft narrative ("smith your statusline") aligns with our extensibility/plugin positioning; it's tool-agnostic as the ecosystem standardizes on the `statusLine` contract; and as a unique term it will own its own SEO over time.
+Chosen option: **`linesmith`** (shipped as `oakoss/linesmith`), because it satisfies every decision driver. It's available across crates.io, npm, and GitHub; the craft narrative ("smith your statusline") aligns with our extensibility/plugin positioning; it's tool-agnostic as the ecosystem standardizes on the `statusLine` contract; and as a unique term it will own its own SEO over time.
 
 ### Consequences
 
 - Good, because the name is available everywhere and we own a clean namespace
-- Good, because the craft theme reinforces "build/customize/extend" — the core differentiator
+- Good, because the craft theme reinforces "build/customize/extend", the core differentiator
 - Good, because we're positioned for Qwen/Codex/Copilot as they ship compatible APIs
 - Good, because `linesmith-themes` / `linesmith-plugins` extensions fit the brand naturally
-- Bad, because zero-discovery SEO today — a new Claude Code user searching "status line" won't find us via organic search initially
+- Bad, because zero-discovery SEO today; a new Claude Code user searching "status line" won't find us via organic search initially
 - Bad, because `cc`-prefixed tools benefit from the Claude Code search space; we'll need to lean on docs, READMEs, and community presence
-- Neutral, because beads issue prefix is `lsm-` (8-char limit) — an acceptable abbreviation
+- Neutral, because beads issue prefix is `lsm-` (8-char limit), an acceptable abbreviation
 
 ### Confirmation
 
@@ -53,7 +53,7 @@ Revisit if:
 ### `linesmith`
 
 - Good: available across crates.io, npm, GitHub; craft narrative; tool-agnostic; unique term
-- Good: 9 characters — pronounceable, typable
+- Good: 9 characters; pronounceable, typable
 - Good: "smith" is productive for ecosystem naming (themes, plugins, presets)
 - Bad: zero initial SEO discoverability
 - Bad: "line" is generic; possible future name collision with vim plugins
@@ -61,7 +61,7 @@ Revisit if:
 ### `ccbar`, `ccline`, `cchud` (cc-prefixed)
 
 - Good: immediately searchable for Claude Code users
-- Bad: all three have multiple existing Claude Code statusline repos (crowded namespace — see competitor research)
+- Bad: all three have multiple existing Claude Code statusline repos (crowded namespace; see competitor research)
 - Bad: locks us to Claude Code as the ecosystem goes cross-tool
 - Bad: users would confuse us with the npm ccstatusline tool
 
@@ -75,7 +75,7 @@ Revisit if:
 
 - Good: Rust-flavored, distinctive
 - Bad: tonally aggressive; may not age well
-- Bad: unfamiliar — requires users to memorize without hook
+- Bad: unfamiliar; requires users to memorize without hook
 
 ### Abstract brands (`cairn`, `lumen`, `glyph`, `vantage`, etc.)
 

@@ -12,22 +12,22 @@ linesmith is a status line tool that will spawn as a fresh process on every Clau
 
 - Cold start budget <20ms
 - Single-binary distribution (no auto-updating npm/npx execution)
-- Supply-chain trustworthiness — users actively distrust `npx -y @latest`
-- Competitive moat — Rust-based tools are gaining share on exactly this axis
-- Plugin system fit — embedded scripting runtimes (rhai, mlua) integrate cleanly with Rust
-- Long-term ecosystem bet — we're willing to trade dev velocity for a better ceiling
+- Supply-chain trustworthiness: users actively distrust `npx -y @latest`
+- Competitive moat: Rust-based tools are gaining share on exactly this axis
+- Plugin system fit: embedded scripting runtimes (rhai, mlua) integrate cleanly with Rust
+- Long-term ecosystem bet; we're willing to trade dev velocity for a better ceiling
 
 ## Considered Options
 
-- **Rust** — ~15ms cold start, ~3-5MB stripped binary, static single-binary
-- **TypeScript + Bun** (`bun build --compile`) — ~30ms cold start, ~50MB binary, keeps TS iteration speed
-- **Go** — ~20ms cold start, ~10MB binary, simpler than Rust but no skill reuse
-- **Node** — ~150ms cold start, needs runtime installed, supply-chain risk
-- **Shell (bash/zsh)** — fastest to write, no portability story, terminal-parsing brittleness
+- **Rust**: ~15ms cold start, ~3-5MB stripped binary, static single-binary
+- **TypeScript + Bun** (`bun build --compile`): ~30ms cold start, ~50MB binary, keeps TS iteration speed
+- **Go**: ~20ms cold start, ~10MB binary, simpler than Rust but no skill reuse
+- **Node**: ~150ms cold start, needs runtime installed, supply-chain risk
+- **Shell (bash/zsh)**: fastest to write, no portability story, terminal-parsing brittleness
 
 ## Decision Outcome
 
-Chosen option: **Rust**, because it's the only option that simultaneously hits the <20ms cold-start budget, produces a single static binary under 10MB, and gives us first-class integration with embedded plugin runtimes (rhai). The supply-chain concern is meaningful enough that Rust's distribution story is not just a nice-to-have — it's a competitive differentiator that users are actively seeking out (see `research/user-demand.md` and the migration toward CCometixLine, claudia-statusline, felipeelias's Go tool).
+Chosen option: **Rust**, because it's the only option that simultaneously hits the <20ms cold-start budget, produces a single static binary under 10MB, and gives us first-class integration with embedded plugin runtimes (rhai). The supply-chain concern is meaningful enough that Rust's distribution story is a competitive differentiator users are actively seeking out (see `research/user-demand.md` and the migration toward CCometixLine, claudia-statusline, felipeelias's Go tool).
 
 ### Consequences
 
@@ -36,9 +36,9 @@ Chosen option: **Rust**, because it's the only option that simultaneously hits t
 - Good, because the `gix` + `rhai` + `owo-colors` + `serde_json` stack is proven and pure-Rust, which simplifies cross-compilation via `cross`
 - Good, because Rust cross-compilation via cargo-dist is mature — macOS universal, Linux glibc+musl, Windows MSVC all ship cleanly
 - Bad, because development velocity is 2-3x slower than TypeScript, especially for UI-adjacent work
-- Bad, because the plugin authoring story for user-written code in native Rust is much heavier than embedded scripting — we mitigate this in [ADR-0004](0004-rhai-for-plugins.md) with rhai
+- Bad, because the plugin authoring story for user-written code in native Rust is much heavier than embedded scripting; we mitigate this in [ADR-0004](0004-rhai-for-plugins.md) with rhai
 - Bad, because community contributors familiar with TypeScript statuslines won't trivially port over
-- Neutral, because binary size (~3-5MB) sits between Go (~10MB) and C — not a differentiator either way
+- Neutral, because binary size (~3-5MB) sits between Go (~10MB) and C, not a differentiator either way
 
 ### Confirmation
 
@@ -62,9 +62,9 @@ Revisit if:
 
 - Good: 80% of the Rust perf win with 20% of the effort
 - Good: keeps TS iteration speed; plugin authors write familiar TS
-- Good: Bun's `--compile` produces a ~50MB standalone binary — kills the npx complaint
-- Bad: ~30ms cold start vs Rust's ~15ms — noticeable at the margin
-- Bad: ~50MB binary vs ~5MB Rust — 10x larger, matters for Homebrew/distribution perception
+- Good: Bun's `--compile` produces a ~50MB standalone binary, which kills the npx complaint
+- Bad: ~30ms cold start vs Rust's ~15ms, noticeable at the margin
+- Bad: ~50MB binary vs ~5MB Rust (10x larger); matters for Homebrew/distribution perception
 - Bad: Bun ecosystem is still maturing; edge cases around FFI and platform binaries
 
 ### Go
@@ -78,7 +78,7 @@ Revisit if:
 ### Node (plain)
 
 - Good: ubiquitous, every Claude Code user has it
-- Bad: 150ms cold start — unacceptable
+- Bad: 150ms cold start (unacceptable)
 - Bad: the exact stack whose supply-chain and resource problems motivated this project
 - Bad: no static binary without heavy tooling (pkg/nexe are deprecated or problematic)
 

@@ -21,7 +21,7 @@ How does Claude Code invoke a user-defined status line? What data does it pass i
 
 - Trigger: executes after each assistant message, permission mode change, or vim mode toggle
 - Debouncing: 300ms window prevents rapid re-invocation
-- Lifecycle: new process spawn per invocation — not persistent
+- Lifecycle: new process spawn per invocation (not persistent)
 - Visibility: hidden during autocomplete, help menus, and permission prompts
 
 ### Configuration
@@ -93,7 +93,7 @@ Claude Code pipes the full session state as JSON to stdin:
 **Important nullability:**
 
 - `current_usage` is `null` before the first API call in a session
-- `rate_limits` is only present for Pro/Max subscriptions — missing for API-key users
+- `rate_limits` is only present for Pro/Max subscriptions; missing for API-key users
 
 ### Output format
 
@@ -119,7 +119,7 @@ Claude Code pipes the full session state as JSON to stdin:
 
 - Recent change: 300ms debounce was added to prevent excessive invocation
 - Cache fields (`cache_read_input_tokens`, `cache_creation_input_tokens`) track prompt caching
-- `rate_limits` fields vary by subscription tier — always check before accessing
+- `rate_limits` fields vary by subscription tier; always check before accessing
 
 ## Conclusions
 
@@ -132,12 +132,12 @@ The API contract is well-shaped for a typed Rust implementation. Every invocatio
 ## Implications / actions
 
 - Drives [ADR-0006: Tool-Agnostic JSON Schema](../adrs/0006-tool-agnostic-json-schema.md) (which extends this with Qwen fields)
-- Informs segment system design — segments receive a parsed/validated context, not raw JSON
+- Informs segment system design: segments receive a parsed/validated context, not raw JSON
 - Performance budget: aim for <20ms cold start; 300ms debounce gives us real breathing room but users notice lag
 
 ## Open questions
 
 - What's the actual observed timeout before Claude Code gives up on a slow statusline? (no docs say)
 - Does `added_dirs` ever carry content for multi-root workspaces, or is it always empty?
-- How does `workspace.git_worktree.name` behave when there's no git — absent, null, or empty?
-- What exactly does `agent.name` contain in practice (custom subagents? MCP tools?) — needs empirical observation
+- How does `workspace.git_worktree.name` behave when there's no git: absent, null, or empty?
+- What exactly does `agent.name` contain in practice (custom subagents? MCP tools?)? Needs empirical observation.

@@ -2,7 +2,7 @@
 
 A Rust status line tool for Claude Code (and other AI coding CLIs) with plugin API, role-based themes, and correctness-first context/rate-limit/worktree handling.
 
-**Status:** Bootstrap phase — docs and tooling foundation complete, Rust scaffold pending.
+**Status:** Bootstrap phase. Docs and tooling foundation complete; Rust scaffold pending.
 
 > **AGENTS.md is the source of truth for AI agent instructions in this project.** `CLAUDE.md` contains only `@AGENTS.md` to import this file. Do not edit `CLAUDE.md` directly or duplicate content across both files. Agents that read `AGENTS.md` (Codex, OpenAI Codex CLI, Cursor, etc.) and Claude Code (via the `@` import) see the same content.
 
@@ -18,7 +18,7 @@ research  →  ideas  →  ADRs  →  specs  →  beads
 - **Ideas** explore possibilities (see `docs/ideas/`; promoted ideas move to `docs/ideas/archived/`)
 - **ADRs** resolve questions in MADR v4.0 format (see `docs/adrs/`, immutable once accepted)
 - **Specs** formalize decisions into implementation contracts (see `docs/specs/`)
-- **Beads** tracks execution work (run `bd ready`)
+- **Beads** tracks execution work (`bd ready`)
 
 See `docs/README.md` for the full pipeline description and promotion rules.
 
@@ -36,7 +36,7 @@ See `docs/README.md` for the full pipeline description and promotion rules.
 ### Mechanics
 
 - **Start from the template.** Copy `0000-template.md` in the target folder, rename it, fill it in. Do not write from scratch.
-- **Numbering.** ADRs and ideas use zero-padded 4-digit prefixes (`0001-`, `0002-`, ...). Pick the next available number. Research docs use descriptive names. Specs use feature-area names.
+- **Numbering.** ADRs and ideas use zero-padded 4-digit prefixes (`0001-`, `0002-`, ...); pick the next available number. Research docs use descriptive names. Specs use feature-area names.
 - **Cross-link.** ADRs cite their driving research docs and list related ADRs. Specs cite their driving ADRs. Research docs cite the ADRs they should drive.
 
 ### Promotion flow
@@ -109,18 +109,18 @@ Beads (`bd`) tracks all implementation work. Issue prefix: `lsm-`.
 - **`bd close <id> --reason="..."`** when completing
 - **`bd remember "insight"`** for persistent knowledge across sessions (search with `bd memories <keyword>`)
 - **`bd prime`** for full workflow context and command reference
-- **Do NOT** use TodoWrite, TaskCreate, or markdown TODO lists — beads is the source of truth
+- **Do NOT** use TodoWrite, TaskCreate, or markdown TODO lists; beads is the source of truth
 
 ## Rules
 
-- **Never commit proactively** — wait for the user's go-ahead
-- **Never push** unless explicitly asked
-- **Read before writing** — understand existing docs/code before modifying
-- **Conventions are law** — follow `docs/README.md` for the docs pipeline, MADR v4.0 for ADRs, per-folder templates for new docs
-- **No empty docs** — every idea needs a problem statement, every ADR needs considered options + rationale, every spec needs interface + behavior
-- **Scope is explicit** — include "What This Is Not" when the boundary matters
-- **Decisions go in ADRs** — don't resolve contradictions inline; write a new ADR (superseding the old one if needed)
-- **One logical change per commit** — split independent concerns
+- **Never commit proactively.** Wait for the user's go-ahead.
+- **Never push** unless explicitly asked.
+- **Read before writing.** Understand existing docs/code before modifying.
+- **Conventions are law.** Follow `docs/README.md` for the docs pipeline, MADR v4.0 for ADRs, per-folder templates for new docs.
+- **No empty docs.** Every idea needs a problem statement, every ADR needs considered options + rationale, every spec needs interface + behavior.
+- **Scope is explicit.** Include "What This Is Not" when the boundary matters.
+- **Decisions go in ADRs.** Don't resolve contradictions inline; write a new ADR (superseding the old one if needed).
+- **One logical change per commit.** Split independent concerns.
 
 ## Commit Style
 
@@ -145,9 +145,9 @@ lsm-sgh
 
 When ending a work session:
 
-1. **File issues for remaining work** — `bd create ...` for anything that needs follow-up
-2. **Run quality gates** if code changed — `mise run check` or relevant subset
-3. **Update issue status** — close finished work with `bd close <id>`, update in-progress items
-4. **Commit if the user asks** — do not commit proactively
+1. **File issues for remaining work.** Run `bd create ...` for anything that needs follow-up.
+2. **Run quality gates** if code changed: `mise run check` or a relevant subset.
+3. **Update issue status.** Close finished work with `bd close <id>`; update in-progress items.
+4. **Commit if the user asks.** Do not commit proactively.
 
 Note: this project is currently local-only (no git remote). Once a remote is configured, session completion will also require `git push` + `bd dolt push`.
