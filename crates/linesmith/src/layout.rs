@@ -13,10 +13,29 @@ use std::io::{self, Write};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Render `segments` for `ctx` within `terminal_width` cells. Returns the
-/// final line without a trailing newline.
+/// final line without a trailing newline. Segment render errors are
+/// logged to the real process stderr; for injected-stderr testability,
+/// use [`render_with_warn`] instead.
 #[must_use]
 pub fn render(segments: &[Box<dyn Segment>], ctx: &StatusContext, terminal_width: u16) -> String {
-    let items = collect_items(segments, ctx);
+    let mut warn = |msg: &str| {
+        let _ = writeln!(io::stderr().lock(), "linesmith: {msg}");
+    };
+    render_with_warn(segments, ctx, terminal_width, &mut warn)
+}
+
+/// Same as [`render`] but routes segment render-error diagnostics
+/// through a caller-supplied warn sink. Used by
+/// `run_with_segments_width_and_stderr` so `cli_main` tests can
+/// capture segment errors alongside exit codes.
+#[must_use]
+pub fn render_with_warn(
+    segments: &[Box<dyn Segment>],
+    ctx: &StatusContext,
+    terminal_width: u16,
+    warn: &mut dyn FnMut(&str),
+) -> String {
+    let items = collect_items_with(segments, ctx, warn);
     render_items(items, terminal_width)
 }
 
@@ -26,13 +45,6 @@ pub fn render(segments: &[Box<dyn Segment>], ctx: &StatusContext, terminal_width
 struct Item {
     rendered: RenderedSegment,
     defaults: SegmentDefaults,
-}
-
-fn collect_items(segments: &[Box<dyn Segment>], ctx: &StatusContext) -> Vec<Item> {
-    let mut warn = |msg: &str| {
-        let _ = writeln!(io::stderr().lock(), "linesmith: {msg}");
-    };
-    collect_items_with(segments, ctx, &mut warn)
 }
 
 fn collect_items_with(

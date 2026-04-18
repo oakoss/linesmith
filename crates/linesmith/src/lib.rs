@@ -43,16 +43,44 @@ pub fn run_with_width(
 }
 
 /// Full-control entry: pre-built segment list plus explicit width.
-/// Parse failures render a `?` marker and log to stderr; only I/O
-/// failures surface as errors.
+/// Parse failures render a `?` marker and log to the real process
+/// stderr; only I/O failures surface as errors. For injected-stderr
+/// testability (used by `cli_main`), call
+/// [`run_with_segments_width_and_stderr`] instead.
 ///
 /// # Errors
 ///
 /// Returns an `io::Error` if reading from `reader` or writing to
 /// `writer` fails.
 pub fn run_with_segments_and_width(
+    reader: impl Read,
+    writer: impl Write,
+    segments: &[Box<dyn Segment>],
+    terminal_width: u16,
+) -> io::Result<()> {
+    run_with_segments_width_and_stderr(
+        reader,
+        writer,
+        &mut io::stderr().lock(),
+        segments,
+        terminal_width,
+    )
+}
+
+/// Full-control entry with injected stderr. Used by `cli_main` so
+/// tests can capture parse-error and segment-render-error diagnostics
+/// alongside exit codes. Parse failures render a `?` marker to
+/// `writer`; only stdin/stdout I/O failures surface as errors.
+///
+/// # Errors
+///
+/// Returns an `io::Error` if reading from `reader` or writing to
+/// `writer` fails. Stderr write failures are swallowed (a broken
+/// stderr pipe must not abort a valid stdout render).
+pub fn run_with_segments_width_and_stderr(
     mut reader: impl Read,
     mut writer: impl Write,
+    stderr: &mut dyn Write,
     segments: &[Box<dyn Segment>],
     terminal_width: u16,
 ) -> io::Result<()> {
@@ -62,14 +90,14 @@ pub fn run_with_segments_and_width(
     let ctx = match input::parse(&buf) {
         Ok(ctx) => ctx,
         Err(err) => {
-            // Swallow stderr errors: a broken stderr pipe must not
-            // abort the stdout render.
-            let _ = writeln!(io::stderr().lock(), "linesmith: parse: {err}");
+            let _ = writeln!(stderr, "linesmith: parse: {err}");
             return writeln!(writer, "?");
         }
     };
 
-    let line = layout::render(segments, &ctx, terminal_width);
+    let line = layout::render_with_warn(segments, &ctx, terminal_width, &mut |msg| {
+        let _ = writeln!(stderr, "linesmith: {msg}");
+    });
     writeln!(writer, "{line}")
 }
 
@@ -205,6 +233,177 @@ fn resolve_terminal_width(
             DEFAULT_TERMINAL_WIDTH
         }
     }
+}
+
+/// Process-ambient inputs the CLI reads: env vars consulted by
+/// `resolve_config_path` plus an optional terminal-width override.
+/// Passed through `cli_main` so tests can drive the whole binary
+/// without touching the real process env. `#[non_exhaustive]` leaves
+/// room for future env vars (NO_COLOR, TERM, ...) without breaking
+/// external construction.
+///
+/// `terminal_width = None` means "detect lazily when the render path
+/// needs it." Meta commands (`--help`, `--version`, `--check-config`)
+/// never probe the terminal, so stray `COLUMNS` warnings don't leak
+/// into clean stderr.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct CliEnv {
+    pub linesmith_config: Option<String>,
+    pub xdg_config_home: Option<String>,
+    pub home: Option<String>,
+    pub terminal_width: Option<u16>,
+}
+
+impl CliEnv {
+    /// Snapshot the real process env vars. Terminal width is left
+    /// unset; `run_cli` probes it only if a render happens.
+    #[must_use]
+    pub fn from_process() -> Self {
+        Self {
+            linesmith_config: std::env::var("LINESMITH_CONFIG").ok(),
+            xdg_config_home: std::env::var("XDG_CONFIG_HOME").ok(),
+            home: std::env::var("HOME").ok(),
+            terminal_width: None,
+        }
+    }
+}
+
+/// CLI entry point. `main.rs` wires real stdin/stdout/stderr and a
+/// process-env snapshot. Returns a `u8` exit code so callers convert
+/// to `ExitCode` only at the outermost layer.
+pub fn cli_main<A>(
+    args: A,
+    stdin: impl Read,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    env: &CliEnv,
+) -> u8
+where
+    A: IntoIterator,
+    A::Item: Into<std::ffi::OsString>,
+{
+    let action = match cli::parse(args) {
+        Ok(a) => a,
+        Err(err) => {
+            let _ = writeln!(stderr, "linesmith: {err}");
+            let _ = writeln!(stderr, "Try --help for usage.");
+            return 2;
+        }
+    };
+
+    match action {
+        cli::Action::Help => {
+            let _ = write!(stdout, "{}", cli::HELP);
+            0
+        }
+        cli::Action::Version => {
+            let _ = writeln!(stdout, "linesmith {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
+        cli::Action::Run(args) => run_cli(args, stdin, stdout, stderr, env),
+    }
+}
+
+fn run_cli(
+    args: cli::CliArgs,
+    stdin: impl Read,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    env: &CliEnv,
+) -> u8 {
+    let resolved = config::resolve_config_path(
+        args.config.clone(),
+        env.linesmith_config.as_deref(),
+        env.xdg_config_home.as_deref(),
+        env.home.as_deref(),
+    );
+    let (cfg, load_error) = load_config(resolved.as_ref(), stderr);
+
+    if args.check_config {
+        return check_config(resolved.as_ref(), cfg.as_ref(), load_error, stderr);
+    }
+
+    let segments = build_segments(cfg.as_ref(), |msg| {
+        let _ = writeln!(stderr, "linesmith: {msg}");
+    });
+
+    let width = env.terminal_width.unwrap_or_else(detect_terminal_width);
+    if let Err(err) = run_with_segments_width_and_stderr(stdin, stdout, stderr, &segments, width) {
+        let _ = writeln!(stderr, "linesmith: {err}");
+        return 1;
+    }
+    0
+}
+
+/// Load the config at `resolved` if present. Missing files are silent
+/// for implicit paths (first-run users) but warn for explicit paths
+/// (the user asked for a specific file and it wasn't there).
+fn load_config(
+    resolved: Option<&config::ConfigPath>,
+    stderr: &mut dyn Write,
+) -> (Option<config::Config>, Option<config::ConfigError>) {
+    let Some(cp) = resolved else {
+        return (None, None);
+    };
+    match config::Config::load(&cp.path) {
+        Ok(Some(c)) => (Some(c), None),
+        Ok(None) => {
+            if cp.explicit {
+                let _ = writeln!(
+                    stderr,
+                    "linesmith: config not found at {}",
+                    cp.path.display()
+                );
+            }
+            (None, None)
+        }
+        Err(e) => {
+            let _ = writeln!(stderr, "linesmith: {e}");
+            (None, Some(e))
+        }
+    }
+}
+
+fn check_config(
+    resolved: Option<&config::ConfigPath>,
+    cfg: Option<&config::Config>,
+    load_error: Option<config::ConfigError>,
+    stderr: &mut dyn Write,
+) -> u8 {
+    // `--check-config` is the CI / editor contract for strict
+    // validation; if we can't even resolve a config path, that's a
+    // failure rather than a "use defaults" fallback.
+    let Some(cp) = resolved else {
+        let _ = writeln!(
+            stderr,
+            "linesmith: no config path (HOME and XDG_CONFIG_HOME both unset, no --config)"
+        );
+        return 1;
+    };
+    if load_error.is_some() {
+        let _ = writeln!(stderr, "linesmith: config invalid ({})", cp.path.display());
+        return 1;
+    }
+    let Some(cfg) = cfg else {
+        let _ = writeln!(
+            stderr,
+            "linesmith: no config at {}; using built-in defaults",
+            cp.path.display()
+        );
+        return 0;
+    };
+
+    let mut warn_count = 0_usize;
+    let _ = build_segments(Some(cfg), |msg| {
+        let _ = writeln!(stderr, "linesmith: {msg}");
+        warn_count += 1;
+    });
+    let _ = writeln!(stderr, "linesmith: config ok ({})", cp.path.display());
+    if warn_count > 0 {
+        let _ = writeln!(stderr, "linesmith: {warn_count} warning(s)");
+    }
+    0
 }
 
 #[cfg(test)]
@@ -517,5 +716,330 @@ mod tests {
             String::from_utf8(out).expect("utf8"),
             "Claude Sonnet 4.6 42% · 200k linesmith/feat-auth\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod cli_main_tests {
+    //! Drive the whole CLI entry point (`cli_main`) with fake IO and a
+    //! hand-built env. These tests lock exit codes and stderr contents
+    //! end-to-end. Integration tests in `tests/integration.rs` exercise
+    //! the same binary flow via `run_with_width`.
+
+    use super::*;
+    use std::io::Cursor;
+
+    /// Shared `CliEnv` for tests that don't care about config resolution.
+    /// Width `Some(200)` gives every segment room to render without
+    /// probing the real TTY.
+    fn empty_env() -> CliEnv {
+        CliEnv {
+            linesmith_config: None,
+            xdg_config_home: None,
+            home: None,
+            terminal_width: Some(200),
+        }
+    }
+
+    /// Run `cli_main` with the given args + stdin; return
+    /// `(exit_code, stdout, stderr)` as UTF-8 strings.
+    fn run_cli_main(args: &[&str], stdin: &[u8], env: &CliEnv) -> (u8, String, String) {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let args_owned: Vec<std::ffi::OsString> =
+            args.iter().map(std::ffi::OsString::from).collect();
+        let code = cli_main(
+            args_owned,
+            Cursor::new(stdin),
+            &mut stdout,
+            &mut stderr,
+            env,
+        );
+        (
+            code,
+            String::from_utf8(stdout).expect("stdout utf8"),
+            String::from_utf8(stderr).expect("stderr utf8"),
+        )
+    }
+
+    // --- meta actions ---
+
+    #[test]
+    fn help_flag_prints_help_to_stdout_and_exits_zero() {
+        let (code, stdout, stderr) = run_cli_main(&["--help"], b"", &empty_env());
+        assert_eq!(code, 0);
+        assert_eq!(stdout, cli::HELP);
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn version_flag_prints_version_to_stdout_and_exits_zero() {
+        let (code, stdout, stderr) = run_cli_main(&["--version"], b"", &empty_env());
+        assert_eq!(code, 0);
+        assert_eq!(stdout, format!("linesmith {}\n", env!("CARGO_PKG_VERSION")));
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn meta_flags_skip_terminal_width_detection() {
+        // With terminal_width: None, the render path probes COLUMNS /
+        // the TTY; meta commands must not, so a broken COLUMNS can't
+        // leak a width warning into --help / --version / --check-config
+        // stderr. Construct an env that would warn *if* detection ran.
+        let lazy_env = CliEnv {
+            linesmith_config: None,
+            xdg_config_home: None,
+            home: None,
+            terminal_width: None,
+        };
+        let (code, _stdout, stderr) = run_cli_main(&["--help"], b"", &lazy_env);
+        assert_eq!(code, 0);
+        assert!(
+            stderr.is_empty(),
+            "meta flag leaked width-detect output: {stderr}"
+        );
+    }
+
+    #[test]
+    fn unknown_flag_exits_two_and_prints_hint_to_stderr() {
+        let (code, stdout, stderr) = run_cli_main(&["--nope"], b"", &empty_env());
+        assert_eq!(code, 2);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("nope"));
+        assert!(stderr.contains("Try --help for usage."));
+    }
+
+    #[test]
+    fn empty_config_value_exits_two() {
+        // Shell-expansion guard: `--config ""` from `--config "$UNSET"`
+        // must not silently fall through to defaults.
+        let (code, _stdout, stderr) = run_cli_main(&["--config", ""], b"", &empty_env());
+        assert_eq!(code, 2);
+        assert!(stderr.contains("Try --help"));
+    }
+
+    // --- render flow ---
+
+    #[test]
+    fn minimal_payload_round_trips_through_cli_main() {
+        let json = br#"{
+            "model": { "display_name": "Claude Test" },
+            "workspace": { "project_dir": "/home/dev/linesmith" }
+        }"#;
+        let (code, stdout, stderr) = run_cli_main(&[], json, &empty_env());
+        assert_eq!(code, 0);
+        assert_eq!(stdout, "Claude Test linesmith\n");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn malformed_json_renders_marker_and_routes_parse_error_to_injected_stderr() {
+        // Locks the stderr plumbing: parse errors must surface on the
+        // caller's stderr sink, not the real process stderr.
+        let (code, stdout, stderr) = run_cli_main(&[], b"{not json", &empty_env());
+        assert_eq!(code, 0);
+        assert_eq!(stdout, "?\n");
+        assert!(
+            stderr.contains("parse:"),
+            "expected parse diag, got: {stderr}"
+        );
+    }
+
+    #[test]
+    fn render_io_error_exits_one() {
+        // Hand cli_main a stdout writer that fails, and confirm the
+        // render path returns 1 rather than 0 or 2. Without this test
+        // the exit code can silently regress to SUCCESS.
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let json = br#"{"model":{"display_name":"Claude"},"workspace":{"project_dir":"/x"}}"#;
+        let mut stderr = Vec::new();
+        let code = cli_main(
+            Vec::<std::ffi::OsString>::new(),
+            Cursor::new(json),
+            &mut FailingWriter,
+            &mut stderr,
+            &empty_env(),
+        );
+        assert_eq!(code, 1);
+        let stderr_str = String::from_utf8(stderr).expect("utf8");
+        assert!(stderr_str.contains("linesmith:"), "got: {stderr_str}");
+    }
+
+    #[test]
+    fn explicit_config_path_drives_render_not_just_check() {
+        // `check_config_with_valid_file_exits_zero_and_reports_ok`
+        // proves the path reaches --check-config; this proves it also
+        // drives the render path, so a regression that validates but
+        // then discards `resolved` gets caught.
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[line]\nsegments = [\"workspace\", \"model\"]\n").unwrap();
+        let json = br#"{
+            "model": { "display_name": "Claude" },
+            "workspace": { "project_dir": "/home/dev/linesmith" }
+        }"#;
+        let (code, stdout, _stderr) =
+            run_cli_main(&["--config", path.to_str().unwrap()], json, &empty_env());
+        assert_eq!(code, 0);
+        // Config reordered segments: workspace before model.
+        assert_eq!(stdout, "linesmith Claude\n");
+    }
+
+    // --- --check-config exit-code contract (docs/specs/config.md) ---
+
+    #[test]
+    fn check_config_with_no_resolvable_path_exits_one() {
+        // HOME, XDG_CONFIG_HOME, and LINESMITH_CONFIG all unset, no
+        // --config flag: resolve_config_path returns None and
+        // --check-config treats that as a failure rather than "use
+        // defaults."
+        let (code, stdout, stderr) = run_cli_main(&["--check-config"], b"", &empty_env());
+        assert_eq!(code, 1);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("no config path"));
+    }
+
+    #[test]
+    fn check_config_with_valid_file_exits_zero_and_reports_ok() {
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[line]\nsegments = [\"model\", \"workspace\"]\n").unwrap();
+        let (code, stdout, stderr) = run_cli_main(
+            &["--check-config", "--config", path.to_str().unwrap()],
+            b"",
+            &empty_env(),
+        );
+        assert_eq!(code, 0);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("config ok"));
+        assert!(stderr.contains(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn check_config_with_malformed_toml_exits_one_and_reports_invalid() {
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[line\nsegments =").unwrap();
+        let (code, stdout, stderr) = run_cli_main(
+            &["--check-config", "--config", path.to_str().unwrap()],
+            b"",
+            &empty_env(),
+        );
+        assert_eq!(code, 1);
+        assert!(stdout.is_empty());
+        assert!(stderr.contains("config invalid"));
+    }
+
+    #[test]
+    fn check_config_with_missing_explicit_path_warns_but_exits_zero() {
+        // `--check-config` only fails when the path is *unresolvable*
+        // (no env anywhere) or the file parses as invalid. A missing
+        // explicit path reports "not found" and falls back to defaults
+        // with SUCCESS.
+        let dir = tempdir();
+        let missing = dir.path().join("nonexistent.toml");
+        let (code, _stdout, stderr) = run_cli_main(
+            &["--check-config", "--config", missing.to_str().unwrap()],
+            b"",
+            &empty_env(),
+        );
+        assert_eq!(code, 0);
+        assert!(stderr.contains("config not found"));
+        assert!(stderr.contains("using built-in defaults"));
+    }
+
+    #[test]
+    fn check_config_surfaces_validation_warnings() {
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[line]\nsegments = [\"model\", \"does_not_exist\"]\n",
+        )
+        .unwrap();
+        let (code, _stdout, stderr) = run_cli_main(
+            &["--check-config", "--config", path.to_str().unwrap()],
+            b"",
+            &empty_env(),
+        );
+        assert_eq!(code, 0);
+        assert!(stderr.contains("does_not_exist"));
+        assert!(stderr.contains("1 warning(s)"));
+    }
+
+    // --- CliEnv plumbing ---
+
+    #[test]
+    fn cli_env_routes_home_through_to_config_resolution() {
+        // Proves env.home actually reaches resolve_config_path rather
+        // than getting shadowed by a process env::var read.
+        let dir = tempdir();
+        let cfg_dir = dir.path().join(".config/linesmith");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "[line]\nsegments = [\"model\"]\n",
+        )
+        .unwrap();
+
+        let env = CliEnv {
+            home: Some(dir.path().to_string_lossy().into_owned()),
+            ..empty_env()
+        };
+        let (code, _stdout, stderr) = run_cli_main(&["--check-config"], b"", &env);
+        assert_eq!(code, 0);
+        assert!(stderr.contains("config ok"));
+    }
+
+    #[test]
+    fn cli_env_xdg_takes_precedence_over_home_in_resolution() {
+        let dir = tempdir();
+        let xdg_cfg = dir.path().join("xdg/linesmith");
+        std::fs::create_dir_all(&xdg_cfg).unwrap();
+        std::fs::write(xdg_cfg.join("config.toml"), "[line]\nsegments = []\n").unwrap();
+
+        let env = CliEnv {
+            xdg_config_home: Some(dir.path().join("xdg").to_string_lossy().into_owned()),
+            home: Some("/nowhere/that/exists".to_string()),
+            ..empty_env()
+        };
+        let (code, _stdout, stderr) = run_cli_main(&["--check-config"], b"", &env);
+        assert_eq!(code, 0);
+        assert!(stderr.contains(dir.path().join("xdg").to_str().unwrap()));
+    }
+
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tempdir() -> TempDir {
+        let base = std::env::temp_dir().join(format!(
+            "linesmith-cli-main-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&base).expect("mkdir");
+        TempDir(base)
     }
 }
