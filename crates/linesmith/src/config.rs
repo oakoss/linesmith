@@ -14,8 +14,32 @@ use std::str::FromStr;
 pub struct Config {
     pub line: Option<LineConfig>,
     pub theme: Option<String>,
+    pub layout_options: Option<LayoutOptions>,
     #[serde(default)]
     pub segments: BTreeMap<String, SegmentOverride>,
+}
+
+/// `[layout_options]` section: render-path tunables that aren't tied
+/// to a specific segment. See `docs/specs/config.md` §layout_options.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct LayoutOptions {
+    pub color: ColorPolicy,
+    pub claude_padding: u16,
+}
+
+/// Config-level color override. `auto` honors CLI flags and env vars;
+/// `always` forces color even in non-TTY output; `never` strips all
+/// color. Sits below CLI flags and env vars in the precedence chain.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum ColorPolicy {
+    #[default]
+    Auto,
+    Always,
+    Never,
 }
 
 /// `[line]` section: ordered list of segment ids to render.
@@ -209,6 +233,62 @@ mod tests {
         .expect("parse ok");
         assert_eq!(c.segments["model"].priority, Some(16));
         assert_eq!(c.segments["model"].width, None);
+    }
+
+    #[test]
+    fn layout_options_color_and_padding_parse() {
+        let c = Config::from_str(
+            r#"
+                [layout_options]
+                color = "always"
+                claude_padding = 3
+            "#,
+        )
+        .expect("parse ok");
+        let lo = c.layout_options.expect("layout_options present");
+        assert_eq!(lo.color, ColorPolicy::Always);
+        assert_eq!(lo.claude_padding, 3);
+    }
+
+    #[test]
+    fn layout_options_color_accepts_all_three_variants() {
+        for (toml_val, expected) in [
+            ("auto", ColorPolicy::Auto),
+            ("always", ColorPolicy::Always),
+            ("never", ColorPolicy::Never),
+        ] {
+            let src = format!("[layout_options]\ncolor = \"{toml_val}\"\n");
+            let c = Config::from_str(&src).expect("parse ok");
+            assert_eq!(c.layout_options.map(|l| l.color), Some(expected));
+        }
+    }
+
+    #[test]
+    fn layout_options_defaults_populate_missing_keys() {
+        // `[layout_options]` with no fields inside still parses; missing
+        // color defaults to Auto, missing claude_padding defaults to 0.
+        let c = Config::from_str("[layout_options]\n").expect("parse ok");
+        let lo = c.layout_options.expect("layout_options present");
+        assert_eq!(lo.color, ColorPolicy::Auto);
+        assert_eq!(lo.claude_padding, 0);
+    }
+
+    #[test]
+    fn layout_options_rejects_unknown_color_variant() {
+        let err = Config::from_str(
+            r#"
+                [layout_options]
+                color = "bogus"
+            "#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn layout_options_omitted_entirely_is_ok() {
+        let c = Config::from_str("[line]\nsegments = [\"model\"]\n").expect("parse ok");
+        assert!(c.layout_options.is_none());
     }
 
     #[test]

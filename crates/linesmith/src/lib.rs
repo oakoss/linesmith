@@ -72,7 +72,8 @@ pub fn run_with_segments_and_width(
 
 /// Theme + capability + terminal width bundled for the render path.
 /// Passed to [`run_with_context`]; the CLI driver builds one from
-/// config (theme name) + `Capability::detect()` + `CliEnv.terminal_width`.
+/// config (theme name), the color-policy precedence chain (CLI flags /
+/// env / config), and `CliEnv.terminal_width` minus any padding.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct RenderContext<'a> {

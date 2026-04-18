@@ -8,26 +8,54 @@ use crate::segments::builder::build_segments;
 use crate::{cli, config, detect_terminal_width, run_with_context, theme, RenderContext};
 use std::io::{Read, Write};
 
+/// `NO_COLOR`-style flag: any non-empty value means "on." Per
+/// no-color.org.
+fn no_color_env(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| !v.is_empty())
+}
+
+/// `FORCE_COLOR`-style flag: treat `"0"`, `"false"`, `"off"`, unset,
+/// and empty as "absent" (no force). Any other value enables force.
+/// Matches npm / supports-color / chalk conventions so `FORCE_COLOR=0`
+/// doesn't accidentally force color on users who set it to disable.
+fn force_color_env(name: &str) -> bool {
+    let Ok(v) = std::env::var(name) else {
+        return false;
+    };
+    !matches!(v.as_str(), "" | "0" | "false" | "off")
+}
+
 /// Process-ambient inputs the CLI reads: env vars consulted by
-/// `resolve_config_path`, an optional terminal-width override, and an
-/// optional color-capability override. Passed through `cli_main` so
-/// tests can drive the whole binary without touching the real process
-/// env. `#[non_exhaustive]` leaves room for future env vars
-/// (FORCE_COLOR, TERM, ...) without breaking external construction.
+/// `resolve_config_path`, the color-policy env flags, an optional
+/// terminal-width override, and an optional color-capability
+/// override. Passed through `cli_main` so tests can drive the whole
+/// binary without touching the real process env. `#[non_exhaustive]`
+/// leaves room for future env vars (TERM, ...) without breaking
+/// external construction.
+///
+/// Env snapshotting is the exclusive job of [`CliEnv::from_process`].
+/// [`CliEnv::default`] and [`CliEnv::for_tests`] do not read any
+/// ambient state — the resolver honors only what the struct carries.
+/// Production binaries must use `from_process`; callers passing
+/// `default()` opt out of env awareness entirely (including
+/// `NO_COLOR` / `FORCE_COLOR` / `COLUMNS`).
 ///
 /// `terminal_width = None` means "detect lazily when the render path
 /// needs it." Meta commands (`--help`, `--version`, `--check-config`)
 /// never probe the terminal, so stray `COLUMNS` warnings don't leak
 /// into clean stderr.
 ///
-/// `color_capability = None` means the same: detect via
-/// `supports-color` on the render path only.
+/// `color_capability = Some(cap)` bypasses the entire color-policy
+/// precedence chain — reserved for test determinism. Production uses
+/// `None` and lets `no_color` / `force_color` / config resolve it.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct CliEnv {
     pub linesmith_config: Option<String>,
     pub xdg_config_home: Option<String>,
     pub home: Option<String>,
+    pub no_color: bool,
+    pub force_color: bool,
     pub terminal_width: Option<u16>,
     pub color_capability: Option<theme::Capability>,
 }
@@ -42,23 +70,26 @@ impl CliEnv {
             linesmith_config: std::env::var("LINESMITH_CONFIG").ok(),
             xdg_config_home: std::env::var("XDG_CONFIG_HOME").ok(),
             home: std::env::var("HOME").ok(),
+            no_color: no_color_env("NO_COLOR"),
+            force_color: force_color_env("FORCE_COLOR"),
             terminal_width: None,
             color_capability: None,
         }
     }
 
-    /// Test-suite baseline: no env paths, `terminal_width = Some(200)`,
-    /// `color_capability = Some(Capability::None)`. Width 200 gives
-    /// every segment room to render; forcing the `None` capability
-    /// keeps stdout plain so assertions don't drift under a truecolor
-    /// host. Use `CliEnv::default()` when the test cares about lazy
-    /// detection instead of a fixed baseline.
+    /// Test-suite baseline: no env paths, color flags off,
+    /// `terminal_width = Some(200)`, `color_capability = Some(None)`.
+    /// Forces the capability override so stdout stays plain under a
+    /// truecolor host; tests that exercise the color-policy resolver
+    /// directly use `CliEnv::default()` instead.
     #[must_use]
     pub fn for_tests() -> Self {
         Self {
             linesmith_config: None,
             xdg_config_home: None,
             home: None,
+            no_color: false,
+            force_color: false,
             terminal_width: Some(200),
             color_capability: Some(theme::Capability::None),
         }
@@ -123,11 +154,11 @@ fn run_cli(
         let _ = writeln!(stderr, "linesmith: {msg}");
     });
 
-    let width = env.terminal_width.unwrap_or_else(detect_terminal_width);
+    let raw_width = env.terminal_width.unwrap_or_else(detect_terminal_width);
+    let padding = layout_options(cfg.as_ref()).map_or(0, |l| l.claude_padding);
+    let width = raw_width.saturating_sub(padding);
     let theme_ref = resolve_theme(cfg.as_ref(), stderr);
-    let capability = env
-        .color_capability
-        .unwrap_or_else(theme::Capability::detect);
+    let capability = resolve_color_capability(args.color_override, env, cfg.as_ref());
     let ctx = RenderContext {
         theme: theme_ref,
         capability,
@@ -138,6 +169,54 @@ fn run_cli(
         return 1;
     }
     0
+}
+
+fn layout_options(cfg: Option<&config::Config>) -> Option<&config::LayoutOptions> {
+    cfg.and_then(|c| c.layout_options.as_ref())
+}
+
+/// Color-policy precedence chain, first match wins:
+///   1. `CliEnv.color_capability` override (test escape hatch)
+///   2. `--no-color` / `--force-color` CLI flag
+///   3. `NO_COLOR` env var
+///   4. `FORCE_COLOR` env var
+///   5. `[layout_options].color` in config
+///   6. default `auto` — detect via `supports-color`
+fn resolve_color_capability(
+    cli_override: Option<cli::ColorOverride>,
+    env: &CliEnv,
+    cfg: Option<&config::Config>,
+) -> theme::Capability {
+    if let Some(cap) = env.color_capability {
+        return cap;
+    }
+    match cli_override {
+        Some(cli::ColorOverride::Never) => return theme::Capability::None,
+        Some(cli::ColorOverride::Always) => return force_color_detect(),
+        None => {}
+    }
+    if env.no_color {
+        return theme::Capability::None;
+    }
+    if env.force_color {
+        return force_color_detect();
+    }
+    match layout_options(cfg).map(|l| l.color).unwrap_or_default() {
+        config::ColorPolicy::Never => theme::Capability::None,
+        config::ColorPolicy::Always => force_color_detect(),
+        config::ColorPolicy::Auto => theme::Capability::from_terminal(),
+    }
+}
+
+/// Under "force color" intent, pick the richest supported tier; if the
+/// terminal reports no color support (typical when stdout isn't a TTY),
+/// fall back to `Palette16` so the user sees something rather than
+/// nothing.
+fn force_color_detect() -> theme::Capability {
+    match theme::Capability::from_terminal() {
+        theme::Capability::None => theme::Capability::Palette16,
+        other => other,
+    }
 }
 
 /// Resolve the active theme from config. Unknown names fall back to
@@ -619,6 +698,254 @@ mod tests {
         let (code, stdout, _stderr) = run_cli_main(&[], json, &env);
         assert_eq!(code, 0);
         assert_eq!(stdout, "C x\n");
+    }
+
+    // --- color-policy precedence ---
+
+    /// Build a `CliEnv` suitable for driving the resolver directly —
+    /// the test-only capability override is cleared so the chain
+    /// actually executes.
+    fn policy_env() -> CliEnv {
+        CliEnv {
+            color_capability: None,
+            ..CliEnv::for_tests()
+        }
+    }
+
+    #[test]
+    fn color_policy_cli_never_wins_over_force_env() {
+        let env = CliEnv {
+            force_color: true,
+            ..policy_env()
+        };
+        assert_eq!(
+            resolve_color_capability(Some(cli::ColorOverride::Never), &env, None),
+            theme::Capability::None,
+        );
+    }
+
+    #[test]
+    fn color_policy_cli_always_wins_over_no_color_env() {
+        let env = CliEnv {
+            no_color: true,
+            ..policy_env()
+        };
+        let got = resolve_color_capability(Some(cli::ColorOverride::Always), &env, None);
+        // Falls back to Palette16 when the terminal reports None (tests
+        // run without a TTY); anything ≥ Palette16 proves the force
+        // path ran and didn't land on Capability::None.
+        assert!(got >= theme::Capability::Palette16, "got {got:?}");
+    }
+
+    #[test]
+    fn color_policy_no_color_env_wins_over_force_env() {
+        // When both NO_COLOR and FORCE_COLOR are set, no-color.org's
+        // rule is that NO_COLOR wins (order in the chain).
+        let env = CliEnv {
+            no_color: true,
+            force_color: true,
+            ..policy_env()
+        };
+        assert_eq!(
+            resolve_color_capability(None, &env, None),
+            theme::Capability::None,
+        );
+    }
+
+    #[test]
+    fn color_policy_no_color_env_wins_over_config_always() {
+        let cfg = config::Config {
+            layout_options: Some(config::LayoutOptions {
+                color: config::ColorPolicy::Always,
+                ..config::LayoutOptions::default()
+            }),
+            ..config::Config::default()
+        };
+        let env = CliEnv {
+            no_color: true,
+            ..policy_env()
+        };
+        assert_eq!(
+            resolve_color_capability(None, &env, Some(&cfg)),
+            theme::Capability::None,
+        );
+    }
+
+    #[test]
+    fn color_policy_config_never_strips_color() {
+        let cfg = config::Config {
+            layout_options: Some(config::LayoutOptions {
+                color: config::ColorPolicy::Never,
+                ..config::LayoutOptions::default()
+            }),
+            ..config::Config::default()
+        };
+        assert_eq!(
+            resolve_color_capability(None, &policy_env(), Some(&cfg)),
+            theme::Capability::None,
+        );
+    }
+
+    #[test]
+    fn color_policy_config_always_forces_color() {
+        // Mirror of the `Never` test for the other explicit branch.
+        let cfg = config::Config {
+            layout_options: Some(config::LayoutOptions {
+                color: config::ColorPolicy::Always,
+                ..config::LayoutOptions::default()
+            }),
+            ..config::Config::default()
+        };
+        let got = resolve_color_capability(None, &policy_env(), Some(&cfg));
+        assert!(got >= theme::Capability::Palette16, "got {got:?}");
+    }
+
+    #[test]
+    fn color_policy_config_auto_falls_through_to_terminal_detection() {
+        let cfg = config::Config {
+            layout_options: Some(config::LayoutOptions {
+                color: config::ColorPolicy::Auto,
+                ..config::LayoutOptions::default()
+            }),
+            ..config::Config::default()
+        };
+        // Without a TTY under `cargo test`, `from_terminal` returns None;
+        // the assertion is just that the resolver didn't short-circuit.
+        let got = resolve_color_capability(None, &policy_env(), Some(&cfg));
+        assert_eq!(got, theme::Capability::from_terminal());
+    }
+
+    #[test]
+    fn force_color_detect_never_returns_none() {
+        // The Palette16 floor is the whole point of force_color_detect;
+        // pin it directly so a regression dropping the fallback match
+        // arm is visible without chasing through resolver assertions.
+        assert_ne!(force_color_detect(), theme::Capability::None);
+    }
+
+    #[test]
+    fn color_policy_force_color_env_zero_is_treated_as_absent() {
+        // npm / chalk / supports-color all treat FORCE_COLOR=0 as
+        // "explicitly disabled", not as force-on. Our `force_color_env`
+        // parse maps it to false, so `env.force_color = false` and the
+        // chain falls through to config / auto rather than forcing.
+        // Verify the parser itself:
+        std::env::set_var("LINESMITH_FORCE_COLOR_TEST_ZERO", "0");
+        assert!(!force_color_env("LINESMITH_FORCE_COLOR_TEST_ZERO"));
+        std::env::set_var("LINESMITH_FORCE_COLOR_TEST_ONE", "1");
+        assert!(force_color_env("LINESMITH_FORCE_COLOR_TEST_ONE"));
+        std::env::set_var("LINESMITH_FORCE_COLOR_TEST_EMPTY", "");
+        assert!(!force_color_env("LINESMITH_FORCE_COLOR_TEST_EMPTY"));
+        std::env::remove_var("LINESMITH_FORCE_COLOR_TEST_ZERO");
+        std::env::remove_var("LINESMITH_FORCE_COLOR_TEST_ONE");
+        std::env::remove_var("LINESMITH_FORCE_COLOR_TEST_EMPTY");
+    }
+
+    #[test]
+    fn color_policy_test_capability_override_short_circuits_everything() {
+        let env = CliEnv {
+            no_color: true,
+            force_color: true,
+            color_capability: Some(theme::Capability::Palette256),
+            ..policy_env()
+        };
+        assert_eq!(
+            resolve_color_capability(Some(cli::ColorOverride::Never), &env, None),
+            theme::Capability::Palette256,
+        );
+    }
+
+    // --- claude_padding ---
+
+    #[test]
+    fn claude_padding_shrinks_render_budget_and_drops_segment() {
+        // Full render: "Claude linesmith" = 16 cells. Budget 20 alone
+        // fits everything; padding=10 shrinks usable to 10 cells, which
+        // forces the higher-priority segment (model=64) to drop so only
+        // workspace (priority 16, 9 cells) survives.
+        let json = br#"{
+            "model": { "display_name": "Claude" },
+            "workspace": { "project_dir": "/home/dev/linesmith" }
+        }"#;
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[layout_options]\nclaude_padding = 10\n").unwrap();
+        let env = CliEnv {
+            terminal_width: Some(20),
+            ..CliEnv::for_tests()
+        };
+        let (code, stdout, _stderr) =
+            run_cli_main(&["--config", path.to_str().unwrap()], json, &env);
+        assert_eq!(code, 0);
+        assert_eq!(stdout, "linesmith\n");
+    }
+
+    #[test]
+    fn claude_padding_exceeds_width_clamps_to_zero_and_drops_everything() {
+        // Pathological misconfiguration: padding larger than the
+        // terminal width saturates to 0 usable cells, so every
+        // positive-priority segment drops. Silent clamp is the right
+        // semantic — validating this at config-load would require
+        // width at parse time, which we don't have.
+        let json = br#"{
+            "model": { "display_name": "Claude" },
+            "workspace": { "project_dir": "/home/dev/linesmith" }
+        }"#;
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[layout_options]\nclaude_padding = 500\n").unwrap();
+        let env = CliEnv {
+            terminal_width: Some(80),
+            ..CliEnv::for_tests()
+        };
+        let (code, stdout, _stderr) =
+            run_cli_main(&["--config", path.to_str().unwrap()], json, &env);
+        assert_eq!(code, 0);
+        // All positive-priority segments drop; only the trailing
+        // newline remains.
+        assert_eq!(stdout, "\n");
+    }
+
+    #[test]
+    fn claude_padding_zero_matches_no_padding() {
+        // Explicit 0 should be indistinguishable from omitting the key.
+        let json = br#"{
+            "model": { "display_name": "Claude" },
+            "workspace": { "project_dir": "/home/dev/linesmith" }
+        }"#;
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[layout_options]\nclaude_padding = 0\n").unwrap();
+        let (code, stdout, _stderr) = run_cli_main(
+            &["--config", path.to_str().unwrap()],
+            json,
+            &CliEnv::for_tests(),
+        );
+        assert_eq!(code, 0);
+        assert_eq!(stdout, "Claude linesmith\n");
+    }
+
+    // --- CLI flag end-to-end ---
+
+    #[test]
+    fn no_color_flag_outranks_force_color_env_end_to_end() {
+        // force_color=true would yield colored output via the resolver's
+        // FORCE_COLOR branch; --no-color must outrank it, proving the
+        // CLI flag sits at the top of the precedence chain through the
+        // full render pipeline.
+        let json = br#"{
+            "model": { "display_name": "Claude" },
+            "workspace": { "project_dir": "/home/dev/linesmith" }
+        }"#;
+        let env = CliEnv {
+            force_color: true,
+            color_capability: None,
+            ..CliEnv::for_tests()
+        };
+        let (code, stdout, _stderr) = run_cli_main(&["--no-color"], json, &env);
+        assert_eq!(code, 0);
+        assert_eq!(stdout, "Claude linesmith\n");
+        assert!(!stdout.contains('\x1b'));
     }
 
     struct TempDir(std::path::PathBuf);

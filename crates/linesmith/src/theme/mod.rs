@@ -174,13 +174,22 @@ pub enum Capability {
 }
 
 impl Capability {
-    /// Detect using `supports-color`. `NO_COLOR` beats everything.
-    /// Called once at startup.
+    /// Detect honoring `NO_COLOR` (per no-color.org). Kept for callers
+    /// that want a single-shot detect without threading the env through
+    /// a precedence chain.
     #[must_use]
     pub fn detect() -> Self {
         if std::env::var_os("NO_COLOR").is_some() {
             return Self::None;
         }
+        Self::from_terminal()
+    }
+
+    /// Raw terminal capability from `supports-color`, ignoring
+    /// `NO_COLOR`. The color-policy precedence chain uses this so a
+    /// `--force-color` flag can outrank the env var.
+    #[must_use]
+    pub fn from_terminal() -> Self {
         match supports_color::on(supports_color::Stream::Stdout) {
             Some(c) if c.has_16m => Self::TrueColor,
             Some(c) if c.has_256 => Self::Palette256,

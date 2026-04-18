@@ -10,6 +10,17 @@ use std::path::PathBuf;
 pub struct CliArgs {
     pub config: Option<PathBuf>,
     pub check_config: bool,
+    pub color_override: Option<ColorOverride>,
+}
+
+/// User-supplied color-policy override. `--no-color` and `--force-color`
+/// are mutually exclusive in intent; the flag that appears last on the
+/// command line wins (lexopt assigns them in order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ColorOverride {
+    Never,
+    Always,
 }
 
 /// What the binary should do after parsing. `Run` is the common case;
@@ -32,6 +43,8 @@ USAGE:
 OPTIONS:
     -c, --config <PATH>    Config file path (overrides default resolution)
         --check-config     Validate config and exit
+        --no-color         Strip all color (equivalent to NO_COLOR=1)
+        --force-color      Emit color even in non-TTY output
     -h, --help             Print this help text
     -V, --version          Print version
 
@@ -61,6 +74,12 @@ where
             }
             Long("check-config") => {
                 args.check_config = true;
+            }
+            Long("no-color") => {
+                args.color_override = Some(ColorOverride::Never);
+            }
+            Long("force-color") => {
+                args.color_override = Some(ColorOverride::Always);
             }
             Short('h') | Long("help") => return Ok(Action::Help),
             Short('V') | Long("version") => return Ok(Action::Version),
@@ -104,6 +123,7 @@ mod tests {
             Action::Run(CliArgs {
                 config: Some(PathBuf::from("/etc/linesmith.toml")),
                 check_config: false,
+                color_override: None,
             })
         );
     }
@@ -116,6 +136,7 @@ mod tests {
             Action::Run(CliArgs {
                 config: Some(PathBuf::from("/etc/linesmith.toml")),
                 check_config: false,
+                color_override: None,
             })
         );
     }
@@ -128,6 +149,7 @@ mod tests {
             Action::Run(CliArgs {
                 config: None,
                 check_config: true,
+                color_override: None,
             })
         );
     }
@@ -140,6 +162,7 @@ mod tests {
             Action::Run(CliArgs {
                 config: Some(PathBuf::from("custom.toml")),
                 check_config: true,
+                color_override: None,
             })
         );
     }
@@ -168,6 +191,49 @@ mod tests {
     }
 
     #[test]
+    fn no_color_flag_sets_never_override() {
+        let got = parse_args(&["--no-color"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::Run(CliArgs {
+                config: None,
+                check_config: false,
+                color_override: Some(ColorOverride::Never),
+            })
+        );
+    }
+
+    #[test]
+    fn force_color_flag_sets_always_override() {
+        let got = parse_args(&["--force-color"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::Run(CliArgs {
+                config: None,
+                check_config: false,
+                color_override: Some(ColorOverride::Always),
+            })
+        );
+    }
+
+    #[test]
+    fn conflicting_color_flags_last_wins() {
+        // lexopt assigns in order; last flag on the command line wins.
+        // Users don't get an error when both flags appear — they get
+        // the most recently specified intent.
+        let got = parse_args(&["--no-color", "--force-color"]).expect("ok");
+        match got {
+            Action::Run(args) => assert_eq!(args.color_override, Some(ColorOverride::Always)),
+            _ => panic!("expected Run action"),
+        }
+        let got = parse_args(&["--force-color", "--no-color"]).expect("ok");
+        match got {
+            Action::Run(args) => assert_eq!(args.color_override, Some(ColorOverride::Never)),
+            _ => panic!("expected Run action"),
+        }
+    }
+
+    #[test]
     fn equals_style_config_value_parses() {
         // lexopt supports `--config=PATH`; pin so a parser swap
         // doesn't silently drop the shape users will try.
@@ -177,6 +243,7 @@ mod tests {
             Action::Run(CliArgs {
                 config: Some(PathBuf::from("/custom.toml")),
                 check_config: false,
+                color_override: None,
             })
         );
     }
