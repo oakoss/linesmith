@@ -1,19 +1,21 @@
 //! 7-day rate-limit segment: renders `7d {pct}% · {countdown}` when the
 //! session tier exposes a 7-day window. Hidden for API-tier users.
 
-use super::{format_window, rate_limit, RenderedSegment, Segment, SegmentDefaults};
+use super::{format_window, rate_limit, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::input::StatusContext;
 
 pub struct RateLimit7dSegment;
 
 impl Segment for RateLimit7dSegment {
-    fn render(&self, ctx: &StatusContext) -> Option<RenderedSegment> {
-        let window = ctx.rate_limits.as_ref()?.seven_day()?;
-        Some(RenderedSegment::new(format_window(
+    fn render(&self, ctx: &StatusContext) -> RenderResult {
+        let Some(window) = ctx.rate_limits.as_ref().and_then(|rl| rl.seven_day()) else {
+            return Ok(None);
+        };
+        Ok(Some(RenderedSegment::new(format_window(
             "7d",
             window,
             chrono::Utc::now(),
-        )))
+        ))))
     }
 
     fn defaults(&self) -> SegmentDefaults {
@@ -56,21 +58,25 @@ mod tests {
         }
     }
 
+    fn render(rl: Option<RateLimits>) -> Option<RenderedSegment> {
+        RateLimit7dSegment.render(&ctx(rl)).expect("render ok")
+    }
+
     #[test]
     fn hidden_when_rate_limits_absent() {
-        assert_eq!(RateLimit7dSegment.render(&ctx(None)), None);
+        assert_eq!(render(None), None);
     }
 
     #[test]
     fn hidden_when_only_five_hour_window_present() {
         let rl = RateLimits::FiveHourOnly(window(5.0, 60));
-        assert_eq!(RateLimit7dSegment.render(&ctx(Some(rl))), None);
+        assert_eq!(render(Some(rl)), None);
     }
 
     #[test]
     fn renders_seven_day_only_variant() {
         let rl = RateLimits::SevenDayOnly(window(12.0, 60 * 24 * 3)); // 3 days
-        let rendered = RateLimit7dSegment.render(&ctx(Some(rl))).expect("rendered");
+        let rendered = render(Some(rl)).expect("rendered");
         assert!(
             rendered.text.starts_with("7d 12%"),
             "got {:?}",

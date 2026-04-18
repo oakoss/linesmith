@@ -2,7 +2,7 @@
 //! formatted in thousands (`200k`, `1M`). Hidden when the payload
 //! doesn't carry context-window data.
 
-use super::{RenderedSegment, Segment, SegmentDefaults};
+use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::input::{ContextWindow, StatusContext};
 
 pub struct ContextWindowSegment;
@@ -13,13 +13,15 @@ pub struct ContextWindowSegment;
 const PRIORITY: u8 = 32;
 
 impl Segment for ContextWindowSegment {
-    fn render(&self, ctx: &StatusContext) -> Option<RenderedSegment> {
-        let cw = ctx.context_window.as_ref()?;
-        Some(RenderedSegment::new(format!(
+    fn render(&self, ctx: &StatusContext) -> RenderResult {
+        let Some(cw) = ctx.context_window.as_ref() else {
+            return Ok(None);
+        };
+        Ok(Some(RenderedSegment::new(format!(
             "{pct:.0}% · {size}",
             pct = cw.used.value(),
             size = format_size(cw),
-        )))
+        ))))
     }
 
     fn defaults(&self) -> SegmentDefaults {
@@ -85,7 +87,9 @@ mod tests {
     #[test]
     fn renders_percent_and_sonnet_200k() {
         assert_eq!(
-            ContextWindowSegment.render(&ctx(Some(window(42.3, 200_000)))),
+            ContextWindowSegment
+                .render(&ctx(Some(window(42.3, 200_000))))
+                .unwrap(),
             Some(RenderedSegment::new("42% · 200k"))
         );
     }
@@ -93,7 +97,9 @@ mod tests {
     #[test]
     fn renders_one_million_size_as_m_suffix() {
         assert_eq!(
-            ContextWindowSegment.render(&ctx(Some(window(5.0, 1_000_000)))),
+            ContextWindowSegment
+                .render(&ctx(Some(window(5.0, 1_000_000))))
+                .unwrap(),
             Some(RenderedSegment::new("5% · 1M"))
         );
     }
@@ -101,7 +107,9 @@ mod tests {
     #[test]
     fn renders_non_round_size_literally() {
         assert_eq!(
-            ContextWindowSegment.render(&ctx(Some(window(10.0, 131_072)))),
+            ContextWindowSegment
+                .render(&ctx(Some(window(10.0, 131_072))))
+                .unwrap(),
             Some(RenderedSegment::new("10% · 131072"))
         );
     }
@@ -109,14 +117,16 @@ mod tests {
     #[test]
     fn rounds_percent_to_nearest_integer() {
         assert_eq!(
-            ContextWindowSegment.render(&ctx(Some(window(99.9, 200_000)))),
+            ContextWindowSegment
+                .render(&ctx(Some(window(99.9, 200_000))))
+                .unwrap(),
             Some(RenderedSegment::new("100% · 200k"))
         );
     }
 
     #[test]
     fn hidden_when_context_window_absent() {
-        assert_eq!(ContextWindowSegment.render(&ctx(None)), None);
+        assert_eq!(ContextWindowSegment.render(&ctx(None)).unwrap(), None);
     }
 
     #[test]

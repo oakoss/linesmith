@@ -206,10 +206,74 @@ impl Default for SegmentDefaults {
     }
 }
 
-pub trait Segment: Send {
-    /// Render this segment for the given context, or `None` to hide.
+/// Shorthand for [`Segment::render`]'s return type.
+///
+/// Three states:
+/// - `Ok(Some(r))`: the segment renders `r`.
+/// - `Ok(None)`: the segment has no content this invocation and should
+///   be hidden (intentional, e.g. rate-limit segment on an API-tier
+///   user).
+/// - `Err(e)`: the segment attempted to render but failed. The layout
+///   engine logs `e` to stderr and hides the segment — same visual
+///   result as `Ok(None)`, but the diagnostic distinguishes failure
+///   from intentional absence.
+pub type RenderResult = Result<Option<RenderedSegment>, SegmentError>;
+
+/// Runtime failure from a segment's [`Segment::render`]. Built-in
+/// segments return `Ok(...)` today; this surface is primarily for
+/// plugin-authored segments (rhai script errors, unexpected input,
+/// propagated I/O).
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct SegmentError {
+    pub message: String,
+    pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl SegmentError {
     #[must_use]
-    fn render(&self, ctx: &StatusContext) -> Option<RenderedSegment>;
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_source(
+        message: impl Into<String>,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            source: Some(source),
+        }
+    }
+}
+
+impl std::fmt::Display for SegmentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)?;
+        if let Some(src) = &self.source {
+            write!(f, ": {src}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for SegmentError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_deref().map(|e| e as &dyn std::error::Error)
+    }
+}
+
+pub trait Segment: Send {
+    /// Render this segment for the given context.
+    ///
+    /// Returns `Ok(None)` to hide, `Ok(Some(_))` to render, or `Err` on
+    /// a runtime failure that the layout engine logs and treats as
+    /// hidden. See [`RenderResult`].
+    fn render(&self, ctx: &StatusContext) -> RenderResult;
 
     /// Layout defaults (priority, width bounds, separator preference).
     /// User config may override each field once the config layer lands.
@@ -414,5 +478,29 @@ mod layout_type_tests {
             d.default_separator,
             Separator::Literal(Cow::Borrowed(" | "))
         );
+    }
+
+    #[test]
+    fn segment_error_display_includes_message_only_without_source() {
+        let err = SegmentError::new("missing rate_limits field");
+        assert_eq!(err.to_string(), "missing rate_limits field");
+    }
+
+    #[test]
+    fn segment_error_display_chains_source() {
+        let src = std::io::Error::new(std::io::ErrorKind::NotFound, "cache.json");
+        let err = SegmentError::with_source("cache read failed", Box::new(src));
+        let rendered = err.to_string();
+        assert!(rendered.starts_with("cache read failed: "));
+        assert!(rendered.contains("cache.json"));
+    }
+
+    #[test]
+    fn segment_error_source_chain_is_walkable() {
+        use std::error::Error;
+        let src = std::io::Error::other("inner");
+        let err = SegmentError::with_source("outer", Box::new(src));
+        let source = err.source().expect("source present");
+        assert_eq!(source.to_string(), "inner");
     }
 }

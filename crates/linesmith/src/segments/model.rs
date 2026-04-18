@@ -1,6 +1,6 @@
 //! Model segment: renders the current model's display name.
 
-use super::{RenderedSegment, Segment, SegmentDefaults};
+use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::input::StatusContext;
 
 pub struct ModelSegment;
@@ -10,12 +10,12 @@ pub struct ModelSegment;
 const PRIORITY: u8 = 64;
 
 impl Segment for ModelSegment {
-    fn render(&self, ctx: &StatusContext) -> Option<RenderedSegment> {
+    fn render(&self, ctx: &StatusContext) -> RenderResult {
         let name = ctx.model.display_name.trim();
         if name.is_empty() {
-            return None;
+            return Ok(None);
         }
-        Some(RenderedSegment::new(name))
+        Ok(Some(RenderedSegment::new(name)))
     }
 
     fn defaults(&self) -> SegmentDefaults {
@@ -51,19 +51,19 @@ mod tests {
     #[test]
     fn renders_display_name() {
         assert_eq!(
-            ModelSegment.render(&ctx("Claude Sonnet 4.6")),
+            ModelSegment.render(&ctx("Claude Sonnet 4.6")).unwrap(),
             Some(RenderedSegment::new("Claude Sonnet 4.6"))
         );
     }
 
     #[test]
     fn hidden_when_display_name_is_empty() {
-        assert_eq!(ModelSegment.render(&ctx("")), None);
+        assert_eq!(ModelSegment.render(&ctx("")).unwrap(), None);
     }
 
     #[test]
     fn hidden_when_display_name_is_whitespace_only() {
-        assert_eq!(ModelSegment.render(&ctx("   ")), None);
+        assert_eq!(ModelSegment.render(&ctx("   ")).unwrap(), None);
     }
 
     #[test]

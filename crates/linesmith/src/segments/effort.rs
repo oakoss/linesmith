@@ -8,7 +8,7 @@
 //! Segment is shipped now so it lights up automatically when the payload
 //! arrives.
 
-use super::{RenderedSegment, Segment, SegmentDefaults};
+use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::input::StatusContext;
 
 pub struct EffortSegment;
@@ -18,9 +18,11 @@ pub struct EffortSegment;
 const PRIORITY: u8 = 160;
 
 impl Segment for EffortSegment {
-    fn render(&self, ctx: &StatusContext) -> Option<RenderedSegment> {
-        let effort = ctx.effort?;
-        Some(RenderedSegment::new(effort.as_str()))
+    fn render(&self, ctx: &StatusContext) -> RenderResult {
+        let Some(effort) = ctx.effort else {
+            return Ok(None);
+        };
+        Ok(Some(RenderedSegment::new(effort.as_str())))
     }
 
     fn defaults(&self) -> SegmentDefaults {
@@ -63,7 +65,7 @@ mod tests {
             (EffortLevel::XHigh, "xhigh"),
         ] {
             assert_eq!(
-                EffortSegment.render(&ctx(Some(level))),
+                EffortSegment.render(&ctx(Some(level))).unwrap(),
                 Some(RenderedSegment::new(expected))
             );
         }
@@ -71,7 +73,7 @@ mod tests {
 
     #[test]
     fn hidden_when_effort_absent() {
-        assert_eq!(EffortSegment.render(&ctx(None)), None);
+        assert_eq!(EffortSegment.render(&ctx(None)).unwrap(), None);
     }
 
     #[test]

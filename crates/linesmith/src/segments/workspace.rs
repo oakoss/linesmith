@@ -4,7 +4,7 @@
 //! - Regular git repo or outside git: the project-dir basename
 //! - Project dir has no usable basename, or worktree name is empty: hidden
 
-use super::{RenderedSegment, Segment, SegmentDefaults};
+use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::input::StatusContext;
 
 pub struct WorkspaceSegment;
@@ -14,24 +14,27 @@ pub struct WorkspaceSegment;
 const PRIORITY: u8 = 16;
 
 impl Segment for WorkspaceSegment {
-    fn render(&self, ctx: &StatusContext) -> Option<RenderedSegment> {
-        let repo_name = ctx
+    fn render(&self, ctx: &StatusContext) -> RenderResult {
+        let Some(repo_name) = ctx
             .workspace
             .project_dir
             .file_name()
-            .and_then(|s| s.to_str())?;
+            .and_then(|s| s.to_str())
+        else {
+            return Ok(None);
+        };
 
         if let Some(worktree) = &ctx.workspace.git_worktree {
             if worktree.name.is_empty() {
-                return None;
+                return Ok(None);
             }
-            return Some(RenderedSegment::new(format!(
+            return Ok(Some(RenderedSegment::new(format!(
                 "{repo_name}/{}",
                 worktree.name
-            )));
+            ))));
         }
 
-        Some(RenderedSegment::new(repo_name))
+        Ok(Some(RenderedSegment::new(repo_name)))
     }
 
     fn defaults(&self) -> SegmentDefaults {
@@ -74,7 +77,7 @@ mod tests {
     #[test]
     fn renders_directory_outside_worktree() {
         assert_eq!(
-            WorkspaceSegment.render(&ctx(None)),
+            WorkspaceSegment.render(&ctx(None)).unwrap(),
             Some(RenderedSegment::new("linesmith"))
         );
     }
@@ -82,7 +85,9 @@ mod tests {
     #[test]
     fn renders_hybrid_inside_worktree() {
         assert_eq!(
-            WorkspaceSegment.render(&ctx(Some(worktree("feat-segments")))),
+            WorkspaceSegment
+                .render(&ctx(Some(worktree("feat-segments"))))
+                .unwrap(),
             Some(RenderedSegment::new("linesmith/feat-segments"))
         );
     }
@@ -93,7 +98,9 @@ mod tests {
         // render verbatim (no escape, no truncation); downstream readers
         // interpret "repo/path-with-slashes" unambiguously in practice.
         assert_eq!(
-            WorkspaceSegment.render(&ctx(Some(worktree("feature/auth")))),
+            WorkspaceSegment
+                .render(&ctx(Some(worktree("feature/auth"))))
+                .unwrap(),
             Some(RenderedSegment::new("linesmith/feature/auth"))
         );
     }
@@ -102,12 +109,15 @@ mod tests {
     fn hidden_when_project_dir_has_no_basename() {
         let mut c = ctx(None);
         c.workspace.project_dir = PathBuf::from("/");
-        assert_eq!(WorkspaceSegment.render(&c), None);
+        assert_eq!(WorkspaceSegment.render(&c).unwrap(), None);
     }
 
     #[test]
     fn hidden_when_worktree_name_is_empty() {
-        assert_eq!(WorkspaceSegment.render(&ctx(Some(worktree("")))), None);
+        assert_eq!(
+            WorkspaceSegment.render(&ctx(Some(worktree("")))).unwrap(),
+            None
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ use crate::input::StatusContext;
 use crate::segments::{
     text_width, RenderedSegment, Segment, SegmentDefaults, Separator, WidthBounds,
 };
+use std::io::{self, Write};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Render `segments` for `ctx` within `terminal_width` cells. Returns the
@@ -28,11 +29,29 @@ struct Item {
 }
 
 fn collect_items(segments: &[Box<dyn Segment>], ctx: &StatusContext) -> Vec<Item> {
+    let mut warn = |msg: &str| {
+        let _ = writeln!(io::stderr().lock(), "linesmith: {msg}");
+    };
+    collect_items_with(segments, ctx, &mut warn)
+}
+
+fn collect_items_with(
+    segments: &[Box<dyn Segment>],
+    ctx: &StatusContext,
+    warn: &mut dyn FnMut(&str),
+) -> Vec<Item> {
     segments
         .iter()
         .filter_map(|seg| {
             let defaults = seg.defaults();
-            let rendered = seg.render(ctx)?;
+            let rendered = match seg.render(ctx) {
+                Ok(Some(r)) => r,
+                Ok(None) => return None,
+                Err(err) => {
+                    warn(&format!("segment error: {err}"));
+                    return None;
+                }
+            };
             apply_width_bounds(rendered, defaults.width).map(|r| Item {
                 rendered: r,
                 defaults,
@@ -398,5 +417,77 @@ mod tests {
         let items = vec![item("aaa", 0), item("bbb", 0), item("ccc", 0)];
         // Full 3+1+3+1+3 = 11. Budget 4 is nowhere near; all three stay.
         assert_eq!(render_items(items, 4), "aaa bbb ccc");
+    }
+
+    // --- error handling ---
+
+    use crate::input::{ModelInfo, Tool, WorkspaceInfo};
+    use crate::segments::{RenderResult, SegmentError};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    struct StubSegment(RenderResult);
+
+    impl Segment for StubSegment {
+        fn render(&self, _ctx: &StatusContext) -> RenderResult {
+            match &self.0 {
+                Ok(Some(r)) => Ok(Some(r.clone())),
+                Ok(None) => Ok(None),
+                Err(e) => Err(SegmentError::new(e.message.clone())),
+            }
+        }
+    }
+
+    fn empty_ctx() -> StatusContext {
+        StatusContext {
+            tool: Tool::ClaudeCode,
+            model: ModelInfo {
+                display_name: "X".into(),
+            },
+            workspace: WorkspaceInfo {
+                project_dir: PathBuf::from("/"),
+                git_worktree: None,
+            },
+            context_window: None,
+            cost: None,
+            rate_limits: None,
+            effort: None,
+            raw: Arc::new(serde_json::Value::Null),
+        }
+    }
+
+    #[test]
+    fn segment_error_is_logged_and_hides_segment() {
+        let segments: Vec<Box<dyn Segment>> = vec![
+            Box::new(StubSegment(Ok(Some(RenderedSegment::new("ok-before"))))),
+            Box::new(StubSegment(Err(SegmentError::new("boom")))),
+            Box::new(StubSegment(Ok(Some(RenderedSegment::new("ok-after"))))),
+        ];
+        let mut warnings = Vec::new();
+        let items = collect_items_with(&segments, &empty_ctx(), &mut |msg| {
+            warnings.push(msg.to_string());
+        });
+        // The Err segment vanishes from layout; neighbors survive.
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].rendered.text, "ok-before");
+        assert_eq!(items[1].rendered.text, "ok-after");
+        // The error is surfaced to stderr exactly once.
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("segment error"));
+        assert!(warnings[0].contains("boom"));
+    }
+
+    #[test]
+    fn ok_none_is_silently_hidden() {
+        let segments: Vec<Box<dyn Segment>> = vec![
+            Box::new(StubSegment(Ok(Some(RenderedSegment::new("visible"))))),
+            Box::new(StubSegment(Ok(None))),
+        ];
+        let mut warnings = Vec::new();
+        let items = collect_items_with(&segments, &empty_ctx(), &mut |msg| {
+            warnings.push(msg.to_string());
+        });
+        assert_eq!(items.len(), 1);
+        assert!(warnings.is_empty());
     }
 }

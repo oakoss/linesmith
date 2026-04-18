@@ -6,7 +6,7 @@
 //! `Segment::children()` is the eventual shape (see
 //! `docs/specs/segment-system.md`).
 
-use super::{format_window, RenderedSegment, Segment, SegmentDefaults};
+use super::{format_window, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::input::{RateLimits, StatusContext};
 
 pub struct RateLimitSegment;
@@ -17,8 +17,10 @@ pub struct RateLimitSegment;
 pub(crate) const PRIORITY: u8 = 96;
 
 impl Segment for RateLimitSegment {
-    fn render(&self, ctx: &StatusContext) -> Option<RenderedSegment> {
-        let rl = ctx.rate_limits.as_ref()?;
+    fn render(&self, ctx: &StatusContext) -> RenderResult {
+        let Some(rl) = ctx.rate_limits.as_ref() else {
+            return Ok(None);
+        };
         let now = chrono::Utc::now();
         let text = match rl {
             RateLimits::FiveHourOnly(w) => format_window("5h", w, now),
@@ -32,7 +34,7 @@ impl Segment for RateLimitSegment {
                 format_window("7d", seven_day, now)
             ),
         };
-        Some(RenderedSegment::new(text))
+        Ok(Some(RenderedSegment::new(text)))
     }
 
     fn defaults(&self) -> SegmentDefaults {
@@ -75,15 +77,19 @@ mod tests {
         }
     }
 
+    fn render(rl: Option<RateLimits>) -> Option<RenderedSegment> {
+        RateLimitSegment.render(&ctx(rl)).expect("render ok")
+    }
+
     #[test]
     fn hidden_when_rate_limits_absent() {
-        assert_eq!(RateLimitSegment.render(&ctx(None)), None);
+        assert_eq!(render(None), None);
     }
 
     #[test]
     fn renders_single_window_for_five_hour_only() {
         let rl = RateLimits::FiveHourOnly(window(42.0, 60));
-        let rendered = RateLimitSegment.render(&ctx(Some(rl))).expect("rendered");
+        let rendered = render(Some(rl)).expect("rendered");
         assert!(rendered.text.starts_with("5h 42%"));
         assert!(!rendered.text.contains('|'));
     }
@@ -91,7 +97,7 @@ mod tests {
     #[test]
     fn renders_single_window_for_seven_day_only() {
         let rl = RateLimits::SevenDayOnly(window(7.0, 60 * 24));
-        let rendered = RateLimitSegment.render(&ctx(Some(rl))).expect("rendered");
+        let rendered = render(Some(rl)).expect("rendered");
         assert!(rendered.text.starts_with("7d 7%"));
         assert!(!rendered.text.contains('|'));
     }
@@ -102,7 +108,7 @@ mod tests {
             five_hour: window(45.0, 30),
             seven_day: window(10.0, 60 * 24 * 4),
         };
-        let rendered = RateLimitSegment.render(&ctx(Some(rl))).expect("rendered");
+        let rendered = render(Some(rl)).expect("rendered");
         assert!(rendered.text.contains("5h 45%"));
         assert!(rendered.text.contains("7d 10%"));
         assert!(rendered.text.contains(" | "));

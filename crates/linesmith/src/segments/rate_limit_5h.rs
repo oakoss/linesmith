@@ -2,19 +2,21 @@
 //! session tier exposes a 5-hour window. Hidden for API-tier users and
 //! Pro/Max sessions that only surface the 7-day window.
 
-use super::{format_window, rate_limit, RenderedSegment, Segment, SegmentDefaults};
+use super::{format_window, rate_limit, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::input::StatusContext;
 
 pub struct RateLimit5hSegment;
 
 impl Segment for RateLimit5hSegment {
-    fn render(&self, ctx: &StatusContext) -> Option<RenderedSegment> {
-        let window = ctx.rate_limits.as_ref()?.five_hour()?;
-        Some(RenderedSegment::new(format_window(
+    fn render(&self, ctx: &StatusContext) -> RenderResult {
+        let Some(window) = ctx.rate_limits.as_ref().and_then(|rl| rl.five_hour()) else {
+            return Ok(None);
+        };
+        Ok(Some(RenderedSegment::new(format_window(
             "5h",
             window,
             chrono::Utc::now(),
-        )))
+        ))))
     }
 
     fn defaults(&self) -> SegmentDefaults {
@@ -57,21 +59,25 @@ mod tests {
         }
     }
 
+    fn render(rl: Option<RateLimits>) -> Option<RenderedSegment> {
+        RateLimit5hSegment.render(&ctx(rl)).expect("render ok")
+    }
+
     #[test]
     fn hidden_when_rate_limits_absent() {
-        assert_eq!(RateLimit5hSegment.render(&ctx(None)), None);
+        assert_eq!(render(None), None);
     }
 
     #[test]
     fn hidden_when_only_seven_day_window_present() {
         let rl = RateLimits::SevenDayOnly(window(5.0, 60));
-        assert_eq!(RateLimit5hSegment.render(&ctx(Some(rl))), None);
+        assert_eq!(render(Some(rl)), None);
     }
 
     #[test]
     fn renders_five_hour_only_variant() {
         let rl = RateLimits::FiveHourOnly(window(42.0, 73)); // ~1h 13m from now
-        let rendered = RateLimit5hSegment.render(&ctx(Some(rl))).expect("rendered");
+        let rendered = render(Some(rl)).expect("rendered");
         assert!(
             rendered.text.starts_with("5h 42%"),
             "got {:?}",
@@ -86,7 +92,7 @@ mod tests {
             five_hour: window(67.0, 30),
             seven_day: window(5.0, 60 * 24),
         };
-        let rendered = RateLimit5hSegment.render(&ctx(Some(rl))).expect("rendered");
+        let rendered = render(Some(rl)).expect("rendered");
         assert!(
             rendered.text.starts_with("5h 67%"),
             "got {:?}",

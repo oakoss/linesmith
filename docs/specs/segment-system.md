@@ -52,9 +52,11 @@ pub trait Segment: Send {
     /// Human-readable name for error messages and `linesmith segments list`.
     fn name(&self) -> &str;
 
-    /// Produce output (or None to hide). Called on every render unless
-    /// cache policy returns Hit.
-    fn render(&self, ctx: &StatusContext) -> Option<RenderedSegment>;
+    /// Produce output (or `Ok(None)` to hide). Called on every render
+    /// unless cache policy returns Hit. `Err` surfaces runtime failures
+    /// (plugin script errors, unexpected state); the layout engine logs
+    /// the error to stderr and hides the segment.
+    fn render(&self, ctx: &StatusContext) -> RenderResult;
 
     /// Default layout intent. Can be overridden by user config.
     fn defaults(&self) -> SegmentDefaults {
@@ -76,6 +78,17 @@ pub trait Segment: Send {
 ```
 
 `Segment: Send` (not `Send + Sync`) per [ADR-0008](../adrs/0008-canonical-type-refinements.md); `rhai::AST` is `Send` but its `Sync` story depends on feature flags. Adding `Sync` later is a non-breaking extension.
+
+```rust
+pub type RenderResult = Result<Option<RenderedSegment>, SegmentError>;
+
+pub struct SegmentError {
+    pub message: String,
+    pub source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+```
+
+`Ok(Some(r))` renders, `Ok(None)` hides, `Err(e)` is logged to stderr and hidden — the distinction matters for plugin-authored segments that want to surface runtime failures without silently vanishing.
 
 ### RenderedSegment
 
