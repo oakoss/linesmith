@@ -124,4 +124,27 @@ mod tests {
     fn defaults_use_expected_priority() {
         assert_eq!(WorkspaceSegment.defaults().priority, PRIORITY);
     }
+
+    #[test]
+    fn hostile_worktree_name_is_stripped_of_control_chars() {
+        let rendered = WorkspaceSegment
+            .render(&ctx(Some(worktree("evil\x1b[2J"))))
+            .unwrap()
+            .expect("renders");
+        assert_eq!(rendered.text(), "linesmith/evil[2J");
+        assert!(!rendered.text().contains('\x1b'));
+    }
+
+    #[test]
+    fn hostile_project_dir_basename_is_stripped_of_control_chars() {
+        // Separate code path from worktree: project-dir basename,
+        // payload varied to OSC-set-title + BEL so the two tests
+        // cover distinct escape families.
+        let mut c = ctx(None);
+        c.workspace.project_dir = PathBuf::from("/tmp/\x1b]0;pwn\x07evil");
+        let rendered = WorkspaceSegment.render(&c).unwrap().expect("renders");
+        assert_eq!(rendered.text(), "]0;pwnevil");
+        assert!(!rendered.text().contains('\x1b'));
+        assert!(!rendered.text().contains('\x07'));
+    }
 }

@@ -36,7 +36,7 @@ impl RenderedSegment {
     /// override its default right-separator for this boundary.
     #[must_use]
     pub fn new(text: impl Into<String>) -> Self {
-        let text = text.into();
+        let text = sanitize_control_chars(text.into());
         let width = text_width(&text);
         Self {
             text,
@@ -47,7 +47,7 @@ impl RenderedSegment {
 
     #[must_use]
     pub fn with_separator(text: impl Into<String>, separator: Separator) -> Self {
-        let text = text.into();
+        let text = sanitize_control_chars(text.into());
         let width = text_width(&text);
         Self {
             text,
@@ -93,6 +93,24 @@ impl RenderedSegment {
 #[must_use]
 pub(crate) fn text_width(s: &str) -> u16 {
     u16::try_from(UnicodeWidthStr::width(s)).unwrap_or(u16::MAX)
+}
+
+/// Strip Unicode control characters from `s`.
+///
+/// Segment text often comes from untrusted input (a project dir
+/// basename, a worktree name). `UnicodeWidthChar::width` reports
+/// control chars as 0 cells, but terminals interpret them as
+/// cursor-movement, screen-clear, or OSC payloads: a worktree named
+/// `evil\x1b[2J` would blank the terminal on every statusline render.
+/// Stripping at the `RenderedSegment` boundary protects every segment
+/// that funnels user data through it.
+///
+/// Returns the input unchanged when it has no control chars.
+fn sanitize_control_chars(s: String) -> String {
+    if !s.chars().any(char::is_control) {
+        return s;
+    }
+    s.chars().filter(|c| !c.is_control()).collect()
 }
 
 /// Separator between adjacent segments. Chosen by the segment to its
@@ -520,6 +538,68 @@ mod layout_type_tests {
         // U+00B7 MIDDLE DOT is 2 bytes but 1 cell.
         let r = RenderedSegment::new("42% · 200k");
         assert_eq!(r.width(), 10);
+    }
+
+    #[test]
+    fn rendered_segment_strips_csi_clear_screen_injection() {
+        // \x1b[2J clears the screen if it reaches stdout.
+        let r = RenderedSegment::new("evil\x1b[2J");
+        assert_eq!(r.text(), "evil[2J");
+        assert_eq!(r.width(), 7);
+        assert!(!r.text().contains('\x1b'));
+    }
+
+    #[test]
+    fn rendered_segment_strips_osc_set_title_with_bel_terminator() {
+        // OSC 0 sets the terminal title; BEL (\x07) terminates it.
+        // Both entry/exit bytes are controls and must drop out.
+        let r = RenderedSegment::new("\x1b]0;pwn\x07rest");
+        assert_eq!(r.text(), "]0;pwnrest");
+        assert!(!r.text().contains('\x1b'));
+        assert!(!r.text().contains('\x07'));
+    }
+
+    #[test]
+    fn rendered_segment_strips_common_c0_controls() {
+        let r = RenderedSegment::new("a\x07b\x08c\td\ne\rf");
+        assert_eq!(r.text(), "abcdef");
+        assert_eq!(r.width(), 6);
+    }
+
+    #[test]
+    fn rendered_segment_strips_c1_controls_and_del() {
+        let r = RenderedSegment::new("x\u{007F}y\u{0085}z\u{009B}");
+        assert_eq!(r.text(), "xyz");
+        assert_eq!(r.width(), 3);
+    }
+
+    #[test]
+    fn rendered_segment_preserves_unicode_without_controls() {
+        let r = RenderedSegment::new("café · 日本語");
+        assert_eq!(r.text(), "café · 日本語");
+    }
+
+    #[test]
+    fn rendered_segment_empty_string_stays_empty() {
+        let r = RenderedSegment::new("");
+        assert_eq!(r.text(), "");
+        assert_eq!(r.width(), 0);
+    }
+
+    #[test]
+    fn rendered_segment_all_control_input_collapses_to_empty() {
+        // Downstream layout math must cope with zero-width non-None
+        // renders; the `width == text_width(text)` invariant still holds.
+        let r = RenderedSegment::new("\x1b\x07\n\t");
+        assert_eq!(r.text(), "");
+        assert_eq!(r.width(), 0);
+    }
+
+    #[test]
+    fn rendered_segment_with_separator_also_strips_controls() {
+        let r = RenderedSegment::with_separator("hi\x1bthere", Separator::None);
+        assert_eq!(r.text(), "hithere");
+        assert_eq!(r.width(), 7);
     }
 
     #[test]
