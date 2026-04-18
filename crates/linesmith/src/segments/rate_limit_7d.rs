@@ -1,7 +1,7 @@
 //! 7-day rate-limit segment: renders `7d {pct}% · {countdown}` when the
 //! session tier exposes a 7-day window. Hidden for API-tier users.
 
-use super::{format_window, RenderedSegment, Segment};
+use super::{format_window, rate_limit, RenderedSegment, Segment, SegmentDefaults};
 use crate::input::StatusContext;
 
 pub struct RateLimit7dSegment;
@@ -14,6 +14,10 @@ impl Segment for RateLimit7dSegment {
             window,
             chrono::Utc::now(),
         )))
+    }
+
+    fn defaults(&self) -> SegmentDefaults {
+        SegmentDefaults::with_priority(rate_limit::PRIORITY)
     }
 }
 
@@ -72,5 +76,10 @@ mod tests {
             "got {:?}",
             rendered.text
         );
+    }
+
+    #[test]
+    fn defaults_match_combined_rate_limit_priority() {
+        assert_eq!(RateLimit7dSegment.defaults().priority, rate_limit::PRIORITY);
     }
 }

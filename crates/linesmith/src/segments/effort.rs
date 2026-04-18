@@ -8,15 +8,23 @@
 //! Segment is shipped now so it lights up automatically when the payload
 //! arrives.
 
-use super::{RenderedSegment, Segment};
+use super::{RenderedSegment, Segment, SegmentDefaults};
 use crate::input::StatusContext;
 
 pub struct EffortSegment;
+
+/// Between rate-limit (96) and cost (192): informational; drops before
+/// cost but after the time-sensitive health metrics.
+const PRIORITY: u8 = 160;
 
 impl Segment for EffortSegment {
     fn render(&self, ctx: &StatusContext) -> Option<RenderedSegment> {
         let effort = ctx.effort?;
         Some(RenderedSegment::new(effort.as_str()))
+    }
+
+    fn defaults(&self) -> SegmentDefaults {
+        SegmentDefaults::with_priority(PRIORITY)
     }
 }
 
@@ -64,5 +72,10 @@ mod tests {
     #[test]
     fn hidden_when_effort_absent() {
         assert_eq!(EffortSegment.render(&ctx(None)), None);
+    }
+
+    #[test]
+    fn defaults_use_expected_priority() {
+        assert_eq!(EffortSegment.defaults().priority, PRIORITY);
     }
 }

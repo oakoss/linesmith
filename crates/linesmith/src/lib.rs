@@ -6,6 +6,7 @@
 //! plugin contracts.
 
 pub mod input;
+pub mod layout;
 pub mod segments;
 
 use std::io::{self, Read, Write};
@@ -18,7 +19,23 @@ use std::io::{self, Read, Write};
 ///
 /// Returns an `io::Error` if reading from `reader` or writing to `writer`
 /// fails. Parse errors are handled internally.
-pub fn run(mut reader: impl Read, mut writer: impl Write) -> io::Result<()> {
+pub fn run(reader: impl Read, writer: impl Write) -> io::Result<()> {
+    run_with_width(reader, writer, detect_terminal_width())
+}
+
+/// Same as [`run`] but with an explicit terminal width. Exposed so tests
+/// and callers with their own width source (e.g. wrapping in a TUI) can
+/// bypass `detect_terminal_width`.
+///
+/// # Errors
+///
+/// Returns an `io::Error` if reading from `reader` or writing to `writer`
+/// fails. Parse errors are handled internally.
+pub fn run_with_width(
+    mut reader: impl Read,
+    mut writer: impl Write,
+    terminal_width: u16,
+) -> io::Result<()> {
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
 
@@ -41,13 +58,56 @@ pub fn run(mut reader: impl Read, mut writer: impl Write) -> io::Result<()> {
         Box::new(segments::workspace::WorkspaceSegment),
     ];
 
-    let parts: Vec<String> = built_in
-        .iter()
-        .filter_map(|seg| seg.render(&ctx))
-        .map(|rendered| rendered.text)
-        .collect();
+    let line = layout::render(&built_in, &ctx, terminal_width);
+    writeln!(writer, "{line}")
+}
 
-    writeln!(writer, "{}", parts.join(" "))
+/// Width fallback when `terminal_size()` and `COLUMNS` both fail.
+/// Matches `docs/specs/segment-system.md` edge-case table.
+const DEFAULT_TERMINAL_WIDTH: u16 = 200;
+
+/// Resolve the terminal width in cells. Prefers the OS-reported size, then
+/// the `COLUMNS` env var, then `DEFAULT_TERMINAL_WIDTH`. A set-but-invalid
+/// `COLUMNS` value logs to stderr so the user can correct their config;
+/// an unset `COLUMNS` falls through silently (the common case when stdout
+/// is piped to Claude Code).
+fn detect_terminal_width() -> u16 {
+    let os_width = terminal_size::terminal_size().map(|(terminal_size::Width(w), _)| w);
+    let columns = std::env::var("COLUMNS").ok();
+    resolve_terminal_width(os_width, columns.as_deref(), |msg| {
+        let _ = writeln!(io::stderr().lock(), "linesmith: {msg}");
+    })
+}
+
+/// Shared core of `detect_terminal_width`. Pure: takes the two inputs
+/// (OS size, `COLUMNS` value) and a stderr sink, returns the chosen
+/// width. Split out so tests don't have to mutate process env.
+fn resolve_terminal_width(
+    os_width: Option<u16>,
+    columns: Option<&str>,
+    mut warn: impl FnMut(&str),
+) -> u16 {
+    if let Some(w) = os_width {
+        return w;
+    }
+    let Some(raw) = columns else {
+        return DEFAULT_TERMINAL_WIDTH;
+    };
+    match raw.parse::<u16>() {
+        Ok(parsed) if parsed > 0 => parsed,
+        Ok(_) => {
+            warn(&format!(
+                "COLUMNS='{raw}' is zero; using {DEFAULT_TERMINAL_WIDTH} cells"
+            ));
+            DEFAULT_TERMINAL_WIDTH
+        }
+        Err(err) => {
+            warn(&format!(
+                "COLUMNS='{raw}' unparseable ({err}); using {DEFAULT_TERMINAL_WIDTH} cells"
+            ));
+            DEFAULT_TERMINAL_WIDTH
+        }
+    }
 }
 
 #[cfg(test)]
@@ -74,6 +134,59 @@ mod tests {
             String::from_utf8(out).expect("utf8"),
             "Claude Test linesmith\n"
         );
+    }
+
+    // --- resolve_terminal_width ---
+
+    fn resolve(os_width: Option<u16>, columns: Option<&str>) -> (u16, Vec<String>) {
+        let mut warnings = Vec::new();
+        let w = resolve_terminal_width(os_width, columns, |m| warnings.push(m.to_string()));
+        (w, warnings)
+    }
+
+    #[test]
+    fn os_width_wins_over_columns_env() {
+        let (w, warns) = resolve(Some(120), Some("80"));
+        assert_eq!(w, 120);
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn columns_env_used_when_os_width_missing() {
+        let (w, warns) = resolve(None, Some("80"));
+        assert_eq!(w, 80);
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn missing_columns_falls_back_silently() {
+        let (w, warns) = resolve(None, None);
+        assert_eq!(w, DEFAULT_TERMINAL_WIDTH);
+        assert!(warns.is_empty());
+    }
+
+    #[test]
+    fn zero_columns_falls_back_and_warns() {
+        let (w, warns) = resolve(None, Some("0"));
+        assert_eq!(w, DEFAULT_TERMINAL_WIDTH);
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("COLUMNS='0'"));
+    }
+
+    #[test]
+    fn unparseable_columns_falls_back_and_warns() {
+        let (w, warns) = resolve(None, Some("wide"));
+        assert_eq!(w, DEFAULT_TERMINAL_WIDTH);
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].contains("unparseable"));
+    }
+
+    #[test]
+    fn columns_beyond_u16_range_warns() {
+        // "99999" is > u16::MAX (65535), so parse::<u16>() fails.
+        let (w, warns) = resolve(None, Some("99999"));
+        assert_eq!(w, DEFAULT_TERMINAL_WIDTH);
+        assert_eq!(warns.len(), 1);
     }
 
     #[test]

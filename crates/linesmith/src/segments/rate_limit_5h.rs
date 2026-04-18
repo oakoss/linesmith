@@ -2,7 +2,7 @@
 //! session tier exposes a 5-hour window. Hidden for API-tier users and
 //! Pro/Max sessions that only surface the 7-day window.
 
-use super::{format_window, RenderedSegment, Segment};
+use super::{format_window, rate_limit, RenderedSegment, Segment, SegmentDefaults};
 use crate::input::StatusContext;
 
 pub struct RateLimit5hSegment;
@@ -15,6 +15,10 @@ impl Segment for RateLimit5hSegment {
             window,
             chrono::Utc::now(),
         )))
+    }
+
+    fn defaults(&self) -> SegmentDefaults {
+        SegmentDefaults::with_priority(rate_limit::PRIORITY)
     }
 }
 
@@ -88,5 +92,10 @@ mod tests {
             "got {:?}",
             rendered.text
         );
+    }
+
+    #[test]
+    fn defaults_match_combined_rate_limit_priority() {
+        assert_eq!(RateLimit5hSegment.defaults().priority, rate_limit::PRIORITY);
     }
 }

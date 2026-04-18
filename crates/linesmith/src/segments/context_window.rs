@@ -2,10 +2,15 @@
 //! formatted in thousands (`200k`, `1M`). Hidden when the payload
 //! doesn't carry context-window data.
 
-use super::{RenderedSegment, Segment};
+use super::{RenderedSegment, Segment, SegmentDefaults};
 use crate::input::{ContextWindow, StatusContext};
 
 pub struct ContextWindowSegment;
+
+/// Just above workspace (16): the context-window percentage is the
+/// health metric that silently breaks sessions when it hits 100%, so it
+/// should outlive everything except orientation.
+const PRIORITY: u8 = 32;
 
 impl Segment for ContextWindowSegment {
     fn render(&self, ctx: &StatusContext) -> Option<RenderedSegment> {
@@ -15,6 +20,10 @@ impl Segment for ContextWindowSegment {
             pct = cw.used.value(),
             size = format_size(cw),
         )))
+    }
+
+    fn defaults(&self) -> SegmentDefaults {
+        SegmentDefaults::with_priority(PRIORITY)
     }
 }
 
@@ -128,5 +137,10 @@ mod tests {
         assert_eq!(format_size_for(131_072), "131072");
         // 1.5M is not a round million, so the 'k' branch catches it.
         assert_eq!(format_size_for(1_500_000), "1500k");
+    }
+
+    #[test]
+    fn defaults_use_expected_priority() {
+        assert_eq!(ContextWindowSegment.defaults().priority, PRIORITY);
     }
 }

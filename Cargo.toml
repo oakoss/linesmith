@@ -14,6 +14,9 @@ authors = ["Jace Babin"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+terminal_size = "0.4"
+unicode-segmentation = "1"
+unicode-width = "0.2"
 
 [profile.release]
 lto = "fat"

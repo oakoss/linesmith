@@ -2,14 +2,19 @@
 //! `|` when both are present. Degrades gracefully on each `RateLimits`
 //! variant so users can pick this segment without branching on tier.
 //!
-//! Sub-composition via `Segment::children()` (per
-//! `docs/specs/segment-system.md`) is deferred to the layout-engine slice;
-//! until then this segment renders its own combined string.
+//! Renders a self-contained combined string today; sub-composition via
+//! `Segment::children()` is the eventual shape (see
+//! `docs/specs/segment-system.md`).
 
-use super::{format_window, RenderedSegment, Segment};
+use super::{format_window, RenderedSegment, Segment, SegmentDefaults};
 use crate::input::{RateLimits, StatusContext};
 
 pub struct RateLimitSegment;
+
+/// Between model (64) and effort (160). Rate-limit visibility is highly
+/// demanded, but the data is cached/delayed so it yields before the
+/// live-health metrics.
+pub(crate) const PRIORITY: u8 = 96;
 
 impl Segment for RateLimitSegment {
     fn render(&self, ctx: &StatusContext) -> Option<RenderedSegment> {
@@ -28,6 +33,10 @@ impl Segment for RateLimitSegment {
             ),
         };
         Some(RenderedSegment::new(text))
+    }
+
+    fn defaults(&self) -> SegmentDefaults {
+        SegmentDefaults::with_priority(PRIORITY)
     }
 }
 
@@ -97,5 +106,10 @@ mod tests {
         assert!(rendered.text.contains("5h 45%"));
         assert!(rendered.text.contains("7d 10%"));
         assert!(rendered.text.contains(" | "));
+    }
+
+    #[test]
+    fn defaults_use_expected_priority() {
+        assert_eq!(RateLimitSegment.defaults().priority, PRIORITY);
     }
 }

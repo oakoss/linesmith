@@ -4,10 +4,14 @@
 //! - Regular git repo or outside git: the project-dir basename
 //! - Project dir has no usable basename, or worktree name is empty: hidden
 
-use super::{RenderedSegment, Segment};
+use super::{RenderedSegment, Segment, SegmentDefaults};
 use crate::input::StatusContext;
 
 pub struct WorkspaceSegment;
+
+/// Lowest non-zero priority in the built-in set: orientation ("where am
+/// I?") survives nearly all width pressure.
+const PRIORITY: u8 = 16;
 
 impl Segment for WorkspaceSegment {
     fn render(&self, ctx: &StatusContext) -> Option<RenderedSegment> {
@@ -28,6 +32,10 @@ impl Segment for WorkspaceSegment {
         }
 
         Some(RenderedSegment::new(repo_name))
+    }
+
+    fn defaults(&self) -> SegmentDefaults {
+        SegmentDefaults::with_priority(PRIORITY)
     }
 }
 
@@ -100,5 +108,10 @@ mod tests {
     #[test]
     fn hidden_when_worktree_name_is_empty() {
         assert_eq!(WorkspaceSegment.render(&ctx(Some(worktree("")))), None);
+    }
+
+    #[test]
+    fn defaults_use_expected_priority() {
+        assert_eq!(WorkspaceSegment.defaults().priority, PRIORITY);
     }
 }

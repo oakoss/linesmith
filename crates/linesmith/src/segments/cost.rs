@@ -1,15 +1,23 @@
 //! Cost segment: renders session cost in USD. Hidden when the payload
 //! doesn't carry cost metrics (currently always present in Claude Code).
 
-use super::{RenderedSegment, Segment};
+use super::{RenderedSegment, Segment, SegmentDefaults};
 use crate::input::StatusContext;
 
 pub struct CostSegment;
+
+/// Highest droppable priority in the built-in set: cost is useful but
+/// least time-sensitive, so it yields first under width pressure.
+const PRIORITY: u8 = 192;
 
 impl Segment for CostSegment {
     fn render(&self, ctx: &StatusContext) -> Option<RenderedSegment> {
         let cost = ctx.cost.as_ref()?;
         Some(RenderedSegment::new(format!("${:.2}", cost.total_cost_usd)))
+    }
+
+    fn defaults(&self) -> SegmentDefaults {
+        SegmentDefaults::with_priority(PRIORITY)
     }
 }
 
@@ -67,5 +75,10 @@ mod tests {
     #[test]
     fn hidden_when_cost_absent() {
         assert_eq!(CostSegment.render(&ctx(None)), None);
+    }
+
+    #[test]
+    fn defaults_use_expected_priority() {
+        assert_eq!(CostSegment.defaults().priority, PRIORITY);
     }
 }

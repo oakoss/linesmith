@@ -121,8 +121,9 @@ Segments should prefer declaring a `role` (maps to theme colors; see `specs/them
 use std::borrow::Cow;
 
 pub struct SegmentDefaults {
-    /// Lower priority drops first under width pressure. 0 = critical
-    /// (never dropped), 255 = first to drop. Defaults to 128.
+    /// Drop order under width pressure: `255` drops first, `0` never
+    /// drops. Defaults to `128`. Ties break by position (right-most
+    /// first).
     pub priority: u8,
 
     /// Width bounds, if any. Construction enforces `min <= max`.

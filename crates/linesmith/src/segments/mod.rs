@@ -1,8 +1,11 @@
-//! Segment trait. Current shape is `render` only; see
-//! `docs/specs/segment-system.md` for the full trait (layout intent,
-//! cache policy, sub-composition) that grows as segments mature.
+//! Segment trait and layout-intent types. Full contract lives in
+//! `docs/specs/segment-system.md`; this module carries the subset the
+//! v0.1 layout engine uses — visibility, cell width, priority, and
+//! separator preference.
 
 use crate::input::StatusContext;
+use std::borrow::Cow;
+use unicode_width::UnicodeWidthStr;
 
 pub mod context_window;
 pub mod cost;
@@ -13,20 +16,141 @@ pub mod rate_limit_5h;
 pub mod rate_limit_7d;
 pub mod workspace;
 
-/// Output of a successful segment render. Carries only `text` today;
-/// width hints, styled runs, and per-segment separator preferences
-/// are added per `docs/specs/segment-system.md`. `#[non_exhaustive]`
-/// keeps those additions SemVer-compatible.
+/// Output of a successful segment render. `width` is the rendered cell
+/// count (via `unicode-width`) computed once at construction;
+/// `right_separator`, when `Some`, overrides the segment's default
+/// separator on this specific boundary.
+///
+/// `#[non_exhaustive]` so we can grow the struct without breaking SemVer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RenderedSegment {
     pub text: String,
+    pub width: u16,
+    pub right_separator: Option<Separator>,
 }
 
 impl RenderedSegment {
     #[must_use]
     pub fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
+        let text = text.into();
+        let width = text_width(&text);
+        Self {
+            text,
+            width,
+            right_separator: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_separator(text: impl Into<String>, separator: Separator) -> Self {
+        let text = text.into();
+        let width = text_width(&text);
+        Self {
+            text,
+            width,
+            right_separator: Some(separator),
+        }
+    }
+}
+
+/// Cell count of `s` on a standard terminal, saturating at `u16::MAX`.
+#[must_use]
+pub(crate) fn text_width(s: &str) -> u16 {
+    u16::try_from(UnicodeWidthStr::width(s)).unwrap_or(u16::MAX)
+}
+
+/// Separator between adjacent segments. Chosen by the segment to its
+/// left; themes and user config can override.
+///
+/// `Theme` renders as a single space until the theme system lands.
+/// `Literal` carries a `Cow<'static, str>` so built-ins stay zero-alloc
+/// while user-supplied config can allocate once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Separator {
+    Space,
+    Theme,
+    Literal(Cow<'static, str>),
+    None,
+}
+
+impl Separator {
+    #[must_use]
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Space | Self::Theme => " ",
+            Self::Literal(s) => s,
+            Self::None => "",
+        }
+    }
+
+    #[must_use]
+    pub fn width(&self) -> u16 {
+        match self {
+            Self::Space | Self::Theme => 1,
+            Self::Literal(s) => text_width(s),
+            Self::None => 0,
+        }
+    }
+}
+
+/// Width bounds in cells with `min <= max` enforced at construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WidthBounds {
+    min: u16,
+    max: u16,
+}
+
+impl WidthBounds {
+    /// Returns `None` when `min > max`.
+    #[must_use]
+    pub fn new(min: u16, max: u16) -> Option<Self> {
+        (min <= max).then_some(Self { min, max })
+    }
+
+    #[must_use]
+    pub fn min(self) -> u16 {
+        self.min
+    }
+
+    #[must_use]
+    pub fn max(self) -> u16 {
+        self.max
+    }
+}
+
+/// Layout intent declared by a segment; user config may override each
+/// field.
+///
+/// Under width pressure the engine drops segments in descending
+/// `priority` order: `255` drops first, `0` never drops. Default `128`.
+/// Ties break by position: the right-most segment drops first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SegmentDefaults {
+    pub priority: u8,
+    pub width: Option<WidthBounds>,
+    pub default_separator: Separator,
+}
+
+impl SegmentDefaults {
+    #[must_use]
+    pub fn with_priority(priority: u8) -> Self {
+        Self {
+            priority,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for SegmentDefaults {
+    fn default() -> Self {
+        Self {
+            priority: 128,
+            width: None,
+            default_separator: Separator::Space,
+        }
     }
 }
 
@@ -34,6 +158,13 @@ pub trait Segment: Send {
     /// Render this segment for the given context, or `None` to hide.
     #[must_use]
     fn render(&self, ctx: &StatusContext) -> Option<RenderedSegment>;
+
+    /// Layout defaults (priority, width bounds, separator preference).
+    /// User config may override each field once the config layer lands.
+    #[must_use]
+    fn defaults(&self) -> SegmentDefaults {
+        SegmentDefaults::default()
+    }
 }
 
 // --- Shared render helpers --------------------------------------------
@@ -163,5 +294,52 @@ mod countdown_tests {
     fn exactly_one_hour_drops_minutes_suffix() {
         let now = ref_time();
         assert_eq!(format_countdown_until(now + Duration::hours(1), now), "1h");
+    }
+}
+
+#[cfg(test)]
+mod layout_type_tests {
+    use super::*;
+
+    #[test]
+    fn rendered_segment_computes_width() {
+        let r = RenderedSegment::new("hello");
+        assert_eq!(r.width, 5);
+        assert_eq!(r.right_separator, None);
+    }
+
+    #[test]
+    fn rendered_segment_counts_cells_not_bytes_for_middle_dot() {
+        // U+00B7 MIDDLE DOT is 2 bytes but 1 cell.
+        let r = RenderedSegment::new("42% · 200k");
+        assert_eq!(r.width, 10);
+    }
+
+    #[test]
+    fn separator_widths_match_expected() {
+        assert_eq!(Separator::Space.width(), 1);
+        assert_eq!(Separator::Theme.width(), 1);
+        assert_eq!(Separator::None.width(), 0);
+        assert_eq!(Separator::Literal(Cow::Borrowed(" | ")).width(), 3);
+    }
+
+    #[test]
+    fn width_bounds_rejects_inverted_range() {
+        assert!(WidthBounds::new(20, 10).is_none());
+        assert!(WidthBounds::new(10, 10).is_some());
+        assert!(WidthBounds::new(0, u16::MAX).is_some());
+    }
+
+    #[test]
+    fn segment_defaults_default_priority_is_128() {
+        assert_eq!(SegmentDefaults::default().priority, 128);
+    }
+
+    #[test]
+    fn with_priority_preserves_other_defaults() {
+        let d = SegmentDefaults::with_priority(64);
+        assert_eq!(d.priority, 64);
+        assert_eq!(d.width, None);
+        assert_eq!(d.default_separator, Separator::Space);
     }
 }

@@ -1,9 +1,13 @@
 //! Model segment: renders the current model's display name.
 
-use super::{RenderedSegment, Segment};
+use super::{RenderedSegment, Segment, SegmentDefaults};
 use crate::input::StatusContext;
 
 pub struct ModelSegment;
+
+/// Between context_window (32) and rate_limit (96): identity matters for
+/// multi-model sessions but isn't time-sensitive like the health metrics.
+const PRIORITY: u8 = 64;
 
 impl Segment for ModelSegment {
     fn render(&self, ctx: &StatusContext) -> Option<RenderedSegment> {
@@ -12,6 +16,10 @@ impl Segment for ModelSegment {
             return None;
         }
         Some(RenderedSegment::new(name))
+    }
+
+    fn defaults(&self) -> SegmentDefaults {
+        SegmentDefaults::with_priority(PRIORITY)
     }
 }
 
@@ -56,5 +64,10 @@ mod tests {
     #[test]
     fn hidden_when_display_name_is_whitespace_only() {
         assert_eq!(ModelSegment.render(&ctx("   ")), None);
+    }
+
+    #[test]
+    fn defaults_use_expected_priority() {
+        assert_eq!(ModelSegment.defaults().priority, PRIORITY);
     }
 }
