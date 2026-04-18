@@ -8,6 +8,7 @@ use crate::theme::{Role, Style};
 use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
 
+pub(crate) mod builder;
 pub mod context_window;
 pub mod cost;
 pub mod effort;
