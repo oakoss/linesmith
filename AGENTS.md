@@ -141,6 +141,34 @@ with Option<T> for nullable fields (current_usage, rate_limits).
 lsm-sgh
 ```
 
+### Closing beads issues
+
+Close the bead **before** staging so the feat/fix commit captures the
+code AND the close atomically. The pre-commit hook (`bd hooks run
+pre-commit`) flushes any pending jsonl export into the same commit.
+
+```text
+# 1. Finish the work, then:
+bd close lsm-xyz --reason="Shipped in this commit: <one-line summary>"
+
+# 2. Stage code + the jsonl bd just updated:
+git add <files> .beads/issues.jsonl
+
+# 3. Commit with lsm-xyz as the bare footer (see above):
+git commit -m "feat(scope): ..."
+```
+
+If `git status` shows `.beads/issues.jsonl` unchanged after `bd close`
+(60s auto-export throttle hit), force the write before staging:
+
+```text
+bd export -o .beads/issues.jsonl
+git add .beads/issues.jsonl
+```
+
+Do NOT make a separate `chore(beads):` commit just to record the close;
+the pre-commit hook keeps code and issue state in the same commit.
+
 ## Session Completion
 
 When ending a work session:
