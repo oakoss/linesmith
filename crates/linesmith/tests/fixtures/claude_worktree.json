@@ -17,5 +17,23 @@
     "context_window_size": 200000,
     "total_input_tokens": 12345,
     "total_output_tokens": 6789
-  }
+  },
+  "cost": {
+    "total_cost_usd": 1.234,
+    "total_duration_ms": 5000,
+    "total_api_duration_ms": 3500,
+    "total_lines_added": 42,
+    "total_lines_removed": 12
+  },
+  "rate_limits": {
+    "five_hour": {
+      "used_percentage": 35.2,
+      "resets_at": "2099-04-17T17:30:00Z"
+    },
+    "seven_day": {
+      "used_percentage": 12.1,
+      "resets_at": "2099-04-24T15:00:00Z"
+    }
+  },
+  "effort": "high"
 }

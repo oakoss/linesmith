@@ -7,14 +7,20 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
 /// The canonical, tool-agnostic input to the rendering pipeline. `Arc`
 /// around `raw` keeps `StatusContext::clone` at O(1) when segments cache.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct StatusContext {
     pub tool: Tool,
     pub model: ModelInfo,
     pub workspace: WorkspaceInfo,
     pub context_window: Option<ContextWindow>,
+    pub cost: Option<CostMetrics>,
+    pub rate_limits: Option<RateLimits>,
+    pub effort: Option<EffortLevel>,
     pub raw: Arc<serde_json::Value>,
 }
 
@@ -60,6 +66,92 @@ impl ContextWindow {
     #[must_use]
     pub fn remaining(&self) -> Percent {
         self.used.complement()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct CostMetrics {
+    pub total_cost_usd: f64,
+    pub total_duration_ms: u64,
+    pub total_api_duration_ms: u64,
+    /// Session lines added; `u64` to match the JSON wire width and avoid
+    /// silent truncation on sessions with very large aggregated counts.
+    pub total_lines_added: u64,
+    pub total_lines_removed: u64,
+}
+
+/// Rate-limit windows exposed to paid tiers. A `Some(RateLimits)` on
+/// `StatusContext` always carries at least one window; the `(None, None)`
+/// state is unrepresentable per ADR-0008.
+#[derive(Debug, Clone, Copy)]
+pub enum RateLimits {
+    FiveHourOnly(RateLimitWindow),
+    SevenDayOnly(RateLimitWindow),
+    Both {
+        five_hour: RateLimitWindow,
+        seven_day: RateLimitWindow,
+    },
+}
+
+impl RateLimits {
+    #[must_use]
+    pub fn five_hour(&self) -> Option<&RateLimitWindow> {
+        match self {
+            Self::FiveHourOnly(w) | Self::Both { five_hour: w, .. } => Some(w),
+            Self::SevenDayOnly(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn seven_day(&self) -> Option<&RateLimitWindow> {
+        match self {
+            Self::SevenDayOnly(w) | Self::Both { seven_day: w, .. } => Some(w),
+            Self::FiveHourOnly(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimitWindow {
+    pub used: Percent,
+    pub resets_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortLevel {
+    Low,
+    Medium,
+    High,
+    Max,
+    XHigh,
+}
+
+impl EffortLevel {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Max => "max",
+            Self::XHigh => "xhigh",
+        }
+    }
+}
+
+impl std::str::FromStr for EffortLevel {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "max" => Ok(Self::Max),
+            "xhigh" => Ok(Self::XHigh),
+            _ => Err(()),
+        }
     }
 }
 
@@ -266,9 +358,10 @@ impl std::error::Error for ParseError {}
 
 mod claude {
     use super::{
-        ContextWindow, GitWorktree, JsonType, ModelInfo, ParseError, Percent, StatusContext, Tool,
-        WorkspaceInfo,
+        ContextWindow, CostMetrics, EffortLevel, GitWorktree, JsonType, ModelInfo, ParseError,
+        Percent, RateLimitWindow, RateLimits, StatusContext, Tool, WorkspaceInfo,
     };
+    use chrono::{DateTime, Utc};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -280,12 +373,18 @@ mod claude {
         let model = parse_model(root)?;
         let workspace = parse_workspace(root)?;
         let context_window = parse_context_window(root)?;
+        let cost = parse_cost(root)?;
+        let rate_limits = parse_rate_limits(root)?;
+        let effort = parse_effort(root)?;
 
         Ok(StatusContext {
             tool: TOOL,
             model,
             workspace,
             context_window,
+            cost,
+            rate_limits,
+            effort,
             raw,
         })
     }
@@ -363,6 +462,110 @@ mod claude {
         }))
     }
 
+    fn parse_cost(
+        root: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<CostMetrics>, ParseError> {
+        let Some(value) = root.get("cost") else {
+            return Ok(None);
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        let cost = expect_object(value, "cost")?;
+
+        let total_cost_usd = require_f64(cost, "cost.total_cost_usd")?;
+        let total_duration_ms = require_u64(cost, "cost.total_duration_ms")?;
+        let total_api_duration_ms = require_u64(cost, "cost.total_api_duration_ms")?;
+        let total_lines_added = require_u64(cost, "cost.total_lines_added")?;
+        let total_lines_removed = require_u64(cost, "cost.total_lines_removed")?;
+
+        Ok(Some(CostMetrics {
+            total_cost_usd,
+            total_duration_ms,
+            total_api_duration_ms,
+            total_lines_added,
+            total_lines_removed,
+        }))
+    }
+
+    fn parse_rate_limits(
+        root: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<RateLimits>, ParseError> {
+        let Some(value) = root.get("rate_limits") else {
+            return Ok(None);
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        let obj = expect_object(value, "rate_limits")?;
+
+        let five_hour = parse_rate_window(obj, "five_hour", "rate_limits.five_hour")?;
+        let seven_day = parse_rate_window(obj, "seven_day", "rate_limits.seven_day")?;
+
+        Ok(match (five_hour, seven_day) {
+            (Some(f), Some(s)) => Some(RateLimits::Both {
+                five_hour: f,
+                seven_day: s,
+            }),
+            (Some(f), None) => Some(RateLimits::FiveHourOnly(f)),
+            (None, Some(s)) => Some(RateLimits::SevenDayOnly(s)),
+            (None, None) => None,
+        })
+    }
+
+    fn parse_rate_window(
+        obj: &serde_json::Map<String, serde_json::Value>,
+        key: &str,
+        path: &'static str,
+    ) -> Result<Option<RateLimitWindow>, ParseError> {
+        let Some(value) = obj.get(key) else {
+            return Ok(None);
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        let window = expect_object(value, path)?;
+
+        let used_raw = require_f64_at(
+            window,
+            "used_percentage",
+            &format!("{path}.used_percentage"),
+        )?;
+        let used = Percent::from_f64(used_raw).ok_or_else(|| {
+            invalid_value(
+                format!("{path}.used_percentage"),
+                "percentage must be in 0.0..=100.0",
+            )
+        })?;
+
+        let resets_at_str = require_string_at(window, "resets_at", &format!("{path}.resets_at"))?;
+        let resets_at = DateTime::parse_from_rfc3339(resets_at_str)
+            .map_err(|err| ParseError::NormalizerError {
+                tool: TOOL,
+                message: format!("rate_limits.{key}.resets_at is not RFC 3339: {err}"),
+            })?
+            .with_timezone(&Utc);
+
+        Ok(Some(RateLimitWindow { used, resets_at }))
+    }
+
+    fn parse_effort(
+        root: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<EffortLevel>, ParseError> {
+        let Some(value) = root.get("effort") else {
+            return Ok(None);
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        let raw = value
+            .as_str()
+            .ok_or_else(|| type_mismatch("effort", JsonType::String, JsonType::of(value)))?;
+        raw.parse::<EffortLevel>()
+            .map(Some)
+            .map_err(|()| invalid_value("effort", "expected one of: low, medium, high, max, xhigh"))
+    }
+
     // --- helpers ------------------------------------------------------
 
     fn expect_object<'a>(
@@ -401,6 +604,31 @@ mod claude {
         let value = obj.get(path_tail(path)).ok_or_else(|| missing(path))?;
         value
             .as_u64()
+            .ok_or_else(|| type_mismatch(path, JsonType::Number, JsonType::of(value)))
+    }
+
+    /// Variants that take an explicit key (lookup) and path (error
+    /// reporting) separately; used when the path is runtime-computed
+    /// (rate_limits.{five_hour|seven_day}.*).
+    fn require_string_at<'a>(
+        obj: &'a serde_json::Map<String, serde_json::Value>,
+        key: &str,
+        path: &str,
+    ) -> Result<&'a str, ParseError> {
+        let value = obj.get(key).ok_or_else(|| missing(path.to_owned()))?;
+        value
+            .as_str()
+            .ok_or_else(|| type_mismatch(path, JsonType::String, JsonType::of(value)))
+    }
+
+    fn require_f64_at(
+        obj: &serde_json::Map<String, serde_json::Value>,
+        key: &str,
+        path: &str,
+    ) -> Result<f64, ParseError> {
+        let value = obj.get(key).ok_or_else(|| missing(path.to_owned()))?;
+        value
+            .as_f64()
             .ok_or_else(|| type_mismatch(path, JsonType::Number, JsonType::of(value)))
     }
 
@@ -686,5 +914,209 @@ mod tests {
         let err = parse(b"[]").expect_err("array at root rejected");
         let display = err.to_string();
         assert!(display.contains("<root>"), "got {display:?}");
+    }
+
+    // --- rate_limits variant matrix ---
+
+    fn base_payload_with_rate_limits(body: &str) -> Vec<u8> {
+        format!(
+            r#"{{"model":{{"display_name":"X"}},"workspace":{{"project_dir":"/r"}},"rate_limits":{body}}}"#
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn rate_limits_with_both_windows_parses_as_both() {
+        let bytes = base_payload_with_rate_limits(
+            r#"{"five_hour":{"used_percentage":35.0,"resets_at":"2099-01-01T00:00:00Z"},
+                "seven_day":{"used_percentage":12.0,"resets_at":"2099-01-08T00:00:00Z"}}"#,
+        );
+        let ctx = parse(&bytes).expect("parse ok");
+        assert!(matches!(ctx.rate_limits, Some(RateLimits::Both { .. })));
+    }
+
+    #[test]
+    fn rate_limits_with_only_five_hour_parses_as_five_hour_only() {
+        let bytes = base_payload_with_rate_limits(
+            r#"{"five_hour":{"used_percentage":35.0,"resets_at":"2099-01-01T00:00:00Z"}}"#,
+        );
+        let ctx = parse(&bytes).expect("parse ok");
+        assert!(matches!(ctx.rate_limits, Some(RateLimits::FiveHourOnly(_))));
+    }
+
+    #[test]
+    fn rate_limits_with_only_seven_day_parses_as_seven_day_only() {
+        let bytes = base_payload_with_rate_limits(
+            r#"{"seven_day":{"used_percentage":12.0,"resets_at":"2099-01-08T00:00:00Z"}}"#,
+        );
+        let ctx = parse(&bytes).expect("parse ok");
+        assert!(matches!(ctx.rate_limits, Some(RateLimits::SevenDayOnly(_))));
+    }
+
+    #[test]
+    fn rate_limits_empty_object_collapses_to_none() {
+        // Forgiving parse: an empty rate_limits object is treated the same
+        // as the key being absent. If Claude ever regresses to emitting {}
+        // when a window should be present we'd silently hide — acceptable
+        // tradeoff today (see slice 3 review). Lock current behavior.
+        let bytes = base_payload_with_rate_limits("{}");
+        let ctx = parse(&bytes).expect("parse ok");
+        assert!(ctx.rate_limits.is_none());
+    }
+
+    #[test]
+    fn rate_limits_explicit_null_treated_as_none() {
+        let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"rate_limits":null}"#;
+        let ctx = parse(bytes).expect("parse ok");
+        assert!(ctx.rate_limits.is_none());
+    }
+
+    // --- rate_window error paths ---
+
+    #[test]
+    fn rate_window_rejects_malformed_rfc3339_as_normalizer_error() {
+        let bytes = base_payload_with_rate_limits(
+            r#"{"five_hour":{"used_percentage":35.0,"resets_at":"not-a-date"}}"#,
+        );
+        match parse(&bytes).expect_err("should reject") {
+            ParseError::NormalizerError { message, .. } => {
+                assert!(message.contains("RFC 3339"), "got {message:?}");
+            }
+            other => panic!("expected NormalizerError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_window_accepts_non_z_timezone_offset() {
+        let bytes = base_payload_with_rate_limits(
+            r#"{"five_hour":{"used_percentage":35.0,"resets_at":"2099-04-17T19:30:00+02:00"}}"#,
+        );
+        let ctx = parse(&bytes).expect("parse ok");
+        let rl = ctx.rate_limits.expect("rate_limits");
+        let window = rl.five_hour().expect("five_hour");
+        // +02:00 19:30 == Z 17:30
+        assert_eq!(window.resets_at.to_rfc3339(), "2099-04-17T17:30:00+00:00");
+    }
+
+    #[test]
+    fn rate_window_rejects_non_string_resets_at_as_type_mismatch() {
+        let bytes = base_payload_with_rate_limits(
+            r#"{"five_hour":{"used_percentage":35.0,"resets_at":42}}"#,
+        );
+        match parse(&bytes).expect_err("should reject") {
+            ParseError::TypeMismatch {
+                path,
+                expected,
+                got,
+                ..
+            } => {
+                assert_eq!(path, "rate_limits.five_hour.resets_at");
+                assert_eq!(expected, JsonType::String);
+                assert_eq!(got, JsonType::Number);
+            }
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_window_rejects_missing_used_percentage_as_missing_field() {
+        let bytes =
+            base_payload_with_rate_limits(r#"{"five_hour":{"resets_at":"2099-01-01T00:00:00Z"}}"#);
+        match parse(&bytes).expect_err("should reject") {
+            ParseError::MissingField { path, .. } => {
+                assert_eq!(path, "rate_limits.five_hour.used_percentage");
+            }
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rate_window_rejects_out_of_range_percent_as_invalid_value() {
+        let bytes = base_payload_with_rate_limits(
+            r#"{"five_hour":{"used_percentage":150,"resets_at":"2099-01-01T00:00:00Z"}}"#,
+        );
+        match parse(&bytes).expect_err("should reject") {
+            ParseError::InvalidValue { path, .. } => {
+                assert_eq!(path, "rate_limits.five_hour.used_percentage");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    // --- cost error paths ---
+
+    #[test]
+    fn cost_absent_treated_as_none() {
+        let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"}}"#;
+        assert!(parse(bytes).expect("ok").cost.is_none());
+    }
+
+    #[test]
+    fn cost_explicit_null_treated_as_none() {
+        let bytes =
+            br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"cost":null}"#;
+        assert!(parse(bytes).expect("ok").cost.is_none());
+    }
+
+    #[test]
+    fn cost_wrong_type_rejected_as_type_mismatch() {
+        let bytes =
+            br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"cost":"nope"}"#;
+        match parse(bytes).expect_err("rejected") {
+            ParseError::TypeMismatch { path, .. } => assert_eq!(path, "cost"),
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cost_missing_sub_field_rejected_as_missing_field() {
+        let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},
+            "cost":{"total_cost_usd":1.0,"total_duration_ms":0,"total_api_duration_ms":0,"total_lines_added":0}}"#;
+        match parse(bytes).expect_err("rejected") {
+            ParseError::MissingField { path, .. } => assert_eq!(path, "cost.total_lines_removed"),
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cost_lines_added_accepts_large_value_without_truncation() {
+        // Regression guard for slice-3 review fix: fields were previously
+        // narrowed to u32, silently truncating at 4.29B.
+        let bytes = format!(
+            r#"{{"model":{{"display_name":"X"}},"workspace":{{"project_dir":"/r"}},
+               "cost":{{"total_cost_usd":0.0,"total_duration_ms":0,"total_api_duration_ms":0,
+                        "total_lines_added":{n},"total_lines_removed":0}}}}"#,
+            n = 5_000_000_000u64
+        );
+        let ctx = parse(bytes.as_bytes()).expect("parse ok");
+        assert_eq!(ctx.cost.expect("cost").total_lines_added, 5_000_000_000u64);
+    }
+
+    // --- effort error paths ---
+
+    #[test]
+    fn effort_non_string_rejected_as_type_mismatch() {
+        let bytes =
+            br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"effort":42}"#;
+        match parse(bytes).expect_err("rejected") {
+            ParseError::TypeMismatch { path, .. } => assert_eq!(path, "effort"),
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effort_unknown_string_rejected_as_invalid_value() {
+        let bytes =
+            br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"effort":"ultra"}"#;
+        match parse(bytes).expect_err("rejected") {
+            ParseError::InvalidValue { path, reason, .. } => {
+                assert_eq!(path, "effort");
+                assert!(
+                    reason.contains("low"),
+                    "reason should list known values, got {reason:?}"
+                );
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
     }
 }

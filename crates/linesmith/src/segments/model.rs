@@ -33,6 +33,9 @@ mod tests {
                 git_worktree: None,
             },
             context_window: None,
+            cost: None,
+            rate_limits: None,
+            effort: None,
             raw: Arc::new(serde_json::Value::Null),
         }
     }

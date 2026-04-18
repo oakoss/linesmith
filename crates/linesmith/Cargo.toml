@@ -14,6 +14,7 @@ unsafe_code = "forbid"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+chrono.workspace = true
 
 [[bin]]
 name = "linesmith"

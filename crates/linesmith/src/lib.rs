@@ -35,6 +35,9 @@ pub fn run(mut reader: impl Read, mut writer: impl Write) -> io::Result<()> {
     let built_in: Vec<Box<dyn segments::Segment>> = vec![
         Box::new(segments::model::ModelSegment),
         Box::new(segments::context_window::ContextWindowSegment),
+        Box::new(segments::rate_limit::RateLimitSegment),
+        Box::new(segments::cost::CostSegment),
+        Box::new(segments::effort::EffortSegment),
         Box::new(segments::workspace::WorkspaceSegment),
     ];
 

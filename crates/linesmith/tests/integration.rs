@@ -14,13 +14,28 @@ fn renders_model_and_workspace_when_outside_worktree() {
 }
 
 #[test]
-fn renders_model_context_and_worktree_when_payload_is_full() {
+fn renders_full_payload_with_rate_limits_cost_effort_and_worktree() {
+    // Rate-limit countdowns depend on wall-clock `now`, so we match the
+    // substrings that are stable rather than the full line.
     let mut out = Vec::new();
     linesmith::run(Cursor::new(CLAUDE_WORKTREE), &mut out).expect("run ok");
-    assert_eq!(
-        String::from_utf8(out).expect("utf8"),
-        "Claude Sonnet 4.6 42% · 200k linesmith/feat-segments\n"
-    );
+    let rendered = String::from_utf8(out).expect("utf8");
+
+    for substring in [
+        "Claude Sonnet 4.6",
+        "42% · 200k",
+        "5h 35%",
+        "7d 12%",
+        "$1.23",
+        "high",
+        "linesmith/feat-segments",
+    ] {
+        assert!(
+            rendered.contains(substring),
+            "expected {substring:?} in {rendered:?}"
+        );
+    }
+    assert!(rendered.ends_with('\n'));
 }
 
 #[test]
