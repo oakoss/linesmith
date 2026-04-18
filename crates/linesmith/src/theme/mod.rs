@@ -10,6 +10,8 @@
 
 use std::fmt::Write;
 
+mod catppuccin;
+
 /// Semantic color slot a segment targets. Themes map every role to a
 /// concrete color; segments never reference hex values directly.
 /// Variants are ordered to match the 16-slot role array themes store.
@@ -267,6 +269,10 @@ const BUILTIN_THEMES: &[Theme] = &[
         name: "minimal",
         colors: [None; Role::COUNT],
     },
+    catppuccin::LATTE,
+    catppuccin::FRAPPE,
+    catppuccin::MACCHIATO,
+    catppuccin::MOCHA,
 ];
 
 /// Look up a built-in theme by name. Unknown names return `None` so

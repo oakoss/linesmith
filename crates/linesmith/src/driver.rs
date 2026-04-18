@@ -811,6 +811,34 @@ mod tests {
     }
 
     #[test]
+    fn catppuccin_mocha_renders_with_mocha_palette_under_truecolor() {
+        // End-to-end contract: `theme = "catppuccin-mocha"` in config +
+        // TrueColor capability emits the Mocha palette's exact RGB
+        // values. Model (Primary → mauve: 203,166,247); workspace
+        // (Info → teal: 148,226,213). If this snapshot fails after a
+        // `catppuccin` crate bump, the upstream palette drifted and the
+        // theme file deserves a deliberate review.
+        let json = br#"{
+            "model": { "display_name": "C" },
+            "workspace": { "project_dir": "/x" }
+        }"#;
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "theme = \"catppuccin-mocha\"\n").unwrap();
+        let env = CliEnv {
+            color_capability: Some(theme::Capability::TrueColor),
+            ..CliEnv::for_tests()
+        };
+        let (code, stdout, _stderr) =
+            run_cli_main(&["--config", path.to_str().unwrap()], json, &env);
+        assert_eq!(code, 0);
+        assert_eq!(
+            stdout,
+            "\x1b[38;2;203;166;247mC\x1b[0m \x1b[38;2;148;226;213mx\x1b[0m\n"
+        );
+    }
+
+    #[test]
     fn no_color_capability_strips_theme_under_default() {
         // Even the `default` theme (Palette16 values) emits nothing
         // under Capability::None. This is the NO_COLOR contract: no
