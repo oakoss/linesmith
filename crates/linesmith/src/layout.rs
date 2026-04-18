@@ -9,34 +9,45 @@ use crate::input::StatusContext;
 use crate::segments::{
     text_width, RenderedSegment, Segment, SegmentDefaults, Separator, WidthBounds,
 };
+use crate::theme::{self, Capability, Theme};
 use std::io::{self, Write};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Render `segments` for `ctx` within `terminal_width` cells. Returns the
 /// final line without a trailing newline. Segment render errors are
-/// logged to the real process stderr; for injected-stderr testability,
-/// use [`render_with_warn`] instead.
+/// logged to the real process stderr; output is unstyled (callers that
+/// want theming use [`render_with_warn`]).
 #[must_use]
 pub fn render(segments: &[Box<dyn Segment>], ctx: &StatusContext, terminal_width: u16) -> String {
     let mut warn = |msg: &str| {
         let _ = writeln!(io::stderr().lock(), "linesmith: {msg}");
     };
-    render_with_warn(segments, ctx, terminal_width, &mut warn)
+    render_with_warn(
+        segments,
+        ctx,
+        terminal_width,
+        &mut warn,
+        theme::default_theme(),
+        Capability::None,
+    )
 }
 
 /// Same as [`render`] but routes segment render-error diagnostics
-/// through a caller-supplied warn sink. Used by
-/// `run_with_segments_width_and_stderr` so `cli_main` tests can
-/// capture segment errors alongside exit codes.
+/// through `warn` and emits ANSI SGR around each segment per `theme`
+/// and `capability`. Used by [`crate::run_with_context`] so `cli_main`
+/// tests can capture segment errors alongside exit codes while the
+/// render path picks up theme colors.
 #[must_use]
 pub fn render_with_warn(
     segments: &[Box<dyn Segment>],
     ctx: &StatusContext,
     terminal_width: u16,
     warn: &mut dyn FnMut(&str),
+    theme: &Theme,
+    capability: Capability,
 ) -> String {
     let items = collect_items_with(segments, ctx, warn);
-    render_items(items, terminal_width)
+    render_items(items, terminal_width, theme, capability)
 }
 
 /// Rendered output paired with the defaults needed to place it (priority,
@@ -72,7 +83,12 @@ fn collect_items_with(
         .collect()
 }
 
-fn render_items(mut items: Vec<Item>, terminal_width: u16) -> String {
+fn render_items(
+    mut items: Vec<Item>,
+    terminal_width: u16,
+    theme: &Theme,
+    capability: Capability,
+) -> String {
     while total_width(&items) > u32::from(terminal_width) {
         let Some(drop_idx) = items
             .iter()
@@ -88,7 +104,15 @@ fn render_items(mut items: Vec<Item>, terminal_width: u16) -> String {
 
     let mut out = String::new();
     for (i, item) in items.iter().enumerate() {
-        out.push_str(&item.rendered.text);
+        let style = &item.rendered.style;
+        let open = theme::sgr_open(style, theme, capability);
+        if !open.is_empty() {
+            out.push_str(&open);
+            out.push_str(&item.rendered.text);
+            out.push_str(theme::sgr_reset());
+        } else {
+            out.push_str(&item.rendered.text);
+        }
         if i + 1 < items.len() {
             out.push_str(effective_separator(item).text());
         }
@@ -143,7 +167,12 @@ fn apply_width_bounds(
 /// cluster so combining marks, ZWJ sequences, and emoji stay intact.
 pub(crate) fn truncate_to(rendered: RenderedSegment, max_cells: u16) -> RenderedSegment {
     if max_cells == 0 {
-        return RenderedSegment::from_parts(String::new(), 0, rendered.right_separator);
+        return RenderedSegment::from_parts(
+            String::new(),
+            0,
+            rendered.right_separator,
+            rendered.style,
+        );
     }
     // Reserve one cell for the ellipsis.
     let budget = max_cells.saturating_sub(1);
@@ -158,12 +187,18 @@ pub(crate) fn truncate_to(rendered: RenderedSegment, max_cells: u16) -> Rendered
         used = used.saturating_add(w);
     }
     out.push('…');
-    RenderedSegment::from_parts(out, used.saturating_add(1), rendered.right_separator)
+    RenderedSegment::from_parts(
+        out,
+        used.saturating_add(1),
+        rendered.right_separator,
+        rendered.style,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme;
     use std::borrow::Cow;
 
     fn item(text: &str, priority: u8) -> Item {
@@ -171,6 +206,50 @@ mod tests {
             rendered: RenderedSegment::new(text),
             defaults: SegmentDefaults::with_priority(priority),
         }
+    }
+
+    /// Test helper: exercise `render_items` with the default theme and
+    /// no color capability so output is plain text — the invariant most
+    /// layout tests actually care about (priority-drop, separators,
+    /// truncation behavior) is independent of theming.
+    fn render_plain(items: Vec<Item>, terminal_width: u16) -> String {
+        render_items(
+            items,
+            terminal_width,
+            theme::default_theme(),
+            theme::Capability::None,
+        )
+    }
+
+    #[test]
+    fn render_items_wraps_each_styled_segment_under_palette16() {
+        // Plain + styled + plain layout: the styled one gets SGR
+        // wrapping, the plain ones pass through. Confirms the layout
+        // emits SGR *per segment* rather than globally, so decorations
+        // don't leak across separators.
+        use crate::theme::Role;
+        let items = vec![
+            Item {
+                rendered: RenderedSegment::new("a"),
+                defaults: SegmentDefaults::with_priority(10),
+            },
+            Item {
+                rendered: RenderedSegment::new("b").with_role(Role::Warning),
+                defaults: SegmentDefaults::with_priority(10),
+            },
+            Item {
+                rendered: RenderedSegment::new("c"),
+                defaults: SegmentDefaults::with_priority(10),
+            },
+        ];
+        let out = render_items(
+            items,
+            100,
+            theme::default_theme(),
+            theme::Capability::Palette16,
+        );
+        // Warning → BrightYellow (SGR 93) on the default theme.
+        assert_eq!(out, "a \x1b[93mb\x1b[0m c");
     }
 
     #[test]
@@ -194,7 +273,7 @@ mod tests {
     #[test]
     fn no_width_pressure_renders_all_with_separators() {
         let items = vec![item("one", 10), item("two", 20), item("three", 30)];
-        assert_eq!(render_items(items, 100), "one two three");
+        assert_eq!(render_plain(items, 100), "one two three");
     }
 
     #[test]
@@ -205,7 +284,7 @@ mod tests {
             item("cccc", 50),
         ];
         // Full: 4+1+4+1+4 = 14. Budget 10 forces one drop.
-        let out = render_items(items, 10);
+        let out = render_plain(items, 10);
         assert!(!out.contains("bbbb"));
         assert!(out.contains("aaaa"));
         assert!(out.contains("cccc"));
@@ -221,13 +300,13 @@ mod tests {
             item("five", 30),
         ];
         // Full: 3+1+3+1+5+1+4+1+4 = 23. Budget 15 forces two drops.
-        assert_eq!(render_items(items, 15), "one three five");
+        assert_eq!(render_plain(items, 15), "one three five");
     }
 
     #[test]
     fn priority_zero_never_drops_even_over_budget() {
         let items = vec![item("aaaa", 0), item("bbbb", 0)];
-        let out = render_items(items, 3);
+        let out = render_plain(items, 3);
         assert_eq!(out, "aaaa bbbb");
     }
 
@@ -239,19 +318,19 @@ mod tests {
             item("sticky", 0),
         ];
         // Budget forces drop; only the priority-200 segment is eligible.
-        let out = render_items(items, 20);
+        let out = render_plain(items, 20);
         assert_eq!(out, "keep-me sticky");
     }
 
     #[test]
     fn no_trailing_separator() {
         let items = vec![item("a", 10), item("b", 10)];
-        assert_eq!(render_items(items, 100), "a b");
+        assert_eq!(render_plain(items, 100), "a b");
     }
 
     #[test]
     fn empty_input_renders_empty_string() {
-        assert_eq!(render_items(vec![], 100), "");
+        assert_eq!(render_plain(vec![], 100), "");
     }
 
     #[test]
@@ -270,7 +349,7 @@ mod tests {
                 defaults: SegmentDefaults::with_priority(10),
             },
         ];
-        assert_eq!(render_items(items, 100), "a | b");
+        assert_eq!(render_plain(items, 100), "a | b");
     }
 
     #[test]
@@ -285,7 +364,7 @@ mod tests {
                 defaults: SegmentDefaults::with_priority(10),
             },
         ];
-        assert_eq!(render_items(items, 100), "ab");
+        assert_eq!(render_plain(items, 100), "ab");
     }
 
     // --- width-bounds helpers ------------------------------------------
@@ -377,7 +456,7 @@ mod tests {
         let items = vec![item("left", 200), item("mid", 50), item("right", 200)];
         // Full: 4+1+3+1+5 = 14. Budget 10 forces one drop; tied priorities
         // on "left" and "right" — right drops first.
-        assert_eq!(render_items(items, 10), "left mid");
+        assert_eq!(render_plain(items, 10), "left mid");
     }
 
     #[test]
@@ -400,7 +479,7 @@ mod tests {
                 defaults: SegmentDefaults::with_priority(200),
             },
         ];
-        assert_eq!(render_items(items, 4), "a bc");
+        assert_eq!(render_plain(items, 4), "a bc");
     }
 
     #[test]
@@ -428,7 +507,7 @@ mod tests {
     fn all_priority_zero_keeps_every_segment_even_when_overfull() {
         let items = vec![item("aaa", 0), item("bbb", 0), item("ccc", 0)];
         // Full 3+1+3+1+3 = 11. Budget 4 is nowhere near; all three stay.
-        assert_eq!(render_items(items, 4), "aaa bbb ccc");
+        assert_eq!(render_plain(items, 4), "aaa bbb ccc");
     }
 
     // --- error handling ---

@@ -8,6 +8,7 @@
 
 use super::{format_window, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::input::{RateLimits, StatusContext};
+use crate::theme::Role;
 
 pub struct RateLimitSegment;
 
@@ -34,7 +35,7 @@ impl Segment for RateLimitSegment {
                 format_window("7d", seven_day, now)
             ),
         };
-        Ok(Some(RenderedSegment::new(text)))
+        Ok(Some(RenderedSegment::new(text).with_role(Role::Info)))
     }
 
     fn defaults(&self) -> SegmentDefaults {

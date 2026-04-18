@@ -214,14 +214,14 @@ foreground default                    map Role → Color (with fallback)
 
 Per `docs/ideas/0001-feature-parity-matrix.md`:
 
-- `default`: neutral, terminal-default colors (uses 16-color palette only)
-- `minimal`: no colors, just bold / dim / italic
-- `catppuccin-latte`
-- `catppuccin-frappe`
-- `catppuccin-macchiato`
-- `catppuccin-mocha`
+- `default`: neutral, terminal-default colors (uses 16-color palette only) — **shipped**
+- `minimal`: no colors, just bold / dim / italic — **shipped**
+- `catppuccin-latte` — deferred; lands alongside the rest of the Catppuccin set
+- `catppuccin-frappe` — deferred
+- `catppuccin-macchiato` — deferred
+- `catppuccin-mocha` — deferred
 
-All compile into the binary via `include_str!`. User themes override built-ins of the same name.
+All compile into the binary. User themes override built-ins of the same name. Config files that reference a not-yet-shipped name emit a stderr warning and fall back to `default`.
 
 ### Catppuccin integration
 

@@ -10,6 +10,7 @@
 
 use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::input::StatusContext;
+use crate::theme::Role;
 
 pub struct EffortSegment;
 
@@ -22,7 +23,9 @@ impl Segment for EffortSegment {
         let Some(effort) = ctx.effort else {
             return Ok(None);
         };
-        Ok(Some(RenderedSegment::new(effort.as_str())))
+        Ok(Some(
+            RenderedSegment::new(effort.as_str()).with_role(Role::Muted),
+        ))
     }
 
     fn defaults(&self) -> SegmentDefaults {
@@ -66,7 +69,7 @@ mod tests {
         ] {
             assert_eq!(
                 EffortSegment.render(&ctx(Some(level))).unwrap(),
-                Some(RenderedSegment::new(expected))
+                Some(RenderedSegment::new(expected).with_role(Role::Muted))
             );
         }
     }

@@ -6,6 +6,7 @@
 
 use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::input::StatusContext;
+use crate::theme::Role;
 
 pub struct WorkspaceSegment;
 
@@ -28,13 +29,13 @@ impl Segment for WorkspaceSegment {
             if worktree.name.is_empty() {
                 return Ok(None);
             }
-            return Ok(Some(RenderedSegment::new(format!(
-                "{repo_name}/{}",
-                worktree.name
-            ))));
+            return Ok(Some(
+                RenderedSegment::new(format!("{repo_name}/{}", worktree.name))
+                    .with_role(Role::Info),
+            ));
         }
 
-        Ok(Some(RenderedSegment::new(repo_name)))
+        Ok(Some(RenderedSegment::new(repo_name).with_role(Role::Info)))
     }
 
     fn defaults(&self) -> SegmentDefaults {
@@ -78,7 +79,7 @@ mod tests {
     fn renders_directory_outside_worktree() {
         assert_eq!(
             WorkspaceSegment.render(&ctx(None)).unwrap(),
-            Some(RenderedSegment::new("linesmith"))
+            Some(RenderedSegment::new("linesmith").with_role(Role::Info))
         );
     }
 
@@ -88,7 +89,7 @@ mod tests {
             WorkspaceSegment
                 .render(&ctx(Some(worktree("feat-segments"))))
                 .unwrap(),
-            Some(RenderedSegment::new("linesmith/feat-segments"))
+            Some(RenderedSegment::new("linesmith/feat-segments").with_role(Role::Info))
         );
     }
 
@@ -101,7 +102,7 @@ mod tests {
             WorkspaceSegment
                 .render(&ctx(Some(worktree("feature/auth"))))
                 .unwrap(),
-            Some(RenderedSegment::new("linesmith/feature/auth"))
+            Some(RenderedSegment::new("linesmith/feature/auth").with_role(Role::Info))
         );
     }
 

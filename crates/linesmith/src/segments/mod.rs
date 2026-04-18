@@ -1,9 +1,10 @@
 //! Segment trait and layout-intent types. Full contract lives in
 //! `docs/specs/segment-system.md`; this module carries the subset the
-//! layout engine uses today: visibility, cell width, priority, and
-//! separator preference.
+//! layout engine uses today: visibility, cell width, priority,
+//! separator preference, and theme role.
 
 use crate::input::StatusContext;
+use crate::theme::{Role, Style};
 use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
 
@@ -28,12 +29,15 @@ pub struct RenderedSegment {
     pub(crate) text: String,
     pub(crate) width: u16,
     pub(crate) right_separator: Option<Separator>,
+    pub(crate) style: Style,
 }
 
 impl RenderedSegment {
     /// Build a rendered segment from `text`, auto-computing its cell
     /// width. Use [`Self::with_separator`] when the segment wants to
-    /// override its default right-separator for this boundary.
+    /// override its default right-separator for this boundary, and
+    /// [`Self::with_role`] / [`Self::with_style`] to attach a theme
+    /// role or full style.
     #[must_use]
     pub fn new(text: impl Into<String>) -> Self {
         let text = sanitize_control_chars(text.into());
@@ -42,6 +46,7 @@ impl RenderedSegment {
             text,
             width,
             right_separator: None,
+            style: Style::default(),
         }
     }
 
@@ -53,7 +58,37 @@ impl RenderedSegment {
             text,
             width,
             right_separator: Some(separator),
+            style: Style::default(),
         }
+    }
+
+    /// Chainable setter for the segment's theme role. The layout
+    /// engine resolves the role against the active theme + terminal
+    /// capability at render time; no ANSI bytes land in `text`.
+    ///
+    /// Preserves any decorations previously set by [`Self::with_style`].
+    /// Pair with `with_style` carefully: `.with_style(s).with_role(r)`
+    /// keeps `s`'s bold/fg/etc. and swaps role, whereas
+    /// `.with_role(r).with_style(s)` wholesale-replaces everything.
+    #[must_use]
+    pub fn with_role(mut self, role: Role) -> Self {
+        self.style.role = Some(role);
+        self
+    }
+
+    /// Chainable setter for the full style (role + decorations).
+    /// Wholesale-replaces the current style; use [`Self::with_role`]
+    /// when you want to preserve decorations and swap only the role.
+    #[must_use]
+    pub fn with_style(mut self, style: Style) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// Style this segment wants applied when the layout emits it.
+    #[must_use]
+    pub fn style(&self) -> &Style {
+        &self.style
     }
 
     /// The rendered text.
@@ -76,15 +111,21 @@ impl RenderedSegment {
     }
 
     /// Trusted crate-internal constructor that accepts an explicit
-    /// `width`. Reserved for [`crate::layout::truncate_to`]; every
-    /// other caller goes through [`Self::new`] so the width stays a
-    /// function of the text.
+    /// `width` and `style`. Reserved for [`crate::layout::truncate_to`];
+    /// every other caller goes through [`Self::new`] so the width stays
+    /// a function of the text.
     #[must_use]
-    pub(crate) fn from_parts(text: String, width: u16, right_separator: Option<Separator>) -> Self {
+    pub(crate) fn from_parts(
+        text: String,
+        width: u16,
+        right_separator: Option<Separator>,
+        style: Style,
+    ) -> Self {
         Self {
             text,
             width,
             right_separator,
+            style,
         }
     }
 }

@@ -3,6 +3,7 @@
 
 use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::input::StatusContext;
+use crate::theme::Role;
 
 pub struct CostSegment;
 
@@ -15,10 +16,9 @@ impl Segment for CostSegment {
         let Some(cost) = ctx.cost.as_ref() else {
             return Ok(None);
         };
-        Ok(Some(RenderedSegment::new(format!(
-            "${:.2}",
-            cost.total_cost_usd
-        ))))
+        Ok(Some(
+            RenderedSegment::new(format!("${:.2}", cost.total_cost_usd)).with_role(Role::Muted),
+        ))
     }
 
     fn defaults(&self) -> SegmentDefaults {
@@ -62,10 +62,10 @@ mod tests {
     }
 
     #[test]
-    fn renders_two_decimal_places() {
+    fn renders_two_decimal_places_with_muted_role() {
         assert_eq!(
             CostSegment.render(&ctx(Some(cost_of(1.234)))).unwrap(),
-            Some(RenderedSegment::new("$1.23"))
+            Some(RenderedSegment::new("$1.23").with_role(Role::Muted))
         );
     }
 
@@ -73,7 +73,7 @@ mod tests {
     fn renders_zero_cost() {
         assert_eq!(
             CostSegment.render(&ctx(Some(cost_of(0.0)))).unwrap(),
-            Some(RenderedSegment::new("$0.00"))
+            Some(RenderedSegment::new("$0.00").with_role(Role::Muted))
         );
     }
 

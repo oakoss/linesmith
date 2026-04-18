@@ -3,6 +3,7 @@
 
 use super::{format_window, rate_limit, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::input::StatusContext;
+use crate::theme::Role;
 
 pub struct RateLimit7dSegment;
 
@@ -11,11 +12,10 @@ impl Segment for RateLimit7dSegment {
         let Some(window) = ctx.rate_limits.as_ref().and_then(|rl| rl.seven_day()) else {
             return Ok(None);
         };
-        Ok(Some(RenderedSegment::new(format_window(
-            "7d",
-            window,
-            chrono::Utc::now(),
-        ))))
+        Ok(Some(
+            RenderedSegment::new(format_window("7d", window, chrono::Utc::now()))
+                .with_role(Role::Info),
+        ))
     }
 
     fn defaults(&self) -> SegmentDefaults {

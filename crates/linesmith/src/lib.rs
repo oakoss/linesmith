@@ -10,6 +10,7 @@ pub mod config;
 pub mod input;
 pub mod layout;
 pub mod segments;
+pub mod theme;
 
 use crate::segments::Segment;
 use std::io::{self, Read, Write};
@@ -44,9 +45,8 @@ pub fn run_with_width(
 
 /// Full-control entry: pre-built segment list plus explicit width.
 /// Parse failures render a `?` marker and log to the real process
-/// stderr; only I/O failures surface as errors. For injected-stderr
-/// testability (used by `cli_main`), call
-/// [`run_with_segments_width_and_stderr`] instead.
+/// stderr; output is unstyled. For themed output or injected-stderr
+/// testability (used by `cli_main`), call [`run_with_context`] instead.
 ///
 /// # Errors
 ///
@@ -58,46 +58,62 @@ pub fn run_with_segments_and_width(
     segments: &[Box<dyn Segment>],
     terminal_width: u16,
 ) -> io::Result<()> {
-    run_with_segments_width_and_stderr(
-        reader,
-        writer,
-        &mut io::stderr().lock(),
-        segments,
+    let ctx = RenderContext {
+        theme: theme::default_theme(),
+        capability: theme::Capability::None,
         terminal_width,
-    )
+    };
+    run_with_context(reader, writer, &mut io::stderr().lock(), segments, &ctx)
 }
 
-/// Full-control entry with injected stderr. Used by `cli_main` so
-/// tests can capture parse-error and segment-render-error diagnostics
-/// alongside exit codes. Parse failures render a `?` marker to
-/// `writer`; only stdin/stdout I/O failures surface as errors.
+/// Theme + capability + terminal width bundled for the render path.
+/// Passed to [`run_with_context`]; `cli_main` builds one from config
+/// (theme name) + `Capability::detect()` + `CliEnv.terminal_width`.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct RenderContext<'a> {
+    pub theme: &'a theme::Theme,
+    pub capability: theme::Capability,
+    pub terminal_width: u16,
+}
+
+/// Full-control entry with injected stderr and explicit render
+/// context. Parse failures render a `?` marker to `writer`; only
+/// stdin/stdout I/O failures surface as errors.
 ///
 /// # Errors
 ///
 /// Returns an `io::Error` if reading from `reader` or writing to
 /// `writer` fails. Stderr write failures are swallowed (a broken
 /// stderr pipe must not abort a valid stdout render).
-pub fn run_with_segments_width_and_stderr(
+pub fn run_with_context(
     mut reader: impl Read,
     mut writer: impl Write,
     stderr: &mut dyn Write,
     segments: &[Box<dyn Segment>],
-    terminal_width: u16,
+    ctx: &RenderContext<'_>,
 ) -> io::Result<()> {
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
 
-    let ctx = match input::parse(&buf) {
-        Ok(ctx) => ctx,
+    let status_ctx = match input::parse(&buf) {
+        Ok(c) => c,
         Err(err) => {
             let _ = writeln!(stderr, "linesmith: parse: {err}");
             return writeln!(writer, "?");
         }
     };
 
-    let line = layout::render_with_warn(segments, &ctx, terminal_width, &mut |msg| {
-        let _ = writeln!(stderr, "linesmith: {msg}");
-    });
+    let line = layout::render_with_warn(
+        segments,
+        &status_ctx,
+        ctx.terminal_width,
+        &mut |msg| {
+            let _ = writeln!(stderr, "linesmith: {msg}");
+        },
+        ctx.theme,
+        ctx.capability,
+    );
     writeln!(writer, "{line}")
 }
 
@@ -236,16 +252,19 @@ fn resolve_terminal_width(
 }
 
 /// Process-ambient inputs the CLI reads: env vars consulted by
-/// `resolve_config_path` plus an optional terminal-width override.
-/// Passed through `cli_main` so tests can drive the whole binary
-/// without touching the real process env. `#[non_exhaustive]` leaves
-/// room for future env vars (NO_COLOR, TERM, ...) without breaking
-/// external construction.
+/// `resolve_config_path`, an optional terminal-width override, and an
+/// optional color-capability override. Passed through `cli_main` so
+/// tests can drive the whole binary without touching the real process
+/// env. `#[non_exhaustive]` leaves room for future env vars
+/// (FORCE_COLOR, TERM, ...) without breaking external construction.
 ///
 /// `terminal_width = None` means "detect lazily when the render path
 /// needs it." Meta commands (`--help`, `--version`, `--check-config`)
 /// never probe the terminal, so stray `COLUMNS` warnings don't leak
 /// into clean stderr.
+///
+/// `color_capability = None` means the same: detect via
+/// `supports-color` on the render path only.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct CliEnv {
@@ -253,11 +272,13 @@ pub struct CliEnv {
     pub xdg_config_home: Option<String>,
     pub home: Option<String>,
     pub terminal_width: Option<u16>,
+    pub color_capability: Option<theme::Capability>,
 }
 
 impl CliEnv {
-    /// Snapshot the real process env vars. Terminal width is left
-    /// unset; `run_cli` probes it only if a render happens.
+    /// Snapshot the real process env vars. Terminal width and color
+    /// capability are left unset; `run_cli` probes them only if a
+    /// render happens.
     #[must_use]
     pub fn from_process() -> Self {
         Self {
@@ -265,6 +286,7 @@ impl CliEnv {
             xdg_config_home: std::env::var("XDG_CONFIG_HOME").ok(),
             home: std::env::var("HOME").ok(),
             terminal_width: None,
+            color_capability: None,
         }
     }
 }
@@ -329,11 +351,39 @@ fn run_cli(
     });
 
     let width = env.terminal_width.unwrap_or_else(detect_terminal_width);
-    if let Err(err) = run_with_segments_width_and_stderr(stdin, stdout, stderr, &segments, width) {
+    let theme_ref = resolve_theme(cfg.as_ref(), stderr);
+    let capability = env
+        .color_capability
+        .unwrap_or_else(theme::Capability::detect);
+    let ctx = RenderContext {
+        theme: theme_ref,
+        capability,
+        terminal_width: width,
+    };
+    if let Err(err) = run_with_context(stdin, stdout, stderr, &segments, &ctx) {
         let _ = writeln!(stderr, "linesmith: {err}");
         return 1;
     }
     0
+}
+
+/// Resolve the active theme from config. Unknown names fall back to
+/// `default` with a stderr warning; missing or empty `theme` uses
+/// the default silently.
+fn resolve_theme(cfg: Option<&config::Config>, stderr: &mut dyn Write) -> &'static theme::Theme {
+    let Some(name) = cfg
+        .and_then(|c| c.theme.as_deref())
+        .filter(|n| !n.is_empty())
+    else {
+        return theme::default_theme();
+    };
+    match theme::built_in(name) {
+        Some(t) => t,
+        None => {
+            let _ = writeln!(stderr, "linesmith: unknown theme '{name}'; using 'default'");
+            theme::default_theme()
+        }
+    }
 }
 
 /// Load the config at `resolved` if present. Missing files are silent
@@ -399,6 +449,12 @@ fn check_config(
         let _ = writeln!(stderr, "linesmith: {msg}");
         warn_count += 1;
     });
+    if let Some(name) = cfg.theme.as_deref().filter(|n| !n.is_empty()) {
+        if theme::built_in(name).is_none() {
+            let _ = writeln!(stderr, "linesmith: unknown theme '{name}'; using 'default'");
+            warn_count += 1;
+        }
+    }
     let _ = writeln!(stderr, "linesmith: config ok ({})", cp.path.display());
     if warn_count > 0 {
         let _ = writeln!(stderr, "linesmith: {warn_count} warning(s)");
@@ -738,6 +794,9 @@ mod cli_main_tests {
             xdg_config_home: None,
             home: None,
             terminal_width: Some(200),
+            // Force plain output so tests' stdout assertions don't
+            // accidentally include theme ANSI under a truecolor host.
+            color_capability: Some(theme::Capability::None),
         }
     }
 
@@ -791,6 +850,7 @@ mod cli_main_tests {
             xdg_config_home: None,
             home: None,
             terminal_width: None,
+            color_capability: None,
         };
         let (code, _stdout, stderr) = run_cli_main(&["--help"], b"", &lazy_env);
         assert_eq!(code, 0);
@@ -976,6 +1036,24 @@ mod cli_main_tests {
         assert!(stderr.contains("1 warning(s)"));
     }
 
+    #[test]
+    fn check_config_catches_unknown_theme_name() {
+        // Without this, a typo like `theme = "defualt"` only surfaces on
+        // render. `--check-config` is the CI/editor contract, so it must
+        // catch unknown theme names too.
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "theme = \"defualt\"\n").unwrap();
+        let (code, _stdout, stderr) = run_cli_main(
+            &["--check-config", "--config", path.to_str().unwrap()],
+            b"",
+            &empty_env(),
+        );
+        assert_eq!(code, 0);
+        assert!(stderr.contains("unknown theme 'defualt'"));
+        assert!(stderr.contains("1 warning(s)"));
+    }
+
     // --- CliEnv plumbing ---
 
     #[test]
@@ -1015,6 +1093,89 @@ mod cli_main_tests {
         let (code, _stdout, stderr) = run_cli_main(&["--check-config"], b"", &env);
         assert_eq!(code, 0);
         assert!(stderr.contains(dir.path().join("xdg").to_str().unwrap()));
+    }
+
+    // --- theme wiring ---
+
+    #[test]
+    fn default_theme_under_palette16_wraps_segments_with_sgr() {
+        let json = br#"{
+            "model": { "display_name": "Claude" },
+            "workspace": { "project_dir": "/home/dev/linesmith" }
+        }"#;
+        let env = CliEnv {
+            color_capability: Some(theme::Capability::Palette16),
+            ..empty_env()
+        };
+        let (code, stdout, _stderr) = run_cli_main(&[], json, &env);
+        assert_eq!(code, 0);
+        // Model (Primary → BrightMagenta = SGR 95) and workspace (Info →
+        // BrightCyan = SGR 96) each get wrapped; plain text between them
+        // is a single space separator.
+        assert_eq!(stdout, "\x1b[95mClaude\x1b[0m \x1b[96mlinesmith\x1b[0m\n");
+    }
+
+    #[test]
+    fn minimal_theme_under_palette16_emits_no_color() {
+        let json = br#"{
+            "model": { "display_name": "Claude" },
+            "workspace": { "project_dir": "/home/dev/linesmith" }
+        }"#;
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "theme = \"minimal\"\n").unwrap();
+
+        let env = CliEnv {
+            color_capability: Some(theme::Capability::Palette16),
+            ..empty_env()
+        };
+        let (code, stdout, _stderr) =
+            run_cli_main(&["--config", path.to_str().unwrap()], json, &env);
+        assert_eq!(code, 0);
+        // Minimal theme has NoColor for every role; segments don't have
+        // bold/italic decorations, so output is plain.
+        assert_eq!(stdout, "Claude linesmith\n");
+    }
+
+    #[test]
+    fn unknown_theme_falls_back_to_default_with_warning() {
+        let json = br#"{
+            "model": { "display_name": "C" },
+            "workspace": { "project_dir": "/x" }
+        }"#;
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "theme = \"nonexistent\"\n").unwrap();
+
+        let env = CliEnv {
+            color_capability: Some(theme::Capability::None),
+            ..empty_env()
+        };
+        let (code, stdout, stderr) =
+            run_cli_main(&["--config", path.to_str().unwrap()], json, &env);
+        assert_eq!(code, 0);
+        assert_eq!(stdout, "C x\n");
+        assert!(stderr.contains("unknown theme 'nonexistent'"));
+        assert!(stderr.contains("using 'default'"));
+    }
+
+    #[test]
+    fn no_color_capability_strips_theme_under_default() {
+        // Even the `default` theme (Palette16 values) emits nothing
+        // under Capability::None. This is the NO_COLOR contract: no
+        // ANSI bytes, no risk of leaking escape sequences when stdout
+        // is piped to non-terminal consumers.
+        let json = br#"{
+            "model": { "display_name": "C" },
+            "workspace": { "project_dir": "/x" }
+        }"#;
+        let env = CliEnv {
+            color_capability: Some(theme::Capability::None),
+            ..empty_env()
+        };
+        let (code, stdout, _stderr) = run_cli_main(&[], json, &env);
+        assert_eq!(code, 0);
+        assert_eq!(stdout, "C x\n");
     }
 
     struct TempDir(std::path::PathBuf);

@@ -2,6 +2,7 @@
 
 use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::input::StatusContext;
+use crate::theme::Role;
 
 pub struct ModelSegment;
 
@@ -15,7 +16,7 @@ impl Segment for ModelSegment {
         if name.is_empty() {
             return Ok(None);
         }
-        Ok(Some(RenderedSegment::new(name)))
+        Ok(Some(RenderedSegment::new(name).with_role(Role::Primary)))
     }
 
     fn defaults(&self) -> SegmentDefaults {
@@ -49,10 +50,10 @@ mod tests {
     }
 
     #[test]
-    fn renders_display_name() {
+    fn renders_display_name_with_primary_role() {
         assert_eq!(
             ModelSegment.render(&ctx("Claude Sonnet 4.6")).unwrap(),
-            Some(RenderedSegment::new("Claude Sonnet 4.6"))
+            Some(RenderedSegment::new("Claude Sonnet 4.6").with_role(Role::Primary))
         );
     }
 

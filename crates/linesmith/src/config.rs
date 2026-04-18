@@ -13,6 +13,7 @@ use std::str::FromStr;
 #[serde(default)]
 pub struct Config {
     pub line: Option<LineConfig>,
+    pub theme: Option<String>,
     #[serde(default)]
     pub segments: BTreeMap<String, SegmentOverride>,
 }

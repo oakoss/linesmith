@@ -4,6 +4,7 @@
 
 use super::{format_window, rate_limit, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::input::StatusContext;
+use crate::theme::Role;
 
 pub struct RateLimit5hSegment;
 
@@ -12,11 +13,10 @@ impl Segment for RateLimit5hSegment {
         let Some(window) = ctx.rate_limits.as_ref().and_then(|rl| rl.five_hour()) else {
             return Ok(None);
         };
-        Ok(Some(RenderedSegment::new(format_window(
-            "5h",
-            window,
-            chrono::Utc::now(),
-        ))))
+        Ok(Some(
+            RenderedSegment::new(format_window("5h", window, chrono::Utc::now()))
+                .with_role(Role::Info),
+        ))
     }
 
     fn defaults(&self) -> SegmentDefaults {

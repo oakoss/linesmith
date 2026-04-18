@@ -4,6 +4,7 @@
 
 use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::input::{ContextWindow, StatusContext};
+use crate::theme::Role;
 
 pub struct ContextWindowSegment;
 
@@ -17,11 +18,14 @@ impl Segment for ContextWindowSegment {
         let Some(cw) = ctx.context_window.as_ref() else {
             return Ok(None);
         };
-        Ok(Some(RenderedSegment::new(format!(
-            "{pct:.0}% · {size}",
-            pct = cw.used.value(),
-            size = format_size(cw),
-        ))))
+        Ok(Some(
+            RenderedSegment::new(format!(
+                "{pct:.0}% · {size}",
+                pct = cw.used.value(),
+                size = format_size(cw),
+            ))
+            .with_role(Role::Info),
+        ))
     }
 
     fn defaults(&self) -> SegmentDefaults {
@@ -90,7 +94,7 @@ mod tests {
             ContextWindowSegment
                 .render(&ctx(Some(window(42.3, 200_000))))
                 .unwrap(),
-            Some(RenderedSegment::new("42% · 200k"))
+            Some(RenderedSegment::new("42% · 200k").with_role(Role::Info))
         );
     }
 
@@ -100,7 +104,7 @@ mod tests {
             ContextWindowSegment
                 .render(&ctx(Some(window(5.0, 1_000_000))))
                 .unwrap(),
-            Some(RenderedSegment::new("5% · 1M"))
+            Some(RenderedSegment::new("5% · 1M").with_role(Role::Info))
         );
     }
 
@@ -110,7 +114,7 @@ mod tests {
             ContextWindowSegment
                 .render(&ctx(Some(window(10.0, 131_072))))
                 .unwrap(),
-            Some(RenderedSegment::new("10% · 131072"))
+            Some(RenderedSegment::new("10% · 131072").with_role(Role::Info))
         );
     }
 
@@ -120,7 +124,7 @@ mod tests {
             ContextWindowSegment
                 .render(&ctx(Some(window(99.9, 200_000))))
                 .unwrap(),
-            Some(RenderedSegment::new("100% · 200k"))
+            Some(RenderedSegment::new("100% · 200k").with_role(Role::Info))
         );
     }
 
