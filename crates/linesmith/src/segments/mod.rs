@@ -381,6 +381,7 @@ pub struct OverriddenSegment {
     priority: Option<u8>,
     width: Option<WidthBounds>,
     default_separator: Option<Separator>,
+    user_style: Option<Style>,
 }
 
 impl OverriddenSegment {
@@ -391,6 +392,7 @@ impl OverriddenSegment {
             priority: None,
             width: None,
             default_separator: None,
+            user_style: None,
         }
     }
 
@@ -411,11 +413,23 @@ impl OverriddenSegment {
         self.default_separator = Some(separator);
         self
     }
+
+    /// Wholesale-replaces the inner segment's declared style at render
+    /// time. See `docs/specs/theming.md` §Resolution precedence.
+    #[must_use]
+    pub fn with_user_style(mut self, style: Style) -> Self {
+        self.user_style = Some(style);
+        self
+    }
 }
 
 impl Segment for OverriddenSegment {
     fn render(&self, ctx: &StatusContext) -> RenderResult {
-        self.inner.render(ctx)
+        let result = self.inner.render(ctx)?;
+        Ok(result.map(|r| match self.user_style {
+            Some(style) => r.with_style(style),
+            None => r,
+        }))
     }
 
     fn defaults(&self) -> SegmentDefaults {
@@ -770,13 +784,62 @@ mod layout_type_tests {
 
     #[test]
     fn overridden_segment_delegates_render_to_inner() {
-        // The wrapper doesn't intercept render; it only overrides
-        // defaults.
+        let wrapped = OverriddenSegment::new(built_in_by_id("workspace").unwrap()).with_priority(0);
+        let rendered = wrapped.render(&stub_ctx()).unwrap().expect("rendered");
+        assert_eq!(rendered.text(), "linesmith");
+    }
+
+    #[test]
+    fn style_override_wholesale_replaces_inner_declared_style() {
+        // A stub that declares Role::Accent + bold at render time. The
+        // override must wipe both, not merge with them.
+        struct Styled;
+        impl Segment for Styled {
+            fn render(&self, _: &StatusContext) -> RenderResult {
+                Ok(Some(
+                    RenderedSegment::new("x")
+                        .with_role(Role::Accent)
+                        .with_style(Style {
+                            bold: true,
+                            ..Style::default()
+                        }),
+                ))
+            }
+            fn defaults(&self) -> SegmentDefaults {
+                SegmentDefaults::with_priority(0)
+            }
+        }
+        let override_style = Style {
+            role: Some(Role::Primary),
+            italic: true,
+            ..Style::default()
+        };
+        let wrapped = OverriddenSegment::new(Box::new(Styled)).with_user_style(override_style);
+        let rendered = wrapped.render(&stub_ctx()).unwrap().expect("rendered");
+        assert_eq!(rendered.style, override_style);
+    }
+
+    #[test]
+    fn style_override_preserves_inner_none_return() {
+        struct Hidden;
+        impl Segment for Hidden {
+            fn render(&self, _: &StatusContext) -> RenderResult {
+                Ok(None)
+            }
+            fn defaults(&self) -> SegmentDefaults {
+                SegmentDefaults::with_priority(0)
+            }
+        }
+        let wrapped =
+            OverriddenSegment::new(Box::new(Hidden)).with_user_style(Style::role(Role::Primary));
+        assert_eq!(wrapped.render(&stub_ctx()).unwrap(), None);
+    }
+
+    fn stub_ctx() -> StatusContext {
         use crate::input::{ModelInfo, Tool, WorkspaceInfo};
         use std::path::PathBuf;
         use std::sync::Arc;
-
-        let ctx = StatusContext {
+        StatusContext {
             tool: Tool::ClaudeCode,
             model: ModelInfo {
                 display_name: "Claude".into(),
@@ -790,9 +853,6 @@ mod layout_type_tests {
             rate_limits: None,
             effort: None,
             raw: Arc::new(serde_json::Value::Null),
-        };
-        let wrapped = OverriddenSegment::new(built_in_by_id("workspace").unwrap()).with_priority(0);
-        let rendered = wrapped.render(&ctx).unwrap().expect("rendered");
-        assert_eq!(rendered.text(), "linesmith");
+        }
     }
 }

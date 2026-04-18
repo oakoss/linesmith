@@ -50,12 +50,16 @@ pub struct LineConfig {
 }
 
 /// `[segments.<id>]` override block. Each field, when `Some`, replaces
-/// the segment's built-in default.
+/// the segment's built-in default. `style` is stored as a raw string;
+/// `segments::builder::apply_override` parses it at build time so
+/// parse errors can emit warnings through the same callback that
+/// handles unknown-ID and inverted-bounds diagnostics.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct SegmentOverride {
     pub priority: Option<u8>,
     pub width: Option<WidthBoundsConfig>,
+    pub style: Option<String>,
 }
 
 /// Width-bounds override. Either side may be omitted; a missing side

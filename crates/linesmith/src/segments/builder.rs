@@ -4,6 +4,7 @@
 
 use super::{built_in_by_id, OverriddenSegment, Segment, WidthBounds, DEFAULT_SEGMENT_IDS};
 use crate::config;
+use crate::theme;
 
 /// Build the default segment list: every built-in in canonical order,
 /// no overrides applied.
@@ -83,8 +84,16 @@ fn apply_override(
         match WidthBounds::new(min, max) {
             Some(bounds) => wrapped = wrapped.with_width(bounds),
             None => warn(&format!(
-                "segments.{id}.width: min ({min}) > max ({max}); ignoring"
+                "segments.{id}.width: min ({min}) > max ({max}); ignoring override"
             )),
+        }
+    }
+    // `style = ""` is a no-op — an empty string almost never means
+    // "strip my declared role"; require an explicit token to override.
+    if let Some(style_str) = ov.style.as_deref().filter(|s| !s.trim().is_empty()) {
+        match theme::parse_style(style_str) {
+            Ok(style) => wrapped = wrapped.with_user_style(style),
+            Err(e) => warn(&format!("segments.{id}.style: {e}; ignoring override")),
         }
     }
     Box::new(wrapped)
@@ -251,6 +260,7 @@ mod tests {
         let ov = config::SegmentOverride {
             priority: None,
             width: Some(config::WidthBoundsConfig { min, max }),
+            style: None,
         };
         let wrapped = apply_override("stub", Box::new(StubWithWidth), Some(&ov), &mut |_| {});
         wrapped.defaults().width.expect("width preserved")
@@ -285,6 +295,141 @@ mod tests {
         let got = merge_width(None, None);
         assert_eq!(got.min(), 10);
         assert_eq!(got.max(), 50);
+    }
+
+    fn model_ctx(display_name: &str) -> input::StatusContext {
+        use crate::input::{ModelInfo, Tool, WorkspaceInfo};
+        use std::path::PathBuf;
+        use std::sync::Arc;
+        input::StatusContext {
+            tool: Tool::ClaudeCode,
+            model: ModelInfo {
+                display_name: display_name.into(),
+            },
+            workspace: WorkspaceInfo {
+                project_dir: PathBuf::from("/repo"),
+                git_worktree: None,
+            },
+            context_window: None,
+            cost: None,
+            rate_limits: None,
+            effort: None,
+            raw: Arc::new(serde_json::Value::Null),
+        }
+    }
+
+    #[test]
+    fn style_override_replaces_segment_declared_style_at_render_time() {
+        use crate::theme::{Color, Role};
+        let cfg = config::Config::from_str(
+            r#"
+                [line]
+                segments = ["model"]
+                [segments.model]
+                style = "role:accent bold italic"
+            "#,
+        )
+        .expect("parse");
+        let built = build_segments(Some(&cfg), |_| {});
+        let rendered = built[0]
+            .render(&model_ctx("Claude Sonnet 4.6"))
+            .expect("render ok")
+            .expect("visible");
+        assert_eq!(rendered.style.role, Some(Role::Accent));
+        assert_eq!(rendered.style.fg, None::<Color>);
+        assert!(rendered.style.bold);
+        assert!(rendered.style.italic);
+        assert!(!rendered.style.underline);
+        assert!(!rendered.style.dim);
+    }
+
+    #[test]
+    fn style_override_with_explicit_fg_populates_fg_slot() {
+        use crate::theme::Color;
+        let cfg = config::Config::from_str(
+            r#"
+                [line]
+                segments = ["model"]
+                [segments.model]
+                style = "fg:#ff0000 underline"
+            "#,
+        )
+        .expect("parse");
+        let built = build_segments(Some(&cfg), |_| {});
+        let rendered = built[0]
+            .render(&model_ctx("Claude Sonnet 4.6"))
+            .expect("render ok")
+            .expect("visible");
+        assert_eq!(
+            rendered.style.fg,
+            Some(Color::TrueColor { r: 255, g: 0, b: 0 })
+        );
+        assert!(rendered.style.underline);
+    }
+
+    #[test]
+    fn invalid_style_string_warns_and_leaves_segment_style_unchanged() {
+        use crate::theme::Role;
+        let cfg = config::Config::from_str(
+            r#"
+                [line]
+                segments = ["model"]
+                [segments.model]
+                style = "role:mauve"
+            "#,
+        )
+        .expect("parse");
+        let mut warnings = Vec::new();
+        let built = build_segments(Some(&cfg), |m| warnings.push(m.to_string()));
+        let rendered = built[0]
+            .render(&model_ctx("Claude Sonnet 4.6"))
+            .expect("render ok")
+            .expect("visible");
+        assert_eq!(rendered.style.role, Some(Role::Primary));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("segments.model.style"));
+        assert!(warnings[0].contains("mauve"));
+        assert!(warnings[0].contains("ignoring"));
+    }
+
+    #[test]
+    fn empty_style_string_is_noop_and_preserves_segment_declared_style() {
+        use crate::theme::Role;
+        let cfg = config::Config::from_str(
+            r#"
+                [line]
+                segments = ["model"]
+                [segments.model]
+                style = ""
+            "#,
+        )
+        .expect("parse");
+        let built = build_segments(Some(&cfg), |_| {});
+        let rendered = built[0]
+            .render(&model_ctx("Claude Sonnet 4.6"))
+            .expect("render ok")
+            .expect("visible");
+        assert_eq!(rendered.style.role, Some(Role::Primary));
+    }
+
+    #[test]
+    fn whitespace_only_style_string_is_noop_and_preserves_segment_declared_style() {
+        use crate::theme::Role;
+        let cfg = config::Config::from_str(
+            r#"
+                [line]
+                segments = ["model"]
+                [segments.model]
+                style = "   "
+            "#,
+        )
+        .expect("parse");
+        let built = build_segments(Some(&cfg), |_| {});
+        let rendered = built[0]
+            .render(&model_ctx("Claude Sonnet 4.6"))
+            .expect("render ok")
+            .expect("visible");
+        assert_eq!(rendered.style.role, Some(Role::Primary));
     }
 
     #[test]

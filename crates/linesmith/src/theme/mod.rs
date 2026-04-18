@@ -11,8 +11,10 @@
 use std::fmt::Write;
 
 mod catppuccin;
+pub mod style_syntax;
 pub mod user;
 
+pub use style_syntax::{parse_style, StyleParseError};
 pub use user::{RegisteredTheme, ThemeRegistry, ThemeSource};
 
 /// Semantic color slot a segment targets. Themes map every role to a

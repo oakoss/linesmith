@@ -90,6 +90,64 @@ fn config_reorders_and_filters_segments() {
 }
 
 #[test]
+fn config_style_override_emits_sgr_bytes_end_to_end() {
+    // TOML → SegmentOverride → parse_style → with_user_style → render_with_warn
+    // pipeline: the model segment's rendered text should be wrapped in a
+    // TrueColor-red + bold SGR prefix followed by a reset.
+    let cfg = linesmith::config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model"]
+            [segments.model]
+            style = "fg:rgb(255, 0, 0) bold"
+        "#,
+    )
+    .expect("parse");
+    let segments = linesmith::build_segments(Some(&cfg), |_| {});
+    let ctx =
+        linesmith::input::parse(include_bytes!("fixtures/claude_minimal.json")).expect("parse");
+    let line = linesmith::layout::render_with_warn(
+        &segments,
+        &ctx,
+        200,
+        &mut |_| {},
+        linesmith::theme::default_theme(),
+        linesmith::theme::Capability::TrueColor,
+    );
+    assert!(
+        line.contains("\x1b[1;38;2;255;0;0m"),
+        "expected bold + truecolor-red SGR prefix, got {line:?}"
+    );
+    assert!(line.contains("Claude Sonnet 4.6"));
+    assert!(line.contains("\x1b[0m"), "expected SGR reset");
+}
+
+#[test]
+fn config_style_override_invalid_warns_and_render_still_succeeds() {
+    let cfg = linesmith::config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model"]
+            [segments.model]
+            style = "role:mauve"
+        "#,
+    )
+    .expect("parse");
+    let mut warnings = Vec::new();
+    let segments = linesmith::build_segments(Some(&cfg), |m| warnings.push(m.to_string()));
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("segments.model.style"));
+    assert!(warnings[0].contains("mauve"));
+    let mut out = Vec::new();
+    linesmith::run_with_segments_and_width(Cursor::new(CLAUDE_MINIMAL), &mut out, &segments, 200)
+        .expect("run ok");
+    // Render still succeeds; the bad override is skipped.
+    assert!(String::from_utf8(out)
+        .expect("utf8")
+        .contains("Claude Sonnet 4.6"));
+}
+
+#[test]
 fn config_priority_override_flips_drop_order_under_pressure() {
     // With default priorities, a narrow terminal drops cost (192)
     // before model (64). Override model's priority to 250 and it drops
