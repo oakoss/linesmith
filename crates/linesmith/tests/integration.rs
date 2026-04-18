@@ -1,4 +1,5 @@
 use std::io::Cursor;
+use std::str::FromStr;
 
 const CLAUDE_MINIMAL: &str = include_str!("fixtures/claude_minimal.json");
 const CLAUDE_WORKTREE: &str = include_str!("fixtures/claude_worktree.json");
@@ -68,4 +69,47 @@ fn extreme_narrow_keeps_only_lowest_priority_segments() {
         String::from_utf8(out).expect("utf8"),
         "linesmith/feat-segments\n"
     );
+}
+
+#[test]
+fn config_reorders_and_filters_segments() {
+    // Config picks only model + workspace, in that custom order.
+    let cfg = linesmith::config::Config::from_str(
+        r#"
+            [line]
+            segments = ["workspace", "model"]
+        "#,
+    )
+    .expect("parse");
+    let segments = linesmith::build_segments(Some(&cfg), |_| {});
+    let mut out = Vec::new();
+    linesmith::run_with_segments_and_width(Cursor::new(CLAUDE_WORKTREE), &mut out, &segments, 200)
+        .expect("run ok");
+    let rendered = String::from_utf8(out).expect("utf8");
+    assert_eq!(rendered, "linesmith/feat-segments Claude Sonnet 4.6\n");
+}
+
+#[test]
+fn config_priority_override_flips_drop_order_under_pressure() {
+    // With default priorities, a narrow terminal drops cost (192)
+    // before model (64). Override model's priority to 250 and it drops
+    // first instead.
+    let cfg = linesmith::config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model", "cost"]
+            [segments.model]
+            priority = 250
+        "#,
+    )
+    .expect("parse");
+    let segments = linesmith::build_segments(Some(&cfg), |_| {});
+    let mut out = Vec::new();
+    // Budget tight enough to force one drop but fit the other.
+    linesmith::run_with_segments_and_width(Cursor::new(CLAUDE_WORKTREE), &mut out, &segments, 10)
+        .expect("run ok");
+    let rendered = String::from_utf8(out).expect("utf8");
+    // Model dropped; cost survived.
+    assert!(!rendered.contains("Claude"));
+    assert!(rendered.contains("$1.23"));
 }

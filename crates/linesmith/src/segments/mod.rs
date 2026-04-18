@@ -1,6 +1,6 @@
 //! Segment trait and layout-intent types. Full contract lives in
 //! `docs/specs/segment-system.md`; this module carries the subset the
-//! v0.1 layout engine uses: visibility, cell width, priority, and
+//! layout engine uses today: visibility, cell width, priority, and
 //! separator preference.
 
 use crate::input::StatusContext;
@@ -98,9 +98,10 @@ pub(crate) fn text_width(s: &str) -> u16 {
 /// Separator between adjacent segments. Chosen by the segment to its
 /// left; themes and user config can override.
 ///
-/// `Theme` renders as a single space until the theme system lands.
-/// `Literal` carries a `Cow<'static, str>` so built-ins stay zero-alloc
-/// while user-supplied config can allocate once.
+/// `Theme` is reserved for theme-provided padding and renders as a
+/// single space when no theme is configured. `Literal` carries a
+/// `Cow<'static, str>` so built-ins stay zero-alloc while user config
+/// allocates once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Separator {
@@ -276,10 +277,99 @@ pub trait Segment: Send {
     fn render(&self, ctx: &StatusContext) -> RenderResult;
 
     /// Layout defaults (priority, width bounds, separator preference).
-    /// User config may override each field once the config layer lands.
+    /// User config may override each field via [`OverriddenSegment`].
     #[must_use]
     fn defaults(&self) -> SegmentDefaults {
         SegmentDefaults::default()
+    }
+}
+
+// --- Built-in registry + config-driven override wrapper ----------------
+
+/// Default segment order when no config supplies one.
+pub const DEFAULT_SEGMENT_IDS: &[&str] = &[
+    "model",
+    "context_window",
+    "rate_limit",
+    "cost",
+    "effort",
+    "workspace",
+];
+
+/// Construct a built-in segment by its config id. Unknown ids return
+/// `None` so config loaders can warn and skip.
+#[must_use]
+pub fn built_in_by_id(id: &str) -> Option<Box<dyn Segment>> {
+    match id {
+        "model" => Some(Box::new(model::ModelSegment)),
+        "context_window" => Some(Box::new(context_window::ContextWindowSegment)),
+        "workspace" => Some(Box::new(workspace::WorkspaceSegment)),
+        "cost" => Some(Box::new(cost::CostSegment)),
+        "effort" => Some(Box::new(effort::EffortSegment)),
+        "rate_limit" => Some(Box::new(rate_limit::RateLimitSegment)),
+        "rate_limit_5h" => Some(Box::new(rate_limit_5h::RateLimit5hSegment)),
+        "rate_limit_7d" => Some(Box::new(rate_limit_7d::RateLimit7dSegment)),
+        _ => None,
+    }
+}
+
+/// Wraps a `Segment` to override its `defaults()` output while
+/// delegating `render` unchanged. Applying `[segments.<id>]` overrides
+/// without touching the inner segment.
+pub struct OverriddenSegment {
+    inner: Box<dyn Segment>,
+    priority: Option<u8>,
+    width: Option<WidthBounds>,
+    default_separator: Option<Separator>,
+}
+
+impl OverriddenSegment {
+    #[must_use]
+    pub fn new(inner: Box<dyn Segment>) -> Self {
+        Self {
+            inner,
+            priority: None,
+            width: None,
+            default_separator: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_priority(mut self, priority: u8) -> Self {
+        self.priority = Some(priority);
+        self
+    }
+
+    #[must_use]
+    pub fn with_width(mut self, bounds: WidthBounds) -> Self {
+        self.width = Some(bounds);
+        self
+    }
+
+    #[must_use]
+    pub fn with_default_separator(mut self, separator: Separator) -> Self {
+        self.default_separator = Some(separator);
+        self
+    }
+}
+
+impl Segment for OverriddenSegment {
+    fn render(&self, ctx: &StatusContext) -> RenderResult {
+        self.inner.render(ctx)
+    }
+
+    fn defaults(&self) -> SegmentDefaults {
+        let mut d = self.inner.defaults();
+        if let Some(p) = self.priority {
+            d.priority = p;
+        }
+        if let Some(w) = self.width {
+            d.width = Some(w);
+        }
+        if let Some(sep) = self.default_separator.clone() {
+            d.default_separator = sep;
+        }
+        d
     }
 }
 
@@ -502,5 +592,85 @@ mod layout_type_tests {
         let err = SegmentError::with_source("outer", Box::new(src));
         let source = err.source().expect("source present");
         assert_eq!(source.to_string(), "inner");
+    }
+
+    // --- registry ---
+
+    #[test]
+    fn built_in_by_id_resolves_every_default_segment() {
+        for id in DEFAULT_SEGMENT_IDS {
+            assert!(
+                built_in_by_id(id).is_some(),
+                "expected built-in registry to know {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn built_in_by_id_resolves_additional_documented_ids() {
+        // Not in the default line, but valid config ids.
+        assert!(built_in_by_id("rate_limit_5h").is_some());
+        assert!(built_in_by_id("rate_limit_7d").is_some());
+    }
+
+    #[test]
+    fn built_in_by_id_rejects_unknown() {
+        assert!(built_in_by_id("nope").is_none());
+        assert!(built_in_by_id("").is_none());
+    }
+
+    // --- OverriddenSegment ---
+
+    #[test]
+    fn overridden_segment_replaces_priority() {
+        let base = built_in_by_id("workspace").expect("known id");
+        let base_priority = base.defaults().priority;
+        let wrapped = OverriddenSegment::new(base).with_priority(200);
+        assert_eq!(wrapped.defaults().priority, 200);
+        assert_ne!(wrapped.defaults().priority, base_priority);
+    }
+
+    #[test]
+    fn overridden_segment_replaces_width_bounds() {
+        let base = built_in_by_id("workspace").expect("known id");
+        assert_eq!(base.defaults().width, None);
+        let bounds = WidthBounds::new(5, 40).expect("valid");
+        let wrapped = OverriddenSegment::new(base).with_width(bounds);
+        assert_eq!(wrapped.defaults().width, Some(bounds));
+    }
+
+    #[test]
+    fn overridden_segment_replaces_default_separator() {
+        let base = built_in_by_id("workspace").expect("known id");
+        let wrapped = OverriddenSegment::new(base).with_default_separator(Separator::None);
+        assert_eq!(wrapped.defaults().default_separator, Separator::None);
+    }
+
+    #[test]
+    fn overridden_segment_delegates_render_to_inner() {
+        // The wrapper doesn't intercept render; it only overrides
+        // defaults.
+        use crate::input::{ModelInfo, Tool, WorkspaceInfo};
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let ctx = StatusContext {
+            tool: Tool::ClaudeCode,
+            model: ModelInfo {
+                display_name: "Claude".into(),
+            },
+            workspace: WorkspaceInfo {
+                project_dir: PathBuf::from("/repo/linesmith"),
+                git_worktree: None,
+            },
+            context_window: None,
+            cost: None,
+            rate_limits: None,
+            effort: None,
+            raw: Arc::new(serde_json::Value::Null),
+        };
+        let wrapped = OverriddenSegment::new(built_in_by_id("workspace").unwrap()).with_priority(0);
+        let rendered = wrapped.render(&ctx).unwrap().expect("rendered");
+        assert_eq!(rendered.text(), "linesmith");
     }
 }
