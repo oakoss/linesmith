@@ -117,7 +117,9 @@ impl FromStr for Config {
 impl Config {
     /// Read and parse the file at `path`. Returns `Ok(None)` when the
     /// file doesn't exist (normal case for first-run users); other I/O
-    /// errors propagate so callers can log them.
+    /// errors propagate so callers can log them. Unknown keys are
+    /// silently ignored — callers that want typo warnings use
+    /// [`Config::load_validated`] instead.
     pub fn load(path: &Path) -> Result<Option<Self>, ConfigError> {
         let raw = match std::fs::read_to_string(path) {
             Ok(s) => s,
@@ -135,6 +137,158 @@ impl Config {
                 path: Some(path.to_owned()),
                 source,
             })
+    }
+
+    /// Same as [`Config::load`] but emits one warning per unknown key
+    /// encountered (top-level, `[layout_options]`, or `[segments.<id>]`).
+    /// The allow-list tolerates spec-documented keys we haven't
+    /// implemented yet (`preset`, `layout`, `plugins`, `$schema`), so
+    /// forward-compat configs stay silent while typos surface.
+    pub fn load_validated(
+        path: &Path,
+        warn: impl FnMut(&str),
+    ) -> Result<Option<Self>, ConfigError> {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(ConfigError::Io {
+                    path: path.to_owned(),
+                    source,
+                })
+            }
+        };
+        Self::from_str_validated_impl(&raw, Some(path), warn).map(Some)
+    }
+
+    /// [`FromStr`]-equivalent with unknown-key warnings. The plain
+    /// `FromStr` impl remains the non-validating form; validation is
+    /// opt-in so callers that don't want the allow-list surface (unit
+    /// tests, programmatic config construction) bypass it.
+    pub fn from_str_validated(s: &str, warn: impl FnMut(&str)) -> Result<Self, ConfigError> {
+        Self::from_str_validated_impl(s, None, warn)
+    }
+
+    fn from_str_validated_impl(
+        s: &str,
+        path: Option<&Path>,
+        mut warn: impl FnMut(&str),
+    ) -> Result<Self, ConfigError> {
+        let raw: toml::Value = toml::from_str(s).map_err(|source| ConfigError::Parse {
+            path: path.map(Path::to_owned),
+            source,
+        })?;
+        validate_keys(&raw, &mut warn);
+        raw.try_into()
+            .map_err(|source: toml::de::Error| ConfigError::Parse {
+                path: path.map(Path::to_owned),
+                source,
+            })
+    }
+}
+
+/// Top-level config keys we recognize. Implemented keys + spec-documented
+/// keys for features not yet shipped (`preset`, `layout`, `plugins`) +
+/// `$schema` for editor tooling.
+const KNOWN_TOP_LEVEL: &[&str] = &[
+    "line",
+    "theme",
+    "layout_options",
+    "segments",
+    "preset",
+    "layout",
+    "plugins",
+    "$schema",
+];
+
+/// Fields under `[layout_options]`. `separator` is tolerated ahead
+/// of its implementation so forward-compat configs don't warn.
+const KNOWN_LAYOUT_OPTIONS: &[&str] = &["color", "claude_padding", "separator"];
+
+/// Per-segment override schema. Returns `None` for segment ids we
+/// don't recognize so plugin segments (which own their own schema)
+/// bypass validation. Built-in segments share a universal allow-list;
+/// segment-specific keys (`format` for context_window,
+/// `show_dirty` / `show_ahead_behind` for git_branch) land alongside
+/// their segments with proper per-type allow-lists.
+fn segment_override_schema(id: &str) -> Option<&'static [&'static str]> {
+    const BUILT_IN_COMMON: &[&str] = &["priority", "width", "style", "visible_if"];
+    const BUILT_IN_IDS: &[&str] = &[
+        "model",
+        "workspace",
+        "cost",
+        "effort",
+        "context_window",
+        "rate_limit",
+        "rate_limit_5h",
+        "rate_limit_7d",
+    ];
+    if BUILT_IN_IDS.contains(&id) {
+        Some(BUILT_IN_COMMON)
+    } else {
+        None
+    }
+}
+
+/// Walk `raw` and emit one warning per key outside the allow-list.
+/// Scope is intentionally shallow: top-level, `[layout_options]`
+/// fields, and fields directly under each `[segments.<id>]` table.
+/// Deeper nesting (plugin configs, per-line segments) stays silent
+/// until those features land with their own schemas.
+fn validate_keys(raw: &toml::Value, warn: &mut impl FnMut(&str)) {
+    let Some(top) = raw.as_table() else {
+        return;
+    };
+    for (key, value) in top {
+        if !KNOWN_TOP_LEVEL.contains(&key.as_str()) {
+            warn(&format!("unknown top-level config key '{key}'; ignoring"));
+            continue;
+        }
+        match key.as_str() {
+            "layout_options" => {
+                validate_flat_table(value, "layout_options", KNOWN_LAYOUT_OPTIONS, warn)
+            }
+            "segments" => validate_segments_table(value, warn),
+            _ => {}
+        }
+    }
+}
+
+fn validate_flat_table(
+    value: &toml::Value,
+    label: &str,
+    allowed: &[&str],
+    warn: &mut impl FnMut(&str),
+) {
+    let Some(table) = value.as_table() else {
+        return;
+    };
+    for key in table.keys() {
+        if !allowed.contains(&key.as_str()) {
+            warn(&format!("unknown key '{key}' in [{label}]; ignoring"));
+        }
+    }
+}
+
+fn validate_segments_table(value: &toml::Value, warn: &mut impl FnMut(&str)) {
+    let Some(segments) = value.as_table() else {
+        return;
+    };
+    for (id, block) in segments {
+        let Some(block_table) = block.as_table() else {
+            continue;
+        };
+        let Some(allowed) = segment_override_schema(id) else {
+            // Plugin or not-yet-shipped segment id; skip so plugin
+            // config keys pass through. Plugins own their schema via
+            // the plugin API when that lands.
+            continue;
+        };
+        for key in block_table.keys() {
+            if !allowed.contains(&key.as_str()) {
+                warn(&format!("unknown key '{key}' in [segments.{id}]; ignoring"));
+            }
+        }
     }
 }
 
@@ -261,6 +415,218 @@ mod tests {
             let c = Config::from_str(&src).expect("parse ok");
             assert_eq!(c.layout_options.map(|l| l.color), Some(expected));
         }
+    }
+
+    // --- unknown-key validation ---
+
+    fn collect_warnings(src: &str) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let _ = Config::from_str_validated(src, |msg| warnings.push(msg.to_string()));
+        warnings
+    }
+
+    #[test]
+    fn from_str_validated_warns_on_unknown_top_level_key() {
+        let warnings = collect_warnings("thme = \"oops\"\n[line]\nsegments = []\n");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("thme"));
+        assert!(warnings[0].contains("top-level"));
+    }
+
+    #[test]
+    fn from_str_validated_allows_implemented_and_forward_compat_top_level_keys() {
+        // `theme` / `line` / `layout_options` / `segments` are
+        // implemented; `preset` / `layout` / `plugins` / `$schema`
+        // are tolerated per the allow-list until they land.
+        let warnings = collect_warnings(
+            r#"
+                $schema = "https://example.invalid/schema.json"
+                theme = "default"
+                preset = "developer"
+                layout = "single-line"
+                [line]
+                segments = ["model"]
+                [layout_options]
+                color = "auto"
+                [plugins.example]
+                foo = "bar"
+            "#,
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn from_str_validated_warns_on_unknown_layout_options_key() {
+        let warnings = collect_warnings(
+            r#"
+                [layout_options]
+                separatr = "powerline"
+            "#,
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("separatr"));
+        assert!(warnings[0].contains("[layout_options]"));
+    }
+
+    #[test]
+    fn from_str_validated_allows_separator_and_other_known_layout_options_keys() {
+        // `separator` is spec'd but not yet implemented; the allow-list
+        // tolerates it so forward-compat configs stay silent.
+        let warnings = collect_warnings(
+            r#"
+                [layout_options]
+                color = "always"
+                claude_padding = 2
+                separator = "powerline"
+            "#,
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn from_str_validated_warns_on_unknown_segment_override_key() {
+        let warnings = collect_warnings(
+            r#"
+                [segments.model]
+                priorty = 16
+            "#,
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("priorty"));
+        assert!(warnings[0].contains("[segments.model]"));
+    }
+
+    #[test]
+    fn from_str_validated_names_the_segment_id_in_warnings() {
+        // Each segment block gets its own warnings namespaced by id so
+        // users with many segments can find which one has the typo.
+        let warnings = collect_warnings(
+            r#"
+                [segments.workspace]
+                bogus = "x"
+                [segments.cost]
+                alsobogus = 1
+            "#,
+        );
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("[segments.workspace]") && w.contains("bogus")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("[segments.cost]") && w.contains("alsobogus")));
+    }
+
+    #[test]
+    fn from_str_validated_skips_unknown_segment_ids_because_plugins_own_their_schema() {
+        // A segment id not in the built-in registry is either a future
+        // built-in or a plugin segment; plugins declare their own
+        // override keys, so we can't know what's valid. Skip rather
+        // than emit false positives.
+        let warnings = collect_warnings(
+            r#"
+                [segments.my_plugin]
+                foo = "bar"
+                baz = 42
+
+                [segments.git_branch]
+                show_ahead_behind = true
+                show_dirty = true
+            "#,
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn from_str_validated_rejects_segment_specific_keys_on_wrong_built_in() {
+        // `show_dirty` is a git_branch concept; putting it on `model`
+        // is a user mistake the validator should catch.
+        let warnings = collect_warnings(
+            r#"
+                [segments.model]
+                show_dirty = true
+            "#,
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("show_dirty"));
+        assert!(warnings[0].contains("[segments.model]"));
+    }
+
+    #[test]
+    fn from_str_validated_allows_spec_documented_segment_override_keys() {
+        // `style` (style-string syntax) and `visible_if` (rhai plugin
+        // expressions) are spec'd but not yet implemented; tolerated
+        // so spec example configs parse cleanly.
+        let warnings = collect_warnings(
+            r#"
+                [segments.workspace]
+                priority = 16
+                width = { min = 10, max = 40 }
+                style = "role:info"
+                visible_if = "true"
+            "#,
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn from_str_validated_returns_parse_error_for_malformed_toml() {
+        let mut warnings = Vec::new();
+        let err =
+            Config::from_str_validated("[line\nsegments =", |msg| warnings.push(msg.to_string()))
+                .unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn validated_and_silent_parse_yield_identical_config_on_clean_input() {
+        // Locks the "validation is purely observational" contract:
+        // from_str_validated must not mutate parse semantics.
+        let src = r#"
+            theme = "default"
+            [line]
+            segments = ["model", "workspace"]
+            [segments.model]
+            priority = 8
+        "#;
+        let silent = Config::from_str(src).expect("silent parse");
+        let validated = Config::from_str_validated(src, |_| {}).expect("validated parse");
+        assert_eq!(silent, validated);
+    }
+
+    #[test]
+    fn load_validated_file_path_surfaces_parse_error_with_path() {
+        // The in-memory variant returns ConfigError::Parse { path: None };
+        // the file variant must populate path for user-facing diagnostics.
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[line\nsegments =").unwrap();
+        let err = Config::load_validated(&path, |_| {}).unwrap_err();
+        match err {
+            ConfigError::Parse { path: Some(p), .. } => assert_eq!(p, path),
+            other => panic!("expected Parse with Some(path), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_validated_returns_none_for_missing_file() {
+        let dir = tempdir();
+        let path = dir.path().join("missing.toml");
+        let mut warnings = Vec::new();
+        let got = Config::load_validated(&path, |m| warnings.push(m.to_string())).expect("ok");
+        assert!(got.is_none());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn load_validated_surfaces_unknown_key_warnings() {
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "thme = \"bad\"\n").unwrap();
+        let mut warnings = Vec::new();
+        let _ = Config::load_validated(&path, |m| warnings.push(m.to_string())).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("thme"));
     }
 
     #[test]

@@ -144,10 +144,22 @@ fn run_cli(
         env.xdg_config_home.as_deref(),
         env.home.as_deref(),
     );
-    let (cfg, load_error) = load_config(resolved.as_ref(), stderr);
+    let (cfg, load_error, config_warnings) = load_config(resolved.as_ref(), stderr);
 
     if args.check_config {
-        return check_config(resolved.as_ref(), cfg.as_ref(), load_error, stderr);
+        return check_config(
+            resolved.as_ref(),
+            cfg.as_ref(),
+            load_error,
+            config_warnings,
+            stderr,
+        );
+    }
+
+    // Surface unknown-key warnings before rendering so they ride on the
+    // same stderr stream as segment-build warnings and parse errors.
+    for msg in &config_warnings {
+        let _ = writeln!(stderr, "linesmith: {msg}");
     }
 
     let segments = build_segments(cfg.as_ref(), |msg| {
@@ -240,16 +252,25 @@ fn resolve_theme(cfg: Option<&config::Config>, stderr: &mut dyn Write) -> &'stat
 
 /// Load the config at `resolved` if present. Missing files are silent
 /// for implicit paths (first-run users) but warn for explicit paths
-/// (the user asked for a specific file and it wasn't there).
+/// (the user asked for a specific file and it wasn't there). Unknown
+/// keys inside the file are collected as warnings so callers (render
+/// path vs `--check-config`) can decide how to surface them.
 fn load_config(
     resolved: Option<&config::ConfigPath>,
     stderr: &mut dyn Write,
-) -> (Option<config::Config>, Option<config::ConfigError>) {
+) -> (
+    Option<config::Config>,
+    Option<config::ConfigError>,
+    Vec<String>,
+) {
     let Some(cp) = resolved else {
-        return (None, None);
+        return (None, None, Vec::new());
     };
-    match config::Config::load(&cp.path) {
-        Ok(Some(c)) => (Some(c), None),
+    let mut warnings = Vec::new();
+    let load_result =
+        config::Config::load_validated(&cp.path, |msg| warnings.push(msg.to_string()));
+    match load_result {
+        Ok(Some(c)) => (Some(c), None, warnings),
         Ok(None) => {
             if cp.explicit {
                 let _ = writeln!(
@@ -258,11 +279,11 @@ fn load_config(
                     cp.path.display()
                 );
             }
-            (None, None)
+            (None, None, warnings)
         }
         Err(e) => {
             let _ = writeln!(stderr, "linesmith: {e}");
-            (None, Some(e))
+            (None, Some(e), warnings)
         }
     }
 }
@@ -271,6 +292,7 @@ fn check_config(
     resolved: Option<&config::ConfigPath>,
     cfg: Option<&config::Config>,
     load_error: Option<config::ConfigError>,
+    config_warnings: Vec<String>,
     stderr: &mut dyn Write,
 ) -> u8 {
     // `--check-config` is the CI / editor contract for strict
@@ -297,6 +319,10 @@ fn check_config(
     };
 
     let mut warn_count = 0_usize;
+    for msg in &config_warnings {
+        let _ = writeln!(stderr, "linesmith: {msg}");
+        warn_count += 1;
+    }
     let _ = build_segments(Some(cfg), |msg| {
         let _ = writeln!(stderr, "linesmith: {msg}");
         warn_count += 1;
@@ -556,6 +582,109 @@ mod tests {
         assert_eq!(code, 0);
         assert!(stderr.contains("does_not_exist"));
         assert!(stderr.contains("1 warning(s)"));
+    }
+
+    #[test]
+    fn check_config_catches_unknown_top_level_key() {
+        // Typo at top level: `thme` should warn and count toward the
+        // summary so CI gates catch it.
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "thme = \"default\"\n").unwrap();
+        let (code, _stdout, stderr) = run_cli_main(
+            &["--check-config", "--config", path.to_str().unwrap()],
+            b"",
+            &CliEnv::for_tests(),
+        );
+        assert_eq!(code, 0);
+        assert!(stderr.contains("thme"));
+        assert!(stderr.contains("1 warning(s)"));
+    }
+
+    #[test]
+    fn check_config_catches_unknown_segment_override_key() {
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[segments.model]\npriorty = 16\n").unwrap();
+        let (code, _stdout, stderr) = run_cli_main(
+            &["--check-config", "--config", path.to_str().unwrap()],
+            b"",
+            &CliEnv::for_tests(),
+        );
+        assert_eq!(code, 0);
+        assert!(stderr.contains("priorty"));
+        assert!(stderr.contains("[segments.model]"));
+        assert!(stderr.contains("1 warning(s)"));
+    }
+
+    #[test]
+    fn check_config_counts_warnings_across_all_three_scopes() {
+        // One typo each at top-level, [layout_options], and
+        // [segments.<id>]: the summary must tally all three so a CI
+        // gate grepping the count catches the full set.
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "thme = \"oops\"\n[layout_options]\nseparatr = \"x\"\n[segments.model]\npriorty = 1\n",
+        )
+        .unwrap();
+        let (code, _stdout, stderr) = run_cli_main(
+            &["--check-config", "--config", path.to_str().unwrap()],
+            b"",
+            &CliEnv::for_tests(),
+        );
+        assert_eq!(code, 0);
+        assert!(stderr.contains("thme"));
+        assert!(stderr.contains("separatr"));
+        assert!(stderr.contains("priorty"));
+        assert!(stderr.contains("3 warning(s)"));
+    }
+
+    #[test]
+    fn unknown_key_warnings_emit_once_per_typo_on_render_path() {
+        // Pins the early-return at `if args.check_config { return ... }`:
+        // the render path's pre-render loop and check_config's loop
+        // must not double-emit for the same typo.
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "thme = \"oops\"\n").unwrap();
+        let json = br#"{
+            "model": { "display_name": "Claude" },
+            "workspace": { "project_dir": "/home/dev/linesmith" }
+        }"#;
+        let (code, _stdout, stderr) = run_cli_main(
+            &["--config", path.to_str().unwrap()],
+            json,
+            &CliEnv::for_tests(),
+        );
+        assert_eq!(code, 0);
+        assert_eq!(
+            stderr.matches("thme").count(),
+            1,
+            "unknown-key warning double-emitted: {stderr}"
+        );
+    }
+
+    #[test]
+    fn render_path_surfaces_unknown_key_warnings_on_stderr() {
+        // Render flow must still see unknown-key warnings even though
+        // no `--check-config` summary runs.
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "thme = \"oops\"\n").unwrap();
+        let json = br#"{
+            "model": { "display_name": "Claude" },
+            "workspace": { "project_dir": "/home/dev/linesmith" }
+        }"#;
+        let (code, stdout, stderr) = run_cli_main(
+            &["--config", path.to_str().unwrap()],
+            json,
+            &CliEnv::for_tests(),
+        );
+        assert_eq!(code, 0);
+        assert_eq!(stdout, "Claude linesmith\n");
+        assert!(stderr.contains("thme"));
     }
 
     #[test]
