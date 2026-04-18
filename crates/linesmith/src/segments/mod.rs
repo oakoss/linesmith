@@ -1,6 +1,6 @@
 //! Segment trait and layout-intent types. Full contract lives in
 //! `docs/specs/segment-system.md`; this module carries the subset the
-//! v0.1 layout engine uses — visibility, cell width, priority, and
+//! v0.1 layout engine uses: visibility, cell width, priority, and
 //! separator preference.
 
 use crate::input::StatusContext;
@@ -16,21 +16,24 @@ pub mod rate_limit_5h;
 pub mod rate_limit_7d;
 pub mod workspace;
 
-/// Output of a successful segment render. `width` is the rendered cell
-/// count (via `unicode-width`) computed once at construction;
-/// `right_separator`, when `Some`, overrides the segment's default
-/// separator on this specific boundary.
+/// Output of a successful segment render.
 ///
-/// `#[non_exhaustive]` so we can grow the struct without breaking SemVer.
+/// Fields are `pub(crate)` so the engine can read them directly;
+/// external callers go through the constructors and accessors so the
+/// `width == text_width(text)` invariant can't desync via a mutable
+/// `text`. `#[non_exhaustive]` keeps future additions SemVer-safe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RenderedSegment {
-    pub text: String,
-    pub width: u16,
-    pub right_separator: Option<Separator>,
+    pub(crate) text: String,
+    pub(crate) width: u16,
+    pub(crate) right_separator: Option<Separator>,
 }
 
 impl RenderedSegment {
+    /// Build a rendered segment from `text`, auto-computing its cell
+    /// width. Use [`Self::with_separator`] when the segment wants to
+    /// override its default right-separator for this boundary.
     #[must_use]
     pub fn new(text: impl Into<String>) -> Self {
         let text = text.into();
@@ -50,6 +53,38 @@ impl RenderedSegment {
             text,
             width,
             right_separator: Some(separator),
+        }
+    }
+
+    /// The rendered text.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Cell width of the rendered text.
+    #[must_use]
+    pub fn width(&self) -> u16 {
+        self.width
+    }
+
+    /// Separator this render prefers on its right edge, if any. `None`
+    /// means "fall back to the segment's default separator."
+    #[must_use]
+    pub fn right_separator(&self) -> Option<&Separator> {
+        self.right_separator.as_ref()
+    }
+
+    /// Trusted crate-internal constructor that accepts an explicit
+    /// `width`. Reserved for [`crate::layout::truncate_to`]; every
+    /// other caller goes through [`Self::new`] so the width stays a
+    /// function of the text.
+    #[must_use]
+    pub(crate) fn from_parts(text: String, width: u16, right_separator: Option<Separator>) -> Self {
+        Self {
+            text,
+            width,
+            right_separator,
         }
     }
 }
@@ -135,12 +170,29 @@ pub struct SegmentDefaults {
 }
 
 impl SegmentDefaults {
+    /// Constructor shorthand for the common case of "default layout
+    /// intent with a specific priority." Chainable with
+    /// [`Self::with_width`] and [`Self::with_default_separator`].
     #[must_use]
     pub fn with_priority(priority: u8) -> Self {
         Self {
             priority,
             ..Self::default()
         }
+    }
+
+    /// Chainable setter for width bounds.
+    #[must_use]
+    pub fn with_width(mut self, bounds: WidthBounds) -> Self {
+        self.width = Some(bounds);
+        self
+    }
+
+    /// Chainable setter for the default right-separator.
+    #[must_use]
+    pub fn with_default_separator(mut self, separator: Separator) -> Self {
+        self.default_separator = separator;
+        self
     }
 }
 
@@ -304,15 +356,22 @@ mod layout_type_tests {
     #[test]
     fn rendered_segment_computes_width() {
         let r = RenderedSegment::new("hello");
-        assert_eq!(r.width, 5);
-        assert_eq!(r.right_separator, None);
+        assert_eq!(r.text(), "hello");
+        assert_eq!(r.width(), 5);
+        assert_eq!(r.right_separator(), None);
     }
 
     #[test]
     fn rendered_segment_counts_cells_not_bytes_for_middle_dot() {
         // U+00B7 MIDDLE DOT is 2 bytes but 1 cell.
         let r = RenderedSegment::new("42% · 200k");
-        assert_eq!(r.width, 10);
+        assert_eq!(r.width(), 10);
+    }
+
+    #[test]
+    fn rendered_segment_with_separator_exposes_override() {
+        let r = RenderedSegment::with_separator("x", Separator::None);
+        assert_eq!(r.right_separator(), Some(&Separator::None));
     }
 
     #[test]
@@ -341,5 +400,19 @@ mod layout_type_tests {
         assert_eq!(d.priority, 64);
         assert_eq!(d.width, None);
         assert_eq!(d.default_separator, Separator::Space);
+    }
+
+    #[test]
+    fn builders_chain_on_segment_defaults() {
+        let bounds = WidthBounds::new(4, 40).expect("valid bounds");
+        let d = SegmentDefaults::with_priority(32)
+            .with_width(bounds)
+            .with_default_separator(Separator::Literal(Cow::Borrowed(" | ")));
+        assert_eq!(d.priority, 32);
+        assert_eq!(d.width, Some(bounds));
+        assert_eq!(
+            d.default_separator,
+            Separator::Literal(Cow::Borrowed(" | "))
+        );
     }
 }

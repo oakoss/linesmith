@@ -110,13 +110,9 @@ fn apply_width_bounds(
 /// Truncate `rendered` to at most `max_cells` terminal cells, appending
 /// `…` (U+2026, 1 cell) as a continuation marker. Iterates by grapheme
 /// cluster so combining marks, ZWJ sequences, and emoji stay intact.
-fn truncate_to(rendered: RenderedSegment, max_cells: u16) -> RenderedSegment {
+pub(crate) fn truncate_to(rendered: RenderedSegment, max_cells: u16) -> RenderedSegment {
     if max_cells == 0 {
-        return RenderedSegment {
-            text: String::new(),
-            width: 0,
-            right_separator: rendered.right_separator,
-        };
+        return RenderedSegment::from_parts(String::new(), 0, rendered.right_separator);
     }
     // Reserve one cell for the ellipsis.
     let budget = max_cells.saturating_sub(1);
@@ -131,11 +127,7 @@ fn truncate_to(rendered: RenderedSegment, max_cells: u16) -> RenderedSegment {
         used = used.saturating_add(w);
     }
     out.push('…');
-    RenderedSegment {
-        text: out,
-        width: used.saturating_add(1),
-        right_separator: rendered.right_separator,
-    }
+    RenderedSegment::from_parts(out, used.saturating_add(1), rendered.right_separator)
 }
 
 #[cfg(test)]
