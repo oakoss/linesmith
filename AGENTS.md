@@ -130,7 +130,7 @@ Conventional commits: `type(scope): short description`
 
 **Scopes (indicative):** `ideas`, `adr`, `spec`, `docs`, `readme`, `config`, `beads`, `core`, `plugins`, `themes`, `segments`, `ci`, `repo`
 
-Beads issue references go in the commit footer as a bare `lsm-xyz`, not in the subject line:
+Beads issue references go in the commit footer as a bare `lsm-xyz`, not in the subject line. Commits not tied to a beads issue (meta / workflow / CI / version bumps) have **no** footer — don't invent one.
 
 ```text
 feat(core): implement stdin JSON parsing
@@ -139,6 +139,16 @@ Parse Claude Code statusline JSON payload into a typed StatusContext
 with Option<T> for nullable fields (current_usage, rate_limits).
 
 lsm-sgh
+```
+
+Close reasons (`bd close <id> --reason="..."`) describe **what shipped**, not **which commit** shipped it. Don't embed commit SHAs — they rot on rebase while subjects survive. Reference the work, not the byte:
+
+```text
+# Good
+bd close lsm-aql --reason="Layout engine: priority-drop, width hints, grapheme-aware truncation. 9 follow-ups filed."
+
+# Bad
+bd close lsm-aql --reason="Shipped in ca91f3a"
 ```
 
 ### Closing beads issues
