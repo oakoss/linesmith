@@ -24,12 +24,15 @@ pub enum ColorOverride {
 }
 
 /// What the binary should do after parsing. `Run` is the common case;
-/// `Help` and `Version` are meta-commands that print and exit.
+/// `Help`, `Version`, and `ThemesList` are meta-commands that print
+/// and exit.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Action {
     Run(CliArgs),
     Help,
     Version,
+    ThemesList,
 }
 
 /// Help text. Kept short; full docs live at
@@ -39,6 +42,7 @@ linesmith — status line for Claude Code and other AI coding CLIs
 
 USAGE:
     linesmith [OPTIONS]
+    linesmith themes list
 
 OPTIONS:
     -c, --config <PATH>    Config file path (overrides default resolution)
@@ -47,6 +51,9 @@ OPTIONS:
         --force-color      Emit color even in non-TTY output
     -h, --help             Print this help text
     -V, --version          Print version
+
+SUBCOMMANDS:
+    themes list            List available themes (built-in + user)
 
 Reads a statusline JSON payload on stdin; writes the rendered line to
 stdout. See docs/specs/input-schema.md for the payload contract.
@@ -61,6 +68,7 @@ where
 {
     let mut parser = lexopt::Parser::from_args(raw);
     let mut args = CliArgs::default();
+    let mut positional: Vec<OsString> = Vec::new();
     while let Some(arg) = parser.next()? {
         match arg {
             Short('c') | Long("config") => {
@@ -83,10 +91,43 @@ where
             }
             Short('h') | Long("help") => return Ok(Action::Help),
             Short('V') | Long("version") => return Ok(Action::Version),
+            Value(v) => positional.push(v),
             _ => return Err(arg.unexpected()),
         }
     }
-    Ok(Action::Run(args))
+    match dispatch_subcommand(&positional)? {
+        Some(action) => Ok(action),
+        None => Ok(Action::Run(args)),
+    }
+}
+
+/// Recognize subcommands from positional args. Today only
+/// `themes list` is supported; anything else returns a clear error
+/// rather than silently falling through to `Run`.
+fn dispatch_subcommand(positional: &[OsString]) -> Result<Option<Action>, lexopt::Error> {
+    if positional.is_empty() {
+        return Ok(None);
+    }
+    let first = positional[0].to_string_lossy();
+    match first.as_ref() {
+        "themes" => {
+            let sub = positional.get(1).map(|s| s.to_string_lossy().into_owned());
+            match sub.as_deref() {
+                Some("list") if positional.len() == 2 => Ok(Some(Action::ThemesList)),
+                Some(other) => Err(lexopt::Error::UnexpectedValue {
+                    option: "themes".to_string(),
+                    value: other.to_string().into(),
+                }),
+                None => Err(lexopt::Error::MissingValue {
+                    option: Some("themes <subcommand>".to_string()),
+                }),
+            }
+        }
+        _ => Err(lexopt::Error::UnexpectedValue {
+            option: "<subcommand>".to_string(),
+            value: first.to_string().into(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -231,6 +272,32 @@ mod tests {
             Action::Run(args) => assert_eq!(args.color_override, Some(ColorOverride::Never)),
             _ => panic!("expected Run action"),
         }
+    }
+
+    #[test]
+    fn themes_list_subcommand_parses() {
+        assert_eq!(
+            parse_args(&["themes", "list"]).expect("ok"),
+            Action::ThemesList
+        );
+    }
+
+    #[test]
+    fn themes_without_subcommand_errors() {
+        let err = parse_args(&["themes"]).unwrap_err();
+        assert!(matches!(err, lexopt::Error::MissingValue { .. }));
+    }
+
+    #[test]
+    fn themes_with_unknown_subcommand_errors() {
+        let err = parse_args(&["themes", "remove"]).unwrap_err();
+        assert!(matches!(err, lexopt::Error::UnexpectedValue { .. }));
+    }
+
+    #[test]
+    fn unknown_top_level_subcommand_errors() {
+        let err = parse_args(&["bogus"]).unwrap_err();
+        assert!(matches!(err, lexopt::Error::UnexpectedValue { .. }));
     }
 
     #[test]

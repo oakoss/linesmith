@@ -7,6 +7,7 @@
 use crate::segments::builder::build_segments;
 use crate::{cli, config, detect_terminal_width, run_with_context, theme, RenderContext};
 use std::io::{Read, Write};
+use std::path::PathBuf;
 
 /// `NO_COLOR`-style flag: any non-empty value means "on." Per
 /// no-color.org.
@@ -127,8 +128,21 @@ where
             let _ = writeln!(stdout, "linesmith {}", env!("CARGO_PKG_VERSION"));
             0
         }
+        cli::Action::ThemesList => themes_list(stdout, stderr, env),
         cli::Action::Run(args) => run_cli(args, stdin, stdout, stderr, env),
     }
+}
+
+fn themes_list(stdout: &mut dyn Write, stderr: &mut dyn Write, env: &CliEnv) -> u8 {
+    let registry = build_theme_registry(env, stderr);
+    for rt in registry.iter() {
+        let source = match &rt.source {
+            theme::ThemeSource::BuiltIn => "built-in".to_string(),
+            theme::ThemeSource::UserFile(p) => p.display().to_string(),
+        };
+        let _ = writeln!(stdout, "{}\t{}", rt.theme.name(), source);
+    }
+    0
 }
 
 fn run_cli(
@@ -146,12 +160,15 @@ fn run_cli(
     );
     let (cfg, load_error, config_warnings) = load_config(resolved.as_ref(), stderr);
 
+    let registry = build_theme_registry(env, stderr);
+
     if args.check_config {
         return check_config(
             resolved.as_ref(),
             cfg.as_ref(),
             load_error,
             config_warnings,
+            &registry,
             stderr,
         );
     }
@@ -169,7 +186,7 @@ fn run_cli(
     let raw_width = env.terminal_width.unwrap_or_else(detect_terminal_width);
     let padding = layout_options(cfg.as_ref()).map_or(0, |l| l.claude_padding);
     let width = raw_width.saturating_sub(padding);
-    let theme_ref = resolve_theme(cfg.as_ref(), stderr);
+    let theme_ref = resolve_theme(cfg.as_ref(), &registry, stderr);
     let capability = resolve_color_capability(args.color_override, env, cfg.as_ref());
     let ctx = RenderContext {
         theme: theme_ref,
@@ -181,6 +198,31 @@ fn run_cli(
         return 1;
     }
     0
+}
+
+/// Where linesmith looks for user theme files. Prefers
+/// `$XDG_CONFIG_HOME/linesmith/themes/`; falls back to
+/// `$HOME/.config/linesmith/themes/`. Returns `None` when neither
+/// env var is set — tests drive this via `CliEnv::default()` and
+/// should see no user-theme loading attempt.
+fn user_themes_dir(env: &CliEnv) -> Option<PathBuf> {
+    if let Some(xdg) = env.xdg_config_home.as_deref().filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(xdg).join("linesmith").join("themes"));
+    }
+    env.home
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|h| PathBuf::from(h).join(".config/linesmith/themes"))
+}
+
+fn build_theme_registry(env: &CliEnv, stderr: &mut dyn Write) -> theme::ThemeRegistry {
+    let mut registry = theme::ThemeRegistry::with_built_ins();
+    if let Some(dir) = user_themes_dir(env) {
+        registry = registry.with_user_themes(&dir, |msg| {
+            let _ = writeln!(stderr, "linesmith: {msg}");
+        });
+    }
+    registry
 }
 
 fn layout_options(cfg: Option<&config::Config>) -> Option<&config::LayoutOptions> {
@@ -234,18 +276,26 @@ fn force_color_detect() -> theme::Capability {
 /// Resolve the active theme from config. Unknown names fall back to
 /// `default` with a stderr warning; missing or empty `theme` uses
 /// the default silently.
-fn resolve_theme(cfg: Option<&config::Config>, stderr: &mut dyn Write) -> &'static theme::Theme {
+fn resolve_theme<'a>(
+    cfg: Option<&config::Config>,
+    registry: &'a theme::ThemeRegistry,
+    stderr: &mut dyn Write,
+) -> &'a theme::Theme {
     let Some(name) = cfg
         .and_then(|c| c.theme.as_deref())
         .filter(|n| !n.is_empty())
     else {
-        return theme::default_theme();
+        return registry
+            .lookup("default")
+            .expect("default theme is always in the registry");
     };
-    match theme::built_in(name) {
+    match registry.lookup(name) {
         Some(t) => t,
         None => {
             let _ = writeln!(stderr, "linesmith: unknown theme '{name}'; using 'default'");
-            theme::default_theme()
+            registry
+                .lookup("default")
+                .expect("default theme is always in the registry")
         }
     }
 }
@@ -293,6 +343,7 @@ fn check_config(
     cfg: Option<&config::Config>,
     load_error: Option<config::ConfigError>,
     config_warnings: Vec<String>,
+    registry: &theme::ThemeRegistry,
     stderr: &mut dyn Write,
 ) -> u8 {
     // `--check-config` is the CI / editor contract for strict
@@ -328,7 +379,7 @@ fn check_config(
         warn_count += 1;
     });
     if let Some(name) = cfg.theme.as_deref().filter(|n| !n.is_empty()) {
-        if theme::built_in(name).is_none() {
+        if registry.lookup(name).is_none() {
             let _ = writeln!(stderr, "linesmith: unknown theme '{name}'; using 'default'");
             warn_count += 1;
         }
@@ -838,6 +889,267 @@ mod tests {
         );
     }
 
+    // --- user theme loading (lsm-qp5) ---
+
+    #[test]
+    fn user_theme_from_disk_renders_with_configured_palette() {
+        let dir = tempdir();
+        let themes_dir = dir.path().join(".config/linesmith/themes");
+        std::fs::create_dir_all(&themes_dir).unwrap();
+        std::fs::write(
+            themes_dir.join("neon.toml"),
+            r##"
+                name = "neon"
+                [roles]
+                foreground = "#ffffff"
+                background = "#000000"
+                muted      = "#888888"
+                primary    = "#ff00ff"
+                accent     = "#00ffff"
+                success    = "#00ff00"
+                warning    = "#ffff00"
+                error      = "#ff0000"
+                info       = "#0080ff"
+            "##,
+        )
+        .unwrap();
+
+        let cfg_dir = dir.path().join(".config/linesmith");
+        std::fs::write(cfg_dir.join("config.toml"), "theme = \"neon\"\n").unwrap();
+
+        let json = br#"{
+            "model": { "display_name": "C" },
+            "workspace": { "project_dir": "/x" }
+        }"#;
+        let env = CliEnv {
+            home: Some(dir.path().to_string_lossy().into_owned()),
+            color_capability: Some(theme::Capability::TrueColor),
+            ..CliEnv::for_tests()
+        };
+        let (code, stdout, _stderr) = run_cli_main(&[], json, &env);
+        assert_eq!(code, 0);
+        // Primary (#ff00ff = 255,0,255) wraps model; Info (#0080ff =
+        // 0,128,255) wraps workspace.
+        assert_eq!(
+            stdout,
+            "\x1b[38;2;255;0;255mC\x1b[0m \x1b[38;2;0;128;255mx\x1b[0m\n"
+        );
+    }
+
+    #[test]
+    fn unknown_user_theme_name_falls_back_to_default_with_warning() {
+        let dir = tempdir();
+        std::fs::create_dir_all(dir.path().join(".config/linesmith/themes")).unwrap();
+        let cfg_dir = dir.path().join(".config/linesmith");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(cfg_dir.join("config.toml"), "theme = \"nonexistent\"\n").unwrap();
+        let env = CliEnv {
+            home: Some(dir.path().to_string_lossy().into_owned()),
+            ..CliEnv::for_tests()
+        };
+        let json = br#"{
+            "model": { "display_name": "C" },
+            "workspace": { "project_dir": "/x" }
+        }"#;
+        let (code, stdout, stderr) = run_cli_main(&[], json, &env);
+        assert_eq!(code, 0);
+        assert_eq!(stdout, "C x\n");
+        assert!(stderr.contains("unknown theme 'nonexistent'"));
+    }
+
+    #[test]
+    fn broken_user_theme_file_warns_but_does_not_abort_startup() {
+        let dir = tempdir();
+        let themes_dir = dir.path().join(".config/linesmith/themes");
+        std::fs::create_dir_all(&themes_dir).unwrap();
+        std::fs::write(themes_dir.join("broken.toml"), "not valid toml [[").unwrap();
+        let env = CliEnv {
+            home: Some(dir.path().to_string_lossy().into_owned()),
+            ..CliEnv::for_tests()
+        };
+        let json = br#"{
+            "model": { "display_name": "C" },
+            "workspace": { "project_dir": "/x" }
+        }"#;
+        let (code, stdout, stderr) = run_cli_main(&[], json, &env);
+        assert_eq!(code, 0);
+        assert_eq!(stdout, "C x\n");
+        assert!(stderr.contains("broken.toml"));
+    }
+
+    #[test]
+    fn check_config_accepts_user_theme_name() {
+        // Regression guard: validation used to consult only built-ins,
+        // so a `theme = "myuser"` that exists on disk was flagged.
+        let dir = tempdir();
+        let themes_dir = dir.path().join(".config/linesmith/themes");
+        std::fs::create_dir_all(&themes_dir).unwrap();
+        std::fs::write(
+            themes_dir.join("myuser.toml"),
+            r##"
+                name = "myuser"
+                [roles]
+                foreground = "#ffffff"
+                background = "#000000"
+                muted      = "#888888"
+                primary    = "#ff00ff"
+                accent     = "#00ffff"
+                success    = "#00ff00"
+                warning    = "#ffff00"
+                error      = "#ff0000"
+                info       = "#0080ff"
+            "##,
+        )
+        .unwrap();
+        let cfg_dir = dir.path().join(".config/linesmith");
+        std::fs::write(cfg_dir.join("config.toml"), "theme = \"myuser\"\n").unwrap();
+        let env = CliEnv {
+            home: Some(dir.path().to_string_lossy().into_owned()),
+            ..CliEnv::for_tests()
+        };
+        let (code, _stdout, stderr) = run_cli_main(&["--check-config"], b"", &env);
+        assert_eq!(code, 0);
+        assert!(stderr.contains("config ok"));
+        assert!(!stderr.contains("unknown theme"));
+    }
+
+    // --- themes list subcommand ---
+
+    #[test]
+    fn themes_list_prints_every_built_in_to_stdout() {
+        let (code, stdout, _stderr) = run_cli_main(&["themes", "list"], b"", &CliEnv::for_tests());
+        assert_eq!(code, 0);
+        for name in [
+            "default",
+            "minimal",
+            "catppuccin-latte",
+            "catppuccin-frappe",
+            "catppuccin-macchiato",
+            "catppuccin-mocha",
+        ] {
+            assert!(
+                stdout.contains(&format!("{name}\tbuilt-in")),
+                "missing '{name}\\tbuilt-in' in:\n{stdout}"
+            );
+        }
+    }
+
+    #[test]
+    fn themes_list_includes_user_themes_with_source_path() {
+        let dir = tempdir();
+        let themes_dir = dir.path().join(".config/linesmith/themes");
+        std::fs::create_dir_all(&themes_dir).unwrap();
+        let user_theme = themes_dir.join("neon.toml");
+        std::fs::write(
+            &user_theme,
+            r##"
+                name = "neon"
+                [roles]
+                foreground = "#ffffff"
+                background = "#000000"
+                muted      = "#888888"
+                primary    = "#ff00ff"
+                accent     = "#00ffff"
+                success    = "#00ff00"
+                warning    = "#ffff00"
+                error      = "#ff0000"
+                info       = "#0080ff"
+            "##,
+        )
+        .unwrap();
+        let env = CliEnv {
+            home: Some(dir.path().to_string_lossy().into_owned()),
+            ..CliEnv::for_tests()
+        };
+        let (code, stdout, _stderr) = run_cli_main(&["themes", "list"], b"", &env);
+        assert_eq!(code, 0);
+        assert!(
+            stdout.contains("neon\t"),
+            "missing user theme line:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(user_theme.to_str().unwrap()),
+            "missing source path in:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn user_themes_dir_prefers_xdg_over_home() {
+        // Both env vars set, different themes in each dir: the one
+        // under $XDG_CONFIG_HOME/linesmith/themes wins. Without this
+        // test, a swap of the precedence (or a bug in the empty-filter
+        // on xdg_config_home) slips through silently.
+        let dir = tempdir();
+        let xdg_themes = dir.path().join("xdg/linesmith/themes");
+        let home_themes = dir.path().join("home/.config/linesmith/themes");
+        std::fs::create_dir_all(&xdg_themes).unwrap();
+        std::fs::create_dir_all(&home_themes).unwrap();
+        std::fs::write(
+            xdg_themes.join("xdg_theme.toml"),
+            r##"
+                name = "xdgonly"
+                [roles]
+                foreground = "#aaaaaa"
+                background = "#000000"
+                muted = "#888888"
+                primary = "#ff00ff"
+                accent = "#00ffff"
+                success = "#00ff00"
+                warning = "#ffff00"
+                error = "#ff0000"
+                info = "#0080ff"
+            "##,
+        )
+        .unwrap();
+        std::fs::write(
+            home_themes.join("home_theme.toml"),
+            r##"
+                name = "homeonly"
+                [roles]
+                foreground = "#bbbbbb"
+                background = "#000000"
+                muted = "#888888"
+                primary = "#ff00ff"
+                accent = "#00ffff"
+                success = "#00ff00"
+                warning = "#ffff00"
+                error = "#ff0000"
+                info = "#0080ff"
+            "##,
+        )
+        .unwrap();
+        let env = CliEnv {
+            xdg_config_home: Some(dir.path().join("xdg").to_string_lossy().into_owned()),
+            home: Some(dir.path().join("home").to_string_lossy().into_owned()),
+            ..CliEnv::for_tests()
+        };
+        let (code, stdout, _stderr) = run_cli_main(&["themes", "list"], b"", &env);
+        assert_eq!(code, 0);
+        assert!(
+            stdout.contains("xdgonly"),
+            "XDG theme missing from list:\n{stdout}",
+        );
+        assert!(
+            !stdout.contains("homeonly"),
+            "HOME theme leaked in when XDG was set:\n{stdout}",
+        );
+    }
+
+    #[test]
+    fn unknown_subcommand_exits_two() {
+        let (code, _stdout, stderr) =
+            run_cli_main(&["bogus", "command"], b"", &CliEnv::for_tests());
+        assert_eq!(code, 2);
+        assert!(stderr.contains("Try --help"));
+    }
+
+    #[test]
+    fn themes_without_subcommand_exits_two() {
+        let (code, _stdout, stderr) = run_cli_main(&["themes"], b"", &CliEnv::for_tests());
+        assert_eq!(code, 2);
+        assert!(stderr.contains("Try --help"));
+    }
+
     #[test]
     fn no_color_capability_strips_theme_under_default() {
         // Even the `default` theme (Palette16 values) emits nothing
@@ -1120,12 +1432,18 @@ mod tests {
     }
 
     fn tempdir() -> TempDir {
+        // Timestamp + monotonic counter: parallel tests can hit the
+        // same nanosecond under cargo test's thread pool, so the
+        // counter is the last line of defense against collisions.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let base = std::env::temp_dir().join(format!(
-            "linesmith-driver-test-{}",
+            "linesmith-driver-test-{}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
         std::fs::create_dir_all(&base).expect("mkdir");
         TempDir(base)

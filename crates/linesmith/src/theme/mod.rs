@@ -11,6 +11,9 @@
 use std::fmt::Write;
 
 mod catppuccin;
+pub mod user;
+
+pub use user::{RegisteredTheme, ThemeRegistry, ThemeSource};
 
 /// Semantic color slot a segment targets. Themes map every role to a
 /// concrete color; segments never reference hex values directly.
@@ -220,6 +223,18 @@ impl Theme {
     #[must_use]
     pub fn name(&self) -> &'static str {
         self.name
+    }
+
+    /// Crate-internal constructor for themes loaded from user files.
+    /// Keeps the private-fields contract intact (so external callers
+    /// can't mint impostor themes) while letting the `user` loader
+    /// produce themes from parsed TOML.
+    #[must_use]
+    pub(super) fn from_user_parts(
+        name: &'static str,
+        colors: [Option<Color>; Role::COUNT],
+    ) -> Self {
+        Self { name, colors }
     }
 
     /// Resolve a role to its color, following the extended-role

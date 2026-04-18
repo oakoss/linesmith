@@ -816,12 +816,15 @@ mod tests {
     }
 
     fn tempdir() -> TempDir {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let base = std::env::temp_dir().join(format!(
-            "linesmith-config-test-{}",
+            "linesmith-config-test-{}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
         ));
         std::fs::create_dir_all(&base).expect("mkdir");
         TempDir(base)
