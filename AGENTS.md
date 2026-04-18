@@ -159,7 +159,7 @@ pre-commit`) flushes any pending jsonl export into the same commit.
 
 ```text
 # 1. Finish the work, then:
-bd close lsm-xyz --reason="Shipped in this commit: <one-line summary>"
+bd close lsm-xyz --reason="<one-line summary of what shipped>"
 
 # 2. Stage code + the jsonl bd just updated:
 git add <files> .beads/issues.jsonl
@@ -188,4 +188,4 @@ When ending a work session:
 3. **Update issue status.** Close finished work with `bd close <id>`; update in-progress items.
 4. **Commit if the user asks.** Do not commit proactively.
 
-Note: this project is currently local-only (no git remote). Once a remote is configured, session completion will also require `git push` + `bd dolt push`.
+Note: this project is local-only until a GitHub remote is added. Beads state syncs via the git-tracked `.beads/issues.jsonl` (no Dolt remote); `git push` is the only sync step.
