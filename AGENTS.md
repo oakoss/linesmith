@@ -188,4 +188,4 @@ When ending a work session:
 3. **Update issue status.** Close finished work with `bd close <id>`; update in-progress items.
 4. **Commit if the user asks.** Do not commit proactively.
 
-Note: this project is local-only until a GitHub remote is added. Beads state syncs via the git-tracked `.beads/issues.jsonl` (no Dolt remote); `git push` is the only sync step.
+Note: beads state syncs via the git-tracked `.beads/issues.jsonl` (no Dolt remote). After committing, `git push` to `origin` (`git@github.com:oakoss/linesmith.git`) is the only sync step — only push when the user asks.
