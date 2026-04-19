@@ -1,0 +1,13 @@
+# linesmith preset: developer
+# Full developer statusline: model, workspace, context, cost, rate limits.
+# The `workspace` segment surfaces the worktree name.
+
+[line]
+segments = [
+  "model",
+  "workspace",
+  "context_window",
+  "cost",
+  "rate_limit_5h",
+  "rate_limit_7d",
+]

@@ -1,0 +1,11 @@
+# linesmith preset: cost-focused
+# Spend + rate-limit visibility for session-budget tracking.
+
+[line]
+segments = [
+  "model",
+  "context_window",
+  "cost",
+  "rate_limit_5h",
+  "rate_limit_7d",
+]

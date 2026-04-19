@@ -24,8 +24,8 @@ pub enum ColorOverride {
 }
 
 /// What the binary should do after parsing. `Run` is the common case;
-/// `Help`, `Version`, and `ThemesList` are meta-commands that print
-/// and exit.
+/// `Help`, `Version`, `ThemesList`, `PresetsList`, and `PresetsApply`
+/// are meta-commands that print / write and exit.
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Action {
@@ -33,6 +33,12 @@ pub enum Action {
     Help,
     Version,
     ThemesList,
+    PresetsList,
+    PresetsApply {
+        name: String,
+        force: bool,
+        config: Option<PathBuf>,
+    },
 }
 
 /// Help text. Kept short; full docs live at
@@ -43,17 +49,22 @@ linesmith — status line for Claude Code and other AI coding CLIs
 USAGE:
     linesmith [OPTIONS]
     linesmith themes list
+    linesmith presets list
+    linesmith presets apply <NAME> [--force]
 
 OPTIONS:
     -c, --config <PATH>    Config file path (overrides default resolution)
         --check-config     Validate config and exit
         --no-color         Strip all color (equivalent to NO_COLOR=1)
         --force-color      Emit color even in non-TTY output
+        --force            For `presets apply`: overwrite without confirmation
     -h, --help             Print this help text
     -V, --version          Print version
 
 SUBCOMMANDS:
     themes list            List available themes (built-in + user)
+    presets list           List available config presets
+    presets apply <NAME>   Write a preset's config.toml to the resolved path
 
 Reads a statusline JSON payload on stdin; writes the rendered line to
 stdout. See docs/specs/input-schema.md for the payload contract.
@@ -69,6 +80,7 @@ where
     let mut parser = lexopt::Parser::from_args(raw);
     let mut args = CliArgs::default();
     let mut positional: Vec<OsString> = Vec::new();
+    let mut force = false;
     while let Some(arg) = parser.next()? {
         match arg {
             Short('c') | Long("config") => {
@@ -89,22 +101,41 @@ where
             Long("force-color") => {
                 args.color_override = Some(ColorOverride::Always);
             }
+            Long("force") => {
+                // Today `--force` is a `presets apply` modifier hoisted
+                // to top-level parsing. If a second subcommand-specific
+                // flag lands (e.g. `presets show --plain`), rewrite
+                // `dispatch_subcommand` to own its own parser slice
+                // rather than growing parallel top-level bools.
+                force = true;
+            }
             Short('h') | Long("help") => return Ok(Action::Help),
             Short('V') | Long("version") => return Ok(Action::Version),
             Value(v) => positional.push(v),
             _ => return Err(arg.unexpected()),
         }
     }
-    match dispatch_subcommand(&positional)? {
-        Some(action) => Ok(action),
-        None => Ok(Action::Run(args)),
+    let action = match dispatch_subcommand(&positional, force, args.config.clone())? {
+        Some(action) => action,
+        None => Action::Run(args),
+    };
+    // `--force` is a `presets apply` modifier; accepting it on any other
+    // action would encourage muscle-memory misuse (e.g. `linesmith
+    // --force themes list` looks plausible and would otherwise be a
+    // no-op).
+    if force && !matches!(action, Action::PresetsApply { .. }) {
+        return Err(lexopt::Error::UnexpectedOption("--force".to_string()));
     }
+    Ok(action)
 }
 
-/// Recognize subcommands from positional args. Today only
-/// `themes list` is supported; anything else returns a clear error
-/// rather than silently falling through to `Run`.
-fn dispatch_subcommand(positional: &[OsString]) -> Result<Option<Action>, lexopt::Error> {
+/// Recognize subcommands from positional args. Anything not matched
+/// returns a clear error rather than silently falling through to `Run`.
+fn dispatch_subcommand(
+    positional: &[OsString],
+    force: bool,
+    config: Option<PathBuf>,
+) -> Result<Option<Action>, lexopt::Error> {
     if positional.is_empty() {
         return Ok(None);
     }
@@ -120,6 +151,35 @@ fn dispatch_subcommand(positional: &[OsString]) -> Result<Option<Action>, lexopt
                 }),
                 None => Err(lexopt::Error::MissingValue {
                     option: Some("themes <subcommand>".to_string()),
+                }),
+            }
+        }
+        "presets" => {
+            let sub = positional.get(1).map(|s| s.to_string_lossy().into_owned());
+            match sub.as_deref() {
+                Some("list") if positional.len() == 2 => Ok(Some(Action::PresetsList)),
+                Some("apply") => {
+                    let name = positional.get(2).ok_or(lexopt::Error::MissingValue {
+                        option: Some("presets apply <NAME>".to_string()),
+                    })?;
+                    if positional.len() > 3 {
+                        return Err(lexopt::Error::UnexpectedValue {
+                            option: "presets apply".to_string(),
+                            value: positional[3].to_string_lossy().to_string().into(),
+                        });
+                    }
+                    Ok(Some(Action::PresetsApply {
+                        name: name.to_string_lossy().into_owned(),
+                        force,
+                        config,
+                    }))
+                }
+                Some(other) => Err(lexopt::Error::UnexpectedValue {
+                    option: "presets".to_string(),
+                    value: other.to_string().into(),
+                }),
+                None => Err(lexopt::Error::MissingValue {
+                    option: Some("presets <subcommand>".to_string()),
                 }),
             }
         }
@@ -298,6 +358,130 @@ mod tests {
     fn unknown_top_level_subcommand_errors() {
         let err = parse_args(&["bogus"]).unwrap_err();
         assert!(matches!(err, lexopt::Error::UnexpectedValue { .. }));
+    }
+
+    #[test]
+    fn presets_list_subcommand_parses() {
+        assert_eq!(
+            parse_args(&["presets", "list"]).expect("ok"),
+            Action::PresetsList
+        );
+    }
+
+    #[test]
+    fn presets_apply_subcommand_parses_name() {
+        assert_eq!(
+            parse_args(&["presets", "apply", "developer"]).expect("ok"),
+            Action::PresetsApply {
+                name: "developer".to_string(),
+                force: false,
+                config: None,
+            }
+        );
+    }
+
+    #[test]
+    fn presets_apply_with_force_flag_sets_force() {
+        let got = parse_args(&["presets", "apply", "developer", "--force"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::PresetsApply {
+                name: "developer".to_string(),
+                force: true,
+                config: None,
+            }
+        );
+    }
+
+    #[test]
+    fn presets_apply_without_name_errors() {
+        let err = parse_args(&["presets", "apply"]).unwrap_err();
+        assert!(matches!(err, lexopt::Error::MissingValue { .. }));
+    }
+
+    #[test]
+    fn presets_apply_with_extra_positional_errors() {
+        let err = parse_args(&["presets", "apply", "developer", "extra"]).unwrap_err();
+        assert!(matches!(err, lexopt::Error::UnexpectedValue { .. }));
+    }
+
+    #[test]
+    fn presets_without_subcommand_errors() {
+        let err = parse_args(&["presets"]).unwrap_err();
+        assert!(matches!(err, lexopt::Error::MissingValue { .. }));
+    }
+
+    #[test]
+    fn presets_with_unknown_subcommand_errors() {
+        let err = parse_args(&["presets", "delete", "minimal"]).unwrap_err();
+        assert!(matches!(err, lexopt::Error::UnexpectedValue { .. }));
+    }
+
+    #[test]
+    fn presets_apply_force_before_subcommand_also_parses() {
+        // lexopt interleaves flags and positionals; pinning both
+        // orderings prevents a parser regression that accepts only one.
+        let got = parse_args(&["--force", "presets", "apply", "developer"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::PresetsApply {
+                name: "developer".to_string(),
+                force: true,
+                config: None,
+            }
+        );
+    }
+
+    #[test]
+    fn force_flag_rejected_outside_presets_apply() {
+        // `--force` only has meaning for `presets apply`; using it with
+        // any other action should error rather than silently no-op.
+        for args in [
+            vec!["--force"],
+            vec!["--force", "themes", "list"],
+            vec!["--force", "presets", "list"],
+            vec!["--force", "--check-config"],
+        ] {
+            let err = parse_args(&args).unwrap_err();
+            assert!(
+                matches!(err, lexopt::Error::UnexpectedOption(ref s) if s == "--force"),
+                "args {args:?} should reject --force, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn presets_apply_threads_config_flag_into_action() {
+        let got = parse_args(&[
+            "--config",
+            "/tmp/custom.toml",
+            "presets",
+            "apply",
+            "minimal",
+        ])
+        .expect("ok");
+        assert_eq!(
+            got,
+            Action::PresetsApply {
+                name: "minimal".to_string(),
+                force: false,
+                config: Some(PathBuf::from("/tmp/custom.toml")),
+            }
+        );
+    }
+
+    #[test]
+    fn presets_apply_empty_string_name_still_parses_as_apply() {
+        // Driver will reject empty name via the registry lookup; CLI
+        // only validates shape here.
+        assert_eq!(
+            parse_args(&["presets", "apply", ""]).expect("ok"),
+            Action::PresetsApply {
+                name: String::new(),
+                force: false,
+                config: None,
+            }
+        );
     }
 
     #[test]

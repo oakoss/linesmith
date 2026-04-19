@@ -1,0 +1,6 @@
+# linesmith preset: worktree-heavy
+# Branch / worktree identity prominent; less metadata noise.
+# The `workspace` segment surfaces the worktree name.
+
+[line]
+segments = ["model", "workspace", "context_window"]

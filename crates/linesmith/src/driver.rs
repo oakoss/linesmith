@@ -5,9 +5,9 @@
 //! and a hand-built `CliEnv`.
 
 use crate::segments::builder::build_segments;
-use crate::{cli, config, detect_terminal_width, run_with_context, theme, RenderContext};
-use std::io::{Read, Write};
-use std::path::PathBuf;
+use crate::{cli, config, detect_terminal_width, presets, run_with_context, theme, RenderContext};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 
 /// `NO_COLOR`-style flag: any non-empty value means "on." Per
 /// no-color.org.
@@ -129,6 +129,12 @@ where
             0
         }
         cli::Action::ThemesList => themes_list(stdout, stderr, env),
+        cli::Action::PresetsList => presets_list(stdout),
+        cli::Action::PresetsApply {
+            name,
+            force,
+            config,
+        } => presets_apply(&name, force, config, stdin, stdout, stderr, env),
         cli::Action::Run(args) => run_cli(args, stdin, stdout, stderr, env),
     }
 }
@@ -143,6 +149,145 @@ fn themes_list(stdout: &mut dyn Write, stderr: &mut dyn Write, env: &CliEnv) -> 
         let _ = writeln!(stdout, "{}\t{}", rt.theme.name(), source);
     }
     0
+}
+
+fn presets_list(stdout: &mut dyn Write) -> u8 {
+    for name in presets::names() {
+        let _ = writeln!(stdout, "{name}");
+    }
+    0
+}
+
+/// Write a preset's body to the resolved config path. Handles
+/// backup-on-overwrite, the `--force` short-circuit, and the y/N
+/// confirmation prompt. Returns 0 on success, 1 on user-facing errors
+/// (unknown preset, aborted overwrite, existing `.bak`, I/O failure,
+/// unresolved path).
+fn presets_apply(
+    name: &str,
+    force: bool,
+    config_override: Option<PathBuf>,
+    stdin: impl Read,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    env: &CliEnv,
+) -> u8 {
+    let Some(body) = presets::body(name) else {
+        let _ = writeln!(stderr, "linesmith: unknown preset '{name}'");
+        let _ = writeln!(stderr, "available presets:");
+        for known in presets::names() {
+            let _ = writeln!(stderr, "  {known}");
+        }
+        return 1;
+    };
+
+    let Some(resolved) = config::resolve_config_path(
+        config_override,
+        env.linesmith_config.as_deref(),
+        env.xdg_config_home.as_deref(),
+        env.home.as_deref(),
+    ) else {
+        let _ = writeln!(
+            stderr,
+            "linesmith: cannot resolve a config path (set XDG_CONFIG_HOME or HOME)"
+        );
+        return 1;
+    };
+    let path = resolved.path;
+    let backup = path.with_extension("toml.bak");
+    let mut backup_written: Option<&Path> = None;
+
+    // TOCTOU between `exists()` and `rename`/`write` is the downstream
+    // call's problem: if the file vanishes mid-call, `fs::rename` /
+    // `fs::write` surface their own error and we return 1. Don't "fix"
+    // this by precomputing a handle — concurrent editors of the same
+    // config path aren't a supported workflow.
+    if path.exists() {
+        if !force && !confirm_overwrite(&path, stdin, stderr) {
+            let _ = writeln!(stderr, "linesmith: aborted; config.toml unchanged");
+            return 1;
+        }
+        // Refuse to clobber an existing backup: the user probably wants
+        // two generations preserved. `--force` says "I really mean it."
+        if backup.exists() {
+            if !force {
+                let _ = writeln!(
+                    stderr,
+                    "linesmith: {} already exists; rerun with --force to replace it",
+                    backup.display()
+                );
+                return 1;
+            }
+            // Windows' `fs::rename` fails when the destination exists;
+            // pre-remove so `--force` works the same on every platform.
+            if let Err(e) = std::fs::remove_file(&backup) {
+                let _ = writeln!(
+                    stderr,
+                    "linesmith: could not remove existing backup {}: {e}",
+                    backup.display()
+                );
+                return 1;
+            }
+        }
+        if let Err(e) = std::fs::rename(&path, &backup) {
+            let _ = writeln!(
+                stderr,
+                "linesmith: could not back up {} to {}: {e}",
+                path.display(),
+                backup.display()
+            );
+            return 1;
+        }
+        let _ = writeln!(
+            stderr,
+            "linesmith: backed up previous config to {}",
+            backup.display()
+        );
+        backup_written = Some(&backup);
+    } else if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            let _ = writeln!(
+                stderr,
+                "linesmith: could not create {}: {e}",
+                parent.display()
+            );
+            return 1;
+        }
+    }
+
+    if let Err(e) = std::fs::write(&path, body) {
+        let _ = writeln!(stderr, "linesmith: write {}: {e}", path.display());
+        if let Some(bak) = backup_written {
+            let _ = writeln!(
+                stderr,
+                "linesmith: your previous config is preserved at {}",
+                bak.display()
+            );
+        }
+        return 1;
+    }
+    let _ = writeln!(stdout, "wrote preset '{name}' to {}", path.display());
+    0
+}
+
+/// Prompt once on stderr; accept `y` / `yes` (case-insensitive) as yes,
+/// everything else as no. EOF is treated as "no" so non-interactive
+/// callers abort rather than overwrite.
+fn confirm_overwrite(path: &Path, stdin: impl Read, stderr: &mut dyn Write) -> bool {
+    let _ = write!(stderr, "overwrite {}? [y/N] ", path.display());
+    let _ = stderr.flush();
+    let mut line = String::new();
+    let mut reader = BufReader::new(stdin);
+    if reader.read_line(&mut line).is_err() {
+        return false;
+    }
+    parse_confirmation(&line)
+}
+
+/// Treat `y` / `yes` (case-insensitive, surrounding whitespace allowed)
+/// as confirmation. Everything else, including empty input, is rejected.
+fn parse_confirmation(input: &str) -> bool {
+    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 fn run_cli(
@@ -1429,6 +1574,262 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn env_with_home(dir: &Path) -> CliEnv {
+        CliEnv {
+            linesmith_config: None,
+            xdg_config_home: None,
+            home: Some(dir.to_string_lossy().into_owned()),
+            no_color: false,
+            force_color: false,
+            terminal_width: Some(200),
+            color_capability: Some(theme::Capability::None),
+        }
+    }
+
+    #[test]
+    fn presets_list_prints_every_preset_name() {
+        let (code, stdout, _stderr) = run_cli_main(&["presets", "list"], b"", &CliEnv::for_tests());
+        assert_eq!(code, 0);
+        for name in crate::presets::names() {
+            assert!(stdout.contains(name), "missing '{name}' in:\n{stdout}");
+        }
+    }
+
+    #[test]
+    fn presets_apply_writes_parsed_config_to_resolved_path() {
+        use std::str::FromStr;
+        let dir = tempdir();
+        let env = env_with_home(dir.path());
+        let (code, stdout, stderr) = run_cli_main(&["presets", "apply", "minimal"], b"", &env);
+        assert_eq!(code, 0, "stderr:\n{stderr}");
+        let expected = dir.path().join(".config/linesmith/config.toml");
+        assert!(expected.exists(), "config.toml not written");
+        let written = std::fs::read_to_string(&expected).unwrap();
+        let cfg = config::Config::from_str(&written).expect("round-trips");
+        assert_eq!(
+            cfg.line.expect("has [line]").segments,
+            vec!["model".to_string(), "context_window".to_string()]
+        );
+        assert!(stdout.contains("wrote preset 'minimal'"));
+    }
+
+    #[test]
+    fn presets_apply_unknown_name_errors_and_lists_valid() {
+        let dir = tempdir();
+        let env = env_with_home(dir.path());
+        let (code, _stdout, stderr) = run_cli_main(&["presets", "apply", "bogus"], b"", &env);
+        assert_eq!(code, 1);
+        assert!(stderr.contains("unknown preset 'bogus'"));
+        assert!(stderr.contains("developer"));
+    }
+
+    #[test]
+    fn presets_apply_prompts_on_existing_config_and_accepts_y() {
+        let dir = tempdir();
+        let cfg = dir.path().join(".config/linesmith/config.toml");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "# prior content\n").unwrap();
+        let env = env_with_home(dir.path());
+        let (code, _stdout, stderr) = run_cli_main(&["presets", "apply", "minimal"], b"y\n", &env);
+        assert_eq!(code, 0);
+        let backup = dir.path().join(".config/linesmith/config.toml.bak");
+        assert!(backup.exists(), "expected .bak");
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            "# prior content\n"
+        );
+        assert!(std::fs::read_to_string(&cfg)
+            .unwrap()
+            .contains("preset: minimal"));
+        // Prompt + backup-success line both land on stderr so stdout
+        // stays clean for pipes.
+        assert!(stderr.contains("overwrite"));
+        assert!(stderr.contains("backed up previous config to"));
+    }
+
+    #[test]
+    fn presets_apply_prompt_rejects_on_n_and_leaves_config_untouched() {
+        let dir = tempdir();
+        let cfg = dir.path().join(".config/linesmith/config.toml");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "# prior content\n").unwrap();
+        let env = env_with_home(dir.path());
+        let (code, _stdout, stderr) = run_cli_main(&["presets", "apply", "minimal"], b"n\n", &env);
+        assert_eq!(code, 1);
+        assert!(stderr.contains("aborted"));
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "# prior content\n");
+    }
+
+    #[test]
+    fn presets_apply_force_skips_prompt_and_backs_up() {
+        let dir = tempdir();
+        let cfg = dir.path().join(".config/linesmith/config.toml");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "# prior content\n").unwrap();
+        let env = env_with_home(dir.path());
+        let (code, _stdout, _stderr) =
+            run_cli_main(&["presets", "apply", "developer", "--force"], b"", &env);
+        assert_eq!(code, 0);
+        let backup = dir.path().join(".config/linesmith/config.toml.bak");
+        assert!(backup.exists());
+        assert!(std::fs::read_to_string(&cfg)
+            .unwrap()
+            .contains("preset: developer"));
+    }
+
+    #[test]
+    fn presets_apply_eof_without_force_aborts() {
+        let dir = tempdir();
+        let cfg = dir.path().join(".config/linesmith/config.toml");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "# prior\n").unwrap();
+        let env = env_with_home(dir.path());
+        let (code, _stdout, stderr) = run_cli_main(&["presets", "apply", "minimal"], b"", &env);
+        assert_eq!(code, 1);
+        assert!(stderr.contains("aborted"));
+    }
+
+    #[test]
+    fn presets_apply_refuses_to_clobber_existing_backup_without_force() {
+        let dir = tempdir();
+        let cfg = dir.path().join(".config/linesmith/config.toml");
+        let bak = dir.path().join(".config/linesmith/config.toml.bak");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "# current\n").unwrap();
+        std::fs::write(&bak, "# older generation\n").unwrap();
+        let env = env_with_home(dir.path());
+        let (code, _stdout, stderr) = run_cli_main(&["presets", "apply", "minimal"], b"y\n", &env);
+        assert_eq!(code, 1);
+        assert!(stderr.contains("already exists"));
+        assert!(stderr.contains("--force"));
+        // Both files are untouched.
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "# current\n");
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            "# older generation\n"
+        );
+    }
+
+    #[test]
+    fn presets_apply_force_replaces_existing_backup() {
+        let dir = tempdir();
+        let cfg = dir.path().join(".config/linesmith/config.toml");
+        let bak = dir.path().join(".config/linesmith/config.toml.bak");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "# current\n").unwrap();
+        std::fs::write(&bak, "# older generation\n").unwrap();
+        let env = env_with_home(dir.path());
+        let (code, _stdout, _stderr) =
+            run_cli_main(&["presets", "apply", "minimal", "--force"], b"", &env);
+        assert_eq!(code, 0);
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "# current\n");
+        assert!(std::fs::read_to_string(&cfg)
+            .unwrap()
+            .contains("preset: minimal"));
+    }
+
+    #[test]
+    fn presets_apply_honors_explicit_config_flag_over_xdg_path() {
+        let dir = tempdir();
+        let custom = dir.path().join("custom-preset.toml");
+        let env = env_with_home(dir.path());
+        let (code, _stdout, stderr) = run_cli_main(
+            &[
+                "--config",
+                custom.to_str().unwrap(),
+                "presets",
+                "apply",
+                "minimal",
+            ],
+            b"",
+            &env,
+        );
+        assert_eq!(code, 0, "stderr:\n{stderr}");
+        assert!(custom.exists(), "expected preset written to --config path");
+        // XDG fallback must NOT have been written.
+        assert!(!dir.path().join(".config/linesmith/config.toml").exists());
+    }
+
+    #[test]
+    fn presets_apply_creates_missing_parent_dirs() {
+        // Fresh HOME with nothing under `.config/`: the resolver
+        // produces `<HOME>/.config/linesmith/config.toml` and
+        // presets_apply must `create_dir_all` both intermediate dirs.
+        let dir = tempdir();
+        assert!(!dir.path().join(".config").exists());
+        let env = env_with_home(dir.path());
+        let (code, _stdout, stderr) = run_cli_main(&["presets", "apply", "minimal"], b"", &env);
+        assert_eq!(code, 0, "stderr:\n{stderr}");
+        assert!(dir.path().join(".config/linesmith").is_dir());
+        assert!(dir.path().join(".config/linesmith/config.toml").exists());
+    }
+
+    #[test]
+    fn presets_apply_empty_name_fails_with_unknown_preset() {
+        let dir = tempdir();
+        let env = env_with_home(dir.path());
+        let (code, _stdout, stderr) = run_cli_main(&["presets", "apply", ""], b"", &env);
+        assert_eq!(code, 1);
+        assert!(stderr.contains("unknown preset ''"));
+    }
+
+    #[test]
+    fn presets_apply_write_failure_reports_stderr_and_exits_one() {
+        // Parent is a regular file, so `create_dir_all` fails and the
+        // write never starts. Pins the stderr-plus-exit-1 contract on
+        // the I/O-failure branch without depending on filesystem
+        // permissions (which vary across CI).
+        let dir = tempdir();
+        let not_a_dir = dir.path().join(".config/linesmith");
+        std::fs::create_dir_all(not_a_dir.parent().unwrap()).unwrap();
+        std::fs::write(&not_a_dir, "I am a file, not a directory").unwrap();
+        let env = env_with_home(dir.path());
+        let (code, _stdout, stderr) = run_cli_main(&["presets", "apply", "minimal"], b"", &env);
+        assert_eq!(code, 1);
+        assert!(
+            stderr.contains("could not create"),
+            "expected 'could not create' diagnostic, got: {stderr}"
+        );
+    }
+
+    #[test]
+    fn presets_list_ignores_force_flag_by_rejecting_it() {
+        // Pins the "force outside apply errors" contract from the CLI
+        // layer through to driver behavior.
+        let (code, _stdout, stderr) =
+            run_cli_main(&["--force", "presets", "list"], b"", &CliEnv::for_tests());
+        assert_eq!(code, 2, "CLI parse error should exit 2");
+        assert!(stderr.contains("--force"));
+    }
+
+    #[test]
+    fn parse_confirmation_accepts_y_yes_case_insensitive_and_trims_whitespace() {
+        for ok in [
+            "y", "Y", "yes", "YES", "Yes", "  y  \n", "yes\r\n", " YES \t",
+        ] {
+            assert!(super::parse_confirmation(ok), "expected yes for {ok:?}");
+        }
+        for no in ["", "\n", " ", "yeah", "ye", "no", "n", "maybe", "yess"] {
+            assert!(!super::parse_confirmation(no), "expected no for {no:?}");
+        }
+    }
+
+    #[test]
+    fn presets_apply_without_resolvable_path_errors() {
+        let env = CliEnv {
+            linesmith_config: None,
+            xdg_config_home: None,
+            home: None,
+            no_color: false,
+            force_color: false,
+            terminal_width: Some(200),
+            color_capability: Some(theme::Capability::None),
+        };
+        let (code, _stdout, stderr) = run_cli_main(&["presets", "apply", "minimal"], b"", &env);
+        assert_eq!(code, 1);
+        assert!(stderr.contains("cannot resolve"));
     }
 
     fn tempdir() -> TempDir {

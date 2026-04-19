@@ -1,0 +1,14 @@
+# linesmith preset: power-user
+# Every built-in segment, in priority order. The layout engine drops
+# lowest-priority segments first when the terminal is narrow.
+
+[line]
+segments = [
+  "model",
+  "context_window",
+  "workspace",
+  "rate_limit_5h",
+  "rate_limit_7d",
+  "cost",
+  "effort",
+]

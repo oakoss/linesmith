@@ -1,0 +1,5 @@
+# linesmith preset: minimal
+# Model name plus context-window percentage. Everything else dropped.
+
+[line]
+segments = ["model", "context_window"]

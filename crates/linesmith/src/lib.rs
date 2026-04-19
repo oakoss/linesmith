@@ -10,6 +10,7 @@ pub mod config;
 pub(crate) mod driver;
 pub mod input;
 pub mod layout;
+pub mod presets;
 pub mod segments;
 pub mod theme;
 
