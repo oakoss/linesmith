@@ -1,28 +1,30 @@
 # Segment System
 
 - Status: draft
-- Version: 0.2
-- Last updated: 2026-04-17
-- Driving ADRs: [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0004](../adrs/0004-rhai-for-plugins.md), [ADR-0005](../adrs/0005-role-based-themes.md), [ADR-0008](../adrs/0008-canonical-type-refinements.md)
+- Version: 0.3
+- Last updated: 2026-04-19
+- Driving ADRs: [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0004](../adrs/0004-rhai-for-plugins.md), [ADR-0005](../adrs/0005-role-based-themes.md), [ADR-0008](../adrs/0008-canonical-type-refinements.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md)
 
 ## Overview
 
 Segments are the composable units linesmith renders into a status line. This spec defines:
 
 1. The `Segment` trait: the contract every segment (built-in or plugin-authored) implements
-2. The rendering pipeline: how `StatusContext` plus a segment list becomes bytes on stdout
+2. The rendering pipeline: how `DataContext` plus a segment list becomes bytes on stdout
 3. The layout engine: how priority, width hints, and terminal width interact to produce final output
 4. The cache layer: how expensive segments avoid re-running on every invocation
 5. Sub-composition: how one "segment" can compose multiple others internally
 6. How plugins (rhai scripts) use the same trait as built-ins, so there is no dual API
+7. How segments declare their data dependencies so the runtime only fetches what they need
 
-Segments know how to render themselves given a `StatusContext`. The layout engine knows how to combine many segments into a final line.
+Segments know how to render themselves given a `DataContext` ([spec: data-fetching](data-fetching.md)), which owns the parsed `StatusContext` (stdin payload, accessible as `ctx.status`) plus lazy accessors for other sources (settings, `~/.claude.json`, JSONL transcripts, OAuth usage, credentials). The layout engine knows how to combine many segments into a final line.
 
 ## Requirements
 
 ### Functional
 
-- Segments render from a typed `StatusContext` ([spec: input-schema](input-schema.md)) and produce styled text
+- Segments render from a typed `DataContext` (which wraps `StatusContext` from [spec: input-schema](input-schema.md)) and produce styled text
+- Segments declare their data dependencies via `data_deps()` so the runtime only fetches sources that some enabled segment needs (see [spec: data-fetching](data-fetching.md))
 - Segments can return "no output" (`None`) to hide themselves (e.g. rate-limit segment hidden for API-tier users, worktree segment hidden outside a worktree)
 - Segments declare layout intent: priority (drop-order under pressure), width bounds, separator preference
 - Segments declare a cache policy so expensive computations don't run every invocation
@@ -52,11 +54,24 @@ pub trait Segment: Send {
     /// Human-readable name for error messages and `linesmith segments list`.
     fn name(&self) -> &str;
 
+    /// Declare which data sources this segment reads. The runtime computes
+    /// the union across all enabled segments and lazy-fetches only those
+    /// sources; undeclared sources never trigger file I/O, subprocess, or
+    /// HTTP calls. Defaults to the stdin payload only; segments that read
+    /// `~/.claude.json`, the OAuth usage endpoint, JSONL transcripts, etc.
+    /// must override. See [spec: data-fetching](data-fetching.md) for the
+    /// full `DataDep` enum.
+    fn data_deps(&self) -> &'static [DataDep] {
+        &[DataDep::Status]
+    }
+
     /// Produce output (or `Ok(None)` to hide). Called on every render
     /// unless cache policy returns Hit. `Err` surfaces runtime failures
     /// (plugin script errors, unexpected state); the layout engine logs
-    /// the error to stderr and hides the segment.
-    fn render(&self, ctx: &StatusContext) -> RenderResult;
+    /// the error to stderr and hides the segment. `ctx` owns the parsed
+    /// stdin payload (`ctx.status`) plus lazy accessors for other sources
+    /// declared in `data_deps()`.
+    fn render(&self, ctx: &DataContext) -> RenderResult;
 
     /// Default layout intent. Can be overridden by user config.
     fn defaults(&self) -> SegmentDefaults {
@@ -78,6 +93,8 @@ pub trait Segment: Send {
 ```
 
 `Segment: Send` (not `Send + Sync`) per [ADR-0008](../adrs/0008-canonical-type-refinements.md); `rhai::AST` is `Send` but its `Sync` story depends on feature flags. Adding `Sync` later is a non-breaking extension.
+
+The render signature receives `&DataContext` as of v0.3. `DataContext` owns `StatusContext` as a field (`ctx.status`), so segments that only need stdin data write `ctx.status.model.id` with no functional loss compared to the v0.2 signature. Segments that need other sources call `ctx.usage()`, `ctx.credentials()`, `ctx.claude_json()`, etc. — each is an `Arc<Result<T, E>>` that lazy-initializes on first call and returns cached results thereafter.
 
 ```rust
 pub type RenderResult = Result<Option<RenderedSegment>, SegmentError>;
@@ -232,20 +249,38 @@ pub struct RhaiSegment {
     script: rhai::AST,
     engine: Arc<rhai::Engine>,
     metadata: SegmentDefaults,
+    declared_deps: Vec<DataDep>,  // parsed from the script's metadata header
 }
 
 impl Segment for RhaiSegment {
     fn id(&self) -> &str { &self.id }
+    fn data_deps(&self) -> &'static [DataDep] {
+        // `RhaiSegment` returns owned deps; leaked to `'static` at config-load
+        // so the trait signature stays compatible with built-in segments
+    }
     // delegates to the rhai script's `render(ctx)` function
 }
 ```
+
+Plugins declare their data dependencies via a script metadata header (e.g., `// @data_deps = ["usage", "claude_json"]`) or a rhai-level config file sibling. The host parses this once at config load, hands the parsed `Vec<DataDep>` to `RhaiSegment`, and the runtime prefetcher includes it in the union just like built-in segments. Without this, rhai plugins that need non-stdin sources would fall through to the default `&[DataDep::Status]` and their `ctx.usage()` / `ctx.credentials()` / etc. calls would block on lazy-init inside the hot render path — the exact cost that segment-driven lazy loading exists to avoid.
+
+The exact metadata syntax and the rhai-side API for reading `DataContext` fields live in [`specs/plugin-api.md`](plugin-api.md), which needs a v0.2 rev to reflect the v0.3 trait contract (tracked as a follow-up bead).
 
 ## Behavior
 
 ### Rendering pipeline
 
 ```text
-StatusContext + config
+stdin payload → StatusContext + config
+         │
+         ▼
+  wrap in DataContext (lazy: usage, credentials, claude_json, jsonl, ...)
+         │
+         ▼
+  compute union of segment.data_deps() across enabled segments
+         │
+         ▼
+  pre-populate OnceCells for declared deps only
          │
          ▼
   load segment list
@@ -255,7 +290,7 @@ StatusContext + config
          │         │
     hit  │    miss │
          │         ▼
-         │     segment.render(ctx) → Option<RenderedSegment>
+         │     segment.render(&DataContext) → Option<RenderedSegment>
          │         │
          └─────────┴───── collected list (with None → dropped)
          │
@@ -374,7 +409,7 @@ Follows `AGENTS.md`: inline `#[cfg(test)] mod tests` for unit tests, `tests/` fo
 
 Every segment in `crates/linesmith/src/segments/` has tests:
 
-- Renders expected output for a canonical `StatusContext`
+- Renders expected output for a canonical `DataContext` (with a fixture `StatusContext` wrapped in it; lazy sources stubbed to `Ok(...)` or `Err(...)` as the segment requires)
 - Returns `None` for context without relevant data (e.g. `workspace` returns `None` with no cwd)
 - Width calculation matches the rendered string (grapheme-aware)
 - Respects its own cache policy
@@ -416,3 +451,4 @@ Fixtures: lists of `(SegmentId, width, priority)` tuples.
 
 - 2026-04-17: initial draft (v0.1)
 - 2026-04-17: v0.2 incorporating [ADR-0008](../adrs/0008-canonical-type-refinements.md) (Separator::Literal Cow, Segment: Send only, CachePolicy::Invalidated with any_of semantics, WidthBounds newtype) + rate_limit combined segment + Nerd Font glyph source + effort segment clarification + link to plugin-api.md
+- 2026-04-19: v0.3 incorporating [ADR-0010](../adrs/0010-data-fetching-architecture.md). Render signature moves from `&StatusContext` to `&DataContext`; `StatusContext` remains accessible via `ctx.status`. Adds `data_deps()` method with a default of `&[DataDep::Status]`. Existing stdin-only segments pick up the default `data_deps()` for free but still migrate their render signature to `&DataContext` and reach stdin fields via `ctx.status`. Rendering pipeline diagram updated to show the dep-union pre-fetch step. See [data-fetching.md](data-fetching.md) for the `DataContext` shape and `DataDep` enum.
