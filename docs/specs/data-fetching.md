@@ -1,7 +1,7 @@
 # Data Fetching
 
 - Status: draft
-- Version: 0.1
+- Version: 0.1.1
 - Last updated: 2026-04-19
 - Driving ADRs: [ADR-0009](../adrs/0009-json-parsing-stack.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md), [ADR-0012](../adrs/0012-per-process-execution.md)
 
@@ -61,6 +61,7 @@ pub struct DataContext {
     usage:        OnceCell<Arc<Result<UsageData, UsageError>>>,
     credentials:  OnceCell<Arc<Result<Credentials, CredentialError>>>,
     sessions:     OnceCell<Arc<Result<LiveSessions, SessionError>>>,
+    git:          OnceCell<Arc<Result<Option<GitContext>, GitError>>>,
 }
 
 impl DataContext {
@@ -73,6 +74,12 @@ impl DataContext {
     pub fn usage(&self)       -> Arc<Result<UsageData,   UsageError>>;
     pub fn credentials(&self) -> Arc<Result<Credentials, CredentialError>>;
     pub fn sessions(&self)    -> Arc<Result<LiveSessions, SessionError>>;
+    /// `Ok(None)` when cwd is not inside a git repo. `Ok(Some(_))` for
+    /// main checkouts, linked worktrees, and bare repos (distinguished
+    /// via `GitContext.repo_kind`). Inner `OnceCell`s inside
+    /// `GitContext` defer dirty-scan and upstream-walk cost to segments
+    /// that actually render those fields.
+    pub fn git(&self)         -> Arc<Result<Option<GitContext>, GitError>>;
 }
 ```
 
@@ -87,11 +94,11 @@ Segments opt in to their data sources via an additional `data_deps()` method on 
 ```rust
 // Addition to the canonical Segment trait in segment-system.md.
 // Render signature and other methods remain as segment-system.md specifies
-// (ctx: &StatusContext; RenderResult return; Send bound; defaults/cache_policy/children).
+// (ctx: &DataContext in v0.3; RenderResult return; Send bound; defaults/cache_policy/children).
 pub trait Segment {
-    /// Which data sources this segment reads from the `DataContext`
-    /// threaded into `StatusContext`. Runtime fetches only the union
-    /// of declared deps across enabled segments.
+    /// Which data sources this segment reads from `DataContext`.
+    /// Runtime fetches only the union of declared deps across enabled
+    /// segments.
     fn data_deps(&self) -> &'static [DataDep] {
         &[DataDep::Status]
     }
@@ -107,6 +114,9 @@ pub enum DataDep {
     Usage,
     Credentials,
     Sessions,
+    /// Git repository state (branch, dirty, ahead/behind, worktree kind).
+    /// See [git-segments.md](git-segments.md) for the `GitContext` shape.
+    Git,
 }
 ```
 
@@ -343,3 +353,4 @@ Rename-based locking avoids platform-specific `flock`/`LockFileEx` gymnastics an
 ## Change log
 
 - 2026-04-19: initial draft (v0.1). Sets out `DataContext` shape, segment dependency declaration, per-source fetch strategies, OAuth fallback cascade, and atomic-write/schema-version conventions. Driven by ADR-0009, ADR-0010, ADR-0012.
+- 2026-04-19: v0.1.1 additive update. Adds `DataDep::Git` + `DataContext::git()` accessor + `GitContext`/`GitError` type pointers to [git-segments.md](git-segments.md). No behavior change for existing sources; git-aware segments opt in via `DataDep::Git`.
