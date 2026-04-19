@@ -10,6 +10,9 @@ Sorted newest first. When a research session produces findings that shape a deci
 
 | Date       | Doc                                                               | Summary                                                                                                     |
 | ---------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| 2026-04-18 | [data-fetching-strategy](data-fetching-strategy.md)               | Per-source cost matrix, mtime caching, JSONL incremental tail, OAuth cache stack, segment-driven lazy load  |
+| 2026-04-18 | [claude-data-files](claude-data-files.md)                         | Complete map of CC's persistent state: settings cascade, ~/.claude.json, sessions/, Keychain, oauthAccount  |
+| 2026-04-18 | [ccometixline-rust-patterns](ccometixline-rust-patterns.md)       | Rust-peer cross-check: CCometixLine uses same OAuth endpoint; patterns to adopt (ureq, cache) + avoid (npm) |
 | 2026-04-18 | [ccstatusline-widget-internals](ccstatusline-widget-internals.md) | ccstatusline's rate-limit widgets, OAuth endpoint (`/api/oauth/usage`), cache strategy, effort detection    |
 | 2026-04-18 | [cc-info-commands](cc-info-commands.md)                           | Claude Code built-in info slash commands (`/usage`, `/stats`, `/config`, ...) and where each sources data   |
 | 2026-04-18 | [jsonl-data-source](jsonl-data-source.md)                         | Claude Code JSONL transcript schema, 5h block aggregation, ccstatusline widget catalog (superseded in part) |
