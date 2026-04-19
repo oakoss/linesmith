@@ -115,4 +115,4 @@ Revisit if:
 - Depends on: [ADR-0009](0009-json-parsing-stack.md) — parsing strategy is serde_json + partial structs
 - Related: [ADR-0012](0012-per-process-execution.md) — per-process execution model; defers daemon mode
 - Will drive: [ADR-0011](0011-rate-limit-data-source.md) — rate-limit segment uses this architecture
-- Will drive: `specs/data-fetching.md` (pending) — interface contracts for `DataContext` and segment-dependency declaration
+- Will drive: [`specs/data-fetching.md`](../specs/data-fetching.md) — interface contracts for `DataContext` and segment-dependency declaration

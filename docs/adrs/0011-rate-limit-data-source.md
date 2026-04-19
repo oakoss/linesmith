@@ -158,7 +158,7 @@ Revisit if:
 - Supporting: [`docs/research/ccometixline-rust-patterns.md`](../research/ccometixline-rust-patterns.md) — Rust-peer confirmation of identical endpoint
 - Supporting: [`docs/research/jsonl-data-source.md`](../research/jsonl-data-source.md) — 5h block aggregation math (used in fallback)
 - Depends on: [ADR-0009](0009-json-parsing-stack.md), [ADR-0010](0010-data-fetching-architecture.md)
-- Will drive: `specs/rate-limit-segments.md` (pending) — segment-level contracts for `rate_limit_5h`, `rate_limit_7d`, `rate_limit_5h_reset`, `rate_limit_7d_reset`, `extra_usage`
-- Will drive: `specs/credentials.md` (pending) — per-OS credential reader specifications
+- Will drive: [`specs/rate-limit-segments.md`](../specs/rate-limit-segments.md) — segment-level contracts for `rate_limit_5h`, `rate_limit_7d`, `rate_limit_5h_reset`, `rate_limit_7d_reset`, `extra_usage`
+- Will drive: [`specs/credentials.md`](../specs/credentials.md) — per-OS credential reader specifications
 - Tracked beads: lsm-y6m (epic), lsm-4qd (`/usage` live-invocation spike, partially resolved by 2026-04-18 endpoint capture), lsm-4lw (worktree kind, not rate-limit specific), lsm-7ki (effort detection, separate segment, not rate-limit). lsm-043 (tier handling) closed as out of scope; see "Tier handling (out of scope)" above.
 - Open follow-up: Windows Credential Manager path (v0.2). Tier-aware segment behavior is deferred to v0.2+ and gated on a concrete product need.
