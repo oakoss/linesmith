@@ -164,7 +164,7 @@ Binary formats earn their keep at 100 KB+ hot-loop caches (ruff's AST cache, uv'
 
 ## Implications / actions
 
-- **File ADR slice for parsing-stack decision.** Cite this doc. ADR locks in: serde_json + partial structs + JSON cache with schema_version. Defer parser-flag decision to a later ADR if/when measurements demand it.
+- **Promoted to [ADR-0009](../adrs/0009-json-parsing-stack.md)** — serde_json + partial structs + JSON cache with schema_version. Defer parser-flag decision to a later ADR if/when measurements demand it.
 - **Update `data-fetching-strategy.md` §"What I traded away"** to point at this doc — that section listed faster alternatives without the comparable-CLI evidence; this doc closes that loop.
 - **Implementation task: partial-struct definitions** for `ClaudeJson` (only `oauthAccount`, `mcpServers`, `projects: HashMap<PathBuf, Box<RawValue>>`). The `Box<RawValue>` for `projects` lets us defer per-project parsing until needed.
 - **Implementation task: JSONL incremental-tail helper** in a shared module (used by rate-limit aggregation, effort detection, future segments). Include offset persistence story (in-memory for v0.1; file-backed in daemon mode).

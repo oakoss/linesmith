@@ -174,6 +174,7 @@ User can lengthen TTLs to be polite to the endpoint or shorten for development/t
 
 ## Implications / actions
 
+- **Promoted to [ADR-0010](../adrs/0010-data-fetching-architecture.md)** — segment-driven lazy load + per-source strategy matrix. Implementation work below flows from that decision.
 - **Wire segment dependency declaration** into the runtime — the lazy-load model needs each segment to opt into its data sources rather than have the runtime fetch everything proactively.
 - **Implement an `mtime + reparse` helper crate** (or module) that all file readers share. Reduces boilerplate and centralizes cache invalidation.
 - **Build the OAuth fetcher with the full ccstatusline cache stack** — file cache, lock file, 429 handling, stale-on-error, distinct error states. File as a slice under `lsm-y6m`.

@@ -158,6 +158,7 @@ Resolves lsm-7ki.
 
 ## Implications / actions
 
+- **Promoted to [ADR-0011](../adrs/0011-rate-limit-data-source.md)** — endpoint, auth, cache, JSONL fallback, and credential cascade now codified. Tier detection explicitly deferred (no competitor does it; out of scope for v0.1). lsm-y6m epic scope reshapes to "implement ADR-0011".
 - **Reshape lsm-y6m epic scope.** ADR should describe the HTTP-first cascade (endpoint, auth, cache, JSONL fallback, error states), not just JSONL aggregation. File a dedicated bead for the HTTP fetcher + credential reader.
 - **New beads needed:**
   - OAuth credential reader (macOS Keychain + cross-platform file fallback)
