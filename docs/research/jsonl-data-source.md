@@ -4,6 +4,8 @@
 - Author: Jace Babin (w/ Claude Code)
 - Scope: How existing Claude Code statusline tools source rate-limit, token, and session-block data, and what widget set the dominant tool ships.
 
+> **Correction (2026-04-18):** this note's Conclusion #1 ("no competitor scrapes HTTP") is accurate for `ccusage` (the analyzer) but **wrong for `ccstatusline`** (the statusline). ccstatusline hits `GET https://api.anthropic.com/api/oauth/usage` as its primary rate-limit source; JSONL aggregation is only the fallback when the HTTP path fails. See `ccstatusline-widget-internals.md` for the endpoint, auth flow, caching, and widget formats.
+
 ## Question
 
 1. How do competitors obtain rate-limit / usage data that Claude Code's statusline stdin payload doesn't include (5h / 7d windows, free-tier usage, historical tokens)?

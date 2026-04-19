@@ -8,13 +8,16 @@ See [`docs/README.md`](../README.md) for the full docs pipeline.
 
 Sorted newest first. When a research session produces findings that shape a decision, the referenced ADR links back here.
 
-| Date       | Doc                                                               | Summary                                                                                                   |
-| ---------- | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| 2026-04-17 | [rust-crate-survey](rust-crate-survey.md)                         | Stack picks for each crate category: JSON, ANSI, git, config, plugins, HTTP, CLI args, release tooling    |
-| 2026-04-17 | [cross-tool-statusline-support](cross-tool-statusline-support.md) | Which AI coding CLIs expose a `statusLine` API today (Claude, Qwen) and which are coming (Codex, Copilot) |
-| 2026-04-17 | [user-demand](user-demand.md)                                     | Ranked feature requests and top complaints from ccstatusline / claude-code issues and community posts     |
-| 2026-04-17 | [competitor-landscape](competitor-landscape.md)                   | Survey of existing Claude Code statusline tools (14+) plus adjacent shell-prompt tools                    |
-| 2026-04-17 | [claude-code-statusline-api](claude-code-statusline-api.md)       | Claude Code's statusline JSON contract: invocation model, schema, performance constraints                 |
+| Date       | Doc                                                               | Summary                                                                                                     |
+| ---------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| 2026-04-18 | [ccstatusline-widget-internals](ccstatusline-widget-internals.md) | ccstatusline's rate-limit widgets, OAuth endpoint (`/api/oauth/usage`), cache strategy, effort detection    |
+| 2026-04-18 | [cc-info-commands](cc-info-commands.md)                           | Claude Code built-in info slash commands (`/usage`, `/stats`, `/config`, ...) and where each sources data   |
+| 2026-04-18 | [jsonl-data-source](jsonl-data-source.md)                         | Claude Code JSONL transcript schema, 5h block aggregation, ccstatusline widget catalog (superseded in part) |
+| 2026-04-17 | [rust-crate-survey](rust-crate-survey.md)                         | Stack picks for each crate category: JSON, ANSI, git, config, plugins, HTTP, CLI args, release tooling      |
+| 2026-04-17 | [cross-tool-statusline-support](cross-tool-statusline-support.md) | Which AI coding CLIs expose a `statusLine` API today (Claude, Qwen) and which are coming (Codex, Copilot)   |
+| 2026-04-17 | [user-demand](user-demand.md)                                     | Ranked feature requests and top complaints from ccstatusline / claude-code issues and community posts       |
+| 2026-04-17 | [competitor-landscape](competitor-landscape.md)                   | Survey of existing Claude Code statusline tools (14+) plus adjacent shell-prompt tools                      |
+| 2026-04-17 | [claude-code-statusline-api](claude-code-statusline-api.md)       | Claude Code's statusline JSON contract: invocation model, schema, performance constraints                   |
 
 ## Conventions
 
