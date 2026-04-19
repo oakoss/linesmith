@@ -1034,7 +1034,7 @@ mod tests {
         );
     }
 
-    // --- user theme loading (lsm-qp5) ---
+    // --- user theme loading ---
 
     #[test]
     fn user_theme_from_disk_renders_with_configured_palette() {
