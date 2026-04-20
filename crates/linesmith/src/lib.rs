@@ -11,6 +11,7 @@ pub mod data_context;
 pub(crate) mod driver;
 pub mod input;
 pub mod layout;
+pub mod plugins;
 pub mod presets;
 pub mod segments;
 pub mod theme;

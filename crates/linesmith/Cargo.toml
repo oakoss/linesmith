@@ -22,6 +22,7 @@ serde_json.workspace = true
 catppuccin.workspace = true
 chrono.workspace = true
 lexopt.workspace = true
+rhai.workspace = true
 supports-color.workspace = true
 terminal_size.workspace = true
 toml.workspace = true
