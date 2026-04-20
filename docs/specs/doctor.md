@@ -2,7 +2,7 @@
 
 - Status: draft
 - Version: 0.1
-- Last updated: 2026-04-20
+- Last updated: 2026-04-19
 - Driving ADRs: [ADR-0001](../adrs/0001-use-rust-for-runtime.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md), [ADR-0011](../adrs/0011-rate-limit-data-source.md)
 
 ## Overview
@@ -371,4 +371,4 @@ Snapshot each scenario's default and `--plain` output. Assert exit codes match t
 
 ## Change log
 
-- 2026-04-20: initial draft (v0.1). Defines the check catalog across eight categories (Environment, Config, Claude Code, Credentials, Cache, Rate-limit endpoint, Plugins, Git, Self), severity levels (PASS / WARN / FAIL / SKIP), exit-code contract (any FAIL → 1; WARN-only → 0), default tree-style output + `--plain` ASCII output, short-circuit propagation rules between categories, panic-safety wrapper, and testing strategy with fixture scenarios. `--json` and `doctor fix` flagged for v0.2+.
+- 2026-04-19: initial draft (v0.1). Defines the check catalog across eight categories (Environment, Config, Claude Code, Credentials, Cache, Rate-limit endpoint, Plugins, Git, Self), severity levels (PASS / WARN / FAIL / SKIP), exit-code contract (any FAIL → 1; WARN-only → 0), default tree-style output + `--plain` ASCII output, short-circuit propagation rules between categories, panic-safety wrapper, and testing strategy with fixture scenarios. `--json` and `doctor fix` flagged for v0.2+.

@@ -2,7 +2,7 @@
 
 - Status: draft
 - Version: 0.1
-- Last updated: 2026-04-20
+- Last updated: 2026-04-19
 - Driving ADRs: [ADR-0001](../adrs/0001-use-rust-for-runtime.md), [ADR-0007](../adrs/0007-cargo-dist-distribution.md)
 
 ## Overview
@@ -215,7 +215,7 @@ This validates the SLSA attestation attached during the release.
 - Per-release: `release-plz` uses the workflow's OIDC token to request a short-lived crates.io token and runs `cargo publish`
 - No `CARGO_REGISTRY_TOKEN` secret in the repo
 
-The crates.io description, README snippet, and keywords are sourced from `Cargo.toml`'s `[package]` metadata. License: `MIT OR Apache-2.0` (standard Rust-ecosystem dual license).
+The crates.io description, README snippet, and keywords are sourced from `Cargo.toml`'s `[package]` metadata. License: `MIT`.
 
 ### Homebrew tap
 
@@ -407,4 +407,5 @@ Criterion benchmarks run pre-release (`mise run bench`). A >10% regression again
 
 ## Change log
 
-- 2026-04-20: initial draft (v0.1). Defines semver posture (pre-1.0 minor-for-breaking), the 7-target platform matrix (macOS/Linux/Windows × x86_64/aarch64 + linux-musl), four installer methods (shell, PowerShell, Homebrew, cargo install), release-plz/cargo-dist responsibility split, release profile settings (matches ADR-0007), supply-chain posture (OIDC trusted publishing, SLSA attestations, pinned action SHAs, `cargo-auditable`), unsigned-binary posture for v0.1, day-of-release runbook, rollback steps, and edge cases. Closes lsm-9sa under epic lsm-c2i.
+- 2026-04-19: initial draft (v0.1). Defines semver posture (pre-1.0 minor-for-breaking), the 7-target platform matrix (macOS/Linux/Windows × x86_64/aarch64 + linux-musl), four installer methods (shell, PowerShell, Homebrew, cargo install), release-plz/cargo-dist responsibility split, release profile settings (matches ADR-0007), supply-chain posture (OIDC trusted publishing, SLSA attestations, pinned action SHAs, `cargo-auditable`), unsigned-binary posture for v0.1, day-of-release runbook, rollback steps, and edge cases. Closes lsm-9sa under epic lsm-c2i.
+- 2026-04-19: license changed from `MIT OR Apache-2.0` to `MIT` to match the repo `LICENSE` swap (MPL-2.0 → MIT). Closes lsm-c2c.

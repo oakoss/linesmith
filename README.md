@@ -104,4 +104,4 @@ Commit style: [Conventional Commits](https://www.conventionalcommits.org/) enfor
 
 ## License
 
-[Mozilla Public License 2.0](LICENSE). The core stays open source; any future plugin ecosystem can ship under any license.
+[MIT](LICENSE). The core stays open source; any future plugin ecosystem can ship under any license.
