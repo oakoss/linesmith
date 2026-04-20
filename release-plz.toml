@@ -1,0 +1,17 @@
+[workspace]
+# cargo-dist creates the GitHub Release, not release-plz
+git_release_enable = false
+# Tag push triggers cargo-dist's release.yml workflow
+git_tag_enable = true
+# Generate/update CHANGELOG.md from conventional commits (delegates to git-cliff via cliff.toml)
+changelog_update = true
+# Update dependency versions in Cargo.lock on release
+dependencies_update = true
+# No public library API yet to semver-check against
+semver_check = false
+# Only trigger a release when commits change runtime behavior.
+# docs/chore/test/ci are visible in git log only.
+# Commit-type allowlist matches AGENTS.md + cog.toml.
+release_commits = "^(feat|fix|perf|refactor)"
+# Label release PRs for easy filtering
+pr_labels = ["release"]
