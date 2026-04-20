@@ -77,20 +77,44 @@ pub enum PluginError {
     /// `@data_deps` declared a name that isn't in the plugin-accessible
     /// set. Per `plugin-api.md`, `credentials` and `jsonl` are reserved
     /// and surface here even though they're real `DataDep` variants.
-    UnknownDataDep { id: String, name: String },
+    /// `path` rather than `id` because header parsing fires before
+    /// `const ID` has been extracted from the script.
+    UnknownDataDep { path: PathBuf, name: String },
 
     /// `@data_deps = ...` header didn't parse as a JSON-style array of
-    /// bare-string dep names.
-    MalformedDataDeps { id: String, message: String },
+    /// bare-string dep names. Same `path`-over-`id` rationale as
+    /// [`Self::UnknownDataDep`].
+    MalformedDataDeps { path: PathBuf, message: String },
 
     /// Two discovered plugins (or a plugin and a built-in) claim the
     /// same `id`. First-discovered wins per the precedence rules in
     /// `plugin-api.md` §Plugin file location; loser is rejected.
     IdCollision {
         id: String,
-        winner_path: PathBuf,
+        winner: CollisionWinner,
         loser_path: PathBuf,
     },
+}
+
+/// What "won" an [`PluginError::IdCollision`] — either a built-in
+/// segment (which plugins can never shadow) or another plugin (keyed
+/// by path). Avoids the stringly-typed `PathBuf::from("<built-in>")`
+/// sentinel used before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CollisionWinner {
+    /// A built-in segment — no on-disk path, reserved globally.
+    BuiltIn,
+    /// Another plugin at the given path.
+    Plugin(PathBuf),
+}
+
+impl std::fmt::Display for CollisionWinner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BuiltIn => f.write_str("<built-in>"),
+            Self::Plugin(p) => f.write_str(&p.display().to_string()),
+        }
+    }
 }
 
 impl std::fmt::Display for PluginError {
@@ -109,20 +133,27 @@ impl std::fmt::Display for PluginError {
             Self::MalformedReturn { id, message } => {
                 write!(f, "plugin {id} returned malformed value: {message}")
             }
-            Self::UnknownDataDep { id, name } => {
-                write!(f, "plugin {id} declares unknown @data_deps entry `{name}`")
+            Self::UnknownDataDep { path, name } => {
+                write!(
+                    f,
+                    "plugin at {} declares unknown @data_deps entry `{name}`",
+                    path.display()
+                )
             }
-            Self::MalformedDataDeps { id, message } => {
-                write!(f, "plugin {id} has malformed @data_deps header: {message}")
+            Self::MalformedDataDeps { path, message } => {
+                write!(
+                    f,
+                    "plugin at {} has malformed @data_deps header: {message}",
+                    path.display()
+                )
             }
             Self::IdCollision {
                 id,
-                winner_path,
+                winner,
                 loser_path,
             } => write!(
                 f,
-                "plugin id `{id}` collision: kept {}, rejected {}",
-                winner_path.display(),
+                "plugin id `{id}` collision: kept {winner}, rejected {}",
                 loser_path.display()
             ),
         }

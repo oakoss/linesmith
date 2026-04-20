@@ -17,6 +17,12 @@ pub struct Config {
     pub layout_options: Option<LayoutOptions>,
     #[serde(default)]
     pub segments: BTreeMap<String, SegmentOverride>,
+    /// Extra directories to scan for user plugin scripts (`.rhai`
+    /// files). Scanned in list order before the default XDG
+    /// directory. See `docs/specs/config.md` §Plugin directories and
+    /// `docs/specs/plugin-api.md` §Plugin file location.
+    #[serde(default)]
+    pub plugin_dirs: Vec<PathBuf>,
 }
 
 /// `[layout_options]` section: render-path tunables that aren't tied
@@ -199,6 +205,7 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
     "theme",
     "layout_options",
     "segments",
+    "plugin_dirs",
     "preset",
     "layout",
     "plugins",
@@ -427,6 +434,36 @@ mod tests {
         let mut warnings = Vec::new();
         let _ = Config::from_str_validated(src, |msg| warnings.push(msg.to_string()));
         warnings
+    }
+
+    #[test]
+    fn plugin_dirs_deserializes_from_toml_as_path_list() {
+        // Lock in the serde contract: `plugin_dirs = [...]` → Vec<PathBuf>
+        // with each entry preserved as written. This is the public
+        // entry point from user config into plugin discovery; a
+        // renamed field or lost `#[serde(default)]` would silently
+        // stop discovery from seeing user-declared dirs.
+        let cfg: Config = Config::from_str(
+            r#"
+                plugin_dirs = ["/etc/linesmith/segments", "./vendor/plugins"]
+                [line]
+                segments = ["model"]
+            "#,
+        )
+        .expect("parse");
+        assert_eq!(
+            cfg.plugin_dirs,
+            vec![
+                PathBuf::from("/etc/linesmith/segments"),
+                PathBuf::from("./vendor/plugins"),
+            ]
+        );
+    }
+
+    #[test]
+    fn plugin_dirs_defaults_to_empty_when_absent() {
+        let cfg: Config = Config::from_str("theme = \"default\"\n").expect("parse");
+        assert!(cfg.plugin_dirs.is_empty());
     }
 
     #[test]

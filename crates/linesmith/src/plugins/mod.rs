@@ -8,8 +8,14 @@
 //! `call_fn` on — and [`PluginError`](errors::PluginError), the
 //! load-time + render-time failure surface.
 
+pub mod discovery;
 pub mod engine;
 pub mod errors;
+pub mod header;
+pub mod registry;
 
+pub use discovery::scan_plugin_dirs;
 pub use engine::build_engine;
-pub use errors::{PluginError, ResourceLimit};
+pub use errors::{CollisionWinner, PluginError, ResourceLimit};
+pub use header::{parse_data_deps_header, HeaderError};
+pub use registry::{CompiledPlugin, PluginRegistry};

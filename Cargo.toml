@@ -27,6 +27,7 @@ lexopt = "0.3"
 # are not needed for our embedder and add 100s of KB to the stripped binary.
 rhai = { version = "1.24", default-features = false, features = ["std", "sync"] }
 supports-color = "3"
+tempfile = "3"
 terminal_size = "0.4"
 toml = "1"
 unicode-segmentation = "1"

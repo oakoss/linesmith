@@ -29,6 +29,9 @@ toml.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [[bin]]
 name = "linesmith"
 path = "src/main.rs"
