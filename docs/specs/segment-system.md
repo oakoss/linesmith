@@ -249,15 +249,15 @@ pub struct RhaiSegment {
     script: rhai::AST,
     engine: Arc<rhai::Engine>,
     metadata: SegmentDefaults,
-    declared_deps: Vec<DataDep>,  // parsed from the script's metadata header
+    // Deps parsed from the script's @data_deps header. Full shape
+    // (field type, leak strategy) defined in plugin-api.md §RhaiSegment
+    // wrapper — that spec owns the rhai-plugin contract.
+    declared_deps: &'static [DataDep],
 }
 
 impl Segment for RhaiSegment {
     fn id(&self) -> &str { &self.id }
-    fn data_deps(&self) -> &'static [DataDep] {
-        // `RhaiSegment` returns owned deps; leaked to `'static` at config-load
-        // so the trait signature stays compatible with built-in segments
-    }
+    fn data_deps(&self) -> &'static [DataDep] { self.declared_deps }
     // delegates to the rhai script's `render(ctx)` function
 }
 ```

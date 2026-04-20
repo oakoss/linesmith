@@ -1,9 +1,9 @@
 # Plugin API
 
 - Status: draft
-- Version: 0.1
-- Last updated: 2026-04-17
-- Driving ADRs: [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0004](../adrs/0004-rhai-for-plugins.md), [ADR-0008](../adrs/0008-canonical-type-refinements.md)
+- Version: 0.2
+- Last updated: 2026-04-19
+- Driving ADRs: [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0004](../adrs/0004-rhai-for-plugins.md), [ADR-0008](../adrs/0008-canonical-type-refinements.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md)
 
 ## Overview
 
@@ -26,7 +26,8 @@ Built-in segments and plugin segments share the `Segment` trait (see [`segment-s
 - Plugins are auto-discovered from `$XDG_CONFIG_HOME/linesmith/segments/*.rhai` at startup
 - Additional discovery paths declarable via `config.toml` → `plugin_dirs`
 - Each plugin script exports: an `id` constant, a `defaults()` function, a `render(ctx)` function, and optionally a `visible_if(ctx)` predicate
-- Plugins receive a `ctx` object mirroring `StatusContext`: fields accessible as `ctx.model.display_name`, `ctx.context_window.used`, etc.
+- Plugins receive a `ctx` object mirroring `DataContext` ([data-fetching.md](data-fetching.md) §DataContext). `ctx.status` exposes the parsed stdin payload (`StatusContext`) for fields like `ctx.status.model.display_name`; non-stdin sources (`ctx.usage`, `ctx.claude_json`, `ctx.settings`, `ctx.sessions`, `ctx.git`) are populated only when the plugin declares the matching `@data_deps`. Some Rust-side sources (`credentials`, `jsonl`) are intentionally not plugin-accessible — see §`@data_deps` header syntax for the reserved list.
+- Plugins declare their data dependencies via a `// @data_deps = [...]` header comment parsed at script load time. Missing declarations mean the runtime's prefetch skips those sources and the corresponding `ctx` accessors return `()`.
 - Plugins return a `RenderedSegment`-shaped value from `render(ctx)` (or `()` to hide)
 - Plugins cannot exec shell, read arbitrary files, open network sockets, or import other rhai files (sandbox)
 - Plugins have bounded CPU and memory per invocation (configurable ceiling; default tight)
@@ -57,6 +58,13 @@ All `.rhai` files in each directory are loaded (non-recursive). Duplicate ids ar
 A plugin script must export (at minimum):
 
 ```rhai
+// OPTIONAL: data-dependency declaration. Parsed from the first block of
+// line comments at the top of the file. Plugin-accessible values:
+// "status" (default, always available), "settings", "claude_json",
+// "usage", "sessions", "git". "credentials" and "jsonl" are reserved —
+// see §@data_deps header syntax below. Unknown names are startup errors.
+// @data_deps = ["usage", "git"]
+
 // REQUIRED: stable id for this segment. Lowercase-kebab-case. Used in
 // config as `[segments.<id>]`. Must not collide with a built-in.
 const ID = "my_segment";
@@ -64,7 +72,7 @@ const ID = "my_segment";
 // REQUIRED: the renderer. Returns a map shaped like RenderedSegment,
 // or () to hide the segment.
 fn render(ctx) {
-    let model_name = ctx.model.display_name;
+    let model_name = ctx.status.model.display_name;
     #{ runs: [ #{ text: `model: ${model_name}`, role: "primary", bold: true } ],
        width: model_name.len() + 7 }
 }
@@ -78,19 +86,119 @@ fn defaults() {
 // OPTIONAL: conditional visibility predicate. If present and returns false,
 // `render` is not called and the segment is hidden.
 fn visible_if(ctx) {
-    ctx.rate_limits != ()
+    ctx.status.rate_limits != ()
 }
 ```
 
+### `@data_deps` header syntax
+
+The data-dependency declaration is an optional line comment of exactly the form:
+
+```rhai
+// @data_deps = ["status", "usage", "git"]
+```
+
+Parser rules:
+
+- Must appear in the first contiguous block of `//`-style line comments at the top of the file. A blank line or any non-`//` token (including `/* */` block comments or rhai statements) ends the block; the parser stops scanning there
+- The RHS is a JSON-style array of bare-string dep names
+- Unknown dep names fail at startup with `PluginError::UnknownDataDep { plugin_id, name }`; the plugin is rejected and reported via `linesmith doctor`
+- Omitted or empty (`@data_deps = []`) declarations default to `["status"]` (stdin-only behavior; matches v0.1 plugins verbatim)
+- `["status"]` doesn't need to be listed explicitly — it's always implicit
+- Trailing commas, comments inside the array, and multi-line forms are all accepted
+- Block-comment syntax (`/* @data_deps = [...] */`) is NOT scanned — line comments only, to keep the parser simple
+
+Accepted dep names are a deliberately narrower subset of the `DataDep` enum from [data-fetching.md](data-fetching.md) §Segment dependency declaration — some Rust-side deps are reserved from plugin access for security or schema-stability reasons.
+
+| Dep name      | DataDep variant | Source                                                      |
+| ------------- | --------------- | ----------------------------------------------------------- |
+| `status`      | `Status`        | Stdin payload (always available; listing is optional)       |
+| `settings`    | `Settings`      | `~/.claude/settings.json` + overlays                        |
+| `claude_json` | `ClaudeJson`    | `~/.claude.json` per-user state                             |
+| `usage`       | `Usage`         | OAuth `/api/oauth/usage` endpoint + JSONL fallback          |
+| `sessions`    | `Sessions`      | `~/.claude/sessions/{pid}.json` live process directory      |
+| `git`         | `Git`           | Git repo state via gix ([git-segments.md](git-segments.md)) |
+
+**Reserved for future use** (rejected at startup with `UnknownDataDep` today):
+
+- `credentials` — the `Credentials` struct contains a `SecretString` OAuth token ([credentials.md](credentials.md)). Exposing it to rhai plugins, even through a tagged-map wrapper, creates a leak path where a third-party or buggy plugin could log the bearer token via `log()` or embed it in rendered output. Plugins needing rate-limit state use `usage` instead; `usage` pulls credentials internally without exposing them. A future `credentials_meta` dep may surface non-secret metadata (scopes, source kind) if a real product need emerges.
+- `jsonl` — `data-fetching.md` currently defines `JsonlAggregate` as an opaque placeholder with its concrete shape deferred. Publishing `ctx.jsonl` now would either lock in an accidental shape or break plugins when the real aggregation spec lands. Plugins that need JSONL data must wait for the dedicated `jsonl-aggregation` spec (tracked under lsm-y6m).
+
 ### `ctx` shape exposed to rhai
 
-`ctx` is an **immutable** rhai `Map` that mirrors `StatusContext`. The Rust-side `StatusContext` uses typed enums and newtypes; the rhai mirror flattens enums into tagged maps and unwraps newtypes to their underlying primitive.
+`ctx` is an **immutable** rhai `Map` that mirrors `DataContext` from [data-fetching.md](data-fetching.md). The Rust-side types use typed enums and newtypes; the rhai mirror flattens enums into tagged maps and unwraps newtypes to their underlying primitive.
+
+**Top-level shape:**
+
+```rhai
+ctx.status          // always available; mirrors StatusContext (parsed stdin)
+ctx.config          // per-plugin config from [segments.<id>] TOML table
+ctx.env             // whitelisted env var snapshot (see §ctx.env below)
+ctx.settings        // present iff @data_deps includes "settings"
+ctx.claude_json     // present iff @data_deps includes "claude_json"
+ctx.usage           // present iff @data_deps includes "usage"
+ctx.sessions        // present iff @data_deps includes "sessions"
+ctx.git             // present iff @data_deps includes "git"
+// ctx.credentials and ctx.jsonl are reserved and not plugin-accessible in v0.2;
+// see §@data_deps header syntax for the rationale
+```
+
+Accessing a non-declared source's accessor (e.g. `ctx.usage` without `@data_deps = ["usage"]`) returns `()`. This is not an error — it's the plugin's responsibility to declare every source it reads.
+
+**Result-shaped accessors.** Non-stdin sources expose `Arc<Result<T, E>>` on the Rust side. In rhai, each is a tagged map:
+
+```rhai
+// Success:
+ctx.usage = #{
+    kind: "ok",
+    data: #{
+        five_hour: #{ utilization: 22.0, resets_at: "2026-04-19T05:00:00Z" },
+        seven_day: #{ utilization: 33.0, resets_at: "..." },
+        seven_day_sonnet: ...,
+        extra_usage: ...,
+    },
+};
+
+// Failure:
+ctx.usage = #{
+    kind: "error",
+    error: "NoCredentials",   // short error code string
+};
+```
+
+Plugins check `kind` before accessing `data` or `error`:
+
+```rhai
+switch ctx.usage.kind {
+    "ok" => {
+        let pct = ctx.usage.data.five_hour.utilization;
+        ...
+    }
+    "error" => {
+        // ctx.usage.error is one of: "NoCredentials" | "SubprocessFailed" |
+        //   "IoError" | "Timeout" | "RateLimited" | "NetworkError" |
+        //   "ParseError" | "Unauthorized"
+        render_error(ctx.usage.error)
+    }
+}
+```
+
+For source-specific data shapes (`ctx.usage.data`, `ctx.git.data`, etc.), plugins consult the spec that owns the source: [rate-limit-segments.md](rate-limit-segments.md) for `usage`, [git-segments.md](git-segments.md) for `git`, [data-fetching.md](data-fetching.md) for `settings` / `claude_json` / `sessions`. Each spec's Rust type translates to a rhai Map by the naming convention below.
+
+**Special cases:**
+
+- **`ctx.git`**: the Rust accessor is `Arc<Result<Option<GitContext>, GitError>>` — a nested `Option` distinguishes "no git repo at cwd" from "gix failed." The rhai mirror collapses `Ok(None)` to `kind: "ok"` + `data: ()`. Plugins check `ctx.git.kind == "ok" && ctx.git.data != ()` before accessing fields like `ctx.git.data.head`.
+- **`ctx.usage` error codes** mirror the `UsageError` variants from [rate-limit-segments.md](rate-limit-segments.md): `"NoCredentials" | "SubprocessFailed" | "IoError" | "Timeout" | "RateLimited" | "NetworkError" | "ParseError" | "Unauthorized"`. Plugins can distinguish credential-layer failures from endpoint-layer failures via these codes without the raw credentials being exposed.
+
+**Legacy `ctx.*` access pre-v0.2.** Scripts written against v0.1 accessed stdin fields directly (`ctx.model.display_name`, `ctx.rate_limits`, etc.). v0.2 moves those under `ctx.status.*` to make room for the DataContext sources. Plugin authors updating existing scripts do a one-time rename from `ctx.X` → `ctx.status.X` for every stdin field. `ctx.raw` (escape hatch for tool-specific fields) stays at `ctx.status.raw` in v0.2.
+
+**`StatusContext` field shape** (accessible as `ctx.status.*`). Same as v0.1's `ctx.*` convention:
 
 **Variant naming convention:** Rust `UpperCamelCase` variants are exposed to rhai as `snake_case` strings. `Tool::ClaudeCode` → `"claude_code"`; `RateLimits::FiveHourOnly` → kind tag `"five_hour_only"`. This convention is uniform across every enum exposed to plugins.
 
 **Nullability:** Rust `Option<T>` surfaces as rhai `()` when `None` (rhai's unit, equivalent to JSON null). Always check for `()` before accessing sub-fields.
 
-Example access patterns:
+Example access patterns (all fields below live under `ctx.status.*` as of v0.2):
 
 ```rhai
 // Tool identification. Map shape preserves the Tool::Other forensic id.
@@ -99,47 +207,46 @@ Example access patterns:
 //   #{ kind: "codex_cli" }
 //   #{ kind: "copilot_cli" }
 //   #{ kind: "other", name: "gemini" }     // `name` only present when kind == "other"
-ctx.tool.kind
-if ctx.tool.kind == "other" { ctx.tool.name }
+ctx.status.tool.kind
+if ctx.status.tool.kind == "other" { ctx.status.tool.name }
 
 // Base fields
-ctx.model.id
-ctx.model.display_name
-ctx.session.id
-ctx.workspace.cwd               // string; preserves platform-native separators
-ctx.workspace.project_dir
-ctx.workspace.git_worktree      // map or ()
-ctx.workspace.git_worktree.name
+ctx.status.model.id
+ctx.status.model.display_name
+ctx.status.session.id
+ctx.status.workspace.cwd            // string; preserves platform-native separators
+ctx.status.workspace.project_dir
+ctx.status.workspace.git_worktree   // map or ()
+ctx.status.workspace.git_worktree.name
 
 // Nullable fields — check for () before accessing sub-fields
-if ctx.context_window != () {
-    ctx.context_window.used          // f32 in 0.0..=100.0 (Percent unwrapped)
-    ctx.context_window.remaining     // f32 in 0.0..=100.0 (pre-computed host-side)
-    ctx.context_window.size
-    ctx.context_window.current_usage // map or ()
+if ctx.status.context_window != () {
+    ctx.status.context_window.used          // f32 in 0.0..=100.0 (Percent unwrapped)
+    ctx.status.context_window.remaining     // f32 in 0.0..=100.0 (pre-computed host-side)
+    ctx.status.context_window.size
+    ctx.status.context_window.current_usage // map or ()
 }
 
-// Rate limits. The `kind` tag determines which sub-fields are present;
-// accessing the wrong sub-field (e.g. `.seven_day` on a "five_hour_only"
-// payload) returns () rather than erroring, so always check `kind` first.
-if ctx.rate_limits != () {
+// Rate limits (stdin-provided; distinct from ctx.usage which is endpoint-fetched).
+// The `kind` tag determines which sub-fields are present.
+if ctx.status.rate_limits != () {
     //   #{ kind: "five_hour_only", five_hour: <window> }
     //   #{ kind: "seven_day_only", seven_day: <window> }
     //   #{ kind: "both", five_hour: <window>, seven_day: <window> }
-    switch ctx.rate_limits.kind {
-        "five_hour_only" => ctx.rate_limits.five_hour.used,
-        "seven_day_only" => ctx.rate_limits.seven_day.used,
-        "both"           => ctx.rate_limits.five_hour.used,
+    switch ctx.status.rate_limits.kind {
+        "five_hour_only" => ctx.status.rate_limits.five_hour.used,
+        "seven_day_only" => ctx.status.rate_limits.seven_day.used,
+        "both"           => ctx.status.rate_limits.five_hour.used,
     }
 }
 
 // Escape hatch for tool-specific fields not in the canonical model
-ctx.raw.some_custom_field
+ctx.status.raw.some_custom_field
 ```
 
-**RateLimitWindow fields:** `used` is `f32` (Percent unwrapped), `resets_at` is an RFC 3339 string. Use `format_countdown_until(ctx.rate_limits.five_hour.resets_at)` to render a human-friendly countdown.
+**RateLimitWindow fields:** `used` is `f32` (Percent unwrapped), `resets_at` is an RFC 3339 string. Use `format_countdown_until(ctx.status.rate_limits.five_hour.resets_at)` to render a human-friendly countdown.
 
-**Immutability enforcement:** `ctx` is built once per render from a `&StatusContext` reference. The host configures the rhai engine so the script scope cannot mutate `ctx`: `Engine::disable_symbol("=")` is disabled for identifiers starting with `ctx`, and `ctx` is passed as an immutable `Dynamic`. Attempts to assign (`ctx.foo = bar`) are rejected at parse or runtime as a `PluginError::Runtime`.
+**Immutability enforcement:** `ctx` is built once per render from a `&DataContext` reference. The host configures the rhai engine so the script scope cannot mutate `ctx`: `Engine::disable_symbol("=")` is disabled for identifiers starting with `ctx`, and `ctx` is passed as an immutable `Dynamic`. Attempts to assign (`ctx.foo = bar`) are rejected at parse or runtime as a `PluginError::Runtime`.
 
 ### Plugin return shape
 
@@ -251,7 +358,7 @@ engine.call_fn(AST, "render", [ctx_as_dynamic])
 
 One shared `Arc<rhai::Engine>` is used for all plugins. `rhai::AST` is cloned into each `RhaiSegment` (rhai's `AST` is `Clone` and cheap). The engine is configured once at startup with registered host functions + resource limits, then reused.
 
-### `RhaiSegment` wrapper (defined in `segment-system.md`)
+### `RhaiSegment` wrapper (sketched in `segment-system.md` v0.3)
 
 ```rust
 pub struct RhaiSegment {
@@ -259,23 +366,28 @@ pub struct RhaiSegment {
     script: rhai::AST,
     engine: Arc<rhai::Engine>,
     metadata: SegmentDefaults,
+    declared_deps: &'static [DataDep],  // leaked from parsed @data_deps header
 }
 
 impl Segment for RhaiSegment {
     fn id(&self) -> &str { &self.id }
-    fn name(&self) -> &str { &self.id } // plugins have no separate name in v0.1
-    fn render(&self, ctx: &StatusContext) -> Option<RenderedSegment> {
-        // 1. Build rhai Dynamic from &StatusContext
+    fn name(&self) -> &str { &self.id }
+    fn data_deps(&self) -> &'static [DataDep] { self.declared_deps }
+    fn render(&self, ctx: &DataContext) -> RenderResult {
+        // 1. Build rhai Dynamic from &DataContext — only populate fields for
+        //    declared deps (lazy sources the runtime pre-fetched)
         // 2. engine.call_fn("render", [ctx_dynamic])
         // 3. Validate return shape
-        // 4. Return Option<RenderedSegment>
+        // 4. Return RenderResult
     }
     fn defaults(&self) -> SegmentDefaults { self.metadata.clone() }
     fn cache_policy(&self) -> CachePolicy { CachePolicy::AlwaysFresh }
 }
 ```
 
-Plugin cache policy defaults to `AlwaysFresh` in v0.1 because plugin scripts can declare arbitrary `visible_if` predicates that depend on anything. If the plugin exposes a `cache_policy()` function, the host may honor it (v0.2+ feature; deferred).
+`declared_deps` is `&'static [DataDep]` to match the canonical `Segment::data_deps` signature. The parser collects a `Vec<DataDep>` from the script header, leaks it with `Vec::leak` at config-load time, and stores the resulting slice. This is safe because plugin registry is built once per process and lives until exit. If the daemon mode arrives later, swap to an arena allocator.
+
+Plugin cache policy defaults to `AlwaysFresh` in v0.1 because plugin scripts can declare arbitrary `visible_if` predicates that depend on anything. If the plugin exposes a `cache_policy()` function, the host may honor it (v0.3+ feature; deferred).
 
 ## Behavior
 
@@ -317,22 +429,26 @@ Plugin `RenderedSegment` outputs aren't cached to disk in v0.1 (`CachePolicy::Al
 
 ## Edge cases
 
-| Case                                                  | Handling                                                                                                          |
-| ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| Plugin file has syntax error                          | `linesmith doctor` reports; segment absent from layout; other plugins unaffected                                  |
-| Plugin `id` collides with a built-in                  | Startup error; built-in wins; `linesmith doctor` reports                                                          |
-| Two plugins share the same `id`                       | First discovered wins; `linesmith doctor` flags collision                                                         |
-| Plugin runtime error during `render`                  | Segment dropped for this invocation; rate-limited log; other segments render normally                             |
-| Plugin returns malformed map                          | Segment dropped; validation error logged; suggests the expected shape                                             |
-| Plugin returns `()`                                   | Segment hidden (normal flow, not an error)                                                                        |
-| Plugin exceeds `max_operations`                       | Segment dropped; logged as ResourceExceeded; plugin marked suspect (future: disable after N consecutive failures) |
-| Plugin exceeds wallclock timeout                      | Engine forcibly stops script; segment dropped; logged                                                             |
-| Plugin accesses `ctx.undefined_field`                 | rhai returns `()`; plugin author must handle                                                                      |
-| Plugin calls unregistered host fn (e.g. `fs::read`)   | rhai errors with "function not found"; caught as runtime error                                                    |
-| Plugin file is 0 bytes                                | Compiled as a no-op AST; `render` call returns `()`; segment hides                                                |
-| Plugin dir doesn't exist                              | Treated as empty (no error); `linesmith doctor` may hint to create it if referenced                               |
-| `config.toml` references plugin that isn't discovered | Warn at config-load time; remove segment from layout                                                              |
-| Plugin needs data not in `StatusContext`              | Read from `ctx.raw` (escape hatch); if still missing, plugin declares `visible_if` returns false                  |
+| Case                                                    | Handling                                                                                                          |
+| ------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| Plugin file has syntax error                            | `linesmith doctor` reports; segment absent from layout; other plugins unaffected                                  |
+| Plugin `id` collides with a built-in                    | Startup error; built-in wins; `linesmith doctor` reports                                                          |
+| Two plugins share the same `id`                         | First discovered wins; `linesmith doctor` flags collision                                                         |
+| `@data_deps` lists an unknown name                      | Startup error (`UnknownDataDep`); plugin rejected; `linesmith doctor` reports valid dep names                     |
+| `@data_deps` is malformed (not a JSON array)            | Startup error (`MalformedDataDeps`); plugin rejected                                                              |
+| Plugin accesses `ctx.usage` without declaring `usage`   | Returns `()`; plugin author must either declare or handle the `()` case                                           |
+| Plugin reads `ctx.usage.data.X` while `kind == "error"` | rhai returns `()` (Map miss); plugin author must check `kind` first                                               |
+| Plugin runtime error during `render`                    | Segment dropped for this invocation; rate-limited log; other segments render normally                             |
+| Plugin returns malformed map                            | Segment dropped; validation error logged; suggests the expected shape                                             |
+| Plugin returns `()`                                     | Segment hidden (normal flow, not an error)                                                                        |
+| Plugin exceeds `max_operations`                         | Segment dropped; logged as ResourceExceeded; plugin marked suspect (future: disable after N consecutive failures) |
+| Plugin exceeds wallclock timeout                        | Engine forcibly stops script; segment dropped; logged                                                             |
+| Plugin accesses `ctx.undefined_field`                   | rhai returns `()`; plugin author must handle                                                                      |
+| Plugin calls unregistered host fn (e.g. `fs::read`)     | rhai errors with "function not found"; caught as runtime error                                                    |
+| Plugin file is 0 bytes                                  | Compiled as a no-op AST; `render` call returns `()`; segment hides                                                |
+| Plugin dir doesn't exist                                | Treated as empty (no error); `linesmith doctor` may hint to create it if referenced                               |
+| `config.toml` references plugin that isn't discovered   | Warn at config-load time; remove segment from layout                                                              |
+| Plugin needs data not in any DataDep                    | Read from `ctx.status.raw` (escape hatch); if still missing, plugin declares `visible_if` returns false           |
 
 ## Testing strategy
 
@@ -356,7 +472,7 @@ Fixture scripts in `tests/fixtures/plugins/`:
 
 - `minimal.rhai`: smallest valid plugin (id + render returning one styled run)
 - `uses_ctx_config.rhai`: reads `ctx.config` and adapts output
-- `uses_visible_if.rhai`: hidden unless `ctx.rate_limits != ()`
+- `uses_visible_if.rhai`: hidden unless `ctx.status.rate_limits != ()`
 - `syntax_error.rhai`: compile-time error case
 - `runtime_error.rhai`: runtime panic case
 - `timeout.rhai`: infinite loop (triggers operation limit)
@@ -399,3 +515,4 @@ Deprecations ship in the changelog at least one minor version before removal.
 ## Change log
 
 - 2026-04-17: initial draft (v0.1) alongside the other foundational specs
+- 2026-04-19: v0.2 incorporating [ADR-0010](../adrs/0010-data-fetching-architecture.md). `ctx` now mirrors `DataContext` (not `StatusContext`); stdin fields move from `ctx.X` to `ctx.status.X` (one-time rename for existing scripts). Adds `@data_deps = [...]` script-header declaration so plugins opt into non-stdin sources. Plugin-accessible dep set is `status | settings | claude_json | usage | sessions | git`; `credentials` is reserved to avoid token-leak paths and `jsonl` is reserved until `JsonlAggregate` has a concrete schema. Unknown dep names fail at startup via `UnknownDataDep`. Result-shaped accessors use `#{ kind: "ok" | "error", data | error }` tagged-map convention. `RhaiSegment` wrapper gains `declared_deps` field to implement the new trait's `data_deps()` method.
