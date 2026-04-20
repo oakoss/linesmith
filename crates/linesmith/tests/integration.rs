@@ -104,8 +104,9 @@ fn config_style_override_emits_sgr_bytes_end_to_end() {
     )
     .expect("parse");
     let segments = linesmith::build_segments(Some(&cfg), |_| {});
-    let ctx =
+    let status_ctx =
         linesmith::input::parse(include_bytes!("fixtures/claude_minimal.json")).expect("parse");
+    let ctx = linesmith::data_context::DataContext::new(status_ctx);
     let line = linesmith::layout::render_with_warn(
         &segments,
         &ctx,

@@ -7,6 +7,7 @@
 
 pub mod cli;
 pub mod config;
+pub mod data_context;
 pub(crate) mod driver;
 pub mod input;
 pub mod layout;
@@ -109,10 +110,11 @@ pub fn run_with_context(
             return writeln!(writer, "?");
         }
     };
+    let data_ctx = data_context::DataContext::new(status_ctx);
 
     let line = layout::render_with_warn(
         segments,
-        &status_ctx,
+        &data_ctx,
         ctx.terminal_width,
         &mut |msg| {
             let _ = writeln!(stderr, "linesmith: {msg}");

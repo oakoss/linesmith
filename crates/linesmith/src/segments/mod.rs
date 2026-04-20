@@ -3,7 +3,7 @@
 //! layout engine uses today: visibility, cell width, priority,
 //! separator preference, and theme role.
 
-use crate::input::StatusContext;
+use crate::data_context::{DataContext, DataDep};
 use crate::theme::{Role, Style};
 use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
@@ -333,8 +333,29 @@ pub trait Segment: Send {
     ///
     /// Returns `Ok(None)` to hide, `Ok(Some(_))` to render, or `Err` on
     /// a runtime failure that the layout engine logs and treats as
-    /// hidden. See [`RenderResult`].
-    fn render(&self, ctx: &StatusContext) -> RenderResult;
+    /// hidden. See [`RenderResult`]. `ctx` owns the parsed stdin
+    /// payload (`ctx.status`) plus lazy accessors for other sources
+    /// (`ctx.usage()`, `ctx.git()`, etc.) declared in
+    /// [`data_deps`](Self::data_deps).
+    fn render(&self, ctx: &DataContext) -> RenderResult;
+
+    /// Declare which data sources this segment reads. The runtime
+    /// computes the union across all enabled segments and lazy-fetches
+    /// only those sources. Defaults to the stdin payload only; segments
+    /// that read other sources must override. See
+    /// `docs/specs/data-fetching.md` §Segment dependency declaration.
+    ///
+    /// The `&'static` lifetime is deliberate: built-in segments return
+    /// a `const &[DataDep]` at zero cost, and runtime-loaded plugin
+    /// segments (e.g. `RhaiSegment`) promote their parsed
+    /// `Vec<DataDep>` via `Vec::leak` once at plugin-load time. The
+    /// plugin registry is built once per process and lives until exit,
+    /// so the leak is bounded. If plugin hot-reload arrives (deferred
+    /// feature), swap to an arena allocator or `Arc<[DataDep]>`.
+    #[must_use]
+    fn data_deps(&self) -> &'static [DataDep] {
+        &[DataDep::Status]
+    }
 
     /// Layout defaults (priority, width bounds, separator preference).
     /// User config may override each field via [`OverriddenSegment`].
@@ -424,12 +445,16 @@ impl OverriddenSegment {
 }
 
 impl Segment for OverriddenSegment {
-    fn render(&self, ctx: &StatusContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext) -> RenderResult {
         let result = self.inner.render(ctx)?;
         Ok(result.map(|r| match self.user_style {
             Some(style) => r.with_style(style),
             None => r,
         }))
+    }
+
+    fn data_deps(&self) -> &'static [DataDep] {
+        self.inner.data_deps()
     }
 
     fn defaults(&self) -> SegmentDefaults {
@@ -795,7 +820,7 @@ mod layout_type_tests {
         // override must wipe both, not merge with them.
         struct Styled;
         impl Segment for Styled {
-            fn render(&self, _: &StatusContext) -> RenderResult {
+            fn render(&self, _: &DataContext) -> RenderResult {
                 Ok(Some(
                     RenderedSegment::new("x")
                         .with_role(Role::Accent)
@@ -823,7 +848,7 @@ mod layout_type_tests {
     fn style_override_preserves_inner_none_return() {
         struct Hidden;
         impl Segment for Hidden {
-            fn render(&self, _: &StatusContext) -> RenderResult {
+            fn render(&self, _: &DataContext) -> RenderResult {
                 Ok(None)
             }
             fn defaults(&self) -> SegmentDefaults {
@@ -835,11 +860,11 @@ mod layout_type_tests {
         assert_eq!(wrapped.render(&stub_ctx()).unwrap(), None);
     }
 
-    fn stub_ctx() -> StatusContext {
-        use crate::input::{ModelInfo, Tool, WorkspaceInfo};
+    fn stub_ctx() -> DataContext {
+        use crate::input::{ModelInfo, StatusContext, Tool, WorkspaceInfo};
         use std::path::PathBuf;
         use std::sync::Arc;
-        StatusContext {
+        DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
             model: ModelInfo {
                 display_name: "Claude".into(),
@@ -853,6 +878,6 @@ mod layout_type_tests {
             rate_limits: None,
             effort: None,
             raw: Arc::new(serde_json::Value::Null),
-        }
+        })
     }
 }

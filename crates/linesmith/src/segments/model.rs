@@ -1,7 +1,7 @@
 //! Model segment: renders the current model's display name.
 
 use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
-use crate::input::StatusContext;
+use crate::data_context::DataContext;
 use crate::theme::Role;
 
 pub struct ModelSegment;
@@ -11,8 +11,8 @@ pub struct ModelSegment;
 const PRIORITY: u8 = 64;
 
 impl Segment for ModelSegment {
-    fn render(&self, ctx: &StatusContext) -> RenderResult {
-        let name = ctx.model.display_name.trim();
+    fn render(&self, ctx: &DataContext) -> RenderResult {
+        let name = ctx.status.model.display_name.trim();
         if name.is_empty() {
             return Ok(None);
         }
@@ -31,8 +31,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    fn ctx(display_name: &str) -> StatusContext {
-        StatusContext {
+    fn ctx(display_name: &str) -> DataContext {
+        DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
             model: ModelInfo {
                 display_name: display_name.into(),
@@ -46,7 +46,7 @@ mod tests {
             rate_limits: None,
             effort: None,
             raw: Arc::new(serde_json::Value::Null),
-        }
+        })
     }
 
     #[test]

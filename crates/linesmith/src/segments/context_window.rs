@@ -3,7 +3,8 @@
 //! doesn't carry context-window data.
 
 use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
-use crate::input::{ContextWindow, StatusContext};
+use crate::data_context::DataContext;
+use crate::input::ContextWindow;
 use crate::theme::Role;
 
 pub struct ContextWindowSegment;
@@ -14,8 +15,8 @@ pub struct ContextWindowSegment;
 const PRIORITY: u8 = 32;
 
 impl Segment for ContextWindowSegment {
-    fn render(&self, ctx: &StatusContext) -> RenderResult {
-        let Some(cw) = ctx.context_window.as_ref() else {
+    fn render(&self, ctx: &DataContext) -> RenderResult {
+        let Some(cw) = ctx.status.context_window.as_ref() else {
             return Ok(None);
         };
         Ok(Some(
@@ -61,8 +62,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    fn ctx(window: Option<ContextWindow>) -> StatusContext {
-        StatusContext {
+    fn ctx(window: Option<ContextWindow>) -> DataContext {
+        DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
             model: ModelInfo {
                 display_name: "X".into(),
@@ -76,7 +77,7 @@ mod tests {
             rate_limits: None,
             effort: None,
             raw: Arc::new(serde_json::Value::Null),
-        }
+        })
     }
 
     fn window(used: f32, size: u64) -> ContextWindow {

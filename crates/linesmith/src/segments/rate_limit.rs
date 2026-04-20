@@ -7,7 +7,8 @@
 //! `docs/specs/segment-system.md`).
 
 use super::{format_window, RenderResult, RenderedSegment, Segment, SegmentDefaults};
-use crate::input::{RateLimits, StatusContext};
+use crate::data_context::DataContext;
+use crate::input::RateLimits;
 use crate::theme::Role;
 
 pub struct RateLimitSegment;
@@ -18,8 +19,8 @@ pub struct RateLimitSegment;
 pub(crate) const PRIORITY: u8 = 96;
 
 impl Segment for RateLimitSegment {
-    fn render(&self, ctx: &StatusContext) -> RenderResult {
-        let Some(rl) = ctx.rate_limits.as_ref() else {
+    fn render(&self, ctx: &DataContext) -> RenderResult {
+        let Some(rl) = ctx.status.rate_limits.as_ref() else {
             return Ok(None);
         };
         let now = chrono::Utc::now();
@@ -53,8 +54,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    fn ctx(rate_limits: Option<RateLimits>) -> StatusContext {
-        StatusContext {
+    fn ctx(rate_limits: Option<RateLimits>) -> DataContext {
+        DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
             model: ModelInfo {
                 display_name: "X".into(),
@@ -68,7 +69,7 @@ mod tests {
             rate_limits,
             effort: None,
             raw: Arc::new(serde_json::Value::Null),
-        }
+        })
     }
 
     fn window(used: f32, minutes_from_now: i64) -> RateLimitWindow {

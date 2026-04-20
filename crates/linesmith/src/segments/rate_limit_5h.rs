@@ -3,14 +3,19 @@
 //! Pro/Max sessions that only surface the 7-day window.
 
 use super::{format_window, rate_limit, RenderResult, RenderedSegment, Segment, SegmentDefaults};
-use crate::input::StatusContext;
+use crate::data_context::DataContext;
 use crate::theme::Role;
 
 pub struct RateLimit5hSegment;
 
 impl Segment for RateLimit5hSegment {
-    fn render(&self, ctx: &StatusContext) -> RenderResult {
-        let Some(window) = ctx.rate_limits.as_ref().and_then(|rl| rl.five_hour()) else {
+    fn render(&self, ctx: &DataContext) -> RenderResult {
+        let Some(window) = ctx
+            .status
+            .rate_limits
+            .as_ref()
+            .and_then(|rl| rl.five_hour())
+        else {
             return Ok(None);
         };
         Ok(Some(
@@ -34,8 +39,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    fn ctx(rate_limits: Option<RateLimits>) -> StatusContext {
-        StatusContext {
+    fn ctx(rate_limits: Option<RateLimits>) -> DataContext {
+        DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
             model: ModelInfo {
                 display_name: "X".into(),
@@ -49,7 +54,7 @@ mod tests {
             rate_limits,
             effort: None,
             raw: Arc::new(serde_json::Value::Null),
-        }
+        })
     }
 
     fn window(used: f32, minutes_from_now: i64) -> RateLimitWindow {

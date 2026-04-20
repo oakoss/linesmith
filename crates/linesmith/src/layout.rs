@@ -5,7 +5,7 @@
 //!
 //! See `docs/specs/segment-system.md` §Layout algorithm.
 
-use crate::input::StatusContext;
+use crate::data_context::DataContext;
 use crate::segments::{
     text_width, RenderedSegment, Segment, SegmentDefaults, Separator, WidthBounds,
 };
@@ -18,7 +18,7 @@ use unicode_segmentation::UnicodeSegmentation;
 /// logged to the real process stderr; output is unstyled (callers that
 /// want theming use [`render_with_warn`]).
 #[must_use]
-pub fn render(segments: &[Box<dyn Segment>], ctx: &StatusContext, terminal_width: u16) -> String {
+pub fn render(segments: &[Box<dyn Segment>], ctx: &DataContext, terminal_width: u16) -> String {
     let mut warn = |msg: &str| {
         let _ = writeln!(io::stderr().lock(), "linesmith: {msg}");
     };
@@ -40,7 +40,7 @@ pub fn render(segments: &[Box<dyn Segment>], ctx: &StatusContext, terminal_width
 #[must_use]
 pub fn render_with_warn(
     segments: &[Box<dyn Segment>],
-    ctx: &StatusContext,
+    ctx: &DataContext,
     terminal_width: u16,
     warn: &mut dyn FnMut(&str),
     theme: &Theme,
@@ -60,7 +60,7 @@ struct Item {
 
 fn collect_items_with(
     segments: &[Box<dyn Segment>],
-    ctx: &StatusContext,
+    ctx: &DataContext,
     warn: &mut dyn FnMut(&str),
 ) -> Vec<Item> {
     segments
@@ -512,7 +512,7 @@ mod tests {
 
     // --- error handling ---
 
-    use crate::input::{ModelInfo, Tool, WorkspaceInfo};
+    use crate::input::{ModelInfo, StatusContext, Tool, WorkspaceInfo};
     use crate::segments::{RenderResult, SegmentError};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -520,7 +520,7 @@ mod tests {
     struct StubSegment(RenderResult);
 
     impl Segment for StubSegment {
-        fn render(&self, _ctx: &StatusContext) -> RenderResult {
+        fn render(&self, _ctx: &DataContext) -> RenderResult {
             match &self.0 {
                 Ok(Some(r)) => Ok(Some(r.clone())),
                 Ok(None) => Ok(None),
@@ -529,8 +529,8 @@ mod tests {
         }
     }
 
-    fn empty_ctx() -> StatusContext {
-        StatusContext {
+    fn empty_ctx() -> DataContext {
+        DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
             model: ModelInfo {
                 display_name: "X".into(),
@@ -544,7 +544,7 @@ mod tests {
             rate_limits: None,
             effort: None,
             raw: Arc::new(serde_json::Value::Null),
-        }
+        })
     }
 
     #[test]

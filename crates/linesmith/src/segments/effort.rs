@@ -9,7 +9,7 @@
 //! arrives.
 
 use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
-use crate::input::StatusContext;
+use crate::data_context::DataContext;
 use crate::theme::Role;
 
 pub struct EffortSegment;
@@ -19,8 +19,8 @@ pub struct EffortSegment;
 const PRIORITY: u8 = 160;
 
 impl Segment for EffortSegment {
-    fn render(&self, ctx: &StatusContext) -> RenderResult {
-        let Some(effort) = ctx.effort else {
+    fn render(&self, ctx: &DataContext) -> RenderResult {
+        let Some(effort) = ctx.status.effort else {
             return Ok(None);
         };
         Ok(Some(
@@ -40,8 +40,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    fn ctx(effort: Option<EffortLevel>) -> StatusContext {
-        StatusContext {
+    fn ctx(effort: Option<EffortLevel>) -> DataContext {
+        DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
             model: ModelInfo {
                 display_name: "X".into(),
@@ -55,7 +55,7 @@ mod tests {
             rate_limits: None,
             effort,
             raw: Arc::new(serde_json::Value::Null),
-        }
+        })
     }
 
     #[test]

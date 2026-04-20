@@ -5,7 +5,7 @@
 //! - Project dir has no usable basename, or worktree name is empty: hidden
 
 use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
-use crate::input::StatusContext;
+use crate::data_context::DataContext;
 use crate::theme::Role;
 
 pub struct WorkspaceSegment;
@@ -15,8 +15,9 @@ pub struct WorkspaceSegment;
 const PRIORITY: u8 = 16;
 
 impl Segment for WorkspaceSegment {
-    fn render(&self, ctx: &StatusContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext) -> RenderResult {
         let Some(repo_name) = ctx
+            .status
             .workspace
             .project_dir
             .file_name()
@@ -25,7 +26,7 @@ impl Segment for WorkspaceSegment {
             return Ok(None);
         };
 
-        if let Some(worktree) = &ctx.workspace.git_worktree {
+        if let Some(worktree) = &ctx.status.workspace.git_worktree {
             if worktree.name.is_empty() {
                 return Ok(None);
             }
@@ -50,8 +51,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    fn ctx(worktree: Option<GitWorktree>) -> StatusContext {
-        StatusContext {
+    fn ctx(worktree: Option<GitWorktree>) -> DataContext {
+        DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
             model: ModelInfo {
                 display_name: "Claude Test".into(),
@@ -65,7 +66,7 @@ mod tests {
             rate_limits: None,
             effort: None,
             raw: Arc::new(serde_json::Value::Null),
-        }
+        })
     }
 
     fn worktree(name: &str) -> GitWorktree {
@@ -109,7 +110,7 @@ mod tests {
     #[test]
     fn hidden_when_project_dir_has_no_basename() {
         let mut c = ctx(None);
-        c.workspace.project_dir = PathBuf::from("/");
+        c.status.workspace.project_dir = PathBuf::from("/");
         assert_eq!(WorkspaceSegment.render(&c).unwrap(), None);
     }
 
@@ -142,7 +143,7 @@ mod tests {
         // payload varied to OSC-set-title + BEL so the two tests
         // cover distinct escape families.
         let mut c = ctx(None);
-        c.workspace.project_dir = PathBuf::from("/tmp/\x1b]0;pwn\x07evil");
+        c.status.workspace.project_dir = PathBuf::from("/tmp/\x1b]0;pwn\x07evil");
         let rendered = WorkspaceSegment.render(&c).unwrap().expect("renders");
         assert_eq!(rendered.text(), "]0;pwnevil");
         assert!(!rendered.text().contains('\x1b'));

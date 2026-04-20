@@ -247,7 +247,7 @@ mod tests {
     struct StubWithWidth;
 
     impl Segment for StubWithWidth {
-        fn render(&self, _: &input::StatusContext) -> segments::RenderResult {
+        fn render(&self, _: &crate::data_context::DataContext) -> segments::RenderResult {
             Ok(Some(segments::RenderedSegment::new("x")))
         }
         fn defaults(&self) -> segments::SegmentDefaults {
@@ -297,11 +297,11 @@ mod tests {
         assert_eq!(got.max(), 50);
     }
 
-    fn model_ctx(display_name: &str) -> input::StatusContext {
+    fn model_ctx(display_name: &str) -> crate::data_context::DataContext {
         use crate::input::{ModelInfo, Tool, WorkspaceInfo};
         use std::path::PathBuf;
         use std::sync::Arc;
-        input::StatusContext {
+        crate::data_context::DataContext::new(input::StatusContext {
             tool: Tool::ClaudeCode,
             model: ModelInfo {
                 display_name: display_name.into(),
@@ -315,7 +315,7 @@ mod tests {
             rate_limits: None,
             effort: None,
             raw: Arc::new(serde_json::Value::Null),
-        }
+        })
     }
 
     #[test]
