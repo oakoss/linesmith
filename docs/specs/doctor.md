@@ -1,0 +1,374 @@
+# Doctor
+
+- Status: draft
+- Version: 0.1
+- Last updated: 2026-04-20
+- Driving ADRs: [ADR-0001](../adrs/0001-use-rust-for-runtime.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md), [ADR-0011](../adrs/0011-rate-limit-data-source.md)
+
+## Overview
+
+`linesmith doctor` is the self-diagnostic subcommand. It inspects the user's environment, config, Claude Code integration, credentials, cache state, plugins, and segment/theme registration — reporting each check as PASS / WARN / FAIL with a one-line remediation hint when something's off. The exit code reflects whether any check failed, so CI pipelines and install scripts can gate on it.
+
+Every spec in the data-fetching lane ([data-fetching.md](data-fetching.md), [credentials.md](credentials.md), [rate-limit-segments.md](rate-limit-segments.md), [plugin-api.md](plugin-api.md), [git-segments.md](git-segments.md)) has "linesmith doctor can inspect this" hooks scattered through it. This spec collects those hooks into a single ordered check catalog with explicit criteria. The catalog inspects cache files and exercises every memoized resolver (credentials, OAuth usage, git, etc.) end-to-end — there's no dedicated "memoized value" row because the source checks themselves populate and validate the memo on first access.
+
+Out of scope: remote telemetry; `doctor fix` auto-remediation; `doctor --json` machine-readable output (deferred to v0.2+ unless it falls out of the implementation trivially).
+
+## Requirements
+
+### Functional
+
+- `linesmith doctor` runs a fixed catalog of checks and reports each as PASS / WARN / FAIL
+- Each check has an explicit pass/warn/fail criterion documented in §Check catalog
+- Each non-PASS result prints a one-line remediation hint
+- Exit code contract: any FAIL → exit 1; WARN-only or all-PASS → exit 0
+- Default output is a grouped tree with colors and Unicode status glyphs
+- `--plain` flag disables colors and Unicode glyphs (ASCII only) for CI / log capture
+- `--full` flag enables opt-in slow checks (endpoint reachability probe, update check) that `doctor` skips by default
+- Running `linesmith init` ends with an automatic `linesmith doctor` invocation; users can opt out with `linesmith init --no-doctor`
+- Every failure mode in the data-fetching lane that the ADRs say should "surface via linesmith doctor" is covered by a check here
+
+### Non-functional
+
+- Default `doctor` run completes in <500ms (no network, no expensive scans)
+- `--full` run may take up to 5s (includes one endpoint probe + update check)
+- Fails gracefully when Claude Code isn't installed — reports that as a FAIL, doesn't crash
+- Fails gracefully on permission errors — reports the specific path and OS error
+- Cross-platform: no Unix-only assumptions (no `security` calls on Linux, no `cmd.exe` calls on macOS)
+- Binary-size neutral: doctor code reuses the per-source probing helpers from the data-fetching layer rather than duplicating logic
+
+## Interface / Contract
+
+### CLI surface
+
+```text
+linesmith doctor [--plain] [--full]
+
+Options:
+  --plain      ASCII output without colors or Unicode glyphs (for CI, logs)
+  --full       Run slow checks: endpoint reachability, update availability
+  -h, --help   Show this help
+```
+
+No positional arguments. Subcommand does one thing; no variants (`doctor check foo`, etc.).
+
+### Severity levels
+
+| Severity | Glyph | Plain | Color  | Meaning                                                                     |
+| -------- | ----- | ----- | ------ | --------------------------------------------------------------------------- |
+| PASS     | `✓`   | `OK`  | green  | Check verified; no action required                                          |
+| WARN     | `⚠`   | `!!`  | yellow | Degraded but functional; linesmith works with reduced features              |
+| FAIL     | `✗`   | `XX`  | red    | Broken; linesmith won't render correctly or at all for the affected surface |
+| SKIP     | `·`   | `--`  | gray   | Not applicable in this environment (e.g., Keychain check on Linux)          |
+
+`SKIP` does not affect the exit code.
+
+### Exit code contract
+
+```text
+0  all checks PASS or WARN or SKIP (no failures)
+1  at least one check FAIL
+2  usage error (unrecognized flag, bad invocation)
+```
+
+CI pipelines gate on exit-code 0; install scripts can treat 1 as "setup incomplete, prompt the user to read doctor output."
+
+The linesmith release profile uses `panic = "abort"` per [ADR-0007](../adrs/0007-cargo-dist-distribution.md) for size and predictability. A panicking check therefore terminates the whole `doctor` run via the abort signal — no per-check `catch_unwind` recovery is possible, and the process dies before reaching these exit codes. `doctor` is not meant to be robust against its own bugs; a panic there is a bug report, not a graceful-degradation opportunity. Prior drafts promised `catch_unwind` safety; that promise is withdrawn in favor of keeping the build profile uniform across the binary.
+
+### Output format — default
+
+Grouped by category, tree-structured. Color + Unicode:
+
+```text
+linesmith doctor (v0.1.0)
+
+Environment
+  ✓ Terminal is a tty (stdout fd 1)
+  ✓ Terminal width detected: 120 cells
+  ✓ TERM=xterm-256color (256-color capable)
+  ✓ NO_COLOR is set — colors disabled per user preference
+
+Config
+  ✓ Config file: ~/.config/linesmith/config.toml
+  ✓ Parses without errors
+  ✓ All 8 enabled segments are registered
+  ✓ Theme "catppuccin-mocha" is installed
+
+Claude Code
+  ✓ claude binary: /opt/homebrew/bin/claude (v2.1.114)
+  ✓ ~/.claude/ exists (mode 755)
+  ✓ ~/.claude.json parses (oauthAccount present)
+  ✓ 3 recent sessions in ~/.claude/sessions/
+
+Credentials
+  ✓ OAuth token found via macOS Keychain ("Claude Code-credentials")
+  ✓ Token has required scopes: user:inference, user:sessions:claude_code
+
+Cache
+  ✓ ~/.cache/linesmith/ exists (will be created on first fetch)
+  · usage.json not yet written (no rate-limit segment enabled)
+
+Plugins
+  ✓ 2 plugins discovered in ~/.config/linesmith/segments/
+  ✓ my-plugin.rhai parses, declares ["status", "usage"]
+  ✓ another.rhai parses, default deps
+  · No @data_deps collisions detected
+
+Git
+  ✓ Repo detected: /Users/jace/code/linesmith (Main checkout)
+  ✓ HEAD: main
+  ✓ Upstream: origin/main (0 ahead, 0 behind)
+
+Summary: 16 PASS · 0 WARN · 0 FAIL · 2 SKIP
+Exit: 0
+```
+
+Failing checks render the remediation hint as an indented second line:
+
+```text
+  ✗ ~/.claude.json parse failed: expected string at line 42, column 7
+    → Fix: run `claude --version` to repair config, or back up and delete the file
+```
+
+### Output format — `--plain`
+
+Same content, no colors, ASCII glyphs:
+
+```text
+linesmith doctor (v0.1.0)
+
+Environment
+  OK Terminal is a tty (stdout fd 1)
+  OK Terminal width detected: 120 cells
+  OK TERM=xterm-256color (256-color capable)
+  OK NO_COLOR is set -- colors disabled per user preference
+...
+Summary: 16 PASS / 0 WARN / 0 FAIL / 2 SKIP
+Exit: 0
+```
+
+### `linesmith init` integration
+
+After `linesmith init` writes the initial config, it prints:
+
+```text
+Wrote default config to ~/.config/linesmith/config.toml.
+
+Running doctor to verify your setup...
+```
+
+Then invokes `linesmith doctor` (inline, same process) and reports its output. If doctor exits non-zero, init's own exit code propagates it. Users bypass the post-init doctor with `linesmith init --no-doctor`.
+
+## Check catalog
+
+Checks are grouped into eight categories. Within each category, checks run top-to-bottom. A panicking check terminates the whole `doctor` run because the binary is built with `panic = "abort"` (see §Exit code contract for the rationale); a panic is a doctor bug to report, not a user-facing failure mode.
+
+### Environment
+
+| Check                   | PASS                                 | WARN                                          | FAIL           | Hint on non-PASS                                             |
+| ----------------------- | ------------------------------------ | --------------------------------------------- | -------------- | ------------------------------------------------------------ |
+| Stdout is a tty         | `isatty(1) == true`                  | `isatty(1) == false` (piped / CI)             | —              | `stdout is not a tty; use --plain for CI or log capture`     |
+| Terminal width detected | `terminal_size::size()` returns Some | returns `None`, OR `Some((W, _))` with W < 40 | —              | `set $COLUMNS or use --plain; narrow widths may wrap output` |
+| TERM is set             | `$TERM` non-empty                    | `$TERM` is `dumb` OR unset                    | —              | `set TERM=xterm-256color, or accept plain-mode fallback`     |
+| NO_COLOR respected      | Either unset, or set and honored     | —                                             | —              | `NO_COLOR` is a user preference, never a warning             |
+| $HOME resolves          | `dirs::home_dir()` returns Some      | —                                             | returns `None` | `set $HOME to your user directory`                           |
+
+### Config
+
+| Check                         | PASS                                                            | WARN                                             | FAIL                                    | Hint on non-PASS                                                   |
+| ----------------------------- | --------------------------------------------------------------- | ------------------------------------------------ | --------------------------------------- | ------------------------------------------------------------------ |
+| Config file discovered        | Found per config.md cascade                                     | None found, using built-in defaults              | —                                       | `run linesmith init to create a config`                            |
+| Config parses                 | TOML parse succeeds                                             | —                                                | TOML parse error                        | `see line/column in the error for the invalid key`                 |
+| All referenced segments exist | Every id in `[line.segments]` is registered                     | Unknown segment id (config ignored)              | —                                       | `remove the unknown id, or install the plugin that provides it`    |
+| Theme is installed            | `[theme] name` maps to a known theme                            | Theme unknown, falling back to default           | —                                       | `linesmith themes list shows available names`                      |
+| Plugin dirs are readable      | Every explicitly configured `plugin_dir` exists and is readable | An explicitly configured `plugin_dir` is missing | Permission denied on any referenced dir | `mkdir -p <path> or remove the entry from config.toml plugin_dirs` |
+
+### Claude Code
+
+| Check                    | PASS                                       | WARN                                      | FAIL                                    | Hint on non-PASS                                  |
+| ------------------------ | ------------------------------------------ | ----------------------------------------- | --------------------------------------- | ------------------------------------------------- |
+| `claude` binary found    | `which claude` succeeds                    | Not found, but `~/.claude/` exists anyway | Neither binary nor `~/.claude/` present | `install Claude Code from https://claude.ai/code` |
+| `~/.claude/` directory   | Exists and readable                        | Exists with permission issues             | Missing                                 | `launch Claude Code at least once to create it`   |
+| `~/.claude.json` parses  | Valid JSON, `oauthAccount` block present   | JSON valid but `oauthAccount` missing     | Parse error                             | delete + recreate, or run `claude` to regenerate  |
+| Recent sessions recorded | At least one file in `~/.claude/sessions/` | Directory exists but empty                | Directory missing                       | `open a new Claude Code session to populate`      |
+
+### Credentials
+
+| Check                   | PASS                                              | WARN                                        | FAIL                                          | Hint on non-PASS                                     |
+| ----------------------- | ------------------------------------------------- | ------------------------------------------- | --------------------------------------------- | ---------------------------------------------------- |
+| OAuth token resolvable  | `resolve_credentials()` returns Ok                | —                                           | Returns `NoCredentials` or `SubprocessFailed` | `log in to Claude Code to provision a fresh token`   |
+| Token source attested   | `CredentialSource` identifiable (keychain / file) | —                                           | Indeterminate source                          | `rm the stale credentials file and log in again`     |
+| Token shape valid       | JSON parse succeeds, `accessToken` non-empty      | —                                           | `ParseError` / `MissingField` / `EmptyToken`  | `rerun claude login to rewrite the credentials file` |
+| Required scopes present | Scopes include `user:inference`                   | Scopes present but include deprecated names | Required scope absent                         | `log in again to refresh scopes`                     |
+
+The token value itself is NEVER printed in doctor output — only source, scope list, and shape validity. See credentials.md §Behavior for the redaction contract.
+
+### Cache
+
+| Check                         | PASS                                             | WARN                                           | FAIL                | Hint on non-PASS                                  |
+| ----------------------------- | ------------------------------------------------ | ---------------------------------------------- | ------------------- | ------------------------------------------------- |
+| Cache dir exists or creatable | `~/.cache/linesmith/` exists, OR parent writable | —                                              | Parent not writable | `check filesystem permissions on $XDG_CACHE_HOME` |
+| `usage.json` shape current    | `schema_version` matches                         | Present but stale schema (will be overwritten) | —                   | `safe to ignore; next fetch rewrites`             |
+| Lock file is fresh            | Absent, or present with `blocked_until > now`    | Present, past `blocked_until` (stale lock)     | —                   | `rm ~/.cache/linesmith/usage.lock to clear`       |
+
+### Rate-limit endpoint (`--full` only)
+
+| Check                           | PASS                                          | WARN                                          | FAIL                                       | Hint on non-PASS                                      |
+| ------------------------------- | --------------------------------------------- | --------------------------------------------- | ------------------------------------------ | ----------------------------------------------------- |
+| Endpoint reachable              | `GET /api/oauth/usage` returns 200            | Response 2s-5s (slow)                         | Timeout, network error, 4xx other than 429 | `check internet, or Anthropic status page`            |
+| Endpoint returns expected shape | Response deserializes into `UsageApiResponse` | Extra unknown fields present (forward-compat) | Missing required fields                    | `report a linesmith issue; Anthropic changed the API` |
+| Rate-limit headers sane         | No 429 returned                               | 429 with a reasonable `Retry-After`           | 429 with an abusive `Retry-After` (>1h)    | `slow down: you're hitting the rate limit`            |
+
+### Plugins
+
+| Check                  | PASS                                                    | WARN | FAIL                                | Hint on non-PASS                                         |
+| ---------------------- | ------------------------------------------------------- | ---- | ----------------------------------- | -------------------------------------------------------- |
+| All plugins compile    | Every discovered `.rhai` parses                         | —    | One or more plugins fail to compile | `the reported plugin file has a syntax error at line N`  |
+| All `@data_deps` valid | Every declared name maps to a plugin-accessible DataDep | —    | Any unknown or reserved dep name    | `remove the reserved dep, or fix the typo in @data_deps` |
+| No id collisions       | Every plugin's `ID` is unique                           | —    | Two plugins share an id             | `rename one of the plugin files' ID const`               |
+| No built-in collisions | No plugin id matches a built-in segment                 | —    | Plugin id matches a built-in        | `rename the plugin (built-in wins)`                      |
+
+### Git
+
+| Check             | PASS                                     | WARN                                               | FAIL                                      | Hint on non-PASS                                                   |
+| ----------------- | ---------------------------------------- | -------------------------------------------------- | ----------------------------------------- | ------------------------------------------------------------------ |
+| cwd git status    | `gix::discover(cwd)` finds a repo        | Not in a repo (SKIP if no git\_\* segment enabled) | Repo found but `gix::open` fails          | `repair the repo; gix reported <cause>`                            |
+| HEAD resolves     | HEAD is `Branch` / `Detached` / `Unborn` | —                                                  | HEAD unresolvable (`.git/HEAD` corrupt)   | `edit .git/HEAD manually or re-clone`                              |
+| RepoKind detected | Main / LinkedWorktree / Bare reported    | —                                                  | gix error during repo-kind classification | file a linesmith bug with the output of `linesmith doctor --plain` |
+
+### Self
+
+| Check                       | PASS                                         | WARN                              | FAIL | Hint on non-PASS                             |
+| --------------------------- | -------------------------------------------- | --------------------------------- | ---- | -------------------------------------------- |
+| Update available (`--full`) | Running on latest release                    | Newer release available on GitHub | —    | `run brew upgrade linesmith (or equivalent)` |
+| Binary integrity            | `linesmith --version` matches build metadata | Build metadata missing (unusual)  | —    | `reinstall from a canonical source`          |
+
+## Behavior
+
+### Check ordering
+
+Categories run in the order shown above (Environment → Config → Claude Code → Credentials → Cache → Rate-limit endpoint → Plugins → Git → Self). Within a category, checks run top-to-bottom. Ordering matters when a later check depends on an earlier one: a FAIL on "Config file discovered" short-circuits the rest of the Config category (all subsequent Config checks render as SKIP with reason "config not loaded").
+
+### Cross-category short-circuits
+
+| If this check FAILs  | Downstream checks SKIP with reason                              |
+| -------------------- | --------------------------------------------------------------- |
+| `$HOME resolves`     | All file-based checks (Config, Claude Code, Credentials, Cache) |
+| `~/.claude/` missing | Recent sessions, Credentials (file path), Claude-state cache    |
+| Config parse fails   | Segment / Theme / Plugin-dirs checks                            |
+| OAuth token missing  | Rate-limit endpoint checks (can't probe without token)          |
+
+### Timing
+
+Default run target: <500ms total on a warm filesystem. Each check's budget:
+
+- Environment: sub-ms per check (all in-process)
+- Config: <5ms (one file parse)
+- Claude Code: <10ms (stat + parse `~/.claude.json`)
+- Credentials: <200ms on macOS (one `security` subprocess on first call, memoized); <1ms on Linux/Windows (file read)
+- Cache: <1ms (stat only)
+- Plugins: <3ms per plugin (rhai parse)
+- Git: <15ms (gix discover + HEAD resolve)
+- Self: <1ms (env var read; `--full` adds a network call)
+
+`--full` adds ~2s for the endpoint probe (2s timeout per rate-limit-segments.md) and up to 2s for the update check (GitHub releases API).
+
+### Color / glyph selection
+
+Default (`--plain` absent):
+
+- Terminal has 16-color support or better (TERM is set, not `dumb`): colors + Unicode glyphs
+- `NO_COLOR` set: colors disabled, Unicode glyphs still rendered (Unicode support is orthogonal to color support)
+- TERM unset or `dumb`: colors disabled and Unicode glyphs replaced with ASCII (the terminal can't render either reliably)
+
+`--plain` always uses ASCII + no colors, regardless of terminal capability.
+
+### Panic behavior
+
+Per [ADR-0007](../adrs/0007-cargo-dist-distribution.md), linesmith's release profile uses `panic = "abort"`, so a panicking check terminates the whole `doctor` run immediately — no `catch_unwind` recovery, no partial output. The checks themselves are written defensively (stat before read, match on Option/Result, no unwraps on user input) so panics indicate a doctor bug, not a user-environment problem. Treat any panic-terminated run as a bug report and include the panic message.
+
+### JSON output (deferred)
+
+`--json` is reserved for v0.2. When implemented, the shape will be:
+
+```json
+{
+  "linesmith_version": "0.1.0",
+  "exit_code": 0,
+  "summary": { "pass": 15, "warn": 1, "fail": 0, "skip": 2 },
+  "categories": [
+    {
+      "name": "Environment",
+      "checks": [
+        {
+          "id": "env.stdout_tty",
+          "label": "Stdout is a tty",
+          "severity": "pass",
+          "detail": "isatty(1) == true",
+          "hint": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+The `id` field is stable across versions for CI-script consumers.
+
+## Edge cases
+
+| Case                                                                 | Handling                                                                                 |
+| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `linesmith doctor` run inside a CI container                         | Terminal width unknown, `$TERM=dumb` → WARN each; many checks still PASS                 |
+| `~/.claude.json` is a 500MB file (pathological)                      | Cap read at 2MB; FAIL with "file too large — likely corrupt"                             |
+| Keychain prompt appears on macOS during Credentials check            | First-run expected; if user denies, report as FAIL with `SubprocessFailed` hint          |
+| Config references a plugin that exists but fails to compile          | Config check PASSes (reference is legal); Plugins check FAILs (compile error)            |
+| Stale `usage.lock` (mtime > 30s)                                     | WARN with path + rm hint; doesn't block                                                  |
+| Anthropic endpoint returns 401                                       | FAIL (token expired/revoked); hint: `log in to Claude Code to refresh`                   |
+| No internet connection, `--full` specified                           | Endpoint reachability → FAIL with "no network"; other checks unaffected                  |
+| Multiple doctor runs in rapid succession                             | Each is independent; no cross-run state                                                  |
+| User runs `doctor` from a non-git directory                          | Git category's first check reports "not in a repo"; remaining Git checks SKIP. No error. |
+| Default plugin directory doesn't exist (no `plugin_dirs` configured) | SKIP the Plugins category with reason "no plugins configured"; not a failure             |
+| `~/.claude/sessions/{pid}.json` with a PID from a dead process       | Neutral — the stale entry doesn't affect doctor's checks                                 |
+| Terminal width < 80 cells                                            | Tree output wraps; no horizontal-scroll guarantees                                       |
+| `doctor` invoked with unrecognized flag                              | Prints usage; exits 2 (the usage-error code — distinct from FAIL's exit 1)               |
+| Cache dir is a symlink to a read-only filesystem                     | Creatable check FAILs with hint to point cache dir elsewhere                             |
+
+## Testing strategy
+
+Follows `AGENTS.md`: inline `#[cfg(test)] mod tests` for unit tests, `tests/doctor_integration.rs` for integration, `insta` for snapshots.
+
+### Unit tests (per check category)
+
+- Severity-determination logic: given a stub source result, the check produces the documented severity
+- Remediation hints: every non-PASS path prints the expected hint text (tested against inline fixtures)
+- Short-circuit propagation: stubbed `$HOME` missing causes file-based checks to SKIP
+- `--plain` rendering: no ANSI codes, no Unicode glyphs
+- Panic catching: a check that panics reports as FAIL without propagating
+
+### Integration tests
+
+Fixtures under `tests/fixtures/doctor/`:
+
+- `all_pass/`: synthetic env with everything healthy → exit 0, snapshot output
+- `no_claude/`: missing `~/.claude/` → specific FAILs, exit 1
+- `stale_lock/`: aged lock file → WARN, exit 0
+- `plugin_collision/`: two plugins with the same id → FAIL, exit 1
+- `ci_mode/`: TERM=dumb + NO_COLOR set + piped stdout → WARN + SKIP, exit 0
+
+Snapshot each scenario's default and `--plain` output. Assert exit codes match the contract.
+
+### Benchmarks
+
+- Full run (no --full) on the `all_pass` fixture — criterion target: p95 <500ms
+
+## Open questions
+
+- **`--json` timeline.** If the v0.1 implementation naturally produces a structured `Vec<CheckResult>` that can be serialized, `--json` is nearly free — include it. If the renderer is string-interpolation-first, defer cleanly to v0.2.
+- **`doctor fix` subcommand.** Auto-remediation for the ten most common FAILs (regenerate config, clear stale lock, etc.) is tempting but opens a large blast-radius surface. Explicitly out of scope for v0.1; revisit once we have real user failure reports.
+- **Per-segment probes.** Currently doctor checks segment _registration_, not whether each segment actually renders output for the current StatusContext. A deeper mode would `render()` each enabled segment and flag any that return an error. Defer — the overhead isn't justified until users report hard-to-diagnose rendering bugs.
+- **Telemetry opt-in.** A "report this doctor output to Anthropic/linesmith maintainers" hint on fatal FAILs would help us debug installation issues. No PII concerns if we prompt + redact (token, email), but v0.1 sidesteps by making `doctor --plain` output easy to copy manually.
+- **Interactive doctor (TUI).** ratatui-driven interactive explorer with expandable details. Nice but optional; v0.1 stays CLI-first.
+
+## Change log
+
+- 2026-04-20: initial draft (v0.1). Defines the check catalog across eight categories (Environment, Config, Claude Code, Credentials, Cache, Rate-limit endpoint, Plugins, Git, Self), severity levels (PASS / WARN / FAIL / SKIP), exit-code contract (any FAIL → 1; WARN-only → 0), default tree-style output + `--plain` ASCII output, short-circuit propagation rules between categories, panic-safety wrapper, and testing strategy with fixture scenarios. `--json` and `doctor fix` flagged for v0.2+.
