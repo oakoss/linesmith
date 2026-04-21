@@ -122,16 +122,17 @@ fn visibility_fixture_renders_when_rate_limits_present() {
 }
 
 #[test]
-fn declares_usage_fixture_sees_stub_not_implemented() {
-    // The lazy `usage` source is a stub returning NotImplemented;
-    // the fixture renders the error code so a regression that dropped
-    // declared-dep gating (or changed the error variant) trips here
-    // before it hits production.
+fn declares_usage_fixture_sees_pre_cascade_sentinel() {
+    // The lazy `usage` source currently returns the pre-cascade
+    // sentinel `UsageError::Jsonl(JsonlError::NoEntries)`; the
+    // fixture renders the delegated short-tag so a regression that
+    // dropped declared-dep gating (or changed the sentinel's inner
+    // variant) trips here before it hits production.
     let (registry, engine, _tmp) = load_isolated("declares_usage.rhai", DECLARES_USAGE);
     let seg = first_segment(registry, engine);
     let dc = DataContext::new(minimal_status());
     let rendered = seg.render(&dc).unwrap().expect("visible");
-    assert_eq!(rendered.text(), "NotImplemented");
+    assert_eq!(rendered.text(), "NoEntries");
 }
 
 #[test]

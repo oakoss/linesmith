@@ -21,6 +21,7 @@ pub mod credentials;
 pub mod deps;
 pub mod errors;
 pub mod fetcher;
+pub mod jsonl;
 pub mod usage;
 
 use std::cell::OnceCell;
@@ -33,6 +34,7 @@ pub use deps::DataDep;
 pub use errors::{
     ClaudeJsonError, CredentialError, GitError, JsonlError, SessionError, SettingsError, UsageError,
 };
+pub use jsonl::{FiveHourBlock, JsonlAggregate, SevenDayWindow, TokenCounts};
 pub use usage::{ExtraUsage, UsageApiResponse, UsageBucket, UsageData, UsageSource};
 
 // --- Stub source types ---------------------------------------------------
@@ -56,12 +58,6 @@ pub struct Settings {}
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ClaudeJson {}
-
-/// Aggregated JSONL transcript state. Stub placeholder; concrete shape
-/// is deferred until the dedicated `jsonl-aggregation` spec lands.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct JsonlAggregate {}
 
 /// Snapshot of `~/.claude/sessions/{pid}.json` entries. Stub.
 #[derive(Debug, Clone)]
@@ -132,26 +128,30 @@ impl DataContext {
     }
 
     /// Aggregated JSONL transcript state.
+    ///
+    /// Invokes [`jsonl::aggregate_jsonl`] on first call and memoizes
+    /// the `Arc<Result<...>>` for the process lifetime. Scans the
+    /// project-root cascade once per process.
     #[must_use]
     pub fn jsonl(&self) -> Arc<Result<JsonlAggregate, JsonlError>> {
         self.jsonl
-            .get_or_init(|| Arc::new(Err(JsonlError::NotImplemented)))
+            .get_or_init(|| Arc::new(jsonl::aggregate_jsonl()))
             .clone()
     }
 
     /// OAuth usage endpoint data (shared across rate-limit segments).
     ///
     /// Returns a sentinel error until the real fallback cascade is
-    /// wired. The sentinel wraps [`JsonlError::NotImplemented`] so the
-    /// mirror's `.code()` delegation produces the same
-    /// `"NotImplemented"` short-tag as the other stub sources — NOT
-    /// the shape a live cascade will produce. ADR-0011 §Fallback
-    /// cascade unwraps inner errors on real failures, so callers
-    /// should not treat the wrap as semantically meaningful.
+    /// wired. The sentinel wraps [`JsonlError::NoEntries`] so the
+    /// mirror's `.code()` delegation produces `"NoEntries"` — the
+    /// semantic "we have no data to give you" rather than a
+    /// mid-cascade failure. ADR-0011 §Fallback cascade unwraps inner
+    /// errors on real failures, so callers should not treat the
+    /// wrap as semantically meaningful.
     #[must_use]
     pub fn usage(&self) -> Arc<Result<UsageData, UsageError>> {
         self.usage
-            .get_or_init(|| Arc::new(Err(UsageError::Jsonl(JsonlError::NotImplemented))))
+            .get_or_init(|| Arc::new(Err(UsageError::Jsonl(JsonlError::NoEntries))))
             .clone()
     }
 

@@ -1,10 +1,12 @@
 // @data_deps = ["usage"]
 //
-// Declares the `usage` source. Today's lazy stub returns
-// `Err(NotImplemented)` so plugins exercising the dep see the tagged
-// error map: `#{ kind: "error", error: "NotImplemented" }`.
-// Renders the error code so a test can pin both the gating path
-// (ctx.usage is present) and the error-shape contract.
+// Declares the `usage` source. Today's lazy accessor returns the
+// pre-cascade sentinel `Err(UsageError::Jsonl(JsonlError::NoEntries))`;
+// the rhai ctx mirror delegates `.code()` through to the inner
+// variant, so plugins exercising the dep see the tagged error map:
+// `#{ kind: "error", error: "NoEntries" }`. Renders the error code
+// so a test can pin both the gating path (ctx.usage is present) and
+// the error-shape contract.
 
 const ID = "declares_usage";
 

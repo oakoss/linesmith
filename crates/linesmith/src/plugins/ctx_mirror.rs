@@ -398,11 +398,14 @@ mod tests {
                 .and_then(|d| d.clone().try_cast::<String>()),
             Some("error".to_string())
         );
+        // `DataContext::usage()` currently returns
+        // `UsageError::Jsonl(JsonlError::NoEntries)` as a pre-cascade
+        // sentinel; `.code()` delegates through to the inner variant.
         assert_eq!(
             usage
                 .get("error")
                 .and_then(|d| d.clone().try_cast::<String>()),
-            Some("NotImplemented".to_string())
+            Some("NoEntries".to_string())
         );
     }
 
@@ -599,14 +602,16 @@ mod tests {
         // Every non-Git lazy source independently builds its tagged
         // map. Test all four arms so a copy-paste bug (wrong source,
         // wrong key) is caught here rather than in a downstream plugin
-        // that suddenly sees `()` instead of an error.
-        let cases: &[(DataDep, &str)] = &[
-            (DataDep::Settings, "settings"),
-            (DataDep::ClaudeJson, "claude_json"),
-            (DataDep::Sessions, "sessions"),
-            (DataDep::Usage, "usage"),
+        // that suddenly sees `()` instead of an error. Expected code
+        // varies per source — stubs emit "NotImplemented"; Usage's
+        // pre-cascade sentinel delegates to JsonlError::NoEntries.
+        let cases: &[(DataDep, &str, &str)] = &[
+            (DataDep::Settings, "settings", "NotImplemented"),
+            (DataDep::ClaudeJson, "claude_json", "NotImplemented"),
+            (DataDep::Sessions, "sessions", "NotImplemented"),
+            (DataDep::Usage, "usage", "NoEntries"),
         ];
-        for (dep, key) in cases {
+        for (dep, key, expected_code) in cases {
             let dc = DataContext::new(minimal_status());
             let ctx = build_and_unwrap_map(&dc, &[*dep]);
             let entry: Map = ctx
@@ -620,13 +625,14 @@ mod tests {
                     .get("kind")
                     .and_then(|d| d.clone().try_cast::<String>()),
                 Some("error".to_string()),
-                "dep {dep:?} should surface NotImplemented",
+                "dep {dep:?} should surface a tagged error",
             );
             assert_eq!(
                 entry
                     .get("error")
                     .and_then(|d| d.clone().try_cast::<String>()),
-                Some("NotImplemented".to_string()),
+                Some((*expected_code).to_string()),
+                "dep {dep:?} expected code {expected_code}",
             );
         }
     }

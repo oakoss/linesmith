@@ -53,14 +53,15 @@ stub_error!(
     "Errors from reading `~/.claude/settings.json` + overlays."
 );
 stub_error!(ClaudeJsonError, "Errors from reading `~/.claude.json`.");
-stub_error!(JsonlError, "Errors from aggregating JSONL transcripts.");
 stub_error!(SessionError, "Errors from the live sessions directory.");
 stub_error!(GitError, "Errors from `gix` repo inspection.");
 
-// `CredentialError` is the real type from `super::credentials` — re-exported
-// at the data_context module root so `pub use errors::CredentialError` still
-// resolves. When other error types graduate, follow the same pattern.
+// `CredentialError` and `JsonlError` are real types from their own
+// modules — re-exported at the data_context module root so
+// `pub use errors::{CredentialError, JsonlError}` still resolves.
+// When other error types graduate, follow the same pattern.
 pub use super::credentials::CredentialError;
+pub use super::jsonl::JsonlError;
 
 // --- UsageError (real, not stub) ---------------------------------------
 //
@@ -204,8 +205,8 @@ mod usage_error_tests {
                 "endpoint returned 401 Unauthorized",
             ),
             (
-                UsageError::Jsonl(JsonlError::NotImplemented),
-                "JSONL fallback failed: NotImplemented",
+                UsageError::Jsonl(JsonlError::NoEntries),
+                "JSONL fallback failed: Claude Code project directory has no JSONL entries",
             ),
         ];
         for (err, expected) in cases {
@@ -228,16 +229,12 @@ mod usage_error_tests {
         assert_eq!(UsageError::ParseError.code(), "ParseError");
         assert_eq!(UsageError::Unauthorized.code(), "Unauthorized");
 
-        // Credentials delegation surfaces real CredentialError codes.
+        // Credentials + Jsonl delegation surfaces real inner codes.
         assert_eq!(
             UsageError::Credentials(CredentialError::NoCredentials).code(),
             "NoCredentials",
         );
-        // Jsonl still delegates to a stub until lsm-26y lands.
-        assert_eq!(
-            UsageError::Jsonl(JsonlError::NotImplemented).code(),
-            "NotImplemented",
-        );
+        assert_eq!(UsageError::Jsonl(JsonlError::NoEntries).code(), "NoEntries",);
     }
 
     #[test]
@@ -260,7 +257,9 @@ mod usage_error_tests {
         let source = credless.source().unwrap();
         assert!(source.source().is_none());
 
-        let wrapped_jsonl = UsageError::Jsonl(JsonlError::NotImplemented);
+        // Jsonl(NoEntries) wraps a leaf — Source exists but has no
+        // inner Source of its own.
+        let wrapped_jsonl = UsageError::Jsonl(JsonlError::NoEntries);
         assert!(wrapped_jsonl.source().is_some());
 
         let bare = UsageError::NoCredentials;
