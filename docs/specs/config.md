@@ -1,9 +1,9 @@
 # Config
 
 - Status: draft
-- Version: 0.1
-- Last updated: 2026-04-17
-- Driving ADRs: [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0005](../adrs/0005-role-based-themes.md), [ADR-0006](../adrs/0006-tool-agnostic-json-schema.md)
+- Version: 0.1.1
+- Last updated: 2026-04-20
+- Driving ADRs: [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0005](../adrs/0005-role-based-themes.md), [ADR-0006](../adrs/0006-tool-agnostic-json-schema.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md), [ADR-0011](../adrs/0011-rate-limit-data-source.md)
 
 ## Overview
 
@@ -112,6 +112,31 @@ claude_padding = 0
 # color emission; "never" strips all color.
 color = "auto"
 
+# Global knobs for the OAuth /api/oauth/usage endpoint used by the
+# rate-limit segments. The cache-tier contract (memory OnceCell +
+# disk data JSON + disk lock) is defined by
+# [specs/data-fetching.md](data-fetching.md) §OAuth usage cache stack;
+# the three keys below are the only user-tunable parts of that stack.
+# Per-segment display knobs (format, invert, progress_width, label,
+# stale_marker, etc.) live under [segments.rate_limit_*]. See
+# [specs/rate-limit-segments.md](rate-limit-segments.md) §Config schema.
+[usage]
+# Disk cache TTL in seconds. Shorter = fresher data + more endpoint
+# traffic; longer = staler data + lower endpoint load. The endpoint
+# is itself rate-limited, so values below ~60s risk 429s.
+cache_duration = 180
+
+# Endpoint base URL. Change only for self-hosters or proxies; the
+# default is Anthropic's production endpoint. Scheme + host (+ port)
+# only; the `/api/oauth/usage` path is fixed.
+api_base_url = "https://api.anthropic.com"
+
+# Request timeout in seconds per endpoint call. On timeout linesmith
+# falls through to stale cache or JSONL aggregation per ADR-0011
+# §Fallback cascade. Raising this only helps users on very slow
+# networks and delays every cache-miss render.
+timeout = 2
+
 # Per-segment overrides. All sections optional. Keys match a segment's `id`.
 # Any field set here overrides the segment's declared defaults.
 [segments.context_window]
@@ -127,8 +152,12 @@ visible_if = "ctx.workspace.git_worktree != ()"
 
 [segments.rate_limit_5h]
 # Show the countdown only when usage > threshold.
-# `ctx.rate_limits` is a map with a `kind` discriminator; see plugin-api.md.
-visible_if = "ctx.rate_limits.kind == \"both\" && ctx.rate_limits.five_hour.used > 50"
+# `ctx.usage` is a tagged result map — `#{ kind: "ok", data: {...} }`
+# on success, `#{ kind: "error", error: "..." }` on failure — so the
+# success payload lives under `ctx.usage.data`. See
+# [specs/plugin-api.md](plugin-api.md) §ctx shape and the `UsageData`
+# contract in [specs/data-fetching.md](data-fetching.md).
+visible_if = "ctx.usage.kind == \"ok\" && ctx.usage.data.five_hour.utilization > 50"
 
 [segments.git_branch]
 # Sub-segments of a sub-composed segment can also be overridden.
@@ -302,3 +331,4 @@ Parse and validate; print errors/warnings to stderr; exit non-zero on errors. Us
 ## Change log
 
 - 2026-04-17: initial draft (v0.1)
+- 2026-04-20: v0.1.1 additive update. Adds `[usage]` top-level section (`cache_duration`, `api_base_url`, `timeout`) for the OAuth rate-limit endpoint knobs referenced by [data-fetching.md](data-fetching.md) §OAuth usage cache stack and [rate-limit-segments.md](rate-limit-segments.md) §Staleness bounds. Updates the `[segments.rate_limit_5h]` `visible_if` example from the stdin-payload `ctx.rate_limits` shape (dropped in lsm-7po) to the `ctx.usage` tagged-map shape matching ADR-0011's `UsageData` contract. Driven by ADR-0010 + ADR-0011. No breaking changes.

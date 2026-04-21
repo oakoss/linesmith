@@ -192,11 +192,11 @@ Per-process model: `JsonlTailer` is created fresh per invocation; `last_offset =
 
 Three-tier per [ADR-0010](../adrs/0010-data-fetching-architecture.md):
 
-| Tier        | Location                         | TTL  | Purpose                                                          |
-| ----------- | -------------------------------- | ---- | ---------------------------------------------------------------- |
-| Memory      | `DataContext.usage` (`OnceCell`) | —    | Same-process re-reads (multiple segments reading `ctx.usage()`)  |
-| Disk (data) | `~/.cache/linesmith/usage.json`  | 180s | Cross-invocation cache (configurable via `usage.cache_duration`) |
-| Disk (lock) | `~/.cache/linesmith/usage.lock`  | 30s  | Cross-process API spam prevention                                |
+| Tier        | Location                         | TTL  | Purpose                                                                                                        |
+| ----------- | -------------------------------- | ---- | -------------------------------------------------------------------------------------------------------------- |
+| Memory      | `DataContext.usage` (`OnceCell`) | —    | Same-process re-reads (multiple segments reading `ctx.usage()`)                                                |
+| Disk (data) | `~/.cache/linesmith/usage.json`  | 180s | Cross-invocation cache (configurable via `usage.cache_duration`; see [config.md](config.md) §Top-level schema) |
+| Disk (lock) | `~/.cache/linesmith/usage.lock`  | 30s  | Cross-process API spam prevention                                                                              |
 
 Cache file shape:
 

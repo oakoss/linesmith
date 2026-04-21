@@ -261,7 +261,7 @@ JSONL fallback produces no `seven_day_sonnet` / `seven_day_opus` / `extra_usage`
 
 ### Staleness bounds
 
-The data-fetching layer already enforces a 180s default TTL. Segments don't independently check staleness — they render whatever `ctx.usage()` returns. If the user configures `usage.cache_duration = 3600`, stale-up-to-an-hour values render without warning. That tradeoff is exposed and owned at the config layer.
+The data-fetching layer already enforces a 180s default TTL. Segments don't independently check staleness — they render whatever `ctx.usage()` returns. If the user configures `usage.cache_duration = 3600` (see [config.md](config.md) §Top-level schema), stale-up-to-an-hour values render without warning. That tradeoff is exposed and owned at the config layer.
 
 ## Edge cases
 
