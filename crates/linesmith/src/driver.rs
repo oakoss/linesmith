@@ -4,7 +4,9 @@
 //! `CliEnv::from_process`; tests pass `Cursor` / `Vec<u8>` buffers
 //! and a hand-built `CliEnv`.
 
+use crate::plugins::{build_engine, PluginRegistry};
 use crate::segments::builder::build_segments;
+use crate::segments::BUILT_IN_SEGMENT_IDS;
 use crate::{cli, config, detect_terminal_width, presets, run_with_context, theme, RenderContext};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -290,6 +292,65 @@ fn parse_confirmation(input: &str) -> bool {
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+/// Discover and compile plugin scripts. Returns `None` when no
+/// `plugin_dirs` are configured AND no XDG default exists, so the
+/// no-plugins fast path skips engine construction entirely.
+///
+/// The XDG dir is computed from [`CliEnv`] (not `std::env`) so test
+/// harnesses don't inherit the developer's real
+/// `~/.config/linesmith/segments/`.
+///
+/// The returned `error_count` lets `--check-config` fold plugin-load
+/// failures into its summary warning total without re-parsing the
+/// stderr stream.
+fn load_plugins(
+    cfg: Option<&config::Config>,
+    env: &CliEnv,
+    stderr: &mut dyn Write,
+) -> (
+    Option<(PluginRegistry, std::sync::Arc<rhai::Engine>)>,
+    usize,
+) {
+    let config_dirs: &[PathBuf] = cfg.map_or(&[], |c| c.plugin_dirs.as_slice());
+    let xdg_dir = xdg_segments_dir(env);
+
+    // Cold-start fast path: skip `build_engine` entirely when no
+    // plugin source exists on disk. The XDG path is set whenever
+    // `HOME` is, but usually points at a directory that was never
+    // created — checking once beats paying engine-construction cost
+    // on every render.
+    let xdg_present = xdg_dir.as_deref().is_some_and(|p| p.is_dir());
+    if config_dirs.is_empty() && !xdg_present {
+        return (None, 0);
+    }
+
+    let engine = build_engine();
+    let (registry, errors) = PluginRegistry::load_with_xdg(
+        config_dirs,
+        xdg_dir.as_deref(),
+        &engine,
+        BUILT_IN_SEGMENT_IDS,
+    );
+    let error_count = errors.len();
+    for err in errors {
+        let _ = writeln!(stderr, "linesmith: plugin: {err}");
+    }
+    (Some((registry, engine)), error_count)
+}
+
+/// `$XDG_CONFIG_HOME/linesmith/segments/` if `XDG_CONFIG_HOME` is set,
+/// else `$HOME/.config/linesmith/segments/`. `None` when neither env
+/// var is populated (clean test harness).
+fn xdg_segments_dir(env: &CliEnv) -> Option<PathBuf> {
+    if let Some(xdg) = env.xdg_config_home.as_deref().filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(xdg).join("linesmith").join("segments"));
+    }
+    env.home
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|home| PathBuf::from(home).join(".config/linesmith/segments"))
+}
+
 fn run_cli(
     args: cli::CliArgs,
     stdin: impl Read,
@@ -314,6 +375,7 @@ fn run_cli(
             load_error,
             config_warnings,
             &registry,
+            env,
             stderr,
         );
     }
@@ -324,7 +386,8 @@ fn run_cli(
         let _ = writeln!(stderr, "linesmith: {msg}");
     }
 
-    let segments = build_segments(cfg.as_ref(), |msg| {
+    let (plugins, _plugin_load_errors) = load_plugins(cfg.as_ref(), env, stderr);
+    let segments = build_segments(cfg.as_ref(), plugins, |msg| {
         let _ = writeln!(stderr, "linesmith: {msg}");
     });
 
@@ -489,6 +552,7 @@ fn check_config(
     load_error: Option<config::ConfigError>,
     config_warnings: Vec<String>,
     registry: &theme::ThemeRegistry,
+    env: &CliEnv,
     stderr: &mut dyn Write,
 ) -> u8 {
     // `--check-config` is the CI / editor contract for strict
@@ -519,7 +583,9 @@ fn check_config(
         let _ = writeln!(stderr, "linesmith: {msg}");
         warn_count += 1;
     }
-    let _ = build_segments(Some(cfg), |msg| {
+    let (plugins, plugin_load_errors) = load_plugins(Some(cfg), env, stderr);
+    warn_count += plugin_load_errors;
+    let _ = build_segments(Some(cfg), plugins, |msg| {
         let _ = writeln!(stderr, "linesmith: {msg}");
         warn_count += 1;
     });

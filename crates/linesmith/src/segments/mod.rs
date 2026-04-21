@@ -148,7 +148,7 @@ pub(crate) fn text_width(s: &str) -> u16 {
 /// that funnels user data through it.
 ///
 /// Returns the input unchanged when it has no control chars.
-fn sanitize_control_chars(s: String) -> String {
+pub(crate) fn sanitize_control_chars(s: String) -> String {
     if !s.chars().any(char::is_control) {
         return s;
     }
@@ -375,6 +375,22 @@ pub const DEFAULT_SEGMENT_IDS: &[&str] = &[
     "cost",
     "effort",
     "workspace",
+];
+
+/// Every built-in segment id. Used by [`PluginRegistry`] to reject
+/// plugins whose `const ID` shadows a built-in. Add new built-ins
+/// here AND to [`built_in_by_id`].
+///
+/// [`PluginRegistry`]: crate::plugins::PluginRegistry
+pub const BUILT_IN_SEGMENT_IDS: &[&str] = &[
+    "model",
+    "context_window",
+    "workspace",
+    "cost",
+    "effort",
+    "rate_limit",
+    "rate_limit_5h",
+    "rate_limit_7d",
 ];
 
 /// Construct a built-in segment by its config id. Unknown ids return

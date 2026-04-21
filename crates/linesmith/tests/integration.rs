@@ -72,6 +72,56 @@ fn extreme_narrow_keeps_only_lowest_priority_segments() {
 }
 
 #[test]
+fn xdg_plugin_renders_via_full_driver_path() {
+    // Pins the `cli_main → load_plugins → build_segments → RhaiSegment::render`
+    // chain end-to-end with a real .rhai file under XDG.
+    use std::fs;
+    use tempfile::TempDir;
+
+    let xdg = TempDir::new().expect("tempdir");
+    let segments_dir = xdg.path().join("linesmith").join("segments");
+    fs::create_dir_all(&segments_dir).expect("mkdir");
+
+    fs::write(
+        segments_dir.join("echo.rhai"),
+        r#"
+        const ID = "echo";
+        fn render(ctx) {
+            #{ runs: [#{ text: ctx.config.text }] }
+        }
+        "#,
+    )
+    .expect("write plugin");
+
+    let config_dir = xdg.path().join("linesmith");
+    fs::write(
+        config_dir.join("config.toml"),
+        r#"
+            [line]
+            segments = ["echo"]
+            [segments.echo]
+            text = "hi-from-plugin"
+        "#,
+    )
+    .expect("write config");
+
+    let mut env = linesmith::CliEnv::for_tests();
+    env.xdg_config_home = Some(xdg.path().to_string_lossy().into_owned());
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = linesmith::cli_main(
+        std::iter::empty::<&str>(),
+        Cursor::new(CLAUDE_MINIMAL),
+        &mut stdout,
+        &mut stderr,
+        &env,
+    );
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&stderr));
+    assert_eq!(String::from_utf8(stdout).expect("utf8"), "hi-from-plugin\n");
+}
+
+#[test]
 fn config_reorders_and_filters_segments() {
     // Config picks only model + workspace, in that custom order.
     let cfg = linesmith::config::Config::from_str(
@@ -81,7 +131,7 @@ fn config_reorders_and_filters_segments() {
         "#,
     )
     .expect("parse");
-    let segments = linesmith::build_segments(Some(&cfg), |_| {});
+    let segments = linesmith::build_segments(Some(&cfg), None, |_| {});
     let mut out = Vec::new();
     linesmith::run_with_segments_and_width(Cursor::new(CLAUDE_WORKTREE), &mut out, &segments, 200)
         .expect("run ok");
@@ -103,7 +153,7 @@ fn config_style_override_emits_sgr_bytes_end_to_end() {
         "#,
     )
     .expect("parse");
-    let segments = linesmith::build_segments(Some(&cfg), |_| {});
+    let segments = linesmith::build_segments(Some(&cfg), None, |_| {});
     let status_ctx =
         linesmith::input::parse(include_bytes!("fixtures/claude_minimal.json")).expect("parse");
     let ctx = linesmith::data_context::DataContext::new(status_ctx);
@@ -135,7 +185,7 @@ fn config_style_override_invalid_warns_and_render_still_succeeds() {
     )
     .expect("parse");
     let mut warnings = Vec::new();
-    let segments = linesmith::build_segments(Some(&cfg), |m| warnings.push(m.to_string()));
+    let segments = linesmith::build_segments(Some(&cfg), None, |m| warnings.push(m.to_string()));
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].contains("segments.model.style"));
     assert!(warnings[0].contains("mauve"));
@@ -162,7 +212,7 @@ fn config_priority_override_flips_drop_order_under_pressure() {
         "#,
     )
     .expect("parse");
-    let segments = linesmith::build_segments(Some(&cfg), |_| {});
+    let segments = linesmith::build_segments(Some(&cfg), None, |_| {});
     let mut out = Vec::new();
     // Budget tight enough to force one drop but fit the other.
     linesmith::run_with_segments_and_width(Cursor::new(CLAUDE_WORKTREE), &mut out, &segments, 10)

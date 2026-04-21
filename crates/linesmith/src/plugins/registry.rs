@@ -16,9 +16,7 @@ use std::path::{Path, PathBuf};
 
 use rhai::{Engine, AST};
 
-#[cfg(test)]
-use super::discovery::scan_dirs;
-use super::discovery::scan_plugin_dirs;
+use super::discovery::{scan_dirs, scan_plugin_dirs};
 use super::errors::{CollisionWinner, PluginError};
 use super::header::{parse_data_deps_header, HeaderError};
 use crate::data_context::DataDep;
@@ -46,12 +44,6 @@ use crate::data_context::DataDep;
 pub struct CompiledPlugin {
     pub(crate) id: String,
     pub(crate) path: PathBuf,
-    // The AST is consumed by the `RhaiSegment` adapter that implements
-    // the `Segment` trait for plugin scripts; today's codebase stops
-    // at the registry so clippy flags the field as unread. Silencing
-    // here keeps the contract explicit rather than deferring the
-    // field to the adapter.
-    #[allow(dead_code)]
     pub(crate) ast: AST,
     pub(crate) declared_deps: Vec<DataDep>,
 }
@@ -99,12 +91,14 @@ impl PluginRegistry {
         Self::load_from_paths(&scan_plugin_dirs(config_dirs), engine, built_in_ids)
     }
 
-    /// Hermetic variant of [`Self::load`] that takes an explicit
-    /// `xdg_dir` override (or `None` to skip the default XDG scan
-    /// entirely). Used by registry tests so a developer's real
-    /// `~/.config/linesmith/segments/` doesn't contaminate fixtures.
-    #[cfg(test)]
-    pub(crate) fn load_with_xdg(
+    /// Explicit-XDG variant of [`Self::load`]. Passes `xdg_dir`
+    /// through to the discovery scan rather than reading
+    /// `XDG_CONFIG_HOME` from the process env. Use `None` to skip the
+    /// XDG fallback entirely — driver paths pass an env-derived
+    /// [`PathBuf`] so test harnesses with a hermetic `CliEnv` don't
+    /// pick up the developer's real `~/.config/linesmith/segments/`.
+    #[must_use]
+    pub fn load_with_xdg(
         config_dirs: &[PathBuf],
         xdg_dir: Option<&Path>,
         engine: &Engine,
@@ -177,6 +171,16 @@ impl PluginRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.plugins.is_empty()
+    }
+
+    /// Consume the registry, yielding every compiled plugin by value.
+    /// The segment builder pulls plugins out by id this way to move
+    /// each [`CompiledPlugin`] into a [`RhaiSegment`].
+    ///
+    /// [`RhaiSegment`]: super::segment::RhaiSegment
+    #[must_use]
+    pub fn into_plugins(self) -> Vec<CompiledPlugin> {
+        self.plugins
     }
 }
 

@@ -8,14 +8,20 @@
 //! `call_fn` on — and [`PluginError`](errors::PluginError), the
 //! load-time + render-time failure surface.
 
+pub mod ctx_mirror;
 pub mod discovery;
 pub mod engine;
 pub mod errors;
 pub mod header;
+pub mod output;
 pub mod registry;
+pub mod segment;
 
+pub use ctx_mirror::build_ctx;
 pub use discovery::scan_plugin_dirs;
 pub use engine::build_engine;
 pub use errors::{CollisionWinner, PluginError, ResourceLimit};
 pub use header::{parse_data_deps_header, HeaderError};
+pub use output::validate_return;
 pub use registry::{CompiledPlugin, PluginRegistry};
+pub use segment::RhaiSegment;

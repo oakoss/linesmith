@@ -95,7 +95,7 @@ mod tests {
             let cfg = Config::from_str(body)
                 .unwrap_or_else(|e| panic!("preset '{name}' failed to parse: {e}"));
             let mut warnings: Vec<String> = Vec::new();
-            let _ = build_segments(Some(&cfg), |m: &str| warnings.push(m.to_string()));
+            let _ = build_segments(Some(&cfg), None, |m: &str| warnings.push(m.to_string()));
             assert!(
                 warnings.is_empty(),
                 "preset '{name}' emitted warnings: {warnings:?}"

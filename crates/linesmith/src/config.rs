@@ -9,7 +9,7 @@ use std::str::FromStr;
 /// Parsed `config.toml`. Serde ignores unknown keys so a file from a
 /// newer linesmith still parses on an older binary; fields this
 /// version doesn't know are dropped rather than rejected.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub line: Option<LineConfig>,
@@ -55,17 +55,29 @@ pub struct LineConfig {
     pub segments: Vec<String>,
 }
 
-/// `[segments.<id>]` override block. Each field, when `Some`, replaces
-/// the segment's built-in default. `style` is stored as a raw string;
-/// `segments::builder::apply_override` parses it at build time so
-/// parse errors can emit warnings through the same callback that
+/// `[segments.<id>]` override block. Each typed field, when `Some`,
+/// replaces the segment's built-in default. Any unrecognized keys land
+/// in [`extra`](Self::extra), which the segment builder forwards to
+/// plugin scripts as `ctx.config.<key>`. `style` is stored as a raw
+/// string; `segments::builder::apply_override` parses it at build time
+/// so parse errors emit warnings through the same callback that
 /// handles unknown-ID and inverted-bounds diagnostics.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+///
+/// `Eq` isn't derived because [`toml::Value`] holds `f64` and so is
+/// `PartialEq` only — `extra` propagates that constraint.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct SegmentOverride {
     pub priority: Option<u8>,
     pub width: Option<WidthBoundsConfig>,
     pub style: Option<String>,
+    /// Plugin-config bag: every TOML key under `[segments.<plugin-id>]`
+    /// not matched by a typed field. Surfaced to the rhai script as
+    /// `ctx.config.<key>` per `docs/specs/plugin-api.md` §ctx shape.
+    /// Built-in segments ignore this; the unknown-key validator still
+    /// warns when a built-in's table contains keys outside its schema.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, toml::Value>,
 }
 
 /// Width-bounds override. Either side may be omitted; a missing side

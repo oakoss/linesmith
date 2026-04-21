@@ -1,9 +1,15 @@
 //! `Config` → `Vec<Box<dyn Segment>>` with validation. Hides built-in
-//! registry lookup, duplicate handling, unknown-ID warnings, and
-//! per-segment override merging.
+//! registry lookup, duplicate handling, unknown-ID warnings,
+//! per-segment override merging, and plugin-registry consultation.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
+use rhai::{Array, Dynamic, Engine, Map};
 
 use super::{built_in_by_id, OverriddenSegment, Segment, WidthBounds, DEFAULT_SEGMENT_IDS};
 use crate::config;
+use crate::plugins::{CompiledPlugin, PluginRegistry, RhaiSegment};
 use crate::theme;
 
 /// Build the default segment list: every built-in in canonical order,
@@ -21,12 +27,19 @@ pub fn build_default_segments() -> Vec<Box<dyn Segment>> {
 /// order. `warn` receives a one-line diagnostic for each validation
 /// rule triggered (pass `|_| {}` to discard).
 ///
+/// `plugins` carries the discovered [`PluginRegistry`] plus its
+/// shared engine. Built-in ids win on collision (the registry already
+/// rejects plugins shadowing built-ins at load time, so a plugin
+/// reaching this function can only collide with another plugin or
+/// stand alone).
+///
 /// Implements the validation rules in `docs/specs/config.md`
 /// §Validation rules: unknown ids skip with a warning, duplicates
 /// keep the first, an explicit `segments = []` warns, inverted width
 /// bounds drop the override with a warning.
 pub fn build_segments(
     config: Option<&config::Config>,
+    plugins: Option<(PluginRegistry, Arc<Engine>)>,
     mut warn: impl FnMut(&str),
 ) -> Vec<Box<dyn Segment>> {
     let configured_line = config.and_then(|c| c.line.as_ref());
@@ -41,23 +54,89 @@ pub fn build_segments(
         None => DEFAULT_SEGMENT_IDS.to_vec(),
     };
 
-    let mut seen = std::collections::HashSet::<&str>::new();
+    // Bundle the lookup table with its engine so the borrow checker
+    // (rather than a runtime invariant + `expect`) enforces that
+    // plugin renders never reach for a missing engine.
+    let mut plugin_bundle: Option<(HashMap<String, CompiledPlugin>, Arc<Engine>)> =
+        plugins.map(|(registry, engine)| {
+            let lookup: HashMap<String, CompiledPlugin> = registry
+                .into_plugins()
+                .into_iter()
+                .map(|p| (p.id().to_string(), p))
+                .collect();
+            (lookup, engine)
+        });
+
+    let mut seen = std::collections::HashSet::<String>::new();
     ids.into_iter()
         .filter_map(|id| {
-            if !seen.insert(id) {
+            if !seen.insert(id.to_string()) {
                 warn(&format!(
                     "segment '{id}' listed more than once; keeping first occurrence"
                 ));
                 return None;
             }
-            let inner = built_in_by_id(id).or_else(|| {
+            let cfg_override = config.and_then(|c| c.segments.get(id));
+            let inner = if let Some(b) = built_in_by_id(id) {
+                Some(b)
+            } else if let Some((lookup, engine)) = plugin_bundle.as_mut() {
+                lookup.remove(id).map(|plugin| {
+                    // Always pass a Map (possibly empty) rather than
+                    // `()` so plugins can probe `ctx.config.foo`
+                    // without first checking the parent for unit.
+                    let plugin_config = cfg_override.map_or_else(
+                        || Dynamic::from_map(Map::new()),
+                        |ov| toml_table_to_dynamic(&ov.extra),
+                    );
+                    Box::new(RhaiSegment::from_compiled(
+                        plugin,
+                        engine.clone(),
+                        plugin_config,
+                    )) as Box<dyn Segment>
+                })
+            } else {
+                None
+            };
+            let inner = inner.or_else(|| {
                 warn(&format!("unknown segment id '{id}' — skipping"));
                 None
             })?;
-            let cfg_override = config.and_then(|c| c.segments.get(id));
             Some(apply_override(id, inner, cfg_override, &mut warn))
         })
         .collect()
+}
+
+/// Convert the `extra` bag of a `[segments.<plugin-id>]` block into
+/// the `rhai::Map` a plugin sees as `ctx.config`.
+fn toml_table_to_dynamic(table: &BTreeMap<String, toml::Value>) -> Dynamic {
+    let mut map = Map::new();
+    for (k, v) in table {
+        map.insert(k.as_str().into(), toml_value_to_dynamic(v));
+    }
+    Dynamic::from_map(map)
+}
+
+fn toml_value_to_dynamic(value: &toml::Value) -> Dynamic {
+    match value {
+        toml::Value::String(s) => Dynamic::from(s.clone()),
+        toml::Value::Integer(i) => Dynamic::from(*i),
+        toml::Value::Float(f) => Dynamic::from(*f),
+        toml::Value::Boolean(b) => Dynamic::from(*b),
+        // toml::Datetime has no native rhai equivalent; surface as the
+        // RFC 3339 string the spec already uses for time fields.
+        toml::Value::Datetime(dt) => Dynamic::from(dt.to_string()),
+        toml::Value::Array(items) => {
+            let arr: Array = items.iter().map(toml_value_to_dynamic).collect();
+            Dynamic::from_array(arr)
+        }
+        toml::Value::Table(t) => {
+            let mut m = Map::new();
+            for (k, v) in t {
+                m.insert(k.as_str().into(), toml_value_to_dynamic(v));
+            }
+            Dynamic::from_map(m)
+        }
+    }
 }
 
 fn apply_override(
@@ -103,11 +182,11 @@ fn apply_override(
 mod tests {
     use super::*;
     use crate::input;
-    use crate::segments;
+    use crate::segments::{self, BUILT_IN_SEGMENT_IDS};
     use std::str::FromStr;
 
     fn built(cfg: Option<&config::Config>) -> Vec<Box<dyn Segment>> {
-        build_segments(cfg, |_| {})
+        build_segments(cfg, None, |_| {})
     }
 
     #[test]
@@ -181,7 +260,7 @@ mod tests {
         )
         .expect("parse");
         let mut warnings = Vec::new();
-        let got = build_segments(Some(&cfg), |msg| warnings.push(msg.to_string()));
+        let got = build_segments(Some(&cfg), None, |msg| warnings.push(msg.to_string()));
         assert_eq!(got.len(), 2);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("does_not_exist"));
@@ -197,7 +276,7 @@ mod tests {
         )
         .expect("parse");
         let mut warnings = Vec::new();
-        let got = build_segments(Some(&cfg), |msg| warnings.push(msg.to_string()));
+        let got = build_segments(Some(&cfg), None, |msg| warnings.push(msg.to_string()));
         assert_eq!(got.len(), 2); // one model, one workspace
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("model"));
@@ -214,7 +293,7 @@ mod tests {
         )
         .expect("parse");
         let mut warnings = Vec::new();
-        let got = build_segments(Some(&cfg), |msg| warnings.push(msg.to_string()));
+        let got = build_segments(Some(&cfg), None, |msg| warnings.push(msg.to_string()));
         assert!(got.is_empty());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("empty"));
@@ -233,7 +312,7 @@ mod tests {
         )
         .expect("parse");
         let mut warnings = Vec::new();
-        let got = build_segments(Some(&cfg), |msg| warnings.push(msg.to_string()));
+        let got = build_segments(Some(&cfg), None, |msg| warnings.push(msg.to_string()));
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].defaults().width, None);
         assert_eq!(warnings.len(), 1);
@@ -261,6 +340,7 @@ mod tests {
             priority: None,
             width: Some(config::WidthBoundsConfig { min, max }),
             style: None,
+            extra: BTreeMap::new(),
         };
         let wrapped = apply_override("stub", Box::new(StubWithWidth), Some(&ov), &mut |_| {});
         wrapped.defaults().width.expect("width preserved")
@@ -330,7 +410,7 @@ mod tests {
             "#,
         )
         .expect("parse");
-        let built = build_segments(Some(&cfg), |_| {});
+        let built = build_segments(Some(&cfg), None, |_| {});
         let rendered = built[0]
             .render(&model_ctx("Claude Sonnet 4.6"))
             .expect("render ok")
@@ -355,7 +435,7 @@ mod tests {
             "#,
         )
         .expect("parse");
-        let built = build_segments(Some(&cfg), |_| {});
+        let built = build_segments(Some(&cfg), None, |_| {});
         let rendered = built[0]
             .render(&model_ctx("Claude Sonnet 4.6"))
             .expect("render ok")
@@ -380,7 +460,7 @@ mod tests {
         )
         .expect("parse");
         let mut warnings = Vec::new();
-        let built = build_segments(Some(&cfg), |m| warnings.push(m.to_string()));
+        let built = build_segments(Some(&cfg), None, |m| warnings.push(m.to_string()));
         let rendered = built[0]
             .render(&model_ctx("Claude Sonnet 4.6"))
             .expect("render ok")
@@ -404,7 +484,7 @@ mod tests {
             "#,
         )
         .expect("parse");
-        let built = build_segments(Some(&cfg), |_| {});
+        let built = build_segments(Some(&cfg), None, |_| {});
         let rendered = built[0]
             .render(&model_ctx("Claude Sonnet 4.6"))
             .expect("render ok")
@@ -424,12 +504,182 @@ mod tests {
             "#,
         )
         .expect("parse");
-        let built = build_segments(Some(&cfg), |_| {});
+        let built = build_segments(Some(&cfg), None, |_| {});
         let rendered = built[0]
             .render(&model_ctx("Claude Sonnet 4.6"))
             .expect("render ok")
             .expect("visible");
         assert_eq!(rendered.style.role, Some(Role::Primary));
+    }
+
+    // --- plugin integration ----------------------------------------
+
+    fn write_plugin(dir: &std::path::Path, name: &str, src: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, src).expect("write plugin");
+        p
+    }
+
+    #[test]
+    fn plugin_id_resolves_through_build_segments() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        write_plugin(
+            tmp.path(),
+            "p.rhai",
+            r#"
+            const ID = "my_plugin";
+            fn render(ctx) { #{ runs: [#{ text: "from-plugin" }] } }
+            "#,
+        );
+        let engine = crate::plugins::build_engine();
+        let (registry, errors) = crate::plugins::PluginRegistry::load_with_xdg(
+            &[tmp.path().to_path_buf()],
+            None,
+            &engine,
+            BUILT_IN_SEGMENT_IDS,
+        );
+        assert!(errors.is_empty(), "load errors: {errors:?}");
+
+        let cfg = config::Config::from_str(
+            r#"
+                [line]
+                segments = ["model", "my_plugin"]
+            "#,
+        )
+        .expect("parse");
+        let built = build_segments(Some(&cfg), Some((registry, engine)), |_| {});
+        assert_eq!(built.len(), 2);
+        // Order matches `[line].segments`: built-in `model` first,
+        // plugin `my_plugin` second. `model` defaults to priority 64;
+        // a plugin with no override defaults to the trait's 128.
+        assert_eq!(built[0].defaults().priority, 64);
+        assert_eq!(built[1].defaults().priority, 128);
+        // The plugin's render emits a known string — pin it so a
+        // wiring regression that swaps slots fails loudly.
+        let dc = model_ctx("Sonnet");
+        let plugin_render = built[1]
+            .render(&dc)
+            .expect("plugin render ok")
+            .expect("visible");
+        assert_eq!(plugin_render.text(), "from-plugin");
+    }
+
+    #[test]
+    fn unknown_id_with_plugin_registry_still_warns() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        write_plugin(
+            tmp.path(),
+            "p.rhai",
+            r#"
+            const ID = "loaded";
+            fn render(ctx) { () }
+            "#,
+        );
+        let engine = crate::plugins::build_engine();
+        let (registry, _) = crate::plugins::PluginRegistry::load_with_xdg(
+            &[tmp.path().to_path_buf()],
+            None,
+            &engine,
+            BUILT_IN_SEGMENT_IDS,
+        );
+
+        let cfg = config::Config::from_str(
+            r#"
+                [line]
+                segments = ["loaded", "missing_plugin"]
+            "#,
+        )
+        .expect("parse");
+        let mut warnings = Vec::new();
+        let built = build_segments(Some(&cfg), Some((registry, engine)), |m| {
+            warnings.push(m.to_string())
+        });
+        assert_eq!(built.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("missing_plugin"));
+    }
+
+    #[test]
+    fn plugin_receives_extra_keys_from_segments_table_as_ctx_config() {
+        // Pins the TOML → SegmentOverride.extra → toml_table_to_dynamic
+        // → ctx.config round-trip. Without it, the wiring could
+        // silently regress to passing Dynamic::UNIT and a plugin
+        // reading `ctx.config.foo` would crash at render time.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        write_plugin(
+            tmp.path(),
+            "labelled.rhai",
+            r#"
+            const ID = "labelled";
+            fn render(ctx) {
+                #{ runs: [#{ text: ctx.config.label }] }
+            }
+            "#,
+        );
+        let engine = crate::plugins::build_engine();
+        let (registry, _) = crate::plugins::PluginRegistry::load_with_xdg(
+            &[tmp.path().to_path_buf()],
+            None,
+            &engine,
+            BUILT_IN_SEGMENT_IDS,
+        );
+
+        let cfg = config::Config::from_str(
+            r#"
+                [line]
+                segments = ["labelled"]
+                [segments.labelled]
+                label = "from-toml"
+            "#,
+        )
+        .expect("parse");
+        let built = build_segments(Some(&cfg), Some((registry, engine)), |_| {});
+        assert_eq!(built.len(), 1);
+        let dc = model_ctx("Sonnet");
+        let rendered = built[0].render(&dc).expect("render ok").expect("visible");
+        assert_eq!(rendered.text(), "from-toml");
+    }
+
+    #[test]
+    fn built_in_id_wins_over_plugin_with_same_id() {
+        // The registry's load-time check normally rejects a plugin
+        // whose `const ID` shadows a built-in. This test smuggles
+        // such a plugin past the registry (empty built-in list at
+        // load time) and configures the colliding id in `[line]`,
+        // then asserts `build_segments` still picks the built-in.
+        // Locks the belt-and-suspenders precedence in case the
+        // registry-level check ever regresses.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        write_plugin(
+            tmp.path(),
+            "ghost.rhai",
+            r#"
+            const ID = "model";
+            fn render(_) { #{ runs: [#{ text: "from-plugin" }] } }
+            "#,
+        );
+        let engine = crate::plugins::build_engine();
+        let (registry, _) = crate::plugins::PluginRegistry::load_with_xdg(
+            &[tmp.path().to_path_buf()],
+            None,
+            &engine,
+            &[],
+        );
+
+        let cfg = config::Config::from_str(
+            r#"
+                [line]
+                segments = ["model"]
+            "#,
+        )
+        .expect("parse");
+        let built = build_segments(Some(&cfg), Some((registry, engine)), |_| {});
+        // The built-in model segment uses display_name from ctx; a
+        // text comparison wouldn't be stable across changes there.
+        // Priority 64 belongs to the built-in; the plugin would have
+        // the trait default of 128.
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].defaults().priority, 64);
     }
 
     #[test]
