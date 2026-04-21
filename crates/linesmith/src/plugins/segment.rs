@@ -15,15 +15,52 @@
 //! a built-in `render` that returns `Err`.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use rhai::{Dynamic, Engine, Scope, AST};
+use rhai::{Dynamic, Engine, EvalAltResult, Scope, AST};
 
 use crate::data_context::{DataContext, DataDep};
 use crate::segments::{RenderResult, Segment, SegmentError};
 
 use super::ctx_mirror::build_ctx;
+use super::engine::{
+    set_current_plugin_id, set_render_deadline, DeadlineAbortMarker, DEFAULT_RENDER_DEADLINE_MS,
+};
 use super::output::validate_return;
 use super::registry::CompiledPlugin;
+
+/// RAII guard for the engine's per-render thread-local state
+/// (`RENDER_DEADLINE` + `CURRENT_PLUGIN_ID`). Drop restores both to
+/// `None` even if the render panics or short-circuits, so a leaky
+/// thread-local can't poison subsequent renders on the same thread.
+struct RenderState;
+
+impl RenderState {
+    fn install(plugin_id: &str, deadline: Instant) -> Self {
+        // Catches a leaked thread-local — would mean a prior render
+        // panicked between install and Drop without unwinding through
+        // a Drop handler (e.g. caught by `catch_unwind`). Production
+        // wouldn't notice; dev / test surfaces it loudly.
+        debug_assert!(
+            super::engine::render_deadline_snapshot().is_none(),
+            "RENDER_DEADLINE leaked from a prior render"
+        );
+        debug_assert!(
+            super::engine::current_plugin_id_snapshot().is_none(),
+            "CURRENT_PLUGIN_ID leaked from a prior render"
+        );
+        set_render_deadline(Some(deadline));
+        set_current_plugin_id(Some(plugin_id));
+        Self
+    }
+}
+
+impl Drop for RenderState {
+    fn drop(&mut self) {
+        set_render_deadline(None);
+        set_current_plugin_id(None);
+    }
+}
 
 /// A plugin-authored segment backed by a compiled rhai script.
 pub struct RhaiSegment {
@@ -60,16 +97,39 @@ impl RhaiSegment {
     pub fn id(&self) -> &str {
         &self.id
     }
+
+    /// Map a rhai eval error into a [`SegmentError`]. Deadline aborts
+    /// get a wallclock-specific message that names the host's default
+    /// budget; every other failure carries rhai's own `Display`
+    /// output through unchanged.
+    ///
+    /// Deadline classification matches against [`DeadlineAbortMarker`]
+    /// — a host-only Rust type plugins can't construct from rhai.
+    /// Plugin `throw` also surfaces as `ErrorTerminated`, but with a
+    /// script-supplied payload that can't impersonate the marker.
+    fn classify_render_error(&self, err: Box<EvalAltResult>) -> SegmentError {
+        if let EvalAltResult::ErrorTerminated(token, _) = err.as_ref() {
+            if token.is::<DeadlineAbortMarker>() {
+                return SegmentError::new(format!(
+                    "plugin `{}` exceeded the {}ms render deadline",
+                    self.id, DEFAULT_RENDER_DEADLINE_MS
+                ));
+            }
+        }
+        SegmentError::new(format!("plugin `{}` render failed: {err}", self.id))
+    }
 }
 
 impl Segment for RhaiSegment {
     fn render(&self, ctx: &DataContext) -> RenderResult {
         let mirror = build_ctx(ctx, self.declared_deps, self.config.clone());
+        let deadline = Instant::now() + Duration::from_millis(DEFAULT_RENDER_DEADLINE_MS);
+        let _state = RenderState::install(&self.id, deadline);
         let mut scope = Scope::new();
         let returned: Dynamic = self
             .engine
             .call_fn(&mut scope, &self.ast, "render", (mirror,))
-            .map_err(|e| SegmentError::new(format!("plugin `{}` render failed: {e}", self.id)))?;
+            .map_err(|e| self.classify_render_error(e))?;
         validate_return(returned, &self.id).map_err(|e| {
             SegmentError::new(format!(
                 "plugin `{}` returned malformed shape: {e}",
@@ -119,9 +179,13 @@ mod tests {
     ) -> (CompiledPlugin, Arc<Engine>) {
         fs::write(dir.path().join(name), src).expect("write plugin");
         let engine = build_engine();
-        let (registry, errors) =
+        let registry =
             PluginRegistry::load_with_xdg(&[dir.path().to_path_buf()], None, &engine, &[]);
-        assert!(errors.is_empty(), "unexpected load errors: {errors:?}");
+        assert!(
+            registry.load_errors().is_empty(),
+            "unexpected load errors: {:?}",
+            registry.load_errors()
+        );
         let plugin = registry
             .into_plugins()
             .into_iter()
@@ -255,7 +319,9 @@ mod tests {
     fn plugin_runtime_error_maps_to_segment_error() {
         // Division-by-zero at runtime surfaces as a rhai error. The
         // segment must map it to `SegmentError` (hide + log), not
-        // panic.
+        // panic. Also confirms the *generic* classifier branch:
+        // non-deadline failures must NOT be relabeled as a deadline
+        // abort by an over-eager classifier match.
         let tmp = TempDir::new().expect("tempdir");
         let (plugin, engine) = load_single(
             &tmp,
@@ -272,6 +338,70 @@ mod tests {
         let dc = DataContext::new(minimal_status());
         let err = seg.render(&dc).unwrap_err();
         assert!(err.message.contains("boom"), "message: {}", err.message);
+        assert!(
+            err.message.contains("render failed"),
+            "non-deadline failures must use the generic branch: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("deadline"),
+            "non-deadline failures must NOT be relabeled as a timeout: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn plugin_throw_cannot_impersonate_deadline_abort() {
+        // Codex flagged: a plugin that `throw`s a string identical to
+        // a former host sentinel could be misclassified as a deadline
+        // timeout. With the marker-type sentinel, even a plugin that
+        // throws the most-suspicious-looking string must fall through
+        // to the generic "render failed" branch.
+        let tmp = TempDir::new().expect("tempdir");
+        let (plugin, engine) = load_single(
+            &tmp,
+            "fake.rhai",
+            r##"
+            const ID = "fake_deadline";
+            fn render(ctx) {
+                throw "linesmith:render-deadline-exceeded";
+            }
+            "##,
+        );
+        let seg = RhaiSegment::from_compiled(plugin, engine, Dynamic::UNIT);
+        let dc = DataContext::new(minimal_status());
+        let err = seg.render(&dc).unwrap_err();
+        assert!(
+            err.message.contains("render failed"),
+            "throw must use the generic branch: {}",
+            err.message
+        );
+        // Host-specific wording is "exceeded the {N}ms render deadline";
+        // the thrown payload's "deadline" substring is allowed because
+        // it's the script's own message, surfaced verbatim by rhai.
+        assert!(
+            !err.message.contains("exceeded the"),
+            "thrown payload must not impersonate the host deadline message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn render_state_drop_clears_thread_locals() {
+        // Pin the load-bearing safety property of `RenderState`: Drop
+        // restores both thread-locals to None even after a clean
+        // scope exit. A regression that removed either set_*(None)
+        // call from Drop would silently leak a stale deadline or
+        // plugin id into subsequent renders on this thread.
+        use crate::plugins::engine::{current_plugin_id_snapshot, render_deadline_snapshot};
+        {
+            let _state =
+                RenderState::install("guard_test", Instant::now() + Duration::from_secs(60));
+            assert!(render_deadline_snapshot().is_some());
+            assert_eq!(current_plugin_id_snapshot().as_deref(), Some("guard_test"));
+        }
+        assert!(render_deadline_snapshot().is_none(), "deadline leaked");
+        assert!(current_plugin_id_snapshot().is_none(), "plugin id leaked");
     }
 
     #[test]
@@ -297,6 +427,29 @@ mod tests {
             err.message.to_lowercase().contains("malformed") || err.message.contains("must return"),
             "message: {}",
             err.message
+        );
+    }
+
+    #[test]
+    fn deadline_abort_surfaces_clear_segment_error() {
+        // RhaiSegment::render installs a fresh 50ms deadline via its
+        // RAII guard, overwriting any prior thread-local. To exercise
+        // the classifier path the segment uses on a real abort, drive
+        // the engine directly with a past deadline, then feed the
+        // resulting EvalAltResult through `classify_render_error`.
+        use crate::plugins::engine::set_render_deadline;
+        let tmp = TempDir::new().expect("tempdir");
+        let (plugin, engine) =
+            load_single(&tmp, "x.rhai", r#"const ID = "x"; fn render(ctx) { () }"#);
+        set_render_deadline(Some(Instant::now()));
+        let err = engine.eval::<()>("loop {}").unwrap_err();
+        set_render_deadline(None);
+        let seg = RhaiSegment::from_compiled(plugin, engine, Dynamic::UNIT);
+        let segment_err = seg.classify_render_error(err);
+        assert!(
+            segment_err.message.contains("deadline"),
+            "deadline aborts should name the timeout: {}",
+            segment_err.message
         );
     }
 

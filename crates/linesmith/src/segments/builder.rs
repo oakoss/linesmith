@@ -532,13 +532,17 @@ mod tests {
             "#,
         );
         let engine = crate::plugins::build_engine();
-        let (registry, errors) = crate::plugins::PluginRegistry::load_with_xdg(
+        let registry = crate::plugins::PluginRegistry::load_with_xdg(
             &[tmp.path().to_path_buf()],
             None,
             &engine,
             BUILT_IN_SEGMENT_IDS,
         );
-        assert!(errors.is_empty(), "load errors: {errors:?}");
+        assert!(
+            registry.load_errors().is_empty(),
+            "load errors: {:?}",
+            registry.load_errors()
+        );
 
         let cfg = config::Config::from_str(
             r#"
@@ -576,7 +580,7 @@ mod tests {
             "#,
         );
         let engine = crate::plugins::build_engine();
-        let (registry, _) = crate::plugins::PluginRegistry::load_with_xdg(
+        let registry = crate::plugins::PluginRegistry::load_with_xdg(
             &[tmp.path().to_path_buf()],
             None,
             &engine,
@@ -617,7 +621,7 @@ mod tests {
             "#,
         );
         let engine = crate::plugins::build_engine();
-        let (registry, _) = crate::plugins::PluginRegistry::load_with_xdg(
+        let registry = crate::plugins::PluginRegistry::load_with_xdg(
             &[tmp.path().to_path_buf()],
             None,
             &engine,
@@ -659,7 +663,7 @@ mod tests {
             "#,
         );
         let engine = crate::plugins::build_engine();
-        let (registry, _) = crate::plugins::PluginRegistry::load_with_xdg(
+        let registry = crate::plugins::PluginRegistry::load_with_xdg(
             &[tmp.path().to_path_buf()],
             None,
             &engine,

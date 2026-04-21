@@ -66,9 +66,13 @@ impl CompiledPlugin {
 }
 
 /// Keyed collection of compiled plugins. Lookup is by `id`; iteration
-/// preserves discovery order.
+/// preserves discovery order. Non-fatal load errors (compile failure,
+/// unknown dep, id collision) live alongside the compiled plugins so
+/// post-load consumers (e.g. `linesmith doctor`) can query them at
+/// any point without re-running discovery.
 pub struct PluginRegistry {
     plugins: Vec<CompiledPlugin>,
+    errors: Vec<PluginError>,
 }
 
 impl PluginRegistry {
@@ -78,16 +82,12 @@ impl PluginRegistry {
     /// shadow (plugins attempting to register one of these names are
     /// rejected as `IdCollision`).
     ///
-    /// Returns the registry plus a vector of non-fatal errors for
-    /// `linesmith doctor` to render. A missing or unreadable
+    /// Non-fatal load errors are collected on the returned registry;
+    /// query them via [`Self::load_errors`]. A missing or unreadable
     /// directory is not an error — the discovery layer silently
     /// skips it.
     #[must_use]
-    pub fn load(
-        config_dirs: &[PathBuf],
-        engine: &Engine,
-        built_in_ids: &[&str],
-    ) -> (Self, Vec<PluginError>) {
+    pub fn load(config_dirs: &[PathBuf], engine: &Engine, built_in_ids: &[&str]) -> Self {
         Self::load_from_paths(&scan_plugin_dirs(config_dirs), engine, built_in_ids)
     }
 
@@ -103,18 +103,14 @@ impl PluginRegistry {
         xdg_dir: Option<&Path>,
         engine: &Engine,
         built_in_ids: &[&str],
-    ) -> (Self, Vec<PluginError>) {
+    ) -> Self {
         Self::load_from_paths(&scan_dirs(config_dirs, xdg_dir), engine, built_in_ids)
     }
 
     /// Core load logic: given an already-discovered list of plugin
     /// file paths (in discovery order), compile each one, detect id
     /// collisions, and build the registry.
-    fn load_from_paths(
-        paths: &[PathBuf],
-        engine: &Engine,
-        built_in_ids: &[&str],
-    ) -> (Self, Vec<PluginError>) {
+    fn load_from_paths(paths: &[PathBuf], engine: &Engine, built_in_ids: &[&str]) -> Self {
         let mut plugins = Vec::new();
         let mut errors = Vec::new();
         // Track plugin ids we've already registered → path of the
@@ -147,7 +143,16 @@ impl PluginRegistry {
             }
         }
 
-        (Self { plugins }, errors)
+        Self { plugins, errors }
+    }
+
+    /// Non-fatal errors from the most recent load. Includes compile
+    /// failures, malformed `@data_deps` headers, unknown dep names,
+    /// and id collisions (with built-ins or other plugins). Returns
+    /// an empty slice when every plugin loaded cleanly.
+    #[must_use]
+    pub fn load_errors(&self) -> &[PluginError] {
+        &self.errors
     }
 
     /// Look up a compiled plugin by its `const ID` value.
@@ -286,8 +291,9 @@ mod tests {
         // No dirs configured AND no XDG scan (unit-tested sibling
         // pieces handle XDG); registry loads zero plugins.
         let tmp = TempDir::new().expect("tempdir");
-        let (reg, errors) =
+        let reg =
             PluginRegistry::load_with_xdg(&[tmp.path().to_path_buf()], None, &engine, BUILTINS);
+        let errors = reg.load_errors();
         assert!(reg.is_empty());
         assert_eq!(reg.len(), 0);
         assert!(errors.is_empty());
@@ -305,8 +311,9 @@ mod tests {
             fn render(ctx) { () }
             "#,
         );
-        let (reg, errors) =
+        let reg =
             PluginRegistry::load_with_xdg(&[tmp.path().to_path_buf()], None, &engine, BUILTINS);
+        let errors = reg.load_errors();
         assert!(errors.is_empty(), "unexpected errors: {errors:?}");
         assert_eq!(reg.len(), 1);
         let plugin = reg.get("foo").expect("registered by id");
@@ -326,8 +333,9 @@ mod tests {
             fn render(ctx) { () }
             "#,
         );
-        let (reg, errors) =
+        let reg =
             PluginRegistry::load_with_xdg(&[tmp.path().to_path_buf()], None, &engine, BUILTINS);
+        let errors = reg.load_errors();
         assert!(errors.is_empty());
         let plugin = reg.get("u").expect("registered");
         assert_eq!(
@@ -347,8 +355,9 @@ mod tests {
             fn render(ctx) { () }
             "#,
         );
-        let (reg, errors) =
+        let reg =
             PluginRegistry::load_with_xdg(&[tmp.path().to_path_buf()], None, &engine, BUILTINS);
+        let errors = reg.load_errors();
         assert!(reg.is_empty());
         assert_eq!(errors.len(), 1);
         assert!(matches!(errors[0], PluginError::Compile { .. }));
@@ -368,8 +377,9 @@ mod tests {
             fn render(ctx) { () }
             "#,
         );
-        let (_reg, errors) =
+        let reg =
             PluginRegistry::load_with_xdg(&[tmp.path().to_path_buf()], None, &engine, BUILTINS);
+        let errors = reg.load_errors();
         assert_eq!(errors.len(), 1);
         assert!(matches!(errors[0], PluginError::Compile { .. }));
     }
@@ -386,8 +396,9 @@ mod tests {
             fn render(ctx) { () }
             "#,
         );
-        let (reg, errors) =
+        let reg =
             PluginRegistry::load_with_xdg(&[tmp.path().to_path_buf()], None, &engine, BUILTINS);
+        let errors = reg.load_errors();
         assert!(reg.is_empty());
         assert_eq!(errors.len(), 1);
         assert!(matches!(errors[0], PluginError::Compile { .. }));
@@ -405,8 +416,9 @@ mod tests {
             fn render(ctx) { () }
             "#,
         );
-        let (reg, errors) =
+        let reg =
             PluginRegistry::load_with_xdg(&[tmp.path().to_path_buf()], None, &engine, BUILTINS);
+        let errors = reg.load_errors();
         assert!(reg.is_empty());
         assert_eq!(errors.len(), 1);
         let PluginError::UnknownDataDep { name, .. } = &errors[0] else {
@@ -429,8 +441,9 @@ mod tests {
             fn render(ctx) { () }
             "#,
         );
-        let (reg, errors) =
+        let reg =
             PluginRegistry::load_with_xdg(&[tmp.path().to_path_buf()], None, &engine, BUILTINS);
+        let errors = reg.load_errors();
         assert!(reg.is_empty());
         assert!(matches!(errors[0], PluginError::UnknownDataDep { .. }));
     }
@@ -447,8 +460,9 @@ mod tests {
             fn render(ctx) { () }
             "#,
         );
-        let (reg, errors) =
+        let reg =
             PluginRegistry::load_with_xdg(&[tmp.path().to_path_buf()], None, &engine, BUILTINS);
+        let errors = reg.load_errors();
         assert!(reg.is_empty());
         assert!(matches!(errors[0], PluginError::MalformedDataDeps { .. }));
     }
@@ -465,8 +479,9 @@ mod tests {
             fn render(ctx) { () }
             "#,
         );
-        let (reg, errors) =
+        let reg =
             PluginRegistry::load_with_xdg(&[tmp.path().to_path_buf()], None, &engine, BUILTINS);
+        let errors = reg.load_errors();
         assert!(reg.is_empty());
         let PluginError::IdCollision { winner, .. } = &errors[0] else {
             panic!("expected IdCollision, got {:?}", errors[0]);
@@ -486,8 +501,9 @@ mod tests {
             fn render(ctx) { () }
             "#,
         );
-        let (reg, errors) =
+        let reg =
             PluginRegistry::load_with_xdg(&[tmp.path().to_path_buf()], None, &engine, BUILTINS);
+        let errors = reg.load_errors();
         assert!(reg.is_empty());
         let PluginError::Compile { message, .. } = &errors[0] else {
             panic!("expected Compile, got {:?}", errors[0]);
@@ -519,12 +535,13 @@ mod tests {
             fn render(ctx) { () }
             "#,
         );
-        let (reg, errors) = PluginRegistry::load_with_xdg(
+        let reg = PluginRegistry::load_with_xdg(
             &[tmp_a.path().to_path_buf(), tmp_b.path().to_path_buf()],
             None,
             &engine,
             BUILTINS,
         );
+        let errors = reg.load_errors();
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.get("dup").expect("first wins").path, winner);
         assert_eq!(errors.len(), 1);
@@ -566,8 +583,9 @@ mod tests {
             fn render(ctx) { () }
             "#,
         );
-        let (reg, errors) =
+        let reg =
             PluginRegistry::load_with_xdg(&[tmp.path().to_path_buf()], None, &engine, BUILTINS);
+        let errors = reg.load_errors();
         assert_eq!(reg.len(), 1);
         assert!(reg.get("good").is_some());
         assert_eq!(errors.len(), 1);

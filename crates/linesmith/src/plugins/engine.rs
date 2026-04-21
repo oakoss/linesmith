@@ -18,11 +18,14 @@
 //! wrapper's job — it owns the per-render `Instant` — not the engine's.
 //! This module enforces operation-count limits only.
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use chrono::Utc;
 use rhai::packages::{Package, StandardPackage};
-use rhai::Engine;
+use rhai::{Dynamic, Engine};
 
 /// Max script operations per plugin invocation.
 pub const MAX_OPERATIONS: u64 = 50_000;
@@ -36,6 +39,93 @@ pub const MAX_STRING_SIZE: usize = 1024;
 pub const MAX_ARRAY_SIZE: usize = 256;
 /// Max entry count of any rhai map.
 pub const MAX_MAP_SIZE: usize = 256;
+/// Default per-render wallclock budget per `plugin-api.md` §Resource ceilings.
+pub const DEFAULT_RENDER_DEADLINE_MS: u64 = 50;
+
+/// Host-side marker passed to `EvalAltResult::ErrorTerminated` when the
+/// `on_progress` callback aborts the script for exceeding its
+/// wallclock deadline. The segment wrapper inspects the token type
+/// to produce a clearer error than rhai's generic "Script terminated".
+///
+/// Must be a host-only type (not a string) so a plugin can't forge a
+/// deadline classification by `throw`-ing a coincidentally-equal
+/// string payload — rhai's `Dynamic` keeps the underlying Rust type
+/// intact, and the type itself is module-private to host code.
+#[derive(Clone)]
+pub(crate) struct DeadlineAbortMarker;
+/// `on_progress` is called per rhai operation; checking the deadline
+/// every op would burn cycles on `Instant::now()`. Stride amortises:
+/// at 256 ops between checks, the worst-case overrun is roughly the
+/// per-op cost × 256 — sub-ms for typical script ops, larger if a
+/// plugin sits in a host-fn-heavy loop. The 50 ms budget should be
+/// read as "50 ms + (stride − 1) × per-op cost".
+const DEADLINE_CHECK_STRIDE: u64 = 256;
+
+// Compile-time invariants for the stride: stride=0 panics with
+// modulo-by-zero on the first op; stride >= MAX_OPERATIONS silently
+// disables deadline enforcement because the op-limit fires first.
+const _: () = assert!(DEADLINE_CHECK_STRIDE > 0);
+const _: () = assert!(DEADLINE_CHECK_STRIDE < MAX_OPERATIONS);
+
+thread_local! {
+    /// Per-render wallclock deadline. The plugin-segment wrapper sets
+    /// this just before invoking the script and clears it after, so
+    /// the engine's `on_progress` callback can abort runaway scripts.
+    static RENDER_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+
+    /// Identifier of the plugin currently being rendered. Lets the
+    /// host `log` function attribute output to a specific plugin and
+    /// rate-limit per id without changing the rhai function surface.
+    static CURRENT_PLUGIN_ID: RefCell<Option<String>> = const { RefCell::new(None) };
+
+    /// Total `log()` invocations emitted to stderr per plugin id for
+    /// the lifetime of this thread (== process for a one-shot CLI).
+    /// Per-plugin rate limit per `plugin-api.md` §Host-registered APIs.
+    /// **Per-thread, not per-process:** if rendering ever goes
+    /// multi-threaded (parallel segment render), each thread gets its
+    /// own quota. Switch to `Mutex<HashMap>` then.
+    static LOG_EMITTED: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
+}
+
+/// Maximum `log()` lines per plugin per process. Higher counts get
+/// silently dropped to keep a chatty plugin from flooding stderr.
+pub const LOG_LINES_PER_PLUGIN: u32 = 1;
+
+/// Install a per-render deadline visible to the engine's `on_progress`
+/// callback. Pass `None` to clear after the render completes.
+pub fn set_render_deadline(deadline: Option<Instant>) {
+    RENDER_DEADLINE.with(|d| d.set(deadline));
+}
+
+/// Tag the active plugin so the host `log()` function can attribute
+/// output for rate-limiting. Pass `None` to clear after the render.
+pub fn set_current_plugin_id(id: Option<&str>) {
+    CURRENT_PLUGIN_ID.with(|cell| {
+        *cell.borrow_mut() = id.map(str::to_owned);
+    });
+}
+
+/// Drop every emission count for the current thread. Wholesale clear
+/// is the contract — callers depending on per-id reset will need a
+/// new helper. Test-only; the production rate-limit is process-
+/// lifetime and intentionally does not expose a reset path to plugins.
+#[cfg(test)]
+pub(crate) fn reset_log_counts() {
+    LOG_EMITTED.with(|cell| cell.borrow_mut().clear());
+}
+
+/// Snapshot of the current thread's `RENDER_DEADLINE`. Used by the
+/// segment wrapper's `debug_assert!` leak-check and by tests; the
+/// production render path doesn't need to read the deadline back.
+pub(crate) fn render_deadline_snapshot() -> Option<Instant> {
+    RENDER_DEADLINE.with(Cell::get)
+}
+
+/// Snapshot of the current thread's `CURRENT_PLUGIN_ID`. Same niche
+/// as [`render_deadline_snapshot`].
+pub(crate) fn current_plugin_id_snapshot() -> Option<String> {
+    CURRENT_PLUGIN_ID.with(|c| c.borrow().clone())
+}
 
 /// Build the shared rhai engine used by every plugin segment. Returns
 /// an `Arc` so the layout engine can clone cheaply into each
@@ -43,23 +133,32 @@ pub const MAX_MAP_SIZE: usize = 256;
 #[must_use]
 pub fn build_engine() -> Arc<Engine> {
     let mut engine = Engine::new_raw();
-    // `new_raw()` starts with nothing registered. Load rhai's
-    // StandardPackage so common script helpers (`str.len()`,
-    // `arr.push(x)`, `map.keys()`, arithmetic, iterators, …) are
-    // available to non-trivial plugins.
+    // `new_raw()` registers nothing; StandardPackage adds the common
+    // script helpers (`str.len()`, `arr.push(x)`, iterators, …).
     engine.register_global_module(StandardPackage::new().as_shared_module());
-    // `print` / `debug` are built-in rhai statements whose output
-    // routes through the engine's on_print / on_debug callbacks.
-    // `Engine::new()` defaults them to stdout / stderr — a leak for
-    // untrusted plugin code. Point both at no-ops so plugin authors
-    // can call them without crashing but nothing reaches the host's
-    // stdout / stderr.
+    // No-op `print`/`debug` overrides; default routing leaks to host
+    // stdout/stderr. The no-op-routing test pins this contract.
     engine.on_print(|_| {});
     engine.on_debug(|_, _, _| {});
+    install_deadline_callback(&mut engine);
     configure_limits(&mut engine);
     lock_down_symbols(&mut engine);
     register_host_fns(&mut engine);
     Arc::new(engine)
+}
+
+fn install_deadline_callback(engine: &mut Engine) {
+    engine.on_progress(|ops| {
+        if ops % DEADLINE_CHECK_STRIDE != 0 {
+            return None;
+        }
+        let deadline = RENDER_DEADLINE.with(Cell::get)?;
+        if Instant::now() >= deadline {
+            Some(Dynamic::from(DeadlineAbortMarker))
+        } else {
+            None
+        }
+    });
 }
 
 fn configure_limits(engine: &mut Engine) {
@@ -103,12 +202,39 @@ const _: fn() = || {
     assert_send_sync::<Arc<Engine>>();
 };
 
-/// Host-registered `log(msg)` for plugin scripts. Writes the message
-/// to stderr prefixed with `linesmith plugin: `. Per-plugin rate
-/// limiting is the segment wrapper's job — it owns the plugin id and
-/// per-run counters; this function is the raw sink.
+/// Host-registered `log(msg)` for plugin scripts. Writes one line per
+/// plugin per process to stderr; subsequent calls from the same
+/// plugin are silently dropped to keep a chatty plugin from flooding
+/// stderr. The active plugin id comes from a thread-local set by
+/// `RhaiSegment::render`; calls outside a render (e.g. tests that
+/// `eval` directly) attribute to a synthetic `<unscoped>` bucket.
+///
+/// Bumping the counter *before* `eprintln!` is deliberate: a chatty
+/// plugin should pay at most a single `to_owned` per process for its
+/// id, not one per dropped call.
 fn rhai_log(msg: &str) {
-    eprintln!("linesmith plugin: {msg}");
+    /// Sentinel id for `log()` calls outside a render scope.
+    const UNSCOPED: &str = "<unscoped>";
+
+    let allowed = LOG_EMITTED.with(|cell| {
+        let mut counts = cell.borrow_mut();
+        let id_str = CURRENT_PLUGIN_ID.with(|c| c.borrow().clone());
+        let key: &str = id_str.as_deref().unwrap_or(UNSCOPED);
+        match counts.get_mut(key) {
+            Some(n) if *n >= LOG_LINES_PER_PLUGIN => None,
+            Some(n) => {
+                *n += 1;
+                Some(key.to_owned())
+            }
+            None => {
+                counts.insert(key.to_owned(), 1);
+                Some(key.to_owned())
+            }
+        }
+    });
+    if let Some(id) = allowed {
+        eprintln!("linesmith plugin {id}: {msg}");
+    }
 }
 
 /// Format a duration in milliseconds as `"1h 23m"` / `"45m"` / `"12s"`.
@@ -192,6 +318,118 @@ mod tests {
         );
     }
 
+    /// RAII guard for the per-render thread-locals so a test panic
+    /// can't leak state into siblings on the same thread. The
+    /// production [`super::super::segment::RhaiSegment::render`] uses
+    /// the same pattern.
+    struct ThreadLocalGuard;
+
+    impl ThreadLocalGuard {
+        fn install_deadline(at: Instant) -> Self {
+            set_render_deadline(Some(at));
+            Self
+        }
+
+        fn install_plugin_id(id: &str) -> Self {
+            set_current_plugin_id(Some(id));
+            Self
+        }
+    }
+
+    impl Drop for ThreadLocalGuard {
+        fn drop(&mut self) {
+            set_render_deadline(None);
+            set_current_plugin_id(None);
+        }
+    }
+
+    #[test]
+    fn past_deadline_aborts_long_running_script() {
+        let engine = build_engine();
+        let _guard = ThreadLocalGuard::install_deadline(Instant::now());
+        let err = engine.eval::<()>("loop {}").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.to_lowercase().contains("terminated"),
+            "expected `Script terminated` from on_progress abort, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn far_future_deadline_does_not_abort_quick_script() {
+        let engine = build_engine();
+        let _guard = ThreadLocalGuard::install_deadline(
+            Instant::now() + std::time::Duration::from_secs(3600),
+        );
+        let n: i64 = engine.eval("1 + 2 + 3").expect("quick eval ok");
+        assert_eq!(n, 6);
+    }
+
+    #[test]
+    fn no_deadline_set_does_not_abort_quick_script() {
+        // Belt-and-suspenders: ensure cleared deadlines don't abort
+        // normal evaluation. A leak from a prior test on this thread
+        // would surface here as an unexpected error.
+        set_render_deadline(None);
+        let engine = build_engine();
+        let n: i64 = engine.eval("4 * 5").expect("eval ok");
+        assert_eq!(n, 20);
+    }
+
+    #[test]
+    fn log_emits_first_call_then_silences() {
+        // Pin the per-plugin rate-limit: three `log()` calls under
+        // the same id collapse to exactly LOG_LINES_PER_PLUGIN
+        // emissions. Reset first so cross-test ordering on this
+        // thread can't preload the counter.
+        reset_log_counts();
+        let engine = build_engine();
+        let _guard = ThreadLocalGuard::install_plugin_id("log_emits_first_call_then_silences");
+        engine
+            .eval::<()>(r#"log("first"); log("second"); log("third");"#)
+            .expect("eval ok");
+        let count = LOG_EMITTED.with(|cell| {
+            cell.borrow()
+                .get("log_emits_first_call_then_silences")
+                .copied()
+                .unwrap_or(0)
+        });
+        assert_eq!(
+            count, LOG_LINES_PER_PLUGIN,
+            "expected exactly {LOG_LINES_PER_PLUGIN} emission(s), counted {count}"
+        );
+    }
+
+    #[test]
+    fn log_under_distinct_plugin_ids_each_gets_its_own_quota() {
+        reset_log_counts();
+        let engine = build_engine();
+        for id in ["log_quota_a", "log_quota_b"] {
+            let _guard = ThreadLocalGuard::install_plugin_id(id);
+            engine.eval::<()>(r#"log("hi");"#).expect("eval ok");
+        }
+        let counts = LOG_EMITTED.with(|cell| {
+            let map = cell.borrow();
+            (
+                map.get("log_quota_a").copied().unwrap_or(0),
+                map.get("log_quota_b").copied().unwrap_or(0),
+            )
+        });
+        assert_eq!(counts, (LOG_LINES_PER_PLUGIN, LOG_LINES_PER_PLUGIN));
+    }
+
+    #[test]
+    fn log_outside_render_attributes_to_unscoped_bucket() {
+        // Pin the sentinel id used when CURRENT_PLUGIN_ID is unset so
+        // a future rename (`<none>`, `<anon>`) doesn't silently
+        // scatter eval-callsite logs across new buckets.
+        reset_log_counts();
+        let engine = build_engine();
+        engine.eval::<()>(r#"log("from-eval");"#).expect("eval ok");
+        let count = LOG_EMITTED.with(|cell| cell.borrow().get("<unscoped>").copied());
+        assert_eq!(count, Some(LOG_LINES_PER_PLUGIN));
+    }
+
     #[test]
     fn import_is_disabled() {
         let engine = build_engine();
@@ -244,8 +482,6 @@ mod tests {
             )
             .expect("print/debug call must succeed as a no-op");
     }
-
-    // --- host fn formatting ---------------------------------------
 
     #[test]
     fn format_duration_sub_minute_renders_seconds() {
@@ -310,8 +546,6 @@ mod tests {
         assert_eq!(rhai_format_countdown_until("2001-09-09T01:46:40Z"), "now");
     }
 
-    // --- host fns callable from scripts ----------------------------
-
     #[test]
     fn host_format_cost_usd_invokable_from_script() {
         let engine = build_engine();
@@ -361,8 +595,6 @@ mod tests {
         let s: String = engine.eval(r#"format_cost_usd(2)"#).expect("eval ok");
         assert_eq!(s, "$2.00");
     }
-
-    // --- host fn boundary coverage --------------------------------
 
     #[test]
     fn format_tokens_boundary_at_exactly_1000() {

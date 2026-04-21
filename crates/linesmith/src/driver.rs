@@ -325,12 +325,13 @@ fn load_plugins(
     }
 
     let engine = build_engine();
-    let (registry, errors) = PluginRegistry::load_with_xdg(
+    let registry = PluginRegistry::load_with_xdg(
         config_dirs,
         xdg_dir.as_deref(),
         &engine,
         BUILT_IN_SEGMENT_IDS,
     );
+    let errors = registry.load_errors();
     let error_count = errors.len();
     for err in errors {
         let _ = writeln!(stderr, "linesmith: plugin: {err}");
