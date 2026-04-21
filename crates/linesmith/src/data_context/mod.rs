@@ -18,6 +18,7 @@
 
 pub mod deps;
 pub mod errors;
+pub mod usage;
 
 use std::cell::OnceCell;
 use std::sync::Arc;
@@ -28,6 +29,7 @@ pub use deps::DataDep;
 pub use errors::{
     ClaudeJsonError, CredentialError, GitError, JsonlError, SessionError, SettingsError, UsageError,
 };
+pub use usage::{ExtraUsage, UsageApiResponse, UsageBucket, UsageData, UsageSource};
 
 // --- Stub source types ---------------------------------------------------
 //
@@ -56,11 +58,6 @@ pub struct ClaudeJson {}
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct JsonlAggregate {}
-
-/// OAuth `/api/oauth/usage` endpoint data. Stub.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct UsageData {}
 
 /// macOS Keychain / file-backed OAuth credentials. Stub.
 #[derive(Debug, Clone)]
@@ -144,10 +141,18 @@ impl DataContext {
     }
 
     /// OAuth usage endpoint data (shared across rate-limit segments).
+    ///
+    /// Returns a sentinel error until the real fallback cascade is
+    /// wired. The sentinel wraps [`JsonlError::NotImplemented`] so the
+    /// mirror's `.code()` delegation produces the same
+    /// `"NotImplemented"` short-tag as the other stub sources — NOT
+    /// the shape a live cascade will produce. ADR-0011 §Fallback
+    /// cascade unwraps inner errors on real failures, so callers
+    /// should not treat the wrap as semantically meaningful.
     #[must_use]
     pub fn usage(&self) -> Arc<Result<UsageData, UsageError>> {
         self.usage
-            .get_or_init(|| Arc::new(Err(UsageError::NotImplemented)))
+            .get_or_init(|| Arc::new(Err(UsageError::Jsonl(JsonlError::NotImplemented))))
             .clone()
     }
 

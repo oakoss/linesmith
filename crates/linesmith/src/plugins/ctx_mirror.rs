@@ -42,7 +42,7 @@ pub fn build_ctx(dc: &DataContext, declared_deps: &[DataDep], config: Dynamic) -
         let arc = dc.settings();
         let value = match &*arc {
             Ok(_) => tagged_ok(Dynamic::from_map(Map::new())),
-            Err(e) => tagged_error(&e.to_string()),
+            Err(e) => tagged_error(e.code()),
         };
         map.insert("settings".into(), value);
     }
@@ -50,7 +50,7 @@ pub fn build_ctx(dc: &DataContext, declared_deps: &[DataDep], config: Dynamic) -
         let arc = dc.claude_json();
         let value = match &*arc {
             Ok(_) => tagged_ok(Dynamic::from_map(Map::new())),
-            Err(e) => tagged_error(&e.to_string()),
+            Err(e) => tagged_error(e.code()),
         };
         map.insert("claude_json".into(), value);
     }
@@ -58,7 +58,7 @@ pub fn build_ctx(dc: &DataContext, declared_deps: &[DataDep], config: Dynamic) -
         let arc = dc.usage();
         let value = match &*arc {
             Ok(_) => tagged_ok(Dynamic::from_map(Map::new())),
-            Err(e) => tagged_error(&e.to_string()),
+            Err(e) => tagged_error(e.code()),
         };
         map.insert("usage".into(), value);
     }
@@ -66,7 +66,7 @@ pub fn build_ctx(dc: &DataContext, declared_deps: &[DataDep], config: Dynamic) -
         let arc = dc.sessions();
         let value = match &*arc {
             Ok(_) => tagged_ok(Dynamic::from_map(Map::new())),
-            Err(e) => tagged_error(&e.to_string()),
+            Err(e) => tagged_error(e.code()),
         };
         map.insert("sessions".into(), value);
     }
@@ -78,7 +78,7 @@ pub fn build_ctx(dc: &DataContext, declared_deps: &[DataDep], config: Dynamic) -
             // gix failure).
             Ok(Some(_)) => tagged_ok(Dynamic::from_map(Map::new())),
             Ok(None) => tagged_ok(Dynamic::UNIT),
-            Err(e) => tagged_error(&e.to_string()),
+            Err(e) => tagged_error(e.code()),
         };
         map.insert("git".into(), value);
     }

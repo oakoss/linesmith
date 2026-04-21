@@ -19,7 +19,7 @@ categories = ["command-line-utilities", "development-tools"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 catppuccin = "2"
-chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 lexopt = "0.3"
 # `sync` makes rhai::Engine Send+Sync so Arc<Engine> can thread across the
 # (currently single-threaded) render path and any future daemon-mode fanout.
