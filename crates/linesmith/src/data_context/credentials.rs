@@ -73,6 +73,28 @@ impl fmt::Debug for Credentials {
     }
 }
 
+#[cfg(test)]
+impl Credentials {
+    /// Test-only constructor. Lets other modules in the crate
+    /// fabricate a `Credentials` without running the cascade.
+    /// Rejects empty tokens so tests can't fabricate a state the
+    /// production resolver would reject as `EmptyToken`.
+    pub(crate) fn for_testing(token: impl Into<String>) -> Self {
+        let token: String = token.into();
+        debug_assert!(
+            !token.is_empty(),
+            "Credentials::for_testing requires a non-empty token",
+        );
+        Self {
+            token: SecretString::from(token),
+            scopes: Vec::new(),
+            source: CredentialSource::ClaudeLegacy {
+                path: PathBuf::from("/test"),
+            },
+        }
+    }
+}
+
 /// Where [`resolve_credentials`] found the token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

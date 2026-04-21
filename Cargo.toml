@@ -5,7 +5,7 @@ members = ["crates/linesmith"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/oakoss/linesmith"
 homepage = "https://github.com/oakoss/linesmith"
@@ -20,6 +20,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 catppuccin = "2"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+# HTTP-date parser for `Retry-After` headers per ADR-0011 §Cache stack.
+# Zero-dep, ~200 LOC — smaller than pulling chrono's HTTP-date story.
+httpdate = "1"
 lexopt = "0.3"
 # `sync` makes rhai::Engine Send+Sync so Arc<Engine> can thread across the
 # (currently single-threaded) render path and any future daemon-mode fanout.
@@ -33,6 +36,10 @@ secrecy = "0.10"
 supports-color = "3"
 tempfile = "3"
 terminal_size = "0.4"
+# ureq 3.x is the current major line — post-rewrite, sync HTTP client
+# with rustls + platform trust store. `gzip`/`brotli` defaults are
+# negligible for our single endpoint; leave them on for compat.
+ureq = "3"
 # Default features include html-report generation + plotters; dropping
 # them keeps the dev-build cost down. `cargo_bench_support` is required
 # for `cargo bench` interop (machine-readable output, baseline save /

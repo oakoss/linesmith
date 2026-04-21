@@ -19,6 +19,7 @@
 pub mod credentials;
 pub mod deps;
 pub mod errors;
+pub mod fetcher;
 pub mod usage;
 
 use std::cell::OnceCell;
