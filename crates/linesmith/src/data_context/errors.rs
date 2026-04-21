@@ -77,10 +77,13 @@ use std::time::Duration;
 /// to the user via the segment error table in
 /// `docs/specs/rate-limit-segments.md`.
 ///
-/// Neither `Clone` nor `PartialEq` are derived: inner types (`io::Error`
-/// via `CredentialError`, `serde_json::Error`) don't support them.
-/// `DataContext` memoizes this behind `Arc<Result<_, UsageError>>` so
-/// cross-segment sharing clones the `Arc`, not the error.
+/// `PartialEq` is not derived: inner types (`io::Error`,
+/// `serde_json::Error`) don't support it. `CredentialError` has a
+/// lossy `Clone` impl so the cascade can preserve variant-level
+/// detail across `Arc<Result<_, CredentialError>>` boundaries;
+/// `UsageError` itself isn't `Clone` because `DataContext` memoizes
+/// it behind `Arc<Result<_, UsageError>>` and cross-segment sharing
+/// clones the `Arc`.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum UsageError {

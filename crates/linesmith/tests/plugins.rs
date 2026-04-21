@@ -122,15 +122,17 @@ fn visibility_fixture_renders_when_rate_limits_present() {
 }
 
 #[test]
-fn declares_usage_fixture_sees_pre_cascade_sentinel() {
-    // The lazy `usage` source currently returns the pre-cascade
-    // sentinel `UsageError::Jsonl(JsonlError::NoEntries)`; the
-    // fixture renders the delegated short-tag so a regression that
-    // dropped declared-dep gating (or changed the sentinel's inner
-    // variant) trips here before it hits production.
+fn declares_usage_fixture_sees_delegated_error_code() {
+    // Pins `UsageError::Jsonl(_).code()` → inner `JsonlError` tag
+    // delegation. Seeded so the real cascade doesn't touch Keychain,
+    // network, or ~/.claude on every run.
+    use linesmith::data_context::{JsonlError, UsageError};
+
     let (registry, engine, _tmp) = load_isolated("declares_usage.rhai", DECLARES_USAGE);
     let seg = first_segment(registry, engine);
     let dc = DataContext::new(minimal_status());
+    dc.preseed_usage(Err(UsageError::Jsonl(JsonlError::NoEntries)))
+        .expect("seed before first ctx.usage()");
     let rendered = seg.render(&dc).unwrap().expect("visible");
     assert_eq!(rendered.text(), "NoEntries");
 }

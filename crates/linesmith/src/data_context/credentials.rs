@@ -166,6 +166,36 @@ impl CredentialError {
     }
 }
 
+/// Lossy `Clone`: `io::Error` and `serde_json::Error` don't implement
+/// `Clone`, so variants carrying them reconstruct near-equivalents
+/// (same `kind()` + textual message; `raw_os_error` and serde line
+/// numbers are lost). The variant tag — which is what [`Self::code`]
+/// and segment renderers key off per `rate-limit-segments.md`
+/// §Error message table — round-trips exactly. The crate's
+/// `unsafe_code = "forbid"` lint forecloses a transmute-based shallow
+/// clone, so this is the cheapest way to preserve variant-level
+/// detail across `Arc<Result<_, Self>>` boundaries like the cascade.
+impl Clone for CredentialError {
+    fn clone(&self) -> Self {
+        match self {
+            Self::NoCredentials => Self::NoCredentials,
+            Self::SubprocessFailed(e) => {
+                Self::SubprocessFailed(io::Error::new(e.kind(), e.to_string()))
+            }
+            Self::IoError { path, cause } => Self::IoError {
+                path: path.clone(),
+                cause: io::Error::new(cause.kind(), cause.to_string()),
+            },
+            Self::ParseError { path, cause } => Self::ParseError {
+                path: path.clone(),
+                cause: serde_json::Error::io(io::Error::other(cause.to_string())),
+            },
+            Self::MissingField { path } => Self::MissingField { path: path.clone() },
+            Self::EmptyToken { path } => Self::EmptyToken { path: path.clone() },
+        }
+    }
+}
+
 impl fmt::Debug for CredentialError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -17,6 +17,7 @@
 //! Canonical definition: `docs/specs/data-fetching.md` §DataContext.
 
 pub mod cache;
+pub mod cascade;
 pub mod credentials;
 pub mod deps;
 pub mod errors;
@@ -141,18 +142,37 @@ impl DataContext {
 
     /// OAuth usage endpoint data (shared across rate-limit segments).
     ///
-    /// Returns a sentinel error until the real fallback cascade is
-    /// wired. The sentinel wraps [`JsonlError::NoEntries`] so the
-    /// mirror's `.code()` delegation produces `"NoEntries"` — the
-    /// semantic "we have no data to give you" rather than a
-    /// mid-cascade failure. ADR-0011 §Fallback cascade unwraps inner
-    /// errors on real failures, so callers should not treat the
-    /// wrap as semantically meaningful.
+    /// Runs the full fallback cascade on first call and memoizes the
+    /// result for the process lifetime. See
+    /// [`cascade::resolve_usage`] for the step order and
+    /// `docs/specs/data-fetching.md` §OAuth fallback cascade for
+    /// rationale. A fresh disk-cache hit short-circuits before any
+    /// Keychain subprocess or HTTP call.
     #[must_use]
     pub fn usage(&self) -> Arc<Result<UsageData, UsageError>> {
         self.usage
-            .get_or_init(|| Arc::new(Err(UsageError::Jsonl(JsonlError::NoEntries))))
+            .get_or_init(|| Arc::new(self.resolve_usage_default()))
             .clone()
+    }
+
+    fn resolve_usage_default(&self) -> Result<UsageData, UsageError> {
+        let root = cache::default_root();
+        let cache_store = root.clone().map(cache::CacheStore::new);
+        let lock_store = root.map(cache::LockStore::new);
+        let transport = fetcher::UreqTransport::new();
+        let config = cascade::UsageCascadeConfig::default();
+        cascade::resolve_usage(
+            cache_store.as_ref(),
+            lock_store.as_ref(),
+            &transport,
+            &|| self.credentials(),
+            // Cheap no-op closure: the cascade currently ignores JSONL
+            // per lsm-xhu; this avoids triggering a full transcript
+            // scan through `self.jsonl()` that would be discarded.
+            &|| Err(JsonlError::NoEntries),
+            &chrono::Utc::now,
+            &config,
+        )
     }
 
     /// macOS Keychain / `.credentials.json` OAuth credentials.
@@ -167,6 +187,19 @@ impl DataContext {
         self.credentials
             .get_or_init(|| Arc::new(credentials::resolve_credentials()))
             .clone()
+    }
+
+    /// Pre-populate the `usage` result so [`Self::usage`] returns it
+    /// without running the fallback cascade (which would otherwise
+    /// touch the real Keychain, network, and JSONL transcripts).
+    /// Mirrors [`OnceCell::set`]'s semantics: returns `Err` with the
+    /// already-stored value if the cell was already populated by a
+    /// prior `ctx.usage()` read.
+    pub fn preseed_usage(
+        &self,
+        result: Result<UsageData, UsageError>,
+    ) -> Result<(), Arc<Result<UsageData, UsageError>>> {
+        self.usage.set(Arc::new(result))
     }
 
     /// `~/.claude/sessions/{pid}.json` live process snapshot.

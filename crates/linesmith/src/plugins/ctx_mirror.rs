@@ -384,7 +384,13 @@ mod tests {
 
     #[test]
     fn declared_source_shows_up_as_tagged_error_when_stub() {
+        // Seeded to decouple from host-machine Keychain/network state;
+        // the real cascade would otherwise hit the OAuth endpoint.
         let dc = DataContext::new(minimal_status());
+        dc.preseed_usage(Err(crate::data_context::UsageError::Jsonl(
+            crate::data_context::JsonlError::NoEntries,
+        )))
+        .expect("seed");
         let ctx = build_and_unwrap_map(&dc, &[DataDep::Usage]);
         let usage: Map = ctx
             .get("usage")
@@ -398,9 +404,6 @@ mod tests {
                 .and_then(|d| d.clone().try_cast::<String>()),
             Some("error".to_string())
         );
-        // `DataContext::usage()` currently returns
-        // `UsageError::Jsonl(JsonlError::NoEntries)` as a pre-cascade
-        // sentinel; `.code()` delegates through to the inner variant.
         assert_eq!(
             usage
                 .get("error")
@@ -603,8 +606,9 @@ mod tests {
         // map. Test all four arms so a copy-paste bug (wrong source,
         // wrong key) is caught here rather than in a downstream plugin
         // that suddenly sees `()` instead of an error. Expected code
-        // varies per source — stubs emit "NotImplemented"; Usage's
-        // pre-cascade sentinel delegates to JsonlError::NoEntries.
+        // varies per source — stubs emit "NotImplemented"; Usage is
+        // seeded with the JSONL sentinel so the test doesn't hit the
+        // real cascade (Keychain + network) on dev machines.
         let cases: &[(DataDep, &str, &str)] = &[
             (DataDep::Settings, "settings", "NotImplemented"),
             (DataDep::ClaudeJson, "claude_json", "NotImplemented"),
@@ -613,6 +617,12 @@ mod tests {
         ];
         for (dep, key, expected_code) in cases {
             let dc = DataContext::new(minimal_status());
+            if matches!(dep, DataDep::Usage) {
+                dc.preseed_usage(Err(crate::data_context::UsageError::Jsonl(
+                    crate::data_context::JsonlError::NoEntries,
+                )))
+                .expect("seed");
+            }
             let ctx = build_and_unwrap_map(&dc, &[*dep]);
             let entry: Map = ctx
                 .get(*key)
