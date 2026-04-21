@@ -168,14 +168,13 @@ impl JsonlTailer {
 
 /// Aggregate of JSONL transcript data used by the usage fallback
 /// and future segments (effort detection, session metrics, etc.).
-/// The concrete shape — 5h block buckets, 7d window rollups, per-model
-/// token totals — is out of scope for this spec; it's defined by the
-/// follow-up `jsonl-aggregation` spec that lands alongside lsm-y6m
-/// implementation. For this spec's purposes, `JsonlAggregate` is the
-/// opaque type returned by `ctx.jsonl()` and the failure type is
-/// `JsonlError { path: PathBuf, source: io::Error | serde_json::Error }`.
-pub struct JsonlAggregate { /* shape deferred */ }
-pub struct JsonlError    { /* shape deferred */ }
+/// The concrete shape — 5h block buckets, 7d window rollups, per-line
+/// record schema, project-root cascade, dedup semantics — is owned by
+/// [jsonl-aggregation.md](jsonl-aggregation.md). For this spec's
+/// purposes, `JsonlAggregate` is the type returned by `ctx.jsonl()`
+/// and `JsonlError` is its failure variant.
+pub struct JsonlAggregate { /* see jsonl-aggregation.md */ }
+pub struct JsonlError    { /* see jsonl-aggregation.md */ }
 ```
 
 Semantics:

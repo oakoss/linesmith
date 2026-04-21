@@ -253,7 +253,7 @@ Error strings are intentionally concise to fit within typical statusline widths.
 
 ### JSONL-fallback display
 
-When `UsageData::source == UsageSource::Jsonl`, every rendered value gets the `stale_marker` prefix (default `~`). This is the sole indicator that the OAuth endpoint was unreachable and these values are derived from local transcripts.
+When `UsageData::source == UsageSource::Jsonl`, every rendered value gets the `stale_marker` prefix (default `~`). This is the sole indicator that the OAuth endpoint was unreachable and these values are derived from local transcripts per [jsonl-aggregation.md](jsonl-aggregation.md).
 
 For users who prefer no marker, setting `stale_marker = ""` suppresses it. The endpoint and fallback produce equivalent-quality 5h data; the indicator is informational.
 
