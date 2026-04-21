@@ -26,6 +26,7 @@ lexopt.workspace = true
 rhai.workspace = true
 secrecy.workspace = true
 supports-color.workspace = true
+tempfile.workspace = true
 terminal_size.workspace = true
 ureq.workspace = true
 toml.workspace = true
@@ -34,7 +35,6 @@ unicode-width.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
-tempfile.workspace = true
 
 [[bin]]
 name = "linesmith"

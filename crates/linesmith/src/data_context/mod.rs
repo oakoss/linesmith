@@ -16,6 +16,7 @@
 //!
 //! Canonical definition: `docs/specs/data-fetching.md` §DataContext.
 
+pub mod cache;
 pub mod credentials;
 pub mod deps;
 pub mod errors;

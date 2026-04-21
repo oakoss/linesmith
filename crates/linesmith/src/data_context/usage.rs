@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::input::Percent;
 
@@ -32,7 +32,7 @@ use crate::input::Percent;
 /// may add without notice (`omelette_*`, `iguana_*`, `cowork`, etc.
 /// observed live 2026-04-18). See `docs/research/claude-data-files.md`
 /// §Raw data for the reference capture.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[non_exhaustive]
 pub struct UsageApiResponse {
     #[serde(default)]
@@ -66,7 +66,7 @@ pub struct UsageApiResponse {
 /// to emit `null` for codenamed buckets (e.g. `seven_day_omelette`
 /// in the 2026-04-18 capture) and we can't rule out the same for
 /// recognized buckets under some account states.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
 pub struct UsageBucket {
     /// Percent used within the window. Clamped to `[0, 100]` during
     /// deserialization per `rate-limit-segments.md` §Edge cases
@@ -81,7 +81,7 @@ pub struct UsageBucket {
 /// Overage-credit tracking for accounts with extra-usage enabled.
 /// `is_enabled` is the load-bearing flag: when `false`, every other
 /// field is typically `null` in the live endpoint.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[non_exhaustive]
 pub struct ExtraUsage {
     #[serde(default)]

@@ -157,7 +157,7 @@ impl std::str::FromStr for EffortLevel {
 
 /// Percentage in `0.0..=100.0`. Construction outside that range returns
 /// `None` so normalizers can translate to `ParseError::InvalidValue`.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, serde::Serialize)]
 pub struct Percent(f32);
 
 impl Percent {
