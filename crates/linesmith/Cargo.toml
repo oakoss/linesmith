@@ -30,8 +30,13 @@ unicode-segmentation.workspace = true
 unicode-width.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 tempfile.workspace = true
 
 [[bin]]
 name = "linesmith"
 path = "src/main.rs"
+
+[[bench]]
+name = "plugins"
+harness = false

@@ -29,6 +29,12 @@ rhai = { version = "1.24", default-features = false, features = ["std", "sync"] 
 supports-color = "3"
 tempfile = "3"
 terminal_size = "0.4"
+# Default features include html-report generation + plotters; dropping
+# them keeps the dev-build cost down. `cargo_bench_support` is required
+# for `cargo bench` interop (machine-readable output, baseline save /
+# compare); the criterion book lists it as mandatory when invoked
+# through the cargo harness.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 toml = "1"
 unicode-segmentation = "1"
 unicode-width = "0.2"
