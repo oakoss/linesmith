@@ -26,6 +26,10 @@ lexopt = "0.3"
 # `std` is required; default features like `metadata` / `serde` / `debugging`
 # are not needed for our embedder and add 100s of KB to the stripped binary.
 rhai = { version = "1.24", default-features = false, features = ["std", "sync"] }
+# `SecretString` redacts on Debug/Display; we expose the inner bytes only
+# through the explicit `.token()` accessor per `docs/specs/credentials.md`
+# §Interface.
+secrecy = "0.10"
 supports-color = "3"
 tempfile = "3"
 terminal_size = "0.4"

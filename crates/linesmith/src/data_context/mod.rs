@@ -16,6 +16,7 @@
 //!
 //! Canonical definition: `docs/specs/data-fetching.md` §DataContext.
 
+pub mod credentials;
 pub mod deps;
 pub mod errors;
 pub mod usage;
@@ -25,6 +26,7 @@ use std::sync::Arc;
 
 use crate::input::StatusContext;
 
+pub use credentials::{CredentialSource, Credentials};
 pub use deps::DataDep;
 pub use errors::{
     ClaudeJsonError, CredentialError, GitError, JsonlError, SessionError, SettingsError, UsageError,
@@ -58,11 +60,6 @@ pub struct ClaudeJson {}
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct JsonlAggregate {}
-
-/// macOS Keychain / file-backed OAuth credentials. Stub.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct Credentials {}
 
 /// Snapshot of `~/.claude/sessions/{pid}.json` entries. Stub.
 #[derive(Debug, Clone)]
@@ -157,10 +154,16 @@ impl DataContext {
     }
 
     /// macOS Keychain / `.credentials.json` OAuth credentials.
+    ///
+    /// Invokes [`credentials::resolve_credentials`] on first call and
+    /// memoizes the `Arc<Result<...>>` for the process lifetime per
+    /// `docs/specs/credentials.md` §Non-functional. On macOS this may
+    /// trigger a `security` subprocess and a one-time Keychain access
+    /// prompt; on Linux/Windows it's a file-cascade read.
     #[must_use]
     pub fn credentials(&self) -> Arc<Result<Credentials, CredentialError>> {
         self.credentials
-            .get_or_init(|| Arc::new(Err(CredentialError::NotImplemented)))
+            .get_or_init(|| Arc::new(credentials::resolve_credentials()))
             .clone()
     }
 

@@ -54,12 +54,13 @@ stub_error!(
 );
 stub_error!(ClaudeJsonError, "Errors from reading `~/.claude.json`.");
 stub_error!(JsonlError, "Errors from aggregating JSONL transcripts.");
-stub_error!(
-    CredentialError,
-    "Errors from macOS Keychain / `.credentials.json` reads."
-);
 stub_error!(SessionError, "Errors from the live sessions directory.");
 stub_error!(GitError, "Errors from `gix` repo inspection.");
+
+// `CredentialError` is the real type from `super::credentials` — re-exported
+// at the data_context module root so `pub use errors::CredentialError` still
+// resolves. When other error types graduate, follow the same pattern.
+pub use super::credentials::CredentialError;
 
 // --- UsageError (real, not stub) ---------------------------------------
 //
@@ -74,7 +75,12 @@ use std::time::Duration;
 /// stack, credential, and JSONL-fallback layers that feed it. Rendered
 /// to the user via the segment error table in
 /// `docs/specs/rate-limit-segments.md`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Neither `Clone` nor `PartialEq` are derived: inner types (`io::Error`
+/// via `CredentialError`, `serde_json::Error`) don't support them.
+/// `DataContext` memoizes this behind `Arc<Result<_, UsageError>>` so
+/// cross-segment sharing clones the `Arc`, not the error.
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum UsageError {
     /// No OAuth token reachable from any cascade path. Rendered
@@ -177,8 +183,8 @@ mod usage_error_tests {
         let cases: &[(UsageError, &str)] = &[
             (UsageError::NoCredentials, "no OAuth credentials found"),
             (
-                UsageError::Credentials(CredentialError::NotImplemented),
-                "credentials error: NotImplemented",
+                UsageError::Credentials(CredentialError::NoCredentials),
+                "credentials error: no OAuth credentials found",
             ),
             (UsageError::Timeout, "endpoint request timed out"),
             (
@@ -222,13 +228,12 @@ mod usage_error_tests {
         assert_eq!(UsageError::ParseError.code(), "ParseError");
         assert_eq!(UsageError::Unauthorized.code(), "Unauthorized");
 
-        // Stub-wrapped variants surface the inner stub code today.
-        // When lsm-a7a lands real CredentialError variants, this test
-        // will shift to "NoCredentials" / "SubprocessFailed" / etc.
+        // Credentials delegation surfaces real CredentialError codes.
         assert_eq!(
-            UsageError::Credentials(CredentialError::NotImplemented).code(),
-            "NotImplemented",
+            UsageError::Credentials(CredentialError::NoCredentials).code(),
+            "NoCredentials",
         );
+        // Jsonl still delegates to a stub until lsm-26y lands.
         assert_eq!(
             UsageError::Jsonl(JsonlError::NotImplemented).code(),
             "NotImplemented",
@@ -239,8 +244,21 @@ mod usage_error_tests {
     fn source_chains_through_wrapping_variants() {
         use std::error::Error;
 
-        let wrapped = UsageError::Credentials(CredentialError::NotImplemented);
-        assert!(wrapped.source().is_some());
+        // Wrapping variants always expose the inner as their source,
+        // regardless of whether that inner itself wraps an io::Error.
+        // The full chain terminates at the leaf variant.
+        let wrapped = UsageError::Credentials(CredentialError::IoError {
+            path: std::path::PathBuf::from("/x"),
+            cause: std::io::Error::other("boom"),
+        });
+        let source = wrapped.source().unwrap();
+        // wrapped → CredentialError::IoError → io::Error
+        assert!(source.source().is_some());
+
+        // `Credentials(NoCredentials)` wraps a leaf — chain has 1 step.
+        let credless = UsageError::Credentials(CredentialError::NoCredentials);
+        let source = credless.source().unwrap();
+        assert!(source.source().is_none());
 
         let wrapped_jsonl = UsageError::Jsonl(JsonlError::NotImplemented);
         assert!(wrapped_jsonl.source().is_some());
