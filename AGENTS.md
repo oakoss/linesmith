@@ -132,6 +132,15 @@ Conventional commits: `type(scope): short description`
 
 Beads issue references go in the commit footer as a bare `lsm-xyz`, not in the subject line. Commits not tied to a beads issue (meta / workflow / CI / version bumps) have **no** footer — don't invent one.
 
+### Body
+
+Optional; wrap at 72 characters. When present:
+
+- **Short bullets** for the material changes (what ships).
+- **A sentence or two of prose** for any WHY that isn't obvious from the code or diff — cross-cutting effects, non-obvious tradeoffs, or context a future bisecter will need.
+
+Skip the body entirely for self-explanatory commits. Don't enumerate tests, narrate the code, or list follow-up beads — those live in `bd ready`.
+
 ```text
 feat(core): implement stdin JSON parsing
 
