@@ -202,14 +202,21 @@ const _: fn() = || {
     assert_send_sync::<Arc<Engine>>();
 };
 
-/// Host-registered `log(msg)` for plugin scripts. Writes one line per
-/// plugin per process to stderr; subsequent calls from the same
-/// plugin are silently dropped to keep a chatty plugin from flooding
-/// stderr. The active plugin id comes from a thread-local set by
-/// `RhaiSegment::render`; calls outside a render (e.g. tests that
-/// `eval` directly) attribute to a synthetic `<unscoped>` bucket.
+/// Host-registered `log(msg)` for plugin scripts. Emits one warn-
+/// level line per plugin per process through the crate logger;
+/// subsequent calls from the same plugin are silently dropped to
+/// keep a chatty plugin from flooding stderr. The active plugin id
+/// comes from a thread-local set by `RhaiSegment::render`; calls
+/// outside a render (e.g. tests that `eval` directly) attribute to
+/// a synthetic `<unscoped>` bucket.
 ///
-/// Bumping the counter *before* `eprintln!` is deliberate: a chatty
+/// `log()` is a diagnostic channel, not a user-feedback channel.
+/// It routes through `LINESMITH_LOG` and a user who sets
+/// `LINESMITH_LOG=off` will not see plugin log lines. Plugins that
+/// want to communicate with users should emit via segment output
+/// (the return of `fn render(ctx)`), not `log()`.
+///
+/// Bumping the counter *before* emitting is deliberate: a chatty
 /// plugin should pay at most a single `to_owned` per process for its
 /// id, not one per dropped call.
 fn rhai_log(msg: &str) {
@@ -233,7 +240,10 @@ fn rhai_log(msg: &str) {
         }
     });
     if let Some(id) = allowed {
-        eprintln!("linesmith plugin {id}: {msg}");
+        // The existing per-plugin counter still gates chattiness; the
+        // logger just adds `LINESMITH_LOG=off` suppression and the
+        // uniform `[warn]` prefix.
+        crate::lsm_warn!("plugin {id}: {msg}");
     }
 }
 

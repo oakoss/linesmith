@@ -9,7 +9,6 @@
 //! read those fields skip the scan entirely.
 
 use std::cell::OnceCell;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -173,11 +172,9 @@ impl GitContext {
             .get_or_init(|| match &self.repo {
                 Some(repo) => Arc::new(compute_dirty(repo).unwrap_or_else(|err| {
                     // Silent false-clean would mask real gix failures
-                    // (e.g. index corruption); write the cause through.
-                    let _ = writeln!(
-                        io::stderr().lock(),
-                        "linesmith: git dirty scan failed: {err}"
-                    );
+                    // (e.g. index corruption); route through the
+                    // logger so `LINESMITH_LOG=off` can suppress it.
+                    crate::lsm_warn!("git dirty scan failed: {err}");
                     DirtyState::Clean
                 })),
                 None => Arc::new(DirtyState::Clean),
@@ -219,10 +216,7 @@ impl GitContext {
         self.upstream
             .get_or_init(|| match &self.repo {
                 Some(repo) => Arc::new(compute_upstream(repo, &self.head).unwrap_or_else(|err| {
-                    let _ = writeln!(
-                        io::stderr().lock(),
-                        "linesmith: git ahead/behind scan failed: {err}"
-                    );
+                    crate::lsm_warn!("git ahead/behind scan failed: {err}");
                     None
                 })),
                 None => Arc::new(None),
@@ -356,9 +350,8 @@ fn compute_upstream(
     let upstream_branch = match full_name.strip_prefix("refs/remotes/") {
         Some(short) => short.to_string(),
         None => {
-            let _ = writeln!(
-                io::stderr().lock(),
-                "linesmith: upstream ref {full_name} is outside refs/remotes/; rendering full refname"
+            crate::lsm_warn!(
+                "upstream ref {full_name} is outside refs/remotes/; rendering full refname"
             );
             full_name
         }

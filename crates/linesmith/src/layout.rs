@@ -10,18 +10,18 @@ use crate::segments::{
     text_width, RenderedSegment, Segment, SegmentDefaults, Separator, WidthBounds,
 };
 use crate::theme::{self, Capability, Theme};
-use std::io::{self, Write};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Render `segments` for `ctx` within `terminal_width` cells. Returns the
-/// final line without a trailing newline. Segment render errors are
-/// logged to the real process stderr; output is unstyled (callers that
-/// want theming use [`render_with_warn`]).
+/// final line without a trailing newline. Segment render errors go
+/// through [`crate::lsm_error!`] so a broken segment always surfaces,
+/// even under `LINESMITH_LOG=off` — a blank statusline with zero
+/// diagnostic is a bad UX even when the user opted into quiet mode.
+/// Output is unstyled (callers that want theming use
+/// [`render_with_warn`] with their own closure).
 #[must_use]
 pub fn render(segments: &[Box<dyn Segment>], ctx: &DataContext, terminal_width: u16) -> String {
-    let mut warn = |msg: &str| {
-        let _ = writeln!(io::stderr().lock(), "linesmith: {msg}");
-    };
+    let mut warn = |msg: &str| crate::lsm_error!("{msg}");
     render_with_warn(
         segments,
         ctx,

@@ -11,6 +11,13 @@
 //! [`Ok(None)`] hide paths in rate-limit segments log at
 //! [`Level::Debug`] and require `LINESMITH_LOG=debug` to appear.
 //!
+//! Structural failures that always warrant a user-visible signal
+//! (segment render panics, fatal plugin init errors) emit through
+//! [`lsm_error!`], which bypasses the level gate. `LINESMITH_LOG=off`
+//! quiets chatter; it is not a silence-all-signals switch, because a
+//! broken statusline needs a stderr line the user can grep. Scripts
+//! that want absolute silence can `2>/dev/null`.
+//!
 //! Output format: `linesmith [<level>]: <message>`. A future doctor
 //! command can buffer and reformat the same emissions.
 //!
@@ -137,6 +144,21 @@ pub fn emit(lvl: Level, msg: &str) {
     let _ = writeln!(io::stderr().lock(), "linesmith [{tag}]: {msg}");
 }
 
+/// Emit a structural-failure diagnostic. Bypasses the level gate:
+/// even `LINESMITH_LOG=off` does not suppress it, because the only
+/// things that reach this function are render failures a user has no
+/// other way of seeing.
+pub fn emit_error(msg: &str) {
+    emit_error_to(msg, &mut io::stderr().lock());
+}
+
+/// Same as [`emit_error`] but to a caller-supplied sink. Separate
+/// from `emit_error` so unit tests can assert the message without
+/// capturing process stderr.
+pub(crate) fn emit_error_to(msg: &str, sink: &mut dyn Write) {
+    let _ = writeln!(sink, "linesmith [error]: {msg}");
+}
+
 impl Level {
     /// Parse the [`ENV_VAR`] string. Accepts `warn` → `Warn`, `debug`
     /// / `trace` / `all` → `Debug`, `off` / `none` / `0` → `Off`.
@@ -170,6 +192,17 @@ macro_rules! lsm_debug {
         if $crate::logging::is_enabled($crate::logging::Level::Debug) {
             $crate::logging::emit($crate::logging::Level::Debug, &format!($($arg)*));
         }
+    };
+}
+
+/// Emit a structural-failure diagnostic that bypasses the level gate.
+/// Reserved for failures a user has no other way of seeing — segment
+/// render errors, fatal plugin init, contract violations — so a user
+/// who set `LINESMITH_LOG=off` still sees "the statusline broke."
+#[macro_export]
+macro_rules! lsm_error {
+    ($($arg:tt)*) => {
+        $crate::logging::emit_error(&format!($($arg)*))
     };
 }
 
@@ -342,5 +375,31 @@ mod tests {
     fn from_u8_debug_panics_on_out_of_range() {
         // Only covered in debug builds; release saturates to Debug.
         let _ = from_u8(99);
+    }
+
+    #[test]
+    fn emit_error_bypasses_off_level() {
+        let _g = lock();
+        set_level(Level::Off);
+        let mut sink = Vec::<u8>::new();
+        emit_error_to("render panic", &mut sink);
+        let written = String::from_utf8(sink).expect("utf8");
+        assert_eq!(written, "linesmith [error]: render panic\n");
+        set_level(DEFAULT_LEVEL);
+    }
+
+    #[test]
+    fn emit_error_fires_at_every_level() {
+        let _g = lock();
+        for l in [Level::Off, Level::Warn, Level::Debug] {
+            set_level(l);
+            let mut sink = Vec::<u8>::new();
+            emit_error_to("x", &mut sink);
+            assert!(
+                !sink.is_empty(),
+                "emit_error must fire at level {l:?}, got empty sink"
+            );
+        }
+        set_level(DEFAULT_LEVEL);
     }
 }

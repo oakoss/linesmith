@@ -27,7 +27,6 @@ pub mod jsonl;
 pub mod usage;
 
 use std::cell::OnceCell;
-use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -248,10 +247,7 @@ impl DataContext {
                     None => Ok(None),
                 };
                 if let Err(err) = &result {
-                    let _ = writeln!(
-                        io::stderr().lock(),
-                        "linesmith: git discovery failed: {err}"
-                    );
+                    crate::lsm_warn!("git discovery failed: {err}");
                 }
                 Arc::new(result)
             })

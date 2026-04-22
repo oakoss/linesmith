@@ -300,7 +300,10 @@ The host validates the shape at render time. Missing `runs` or malformed entries
 Rhai plugins can call a small set of host-exposed functions. No other ambient capabilities are granted.
 
 ```text
-log(msg)                  // debug log line to stderr, rate-limited per plugin per run
+log(msg)                  // diagnostic line to stderr, routed through LINESMITH_LOG
+                          //   and rate-limited to one line per plugin per run.
+                          //   NOT a user-feedback channel: emit user-visible text
+                          //   via the segment return value instead.
 format_duration(ms)       // format milliseconds (i64) as "1h 23m"
 format_cost_usd(dollars)  // format an f64 dollar amount as "$1.23" (matches ctx.cost.total_cost_usd)
 format_tokens(count)      // format a token count (u64) as "1.2k", "3.5M", etc.

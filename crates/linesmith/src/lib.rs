@@ -142,15 +142,15 @@ const DEFAULT_TERMINAL_WIDTH: u16 = 200;
 
 /// Resolve the terminal width in cells. Prefers the OS-reported size, then
 /// the `COLUMNS` env var, then `DEFAULT_TERMINAL_WIDTH`. A set-but-invalid
-/// `COLUMNS` value logs to stderr so the user can correct their config;
-/// an unset `COLUMNS` falls through silently (the common case when stdout
-/// is piped to Claude Code).
+/// `COLUMNS` value routes through [`lsm_warn!`] so the user can correct
+/// their config; an unset `COLUMNS` falls through silently (the common
+/// case when stdout is piped to Claude Code).
 #[must_use]
 pub fn detect_terminal_width() -> u16 {
     let os_width = terminal_size::terminal_size().map(|(terminal_size::Width(w), _)| w);
     let columns = std::env::var("COLUMNS").ok();
     resolve_terminal_width(os_width, columns.as_deref(), |msg| {
-        let _ = writeln!(io::stderr().lock(), "linesmith: {msg}");
+        crate::lsm_warn!("{msg}")
     })
 }
 
