@@ -230,26 +230,53 @@ const KNOWN_LAYOUT_OPTIONS: &[&str] = &["color", "claude_padding", "separator"];
 
 /// Per-segment override schema. Returns `None` for segment ids we
 /// don't recognize so plugin segments (which own their own schema)
-/// bypass validation. Built-in segments share a universal allow-list;
-/// segment-specific keys (`format` for context_window,
-/// `show_dirty` / `show_ahead_behind` for git_branch) land alongside
-/// their segments with proper per-type allow-lists.
+/// bypass validation. Most built-ins share the universal allow-list;
+/// rate-limit segments extend it with per-family knobs that
+/// `segments::rate_limit_format` reads from the TOML extras bag.
 fn segment_override_schema(id: &str) -> Option<&'static [&'static str]> {
     const BUILT_IN_COMMON: &[&str] = &["priority", "width", "style", "visible_if"];
-    const BUILT_IN_IDS: &[&str] = &[
-        "model",
-        "workspace",
-        "cost",
-        "effort",
-        "context_window",
-        "rate_limit",
-        "rate_limit_5h",
-        "rate_limit_7d",
+    const RATE_LIMIT_COMMON: &[&str] = &[
+        "priority",
+        "width",
+        "style",
+        "visible_if",
+        "icon",
+        "label",
+        "stale_marker",
+        "progress_width",
+        "format",
     ];
-    if BUILT_IN_IDS.contains(&id) {
-        Some(BUILT_IN_COMMON)
-    } else {
-        None
+    const PERCENT_SEGMENT: &[&str] = &[
+        "priority",
+        "width",
+        "style",
+        "visible_if",
+        "icon",
+        "label",
+        "stale_marker",
+        "progress_width",
+        "format",
+        "invert",
+    ];
+    const RESET_SEGMENT: &[&str] = &[
+        "priority",
+        "width",
+        "style",
+        "visible_if",
+        "icon",
+        "label",
+        "stale_marker",
+        "progress_width",
+        "format",
+        "compact",
+        "use_days",
+    ];
+    match id {
+        "model" | "workspace" | "cost" | "effort" | "context_window" => Some(BUILT_IN_COMMON),
+        "rate_limit_5h" | "rate_limit_7d" => Some(PERCENT_SEGMENT),
+        "rate_limit_5h_reset" | "rate_limit_7d_reset" => Some(RESET_SEGMENT),
+        "extra_usage" => Some(RATE_LIMIT_COMMON),
+        _ => None,
     }
 }
 
@@ -620,6 +647,93 @@ mod tests {
             "#,
         );
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn rate_limit_percent_segments_allow_format_and_invert_without_warning() {
+        let warnings = collect_warnings(
+            r#"
+                [segments.rate_limit_5h]
+                format = "progress"
+                invert = true
+                icon = "⏱"
+                label = "5h"
+                stale_marker = "~"
+                progress_width = 20
+
+                [segments.rate_limit_7d]
+                format = "percent"
+                invert = false
+            "#,
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn rate_limit_reset_segments_allow_compact_and_use_days_without_warning() {
+        let warnings = collect_warnings(
+            r#"
+                [segments.rate_limit_5h_reset]
+                format = "duration"
+                compact = true
+                use_days = false
+
+                [segments.rate_limit_7d_reset]
+                format = "progress"
+                use_days = true
+            "#,
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn extra_usage_allows_currency_and_percent_format_without_warning() {
+        let warnings = collect_warnings(
+            r#"
+                [segments.extra_usage]
+                format = "currency"
+                icon = ""
+                label = "extra"
+                stale_marker = "~"
+            "#,
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn invert_warns_on_reset_segment_schema() {
+        // `invert` is percent-family only; allow-list for reset
+        // segments must reject it.
+        let warnings = collect_warnings(
+            r#"
+                [segments.rate_limit_5h_reset]
+                invert = true
+            "#,
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("invert") && warnings[0].contains("rate_limit_5h_reset"),
+            "{:?}",
+            warnings[0]
+        );
+    }
+
+    #[test]
+    fn use_days_warns_on_percent_segment_schema() {
+        // `use_days` is reset-family only; allow-list for percent
+        // segments must reject it.
+        let warnings = collect_warnings(
+            r#"
+                [segments.rate_limit_5h]
+                use_days = true
+            "#,
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].contains("use_days") && warnings[0].contains("rate_limit_5h"),
+            "{:?}",
+            warnings[0]
+        );
     }
 
     #[test]

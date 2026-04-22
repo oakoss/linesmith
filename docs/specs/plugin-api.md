@@ -86,7 +86,7 @@ fn defaults() {
 // OPTIONAL: conditional visibility predicate. If present and returns false,
 // `render` is not called and the segment is hidden.
 fn visible_if(ctx) {
-    ctx.status.rate_limits != ()
+    ctx.status.cost != ()
 }
 ```
 
@@ -190,11 +190,11 @@ For source-specific data shapes (`ctx.usage.data`, `ctx.git.data`, etc.), plugin
 - **`ctx.git`**: the Rust accessor is `Arc<Result<Option<GitContext>, GitError>>` — a nested `Option` distinguishes "no git repo at cwd" from "gix failed." The rhai mirror collapses `Ok(None)` to `kind: "ok"` + `data: ()`. Plugins check `ctx.git.kind == "ok" && ctx.git.data != ()` before accessing fields like `ctx.git.data.head`.
 - **`ctx.usage` error codes** mirror the `UsageError` variants from [rate-limit-segments.md](rate-limit-segments.md): `"NoCredentials" | "SubprocessFailed" | "IoError" | "Timeout" | "RateLimited" | "NetworkError" | "ParseError" | "Unauthorized"`. Plugins can distinguish credential-layer failures from endpoint-layer failures via these codes without the raw credentials being exposed.
 
-**Legacy `ctx.*` access pre-v0.2.** Scripts written against v0.1 accessed stdin fields directly (`ctx.model.display_name`, `ctx.rate_limits`, etc.). v0.2 moves those under `ctx.status.*` to make room for the DataContext sources. Plugin authors updating existing scripts do a one-time rename from `ctx.X` → `ctx.status.X` for every stdin field. `ctx.raw` (escape hatch for tool-specific fields) stays at `ctx.status.raw` in v0.2.
+**Legacy `ctx.*` access pre-v0.2.** Scripts written against v0.1 accessed stdin fields directly (`ctx.model.display_name`, `ctx.cost`, etc.). v0.2 moves those under `ctx.status.*` to make room for the DataContext sources. Plugin authors updating existing scripts do a one-time rename from `ctx.X` → `ctx.status.X` for every stdin field. `ctx.raw` (escape hatch for tool-specific fields) stays at `ctx.status.raw` in v0.2.
 
 **`StatusContext` field shape** (accessible as `ctx.status.*`). Same as v0.1's `ctx.*` convention:
 
-**Variant naming convention:** Rust `UpperCamelCase` variants are exposed to rhai as `snake_case` strings. `Tool::ClaudeCode` → `"claude_code"`; `RateLimits::FiveHourOnly` → kind tag `"five_hour_only"`. This convention is uniform across every enum exposed to plugins.
+**Variant naming convention:** Rust `UpperCamelCase` variants are exposed to rhai as `snake_case` strings. `Tool::ClaudeCode` → `"claude_code"`; `UsageSource::Endpoint` → `"endpoint"`. This convention is uniform across every enum exposed to plugins.
 
 **Nullability:** Rust `Option<T>` surfaces as rhai `()` when `None` (rhai's unit, equivalent to JSON null). Always check for `()` before accessing sub-fields.
 
@@ -227,24 +227,37 @@ if ctx.status.context_window != () {
     ctx.status.context_window.current_usage // map or ()
 }
 
-// Rate limits (stdin-provided; distinct from ctx.usage which is endpoint-fetched).
-// The `kind` tag determines which sub-fields are present.
-if ctx.status.rate_limits != () {
-    //   #{ kind: "five_hour_only", five_hour: <window> }
-    //   #{ kind: "seven_day_only", seven_day: <window> }
-    //   #{ kind: "both", five_hour: <window>, seven_day: <window> }
-    switch ctx.status.rate_limits.kind {
-        "five_hour_only" => ctx.status.rate_limits.five_hour.used,
-        "seven_day_only" => ctx.status.rate_limits.seven_day.used,
-        "both"           => ctx.status.rate_limits.five_hour.used,
-    }
-}
+// Rate-limit data is not on ctx.status — read ctx.usage instead
+// (declared via @data_deps = ["usage"]). The OAuth endpoint +
+// JSONL fallback cascade is strictly richer than the old stdin
+// rate_limits field it replaced.
 
 // Escape hatch for tool-specific fields not in the canonical model
 ctx.status.raw.some_custom_field
 ```
 
-**RateLimitWindow fields:** `used` is `f32` (Percent unwrapped), `resets_at` is an RFC 3339 string. Use `format_countdown_until(ctx.status.rate_limits.five_hour.resets_at)` to render a human-friendly countdown.
+**`ctx.usage` shape** (present only when the plugin declared `@data_deps = ["usage"]`). The `data` payload mirrors `UsageData`:
+
+```rhai
+if ctx.usage.kind == "ok" {
+    ctx.usage.data.source               // "endpoint" | "jsonl"
+    if ctx.usage.data.five_hour != () {
+        ctx.usage.data.five_hour.utilization   // f64 in 0.0..=100.0
+        ctx.usage.data.five_hour.resets_at     // RFC 3339 string or ()
+    }
+    // Same shape for seven_day, seven_day_opus, seven_day_sonnet, seven_day_oauth_apps
+    if ctx.usage.data.extra_usage != () {
+        ctx.usage.data.extra_usage.is_enabled     // bool or ()
+        ctx.usage.data.extra_usage.monthly_limit  // f64 or ()
+        ctx.usage.data.extra_usage.used_credits   // f64 or ()
+        ctx.usage.data.extra_usage.currency       // ISO 4217 string or ()
+    }
+}
+// When ctx.usage.kind == "error", ctx.usage.error is a short tag
+// string (e.g. "NoCredentials", "Timeout", "RateLimited").
+```
+
+Use `format_countdown_until(ctx.usage.data.five_hour.resets_at)` to render a human-friendly countdown.
 
 **Immutability enforcement:** `ctx` is built once per render from a `&DataContext` reference. The host configures the rhai engine so the script scope cannot mutate `ctx`: `Engine::disable_symbol("=")` is disabled for identifiers starting with `ctx`, and `ctx` is passed as an immutable `Dynamic`. Attempts to assign (`ctx.foo = bar`) are rejected at parse or runtime as a `PluginError::Runtime`.
 
@@ -472,7 +485,7 @@ Fixture scripts in `tests/fixtures/plugins/`:
 
 - `minimal.rhai`: smallest valid plugin (id + render returning one styled run)
 - `uses_ctx_config.rhai`: reads `ctx.config` and adapts output
-- `uses_visible_if.rhai`: hidden unless `ctx.status.rate_limits != ()`
+- `uses_visible_if.rhai`: hidden unless `ctx.status.cost != ()`
 - `syntax_error.rhai`: compile-time error case
 - `runtime_error.rhai`: runtime panic case
 - `timeout.rhai`: infinite loop (triggers operation limit)

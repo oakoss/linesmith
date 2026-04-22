@@ -74,7 +74,6 @@ mod tests {
             },
             context_window: window,
             cost: None,
-            rate_limits: None,
             effort: None,
             raw: Arc::new(serde_json::Value::Null),
         })

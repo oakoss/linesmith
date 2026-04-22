@@ -288,11 +288,34 @@ fn rhai_format_tokens(count: i64) -> String {
 /// Format an RFC 3339 timestamp string as a coarse countdown relative
 /// to now (`"2h 13m"` / `"45m"` / `"6d"` / `"now"`). Parse failures
 /// surface as the literal `"?"` so the statusline degrades visibly.
+/// Inlined here rather than sharing with the rate-limit segments
+/// (which use a different format per spec) — this is a stable
+/// plugin-facing API and moving cadence shouldn't track segment refactors.
 fn rhai_format_countdown_until(rfc3339_ts: &str) -> String {
-    match chrono::DateTime::parse_from_rfc3339(rfc3339_ts) {
-        Ok(dt) => crate::segments::format_countdown_until(dt.with_timezone(&Utc), Utc::now()),
-        Err(_) => "?".to_string(),
+    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339_ts) else {
+        return "?".to_string();
+    };
+    let target = dt.with_timezone(&Utc);
+    let now = Utc::now();
+    let delta = target - now;
+    let total_minutes = delta.num_minutes();
+    if total_minutes <= 0 {
+        return "now".to_string();
     }
+    let days = delta.num_days();
+    if days >= 2 {
+        return format!("{days}d");
+    }
+    let hours = delta.num_hours();
+    if hours >= 1 {
+        let minutes = (total_minutes - hours * 60).max(0);
+        return if minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {minutes}m")
+        };
+    }
+    format!("{total_minutes}m")
 }
 
 #[cfg(test)]

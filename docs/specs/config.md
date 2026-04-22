@@ -321,7 +321,7 @@ Parse and validate; print errors/warnings to stderr; exit non-zero on errors. Us
 
 ## Open questions
 
-- **`visible_if` expression sandbox** — rhai expressions for visibility sound powerful but add complexity. Alternative: a small predicate DSL (`"ctx.rate_limits.five_hour.used > 50"`). Decision deferred; v0.1 ships with a minimal predicate set, full rhai in v0.2+ if demand exists.
+- **`visible_if` expression sandbox** — rhai expressions for visibility sound powerful but add complexity. Alternative: a small predicate DSL (`"ctx.usage.data.five_hour.utilization > 50"`). Decision deferred; v0.1 ships with a minimal predicate set, full rhai in v0.2+ if demand exists.
 - **Preset storage** — in-binary (embedded TOML) vs. generated on demand from defaults. Current design: embedded. Adding new presets costs rebuilds. Deferred until we have 10+ presets.
 - **Config versioning** — should we add a `version = 1` key to enable migration? Current design: no; forward-compat via "unknown keys are warnings" is enough until we have a breaking change.
 - **Plugin discovery scope resolution** — both `plugin_dirs` and the default XDG directory are always scanned. On duplicate ids, `plugin_dirs` entries win over the XDG default (project-local / config-specified plugins override user-level ones), matching `specs/plugin-api.md`'s discovery order. Revisit if users want "replace, don't append" semantics.

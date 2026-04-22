@@ -18,7 +18,7 @@ use crate::theme;
 pub fn build_default_segments() -> Vec<Box<dyn Segment>> {
     DEFAULT_SEGMENT_IDS
         .iter()
-        .filter_map(|id| built_in_by_id(id))
+        .filter_map(|id| built_in_by_id(id, None, &mut |_| {}))
         .collect()
 }
 
@@ -77,7 +77,8 @@ pub fn build_segments(
                 return None;
             }
             let cfg_override = config.and_then(|c| c.segments.get(id));
-            let inner = if let Some(b) = built_in_by_id(id) {
+            let extras = cfg_override.map(|ov| &ov.extra);
+            let inner = if let Some(b) = built_in_by_id(id, extras, &mut warn) {
                 Some(b)
             } else if let Some((lookup, engine)) = plugin_bundle.as_mut() {
                 lookup.remove(id).map(|plugin| {
@@ -392,7 +393,6 @@ mod tests {
             },
             context_window: None,
             cost: None,
-            rate_limits: None,
             effort: None,
             raw: Arc::new(serde_json::Value::Null),
         })

@@ -257,7 +257,7 @@ Competitor columns use abbreviations: **cc** = ccstatusline (sirmalloc), **cpl**
 | **Context % correct post-/compact**                 | ✗             | ✗       |     | ✗       | **Differentiate** |
 | **Context % correct post-/resume**                  | ✗             | ✗       |     | ✗       | **Differentiate** |
 | **Context % correct during 429s**                   | ✗             |         |     |         | **Differentiate** |
-| Rate limits correct when `rate_limits` is null      | partial       |         |     |         | **v0.1**          |
+| Rate limits source (endpoint + JSONL fallback)      | partial       |         |     |         | **v0.1**          |
 | Render unchanged when no Rust code yet              | n/a           | n/a     | n/a | n/a     | **v0.1**          |
 | Graceful no-op when no git                          | ✓             | ✓       | ✗   | mixed   | **v0.1**          |
 | Worktree detection (`.git` as file)                 | partial       | partial |     | partial | **v0.1**          |

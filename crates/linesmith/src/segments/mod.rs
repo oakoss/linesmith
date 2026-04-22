@@ -12,10 +12,13 @@ pub(crate) mod builder;
 pub mod context_window;
 pub mod cost;
 pub mod effort;
+pub mod extra_usage;
 pub mod model;
-pub mod rate_limit;
 pub mod rate_limit_5h;
+pub mod rate_limit_5h_reset;
 pub mod rate_limit_7d;
+pub mod rate_limit_7d_reset;
+pub mod rate_limit_format;
 pub mod workspace;
 
 /// Output of a successful segment render.
@@ -367,15 +370,13 @@ pub trait Segment: Send {
 
 // --- Built-in registry + config-driven override wrapper ----------------
 
-/// Default segment order when no config supplies one.
-pub const DEFAULT_SEGMENT_IDS: &[&str] = &[
-    "model",
-    "context_window",
-    "rate_limit",
-    "cost",
-    "effort",
-    "workspace",
-];
+/// Default segment order when no config supplies one. No rate-limit
+/// segments are in the default line: a first-run user without any
+/// config shouldn't trigger a macOS Keychain prompt or a network
+/// request just to render the statusline. Users opt in by listing
+/// the rate-limit segments explicitly in `[line.segments]`.
+pub const DEFAULT_SEGMENT_IDS: &[&str] =
+    &["model", "context_window", "cost", "effort", "workspace"];
 
 /// Every built-in segment id. Used by [`PluginRegistry`] to reject
 /// plugins whose `const ID` shadows a built-in. Add new built-ins
@@ -388,24 +389,48 @@ pub const BUILT_IN_SEGMENT_IDS: &[&str] = &[
     "workspace",
     "cost",
     "effort",
-    "rate_limit",
     "rate_limit_5h",
     "rate_limit_7d",
+    "rate_limit_5h_reset",
+    "rate_limit_7d_reset",
+    "extra_usage",
 ];
 
 /// Construct a built-in segment by its config id. Unknown ids return
-/// `None` so config loaders can warn and skip.
+/// `None` so config loaders can warn and skip. `extras` carries the
+/// `[segments.<id>]` TOML bag; rate-limit segments parse their knobs
+/// from it (`format`, `invert`, `compact`, `use_days`, `icon`,
+/// `label`, `stale_marker`, `progress_width`). Other built-ins
+/// currently ignore `extras`.
 #[must_use]
-pub fn built_in_by_id(id: &str) -> Option<Box<dyn Segment>> {
+pub fn built_in_by_id(
+    id: &str,
+    extras: Option<&std::collections::BTreeMap<String, toml::Value>>,
+    warn: &mut impl FnMut(&str),
+) -> Option<Box<dyn Segment>> {
+    let empty: std::collections::BTreeMap<String, toml::Value> = std::collections::BTreeMap::new();
+    let e = extras.unwrap_or(&empty);
     match id {
         "model" => Some(Box::new(model::ModelSegment)),
         "context_window" => Some(Box::new(context_window::ContextWindowSegment)),
         "workspace" => Some(Box::new(workspace::WorkspaceSegment)),
         "cost" => Some(Box::new(cost::CostSegment)),
         "effort" => Some(Box::new(effort::EffortSegment)),
-        "rate_limit" => Some(Box::new(rate_limit::RateLimitSegment)),
-        "rate_limit_5h" => Some(Box::new(rate_limit_5h::RateLimit5hSegment)),
-        "rate_limit_7d" => Some(Box::new(rate_limit_7d::RateLimit7dSegment)),
+        "rate_limit_5h" => Some(Box::new(rate_limit_5h::RateLimit5hSegment::from_extras(
+            e, warn,
+        ))),
+        "rate_limit_7d" => Some(Box::new(rate_limit_7d::RateLimit7dSegment::from_extras(
+            e, warn,
+        ))),
+        "rate_limit_5h_reset" => Some(Box::new(
+            rate_limit_5h_reset::RateLimit5hResetSegment::from_extras(e, warn),
+        )),
+        "rate_limit_7d_reset" => Some(Box::new(
+            rate_limit_7d_reset::RateLimit7dResetSegment::from_extras(e, warn),
+        )),
+        "extra_usage" => Some(Box::new(extra_usage::ExtraUsageSegment::from_extras(
+            e, warn,
+        ))),
         _ => None,
     }
 }
@@ -485,136 +510,6 @@ impl Segment for OverriddenSegment {
             d.default_separator = sep;
         }
         d
-    }
-}
-
-// --- Shared render helpers --------------------------------------------
-
-/// Format a rate-limit window as `"{label} {pct:.0}% · {countdown}"`.
-pub(crate) fn format_window(
-    label: &str,
-    window: &crate::input::RateLimitWindow,
-    now: chrono::DateTime<chrono::Utc>,
-) -> String {
-    format!(
-        "{label} {pct:.0}% · {countdown}",
-        pct = window.used.value(),
-        countdown = format_countdown_until(window.resets_at, now),
-    )
-}
-
-/// Format a future UTC timestamp as a coarse countdown like `"2h 13m"`,
-/// `"45m"`, `"6d"`, or `"now"` for times at or in the past.
-pub(crate) fn format_countdown_until(
-    target: chrono::DateTime<chrono::Utc>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> String {
-    let delta = target - now;
-    let total_minutes = delta.num_minutes();
-    if total_minutes <= 0 {
-        return "now".to_string();
-    }
-    let days = delta.num_days();
-    if days >= 2 {
-        return format!("{days}d");
-    }
-    let hours = delta.num_hours();
-    if hours >= 1 {
-        let minutes = (total_minutes - hours * 60).max(0);
-        return if minutes == 0 {
-            format!("{hours}h")
-        } else {
-            format!("{hours}h {minutes}m")
-        };
-    }
-    format!("{total_minutes}m")
-}
-
-#[cfg(test)]
-mod countdown_tests {
-    use super::format_countdown_until;
-    use chrono::{Duration, TimeZone, Utc};
-
-    fn ref_time() -> chrono::DateTime<chrono::Utc> {
-        Utc.with_ymd_and_hms(2026, 4, 17, 12, 0, 0).unwrap()
-    }
-
-    #[test]
-    fn past_or_present_renders_as_now() {
-        let now = ref_time();
-        assert_eq!(format_countdown_until(now, now), "now");
-        assert_eq!(
-            format_countdown_until(now - Duration::minutes(5), now),
-            "now"
-        );
-    }
-
-    #[test]
-    fn sub_hour_renders_minutes_only() {
-        let now = ref_time();
-        assert_eq!(
-            format_countdown_until(now + Duration::minutes(45), now),
-            "45m"
-        );
-    }
-
-    #[test]
-    fn multi_hour_renders_hours_and_minutes() {
-        let now = ref_time();
-        assert_eq!(
-            format_countdown_until(now + Duration::minutes(73), now),
-            "1h 13m"
-        );
-    }
-
-    #[test]
-    fn round_hour_drops_minutes_suffix() {
-        let now = ref_time();
-        assert_eq!(format_countdown_until(now + Duration::hours(3), now), "3h");
-    }
-
-    #[test]
-    fn two_or_more_days_renders_days_only() {
-        let now = ref_time();
-        assert_eq!(format_countdown_until(now + Duration::days(2), now), "2d");
-        assert_eq!(format_countdown_until(now + Duration::days(6), now), "6d");
-    }
-
-    #[test]
-    fn under_two_days_still_uses_hours() {
-        let now = ref_time();
-        // 47h 30m: under the 2-day threshold, so hours-minutes form applies.
-        assert_eq!(
-            format_countdown_until(now + Duration::minutes(47 * 60 + 30), now),
-            "47h 30m"
-        );
-    }
-
-    #[test]
-    fn seam_at_two_day_boundary_switches_units() {
-        let now = ref_time();
-        // 47h 59m: still hours form.
-        assert_eq!(
-            format_countdown_until(now + Duration::minutes(48 * 60 - 1), now),
-            "47h 59m"
-        );
-        // Exactly 48h: flips to days form.
-        assert_eq!(format_countdown_until(now + Duration::hours(48), now), "2d");
-    }
-
-    #[test]
-    fn sub_minute_collapses_to_now() {
-        let now = ref_time();
-        assert_eq!(
-            format_countdown_until(now + Duration::seconds(30), now),
-            "now"
-        );
-    }
-
-    #[test]
-    fn exactly_one_hour_drops_minutes_suffix() {
-        let now = ref_time();
-        assert_eq!(format_countdown_until(now + Duration::hours(1), now), "1h");
     }
 }
 
@@ -777,7 +672,7 @@ mod layout_type_tests {
     fn built_in_by_id_resolves_every_default_segment() {
         for id in DEFAULT_SEGMENT_IDS {
             assert!(
-                built_in_by_id(id).is_some(),
+                built_in_by_id(id, None, &mut |_| {}).is_some(),
                 "expected built-in registry to know {id}"
             );
         }
@@ -785,22 +680,31 @@ mod layout_type_tests {
 
     #[test]
     fn built_in_by_id_resolves_additional_documented_ids() {
-        // Not in the default line, but valid config ids.
-        assert!(built_in_by_id("rate_limit_5h").is_some());
-        assert!(built_in_by_id("rate_limit_7d").is_some());
+        for id in [
+            "rate_limit_5h",
+            "rate_limit_7d",
+            "rate_limit_5h_reset",
+            "rate_limit_7d_reset",
+            "extra_usage",
+        ] {
+            assert!(
+                built_in_by_id(id, None, &mut |_| {}).is_some(),
+                "expected {id} to resolve"
+            );
+        }
     }
 
     #[test]
     fn built_in_by_id_rejects_unknown() {
-        assert!(built_in_by_id("nope").is_none());
-        assert!(built_in_by_id("").is_none());
+        assert!(built_in_by_id("nope", None, &mut |_| {}).is_none());
+        assert!(built_in_by_id("", None, &mut |_| {}).is_none());
     }
 
     // --- OverriddenSegment ---
 
     #[test]
     fn overridden_segment_replaces_priority() {
-        let base = built_in_by_id("workspace").expect("known id");
+        let base = built_in_by_id("workspace", None, &mut |_| {}).expect("known id");
         let base_priority = base.defaults().priority;
         let wrapped = OverriddenSegment::new(base).with_priority(200);
         assert_eq!(wrapped.defaults().priority, 200);
@@ -809,7 +713,7 @@ mod layout_type_tests {
 
     #[test]
     fn overridden_segment_replaces_width_bounds() {
-        let base = built_in_by_id("workspace").expect("known id");
+        let base = built_in_by_id("workspace", None, &mut |_| {}).expect("known id");
         assert_eq!(base.defaults().width, None);
         let bounds = WidthBounds::new(5, 40).expect("valid");
         let wrapped = OverriddenSegment::new(base).with_width(bounds);
@@ -818,14 +722,16 @@ mod layout_type_tests {
 
     #[test]
     fn overridden_segment_replaces_default_separator() {
-        let base = built_in_by_id("workspace").expect("known id");
+        let base = built_in_by_id("workspace", None, &mut |_| {}).expect("known id");
         let wrapped = OverriddenSegment::new(base).with_default_separator(Separator::None);
         assert_eq!(wrapped.defaults().default_separator, Separator::None);
     }
 
     #[test]
     fn overridden_segment_delegates_render_to_inner() {
-        let wrapped = OverriddenSegment::new(built_in_by_id("workspace").unwrap()).with_priority(0);
+        let wrapped =
+            OverriddenSegment::new(built_in_by_id("workspace", None, &mut |_| {}).unwrap())
+                .with_priority(0);
         let rendered = wrapped.render(&stub_ctx()).unwrap().expect("rendered");
         assert_eq!(rendered.text(), "linesmith");
     }
@@ -891,7 +797,6 @@ mod layout_type_tests {
             },
             context_window: None,
             cost: None,
-            rate_limits: None,
             effort: None,
             raw: Arc::new(serde_json::Value::Null),
         })

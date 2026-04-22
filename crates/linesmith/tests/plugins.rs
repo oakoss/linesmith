@@ -73,7 +73,7 @@ fn minimal_status() -> StatusContext {
 }
 
 fn worktree_status() -> StatusContext {
-    // Carries `rate_limits` so the visibility fixture can render its
+    // Carries `cost` so the visibility fixture can render its
     // `Some(_)` branch end-to-end.
     linesmith::input::parse(WORKTREE_PAYLOAD).expect("worktree fixture parses")
 }
@@ -105,7 +105,7 @@ fn uses_ctx_config_fixture_round_trips_label_from_toml_extras() {
 }
 
 #[test]
-fn visibility_fixture_hides_when_rate_limits_unset() {
+fn visibility_fixture_hides_when_cost_unset() {
     let (registry, engine, _tmp) = load_isolated("visibility_via_render.rhai", VISIBILITY);
     let seg = first_segment(registry, engine);
     let dc = DataContext::new(minimal_status());
@@ -113,12 +113,12 @@ fn visibility_fixture_hides_when_rate_limits_unset() {
 }
 
 #[test]
-fn visibility_fixture_renders_when_rate_limits_present() {
+fn visibility_fixture_renders_when_cost_present() {
     let (registry, engine, _tmp) = load_isolated("visibility_via_render.rhai", VISIBILITY);
     let seg = first_segment(registry, engine);
     let dc = DataContext::new(worktree_status());
     let rendered = seg.render(&dc).unwrap().expect("visible");
-    assert_eq!(rendered.text(), "rate-limit-aware");
+    assert_eq!(rendered.text(), "cost-aware");
 }
 
 #[test]

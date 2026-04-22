@@ -64,7 +64,9 @@ pub struct StatusContext {
     /// Potentially absent. See Edge cases section.
     pub context_window: Option<ContextWindow>,
     pub cost: Option<CostMetrics>,
-    pub rate_limits: Option<RateLimits>,
+    // Rate-limit data lives on `ctx.usage()` (OAuth endpoint + JSONL
+    // fallback cascade) per rate-limit-segments.md; the stdin
+    // `rate_limits` field is deliberately NOT parsed.
     pub effort: Option<EffortLevel>,
     pub vim: Option<VimMode>,
     pub output_style: Option<OutputStyle>,
@@ -175,24 +177,9 @@ pub struct CostMetrics {
     pub total_lines_removed: u32,
 }
 
-/// Rate limit exposure. A `Some(RateLimits)` on `StatusContext` always
-/// carries at least one window; the (None, None) state is unrepresentable.
-/// Only present for paid tiers (Pro/Max on Claude Code).
-#[derive(Debug, Clone)]
-pub enum RateLimits {
-    FiveHourOnly(RateLimitWindow),
-    SevenDayOnly(RateLimitWindow),
-    Both {
-        five_hour: RateLimitWindow,
-        seven_day: RateLimitWindow,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct RateLimitWindow {
-    pub used: Percent,
-    pub resets_at: DateTime<Utc>,
-}
+// Rate-limit data is not modeled on StatusContext — it lives on
+// `DataContext::usage()` (OAuth endpoint + JSONL fallback cascade) per
+// [rate-limit-segments.md](rate-limit-segments.md).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffortLevel {
@@ -358,20 +345,17 @@ If heuristic matching is ambiguous, emit a warning-level log line once (to stder
 
 ### Field-level
 
-| Case                                                | Handling                                                                               |
-| --------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `current_usage` is `null`                           | `ContextWindow.current_usage = None` (pre-first-call)                                  |
-| `rate_limits` is absent entirely                    | `StatusContext.rate_limits = None` (API-tier user)                                     |
-| `rate_limits.five_hour` present, `seven_day` absent | `RateLimits::FiveHourOnly(_)` (the `(None, None)` state is unrepresentable)            |
-| `rate_limits.seven_day` present, `five_hour` absent | `RateLimits::SevenDayOnly(_)`                                                          |
-| Both windows present                                | `RateLimits::Both { .. }`                                                              |
-| `workspace.git_worktree` is `null` or absent        | `WorkspaceInfo.git_worktree = None` (not in a worktree)                                |
-| `added_dirs` is absent                              | `WorkspaceInfo.added_dirs = Vec::new()`                                                |
-| `vim` is absent                                     | `StatusContext.vim = None`                                                             |
-| `cost.total_cost_usd` present but `0.0`             | Emit as-is (zero is valid, not missing)                                                |
-| `context_window.size` is `0`                        | Parse as-is; segments decide whether to render                                         |
-| `used_percentage` out of `0.0..=100.0`              | `ParseError::TypeMismatch { path: "context_window.used_percentage", ... }`             |
-| `effort` field not in Claude payload                | `StatusContext.effort = None` (Claude Code doesn't emit yet; see user-demand research) |
+| Case                                         | Handling                                                                                         |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `current_usage` is `null`                    | `ContextWindow.current_usage = None` (pre-first-call)                                            |
+| `rate_limits` field present on stdin         | Ignored — see [rate-limit-segments.md](rate-limit-segments.md); `ctx.usage()` is the data source |
+| `workspace.git_worktree` is `null` or absent | `WorkspaceInfo.git_worktree = None` (not in a worktree)                                          |
+| `added_dirs` is absent                       | `WorkspaceInfo.added_dirs = Vec::new()`                                                          |
+| `vim` is absent                              | `StatusContext.vim = None`                                                                       |
+| `cost.total_cost_usd` present but `0.0`      | Emit as-is (zero is valid, not missing)                                                          |
+| `context_window.size` is `0`                 | Parse as-is; segments decide whether to render                                                   |
+| `used_percentage` out of `0.0..=100.0`       | `ParseError::TypeMismatch { path: "context_window.used_percentage", ... }`                       |
+| `effort` field not in Claude payload         | `StatusContext.effort = None` (Claude Code doesn't emit yet; see user-demand research)           |
 
 ### Input-level
 
@@ -409,7 +393,6 @@ Follows the testing approach in `AGENTS.md`: inline `#[cfg(test)] mod tests` for
 - `Tool` variant parsing and display, including `Tool::Other(...)` roundtrip
 - `EffortLevel` string parsing (low/medium/high/max/xhigh, unknown variant fallback)
 - `VimMode` string parsing
-- `RateLimits` construction: cannot produce a `(None, None)` state
 - `JsonType` display and round-trip
 - `PathBuf` handling on Windows (forward vs backward slashes)
 
@@ -417,14 +400,12 @@ Follows the testing approach in `AGENTS.md`: inline `#[cfg(test)] mod tests` for
 
 Each uses a JSON fixture in `tests/fixtures/`:
 
-- `claude_pro_full.json`: Pro tier with all fields including rate_limits
-- `claude_api_minimal.json`: API tier (no rate_limits, current_usage null)
+- `claude_pro_full.json`: Pro tier with all fields
+- `claude_api_minimal.json`: API tier (current_usage null)
 - `claude_first_call.json`: after first API call (current_usage populated)
 - `claude_1m_context.json`: 1M context window
 - `claude_post_compact.json`: post-`/compact` state (context % behavior)
 - `claude_worktree.json`: inside a git worktree
-- `claude_five_hour_only.json`: rate_limits with only five_hour present
-- `claude_seven_day_only.json`: rate_limits with only seven_day present
 - `qwen_full.json`: Qwen Code payload
 - `malformed_truncated.json`: truncated JSON
 - `empty.json`: zero-byte
@@ -444,7 +425,6 @@ For each fixture, assert the parsed `StatusContext` matches an `insta` snapshot,
 - `Option<T>` preservation: `None` stays `None`, `Some(x)` stays `Some(x)`
 - Unknown fields in input JSON: adding an unrecognized field never changes the typed fields
 - `Percent::new`: for any `f32 x`, `Percent::new(x).is_some() == (0.0..=100.0).contains(&x)`
-- `RateLimits::Both::into_parts` round-trip
 
 ### Benchmarks
 
@@ -465,3 +445,4 @@ For each fixture, assert the parsed `StatusContext` matches an `insta` snapshot,
 
 - 2026-04-17: initial draft (v0.1)
 - 2026-04-17: v0.2 incorporating [ADR-0008](../adrs/0008-canonical-type-refinements.md) refinements (Percent newtype, RateLimits enum collapse, Tool::Other(Cow), JsonType + optional SourcePos, Arc<Value> for raw, flattened VimState/AgentInfo)
+- 2026-04-21: removed `rate_limits` field, `RateLimits` enum, and `RateLimitWindow` struct. Rate-limit data is sourced via `ctx.usage()` (OAuth endpoint + JSONL fallback cascade); the stdin field is no longer parsed. Driven by lsm-7po; see [rate-limit-segments.md](rate-limit-segments.md).

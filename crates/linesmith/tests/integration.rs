@@ -15,9 +15,10 @@ fn renders_model_and_workspace_when_outside_worktree() {
 }
 
 #[test]
-fn renders_full_payload_with_rate_limits_cost_effort_and_worktree() {
-    // Rate-limit countdowns depend on wall-clock `now`, so we match the
-    // substrings that are stable rather than the full line.
+fn renders_full_payload_with_cost_effort_and_worktree() {
+    // The stdin `rate_limits` field is no longer consumed; rate-limit
+    // segments are opt-in so a first-run user doesn't trigger a
+    // Keychain prompt from the default line.
     let mut out = Vec::new();
     linesmith::run(Cursor::new(CLAUDE_WORKTREE), &mut out).expect("run ok");
     let rendered = String::from_utf8(out).expect("utf8");
@@ -25,8 +26,6 @@ fn renders_full_payload_with_rate_limits_cost_effort_and_worktree() {
     for substring in [
         "Claude Sonnet 4.6",
         "42% · 200k",
-        "5h 35%",
-        "7d 12%",
         "$1.23",
         "high",
         "linesmith/feat-segments",
@@ -34,6 +33,12 @@ fn renders_full_payload_with_rate_limits_cost_effort_and_worktree() {
         assert!(
             rendered.contains(substring),
             "expected {substring:?} in {rendered:?}"
+        );
+    }
+    for absent in ["5h", "7d", "rate_limit"] {
+        assert!(
+            !rendered.contains(absent),
+            "{absent:?} should not appear without explicit opt-in ({rendered:?})",
         );
     }
     assert!(rendered.ends_with('\n'));

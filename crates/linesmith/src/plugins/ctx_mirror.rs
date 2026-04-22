@@ -17,10 +17,9 @@ use std::sync::OnceLock;
 use rhai::{Array, Dynamic, Map};
 use serde_json::Value as JsonValue;
 
-use crate::data_context::{DataContext, DataDep};
+use crate::data_context::{DataContext, DataDep, ExtraUsage, UsageBucket, UsageData, UsageSource};
 use crate::input::{
-    ContextWindow, CostMetrics, GitWorktree, ModelInfo, RateLimitWindow, RateLimits, StatusContext,
-    Tool, WorkspaceInfo,
+    ContextWindow, CostMetrics, GitWorktree, ModelInfo, StatusContext, Tool, WorkspaceInfo,
 };
 
 const ENV_WHITELIST: &[&str] = &["TERM", "COLORTERM", "NO_COLOR", "FORCE_COLOR", "LANG"];
@@ -57,7 +56,7 @@ pub fn build_ctx(dc: &DataContext, declared_deps: &[DataDep], config: Dynamic) -
     if declared(DataDep::Usage) {
         let arc = dc.usage();
         let value = match &*arc {
-            Ok(_) => tagged_ok(Dynamic::from_map(Map::new())),
+            Ok(data) => tagged_ok(build_usage_data(data)),
             Err(e) => tagged_error(e.code()),
         };
         map.insert("usage".into(), value);
@@ -103,12 +102,8 @@ fn build_status(s: &StatusContext) -> Dynamic {
         "cost".into(),
         s.cost.as_ref().map_or(Dynamic::UNIT, build_cost),
     );
-    m.insert(
-        "rate_limits".into(),
-        s.rate_limits
-            .as_ref()
-            .map_or(Dynamic::UNIT, build_rate_limits),
-    );
+    // `rate_limits` is not on StatusContext; plugins read `ctx.usage`
+    // via `DataDep::Usage` (see plugin-api.md §ctx.usage shape).
     m.insert(
         "effort".into(),
         s.effort
@@ -206,33 +201,112 @@ fn build_cost(c: &CostMetrics) -> Dynamic {
     Dynamic::from_map(m)
 }
 
-fn build_rate_limits(rl: &RateLimits) -> Dynamic {
+fn build_usage_data(data: &UsageData) -> Dynamic {
+    // Destructure so adding a field to UsageData surfaces as a compile
+    // error here rather than silently dropping from the rhai mirror.
+    let UsageData {
+        source,
+        five_hour,
+        seven_day,
+        seven_day_opus,
+        seven_day_sonnet,
+        seven_day_oauth_apps,
+        extra_usage,
+    } = data;
     let mut m = Map::new();
-    match rl {
-        RateLimits::FiveHourOnly(w) => {
-            m.insert("kind".into(), Dynamic::from("five_hour_only".to_string()));
-            m.insert("five_hour".into(), build_rate_window(w));
-        }
-        RateLimits::SevenDayOnly(w) => {
-            m.insert("kind".into(), Dynamic::from("seven_day_only".to_string()));
-            m.insert("seven_day".into(), build_rate_window(w));
-        }
-        RateLimits::Both {
-            five_hour,
-            seven_day,
-        } => {
-            m.insert("kind".into(), Dynamic::from("both".to_string()));
-            m.insert("five_hour".into(), build_rate_window(five_hour));
-            m.insert("seven_day".into(), build_rate_window(seven_day));
-        }
-    }
+    m.insert(
+        "source".into(),
+        Dynamic::from(
+            match source {
+                UsageSource::Endpoint => "endpoint",
+                UsageSource::Jsonl => "jsonl",
+            }
+            .to_string(),
+        ),
+    );
+    m.insert(
+        "five_hour".into(),
+        five_hour.as_ref().map_or(Dynamic::UNIT, build_usage_bucket),
+    );
+    m.insert(
+        "seven_day".into(),
+        seven_day.as_ref().map_or(Dynamic::UNIT, build_usage_bucket),
+    );
+    m.insert(
+        "seven_day_opus".into(),
+        seven_day_opus
+            .as_ref()
+            .map_or(Dynamic::UNIT, build_usage_bucket),
+    );
+    m.insert(
+        "seven_day_sonnet".into(),
+        seven_day_sonnet
+            .as_ref()
+            .map_or(Dynamic::UNIT, build_usage_bucket),
+    );
+    m.insert(
+        "seven_day_oauth_apps".into(),
+        seven_day_oauth_apps
+            .as_ref()
+            .map_or(Dynamic::UNIT, build_usage_bucket),
+    );
+    m.insert(
+        "extra_usage".into(),
+        extra_usage
+            .as_ref()
+            .map_or(Dynamic::UNIT, build_extra_usage),
+    );
     Dynamic::from_map(m)
 }
 
-fn build_rate_window(w: &RateLimitWindow) -> Dynamic {
+fn build_usage_bucket(b: &UsageBucket) -> Dynamic {
+    let UsageBucket {
+        utilization,
+        resets_at,
+    } = b;
     let mut m = Map::new();
-    m.insert("used".into(), Dynamic::from(f64::from(w.used.value())));
-    m.insert("resets_at".into(), Dynamic::from(w.resets_at.to_rfc3339()));
+    m.insert(
+        "utilization".into(),
+        Dynamic::from(f64::from(utilization.value())),
+    );
+    m.insert(
+        "resets_at".into(),
+        resets_at.map_or(Dynamic::UNIT, |t| Dynamic::from(t.to_rfc3339())),
+    );
+    Dynamic::from_map(m)
+}
+
+fn build_extra_usage(x: &ExtraUsage) -> Dynamic {
+    let ExtraUsage {
+        is_enabled,
+        utilization,
+        monthly_limit,
+        used_credits,
+        currency,
+    } = x;
+    let mut m = Map::new();
+    m.insert(
+        "is_enabled".into(),
+        is_enabled.map_or(Dynamic::UNIT, Dynamic::from),
+    );
+    m.insert(
+        "utilization".into(),
+        utilization.map_or(Dynamic::UNIT, |p| Dynamic::from(f64::from(p.value()))),
+    );
+    m.insert(
+        "monthly_limit".into(),
+        monthly_limit.map_or(Dynamic::UNIT, Dynamic::from),
+    );
+    m.insert(
+        "used_credits".into(),
+        used_credits.map_or(Dynamic::UNIT, Dynamic::from),
+    );
+    m.insert(
+        "currency".into(),
+        currency
+            .as_deref()
+            .map_or(Dynamic::UNIT, |c| Dynamic::from(c.to_string())),
+    );
     Dynamic::from_map(m)
 }
 
@@ -329,7 +403,6 @@ mod tests {
     use super::*;
     use crate::data_context::DataContext;
     use crate::input::{EffortLevel, Percent};
-    use chrono::TimeZone;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -345,7 +418,6 @@ mod tests {
             },
             context_window: None,
             cost: None,
-            rate_limits: None,
             effort: None,
             raw: Arc::new(serde_json::json!({"custom": "field"})),
         }
@@ -380,6 +452,146 @@ mod tests {
         for key in ["settings", "claude_json", "usage", "sessions", "git"] {
             assert!(!ctx.contains_key(key), "{key} should not appear");
         }
+    }
+
+    #[test]
+    fn usage_ok_mirror_preserves_every_field_plugins_depend_on() {
+        // Plugin-facing contract: `ctx.usage.data.*` field names and
+        // their scalar types are load-bearing. A rename in
+        // `UsageData` / `UsageBucket` / `ExtraUsage` must either break
+        // this test or update it so spec drift surfaces in CI.
+        use crate::data_context::{ExtraUsage, UsageBucket, UsageData, UsageSource};
+        use chrono::{TimeZone, Utc};
+
+        let data = UsageData {
+            source: UsageSource::Endpoint,
+            five_hour: Some(UsageBucket {
+                utilization: Percent::new(42.0).unwrap(),
+                resets_at: Some(Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap()),
+            }),
+            seven_day: Some(UsageBucket {
+                utilization: Percent::new(33.0).unwrap(),
+                resets_at: None,
+            }),
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            seven_day_oauth_apps: None,
+            extra_usage: Some(ExtraUsage {
+                is_enabled: Some(true),
+                utilization: Some(Percent::new(17.5).unwrap()),
+                monthly_limit: Some(100.0),
+                used_credits: Some(40.0),
+                currency: Some("EUR".into()),
+            }),
+        };
+
+        let dc = DataContext::new(minimal_status());
+        dc.preseed_usage(Ok(data)).expect("seed");
+        let ctx = build_and_unwrap_map(&dc, &[DataDep::Usage]);
+
+        let wrapper: Map = ctx
+            .get("usage")
+            .expect("usage key")
+            .clone()
+            .try_cast()
+            .expect("usage is a map");
+        assert_eq!(
+            wrapper
+                .get("kind")
+                .and_then(|d| d.clone().try_cast::<String>()),
+            Some("ok".to_string()),
+        );
+        let payload: Map = wrapper
+            .get("data")
+            .expect("data payload")
+            .clone()
+            .try_cast()
+            .expect("data is a map");
+
+        assert_eq!(
+            payload
+                .get("source")
+                .and_then(|d| d.clone().try_cast::<String>()),
+            Some("endpoint".to_string()),
+        );
+        let five: Map = payload
+            .get("five_hour")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        assert_eq!(
+            five.get("utilization")
+                .and_then(|d| d.clone().try_cast::<f64>()),
+            Some(42.0),
+        );
+        assert!(five.get("resets_at").unwrap().is_string());
+        let seven: Map = payload
+            .get("seven_day")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        assert!(seven.get("resets_at").unwrap().is_unit());
+        assert!(payload.get("seven_day_opus").unwrap().is_unit());
+        let extra: Map = payload
+            .get("extra_usage")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        assert_eq!(
+            extra
+                .get("is_enabled")
+                .and_then(|d| d.clone().try_cast::<bool>()),
+            Some(true),
+        );
+        assert_eq!(
+            extra
+                .get("monthly_limit")
+                .and_then(|d| d.clone().try_cast::<f64>()),
+            Some(100.0),
+        );
+        assert_eq!(
+            extra
+                .get("currency")
+                .and_then(|d| d.clone().try_cast::<String>()),
+            Some("EUR".to_string()),
+        );
+    }
+
+    #[test]
+    fn usage_jsonl_source_renders_as_snake_case_string() {
+        use crate::data_context::{UsageData, UsageSource};
+        let data = UsageData {
+            source: UsageSource::Jsonl,
+            five_hour: None,
+            seven_day: None,
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            seven_day_oauth_apps: None,
+            extra_usage: None,
+        };
+        let dc = DataContext::new(minimal_status());
+        dc.preseed_usage(Ok(data)).expect("seed");
+        let ctx = build_and_unwrap_map(&dc, &[DataDep::Usage]);
+        let payload: Map = ctx
+            .get("usage")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("data")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        assert_eq!(
+            payload
+                .get("source")
+                .and_then(|d| d.clone().try_cast::<String>()),
+            Some("jsonl".to_string()),
+        );
     }
 
     #[test]
@@ -445,9 +657,9 @@ mod tests {
 
     #[test]
     fn all_tool_variants_map_to_snake_case_kind() {
-        // Regression guard: a `Tool` variant added without a matching
-        // arm in `build_tool` would silently fall through to "other"
-        // (or fail to compile if exhaustive). Pin every variant.
+        // `build_tool`'s match is exhaustive, so a new `Tool` variant
+        // fails to compile. This test pins the snake_case label each
+        // variant maps to so an accidental label rename still trips.
         let cases: &[(Tool, &str)] = &[
             (Tool::ClaudeCode, "claude_code"),
             (Tool::QwenCode, "qwen_code"),
@@ -508,8 +720,11 @@ mod tests {
         let status = status_map(&ctx);
         assert!(status.get("context_window").unwrap().is_unit());
         assert!(status.get("cost").unwrap().is_unit());
-        assert!(status.get("rate_limits").unwrap().is_unit());
         assert!(status.get("effort").unwrap().is_unit());
+        assert!(
+            !status.contains_key("rate_limits"),
+            "rate_limits is no longer mirrored; plugins read ctx.usage",
+        );
     }
 
     #[test]
@@ -525,79 +740,6 @@ mod tests {
             .try_cast::<String>()
             .unwrap();
         assert_eq!(effort, "xhigh");
-    }
-
-    #[test]
-    fn rate_limits_both_variant_has_all_three_keys() {
-        let mut s = minimal_status();
-        let w = RateLimitWindow {
-            used: Percent::new(20.0).unwrap(),
-            resets_at: chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap(),
-        };
-        s.rate_limits = Some(RateLimits::Both {
-            five_hour: w,
-            seven_day: w,
-        });
-        let dc = DataContext::new(s);
-        let ctx = build_and_unwrap_map(&dc, &[]);
-        let rl: Map = status_map(&ctx)
-            .get("rate_limits")
-            .unwrap()
-            .clone()
-            .try_cast()
-            .unwrap();
-        assert_eq!(
-            rl.get("kind").and_then(|d| d.clone().try_cast::<String>()),
-            Some("both".to_string())
-        );
-        assert!(rl.contains_key("five_hour"));
-        assert!(rl.contains_key("seven_day"));
-    }
-
-    #[test]
-    fn rate_limits_five_hour_only_omits_seven_day() {
-        let mut s = minimal_status();
-        s.rate_limits = Some(RateLimits::FiveHourOnly(RateLimitWindow {
-            used: Percent::new(5.0).unwrap(),
-            resets_at: chrono::Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap(),
-        }));
-        let dc = DataContext::new(s);
-        let ctx = build_and_unwrap_map(&dc, &[]);
-        let rl: Map = status_map(&ctx)
-            .get("rate_limits")
-            .unwrap()
-            .clone()
-            .try_cast()
-            .unwrap();
-        assert_eq!(
-            rl.get("kind").and_then(|d| d.clone().try_cast::<String>()),
-            Some("five_hour_only".to_string())
-        );
-        assert!(rl.contains_key("five_hour"));
-        assert!(!rl.contains_key("seven_day"));
-    }
-
-    #[test]
-    fn rate_limits_seven_day_only_omits_five_hour() {
-        let mut s = minimal_status();
-        s.rate_limits = Some(RateLimits::SevenDayOnly(RateLimitWindow {
-            used: Percent::new(8.0).unwrap(),
-            resets_at: chrono::Utc.with_ymd_and_hms(2099, 1, 8, 0, 0, 0).unwrap(),
-        }));
-        let dc = DataContext::new(s);
-        let ctx = build_and_unwrap_map(&dc, &[]);
-        let rl: Map = status_map(&ctx)
-            .get("rate_limits")
-            .unwrap()
-            .clone()
-            .try_cast()
-            .unwrap();
-        assert_eq!(
-            rl.get("kind").and_then(|d| d.clone().try_cast::<String>()),
-            Some("seven_day_only".to_string())
-        );
-        assert!(rl.contains_key("seven_day"));
-        assert!(!rl.contains_key("five_hour"));
     }
 
     #[test]
