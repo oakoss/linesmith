@@ -65,24 +65,33 @@ pub fn run_with_segments_and_width(
     segments: &[Box<dyn Segment>],
     terminal_width: u16,
 ) -> io::Result<()> {
+    // `cwd: None` — callers that want gix discovery go through
+    // `run_with_context` with a populated RenderContext.
     let ctx = RenderContext {
         theme: theme::default_theme(),
         capability: theme::Capability::None,
         terminal_width,
+        cwd: None,
     };
     run_with_context(reader, writer, &mut io::stderr().lock(), segments, &ctx)
 }
 
-/// Theme + capability + terminal width bundled for the render path.
-/// Passed to [`run_with_context`]; the CLI driver builds one from
-/// config (theme name), the color-policy precedence chain (CLI flags /
-/// env / config), and `CliEnv.terminal_width` minus any padding.
-#[derive(Debug, Clone, Copy)]
+/// Theme + capability + terminal width + cwd bundled for the render
+/// path. Passed to [`run_with_context`]; the CLI driver builds one
+/// from config (theme name), the color-policy precedence chain (CLI
+/// flags / env / config), `CliEnv.terminal_width` minus any padding,
+/// and the process cwd.
+///
+/// `cwd` seeds gix repo discovery. `None` skips discovery entirely;
+/// `Some(path)` runs `gix::discover(path)` on the first `ctx.git()`
+/// read.
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct RenderContext<'a> {
     pub theme: &'a theme::Theme,
     pub capability: theme::Capability,
     pub terminal_width: u16,
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 /// Full-control entry with injected stderr and explicit render
@@ -111,7 +120,7 @@ pub fn run_with_context(
             return writeln!(writer, "?");
         }
     };
-    let data_ctx = data_context::DataContext::new(status_ctx);
+    let data_ctx = data_context::DataContext::with_cwd(status_ctx, ctx.cwd.clone());
 
     let line = layout::render_with_warn(
         segments,

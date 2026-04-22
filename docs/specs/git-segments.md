@@ -1,8 +1,8 @@
 # Git Segments
 
 - Status: draft
-- Version: 0.1
-- Last updated: 2026-04-19
+- Version: 0.1.1
+- Last updated: 2026-04-21
 - Driving ADRs: [ADR-0001](../adrs/0001-use-rust-for-runtime.md), [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md)
 
 ## Overview
@@ -46,12 +46,9 @@ This spec does NOT cover: worktree-name rendering inside the `workspace` segment
 enabled = true
 icon = ""                      # optional prefix (Nerd Font glyph or text); default empty
 label = ""                     # optional label; default empty (branch name stands alone)
-
-[segments.git_branch.branch]
-max_length = 40                # truncate branch name beyond this cell count
+max_length = 40                # truncate branch name beyond this cell count (min 1)
 truncation_marker = "…"        # appended when truncated
-detached_style = "short_sha"   # "short_sha" | "sha_with_tag" — future: tag lookup
-short_sha_length = 7           # characters
+short_sha_length = 7           # characters for detached-HEAD short SHA (1..=40)
 
 [segments.git_branch.dirty]
 enabled = true                 # include dirty indicator
@@ -70,6 +67,14 @@ behind_format = "↓{n}"
 hide_when_zero = true          # hide ahead/behind entirely when both are 0
 hide_when_no_upstream = true   # hide when branch has no tracked upstream (true = hide; false = render "?")
 ```
+
+Branch-rendering keys (`max_length`, `truncation_marker`,
+`short_sha_length`) live at the top level of `[segments.git_branch]`
+rather than a nested `[.branch]` table. Flattening matches the
+implementation's `Config` shape and keeps the simple knobs one level
+shallower. Nested tables (`dirty`, `ahead_behind`) remain nested
+because they group multiple related settings. `detached_style` is
+deferred to a follow-up (tag-aware rendering is not in v0.1.1).
 
 Rendered examples, default config:
 
@@ -96,7 +101,7 @@ fn data_deps(&self) -> &'static [DataDep] {
 
 - `Ok(None)` — cwd is not in a git repo; segment hides
 - `Ok(Some(gc))` — repo found, `gc` populated
-- `Err(e)` — gix failed (corrupt repo, permission denied); segment renders a short error marker
+- `Err(e)` — gix failed (corrupt repo, permission denied, `safe.directory` trust rejection, &c); segment hides. The error `Display` is written to stderr with the `linesmith:` prefix so a user running from a terminal sees the cause. A future render mode can surface a `[git error]` marker once the structured logger (lsm-cgg) lets segments opt into inline error messaging
 
 Multiple future git segments share the same `Arc<GitContext>` without re-walking the repo.
 
@@ -153,10 +158,18 @@ pub struct UpstreamState {
 }
 
 pub enum GitError {
-    CorruptRepo { path: PathBuf, cause: gix::open::Error },
-    WalkFailed  { path: PathBuf, cause: gix::revwalk::Error },
+    CorruptRepo { path: PathBuf, message: String },
+    WalkFailed  { path: PathBuf, message: String },
 }
 ```
+
+**Note on `message: String`:** the implementation stringifies the
+underlying `gix` cause at the error-construction boundary so `GitError`
+stays `Clone + PartialEq + Eq`. `DataContext` memoizes git state as
+`Arc<Result<Option<GitContext>, GitError>>`, and that `Arc<Result<...>>`
+boundary requires `Clone`. Trade-off: the structured source chain
+terminates at the string. No statusline render path branches on inner
+`gix` variants, so no behavior is lost.
 
 Why `OnceCell` inside `GitContext` on top of `OnceCell` in `DataContext`: two tiers of laziness. The outer layer decides whether to open the repo at all; the inner layer decides whether to pay for a dirty scan. Even inside a git repo, a config rendering only branch + ahead/behind skips the dirty walk entirely.
 
@@ -178,8 +191,9 @@ fn resolve_repo(cwd: &Path) -> Result<Option<GitContext>, GitError>;
 ```rust
 fn render(&self, ctx: &DataContext) -> RenderResult {
     match &*ctx.git() {
-        Err(_) => Ok(Some(self.error_segment("[git error]"))),
-        Ok(None) => Ok(None),                            // not in a repo
+        // Hide on error; cause has already been logged to stderr by
+        // the data-layer scan (see §Data dependency).
+        Err(_) | Ok(None) => Ok(None),
         Ok(Some(gc)) if matches!(gc.repo_kind, RepoKind::Bare) => Ok(None),
         Ok(Some(gc)) => {
             let parts = self.assemble(gc);              // branch | dirty | ahead_behind
@@ -188,8 +202,6 @@ fn render(&self, ctx: &DataContext) -> RenderResult {
     }
 }
 ```
-
-`self.error_segment(msg)` is a small helper each segment carries for rendering a bracketed error string; its exact shape (single-run `RenderedSegment` with an `Error` role) lives alongside the segment implementation.
 
 Render output is a single `RenderedSegment` with multiple `StyledRun`s so each part takes its own color role: branch name in `git.branch`, dirty marker in `git.dirty`, ahead/behind counters in `git.ahead` / `git.behind`. Roles resolve via [theming.md](theming.md).
 
@@ -257,9 +269,11 @@ Themes that don't define these roles fall back to the theme's default text color
 | Branch name longer than `max_length`                     | Middle-truncate per config                                                                                                                                           |
 | No upstream configured                                   | ahead/behind hidden when `hide_when_no_upstream = true`; renders `?` when false                                                                                      |
 | Very large repo (dirty scan >100ms)                      | The dirty `OnceCell` still only runs once per invocation; for repeated invocations across sessions, add a future TTL cache (filed separately)                        |
-| Corrupt `.git/index`                                     | `GitError::WalkFailed`; segment renders `[git error]` short marker and emits the full cause to stderr                                                                |
-| Permission denied on `.git/`                             | `gix::open::Error::Io(PermissionDenied)` → `GitError::CorruptRepo`; same rendering as above                                                                          |
-| Submodules                                               | Treated as their own repo if cwd is inside the submodule; parent-repo view hides submodule-specific state                                                            |
+| Corrupt `.git/index`                                     | `GitError::WalkFailed`; segment hides and writes the cause to stderr                                                                                                 |
+| Permission denied on `.git/`                             | `GitError::CorruptRepo`; same rendering and stderr behavior                                                                                                          |
+| `safe.directory` trust rejection                         | `GitError::CorruptRepo`; hidden, cause on stderr so the user can run `git config --global --add safe.directory ...`                                                  |
+| Submodules                                               | `RepoKind::Submodule`; segment renders the submodule's branch / dirty state like any other checkout                                                                  |
+| HEAD points at a non-`refs/heads/` ref                   | `Head::OtherRef { full_name }`; segment renders the full refname (middle-truncated)                                                                                  |
 | Packed refs only (no loose refs)                         | gix handles transparently; no special case in this spec                                                                                                              |
 | Merge/rebase/bisect in progress                          | Out of scope for v0.1 (future `git_state` segment); `git_branch` renders the HEAD branch unchanged                                                                   |
 | Windows case-insensitive filesystem                      | gix normalizes per platform; segment sees the canonical form                                                                                                         |
@@ -320,4 +334,44 @@ Each fixture runs the full render pipeline (stdin → config → segment render 
 
 ## Change log
 
+- 2026-04-21 (v0.1.1): several reconciliations between the v0.1
+  draft and the shipped lsm-4cf implementation:
+  - `GitError` variants carry `message: String` instead of
+    structured `cause: gix::open::Error` / `gix::revwalk::Error`.
+    `DataContext` memoizes git state as
+    `Arc<Result<Option<GitContext>, GitError>>`, and that boundary
+    requires `Clone + PartialEq + Eq`. Structured source chain is
+    the only thing lost.
+  - `Err(_)` in the segment render path **hides** rather than
+    emitting a `[git error]` marker. The cause is written to stderr
+    (the existing `linesmith:` diagnostic channel). A future render
+    mode can opt back into inline error text once the structured
+    logger (lsm-cgg) lands.
+  - Branch-rendering knobs (`max_length`, `truncation_marker`,
+    `short_sha_length`) moved from the nested `[segments.git_branch.branch]`
+    table up to `[segments.git_branch]` directly. The dirty /
+    ahead_behind sub-tables remain nested.
+  - `RepoKind` gains a `Submodule` variant so submodule checkouts
+    can be styled distinctly later without re-classification; today
+    the segment renders them identically to `Main`.
+  - `Head` gains an `OtherRef { full_name }` variant for HEADs
+    pointing outside `refs/heads/` (remote-tracking branches, tags,
+    etc.). `Head::Branch` now strictly holds short local-branch
+    names.
+  - `DirtyState` is now an enum (`Clean` |
+    `Dirty(Option<DirtyCounts>)`) instead of a flat struct, so the
+    fast-path "dirty but counts not computed" state is explicit
+    rather than encoded in a bool+zero-counts denormalization.
+  - The dirty scan now includes untracked files via
+    `status().untracked_files(Collapsed)`. gix 0.67's own
+    `Repository::is_dirty()` is not used because it excludes
+    untracked files and (per its own TODO) doesn't compare HEAD to
+    the index. HEAD↔index (staged-only) detection is still missing;
+    tracked in lsm-u5h.
+  - `resolve_repo` now matches `gix::discover::upwards::Error` inner
+    variants. Only the three genuine "no repo here" kinds
+    (`NoGitRepository*`) become `Ok(None)`; trust rejections
+    (`safe.directory`), ceiling-dir misconfig, and permission errors
+    all become `GitError::CorruptRepo` so the user sees the cause
+    on stderr.
 - 2026-04-19: initial draft (v0.1). Defines the `git_branch` segment's rendering contract (branch + dirty + ahead/behind as one visual unit), config schema, `GitContext` data type populated via `DataContext::git()` / `DataDep::Git`, repo discovery via `gix::discover`, worktree-aware resolution, edge-case taxonomy, and integration test plan. Driven by ADR-0001 (gix), ADR-0003 (segment system), ADR-0010 (data-fetching).

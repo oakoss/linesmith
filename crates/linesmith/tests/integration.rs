@@ -127,6 +127,90 @@ fn xdg_plugin_renders_via_full_driver_path() {
 }
 
 #[test]
+fn git_branch_renders_unborn_head_via_full_driver_path() {
+    // End-to-end through cli_main: a freshly init'd repo fixture has
+    // no commits, so HEAD is unborn and the segment renders the
+    // symbolic-ref target (whatever init.defaultBranch resolves to).
+    use tempfile::TempDir;
+
+    let repo_dir = TempDir::new().expect("tempdir");
+    gix::init(repo_dir.path()).expect("gix::init");
+
+    let mut env = linesmith::CliEnv::for_tests();
+    env.cwd = Some(repo_dir.path().to_path_buf());
+
+    // Scope the segment list to just `git_branch` so the assertion
+    // doesn't couple to the rest of the default line.
+    let xdg = TempDir::new().expect("tempdir");
+    let config_dir = xdg.path().join("linesmith");
+    std::fs::create_dir_all(&config_dir).expect("mkdir");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        r#"
+            [line]
+            segments = ["git_branch"]
+        "#,
+    )
+    .expect("write config");
+    env.xdg_config_home = Some(xdg.path().to_string_lossy().into_owned());
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = linesmith::cli_main(
+        std::iter::empty::<&str>(),
+        Cursor::new(CLAUDE_MINIMAL),
+        &mut stdout,
+        &mut stderr,
+        &env,
+    );
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&stderr));
+    let rendered = String::from_utf8(stdout).expect("utf8");
+    // gix's default branch is `main` unless init.defaultBranch is
+    // configured; accept either.
+    assert!(
+        rendered.starts_with("main") || rendered.starts_with("master"),
+        "expected branch name at start, got {rendered:?}"
+    );
+}
+
+#[test]
+fn git_branch_hides_outside_repo() {
+    use tempfile::TempDir;
+
+    let cwd = TempDir::new().expect("tempdir");
+
+    let mut env = linesmith::CliEnv::for_tests();
+    env.cwd = Some(cwd.path().to_path_buf());
+
+    let xdg = TempDir::new().expect("tempdir");
+    let config_dir = xdg.path().join("linesmith");
+    std::fs::create_dir_all(&config_dir).expect("mkdir");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        r#"
+            [line]
+            segments = ["git_branch", "model"]
+        "#,
+    )
+    .expect("write config");
+    env.xdg_config_home = Some(xdg.path().to_string_lossy().into_owned());
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = linesmith::cli_main(
+        std::iter::empty::<&str>(),
+        Cursor::new(CLAUDE_MINIMAL),
+        &mut stdout,
+        &mut stderr,
+        &env,
+    );
+    assert_eq!(code, 0);
+    let rendered = String::from_utf8(stdout).expect("utf8");
+    // Only the model segment rendered; git_branch hid silently.
+    assert_eq!(rendered, "Claude Sonnet 4.6\n");
+}
+
+#[test]
 fn config_reorders_and_filters_segments() {
     // Config picks only model + workspace, in that custom order.
     let cfg = linesmith::config::Config::from_str(

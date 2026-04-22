@@ -13,6 +13,7 @@ pub mod context_window;
 pub mod cost;
 pub mod effort;
 pub mod extra_usage;
+pub mod git_branch;
 pub mod model;
 pub mod rate_limit_5h;
 pub mod rate_limit_5h_reset;
@@ -375,8 +376,14 @@ pub trait Segment: Send {
 /// config shouldn't trigger a macOS Keychain prompt or a network
 /// request just to render the statusline. Users opt in by listing
 /// the rate-limit segments explicitly in `[line.segments]`.
-pub const DEFAULT_SEGMENT_IDS: &[&str] =
-    &["model", "context_window", "cost", "effort", "workspace"];
+pub const DEFAULT_SEGMENT_IDS: &[&str] = &[
+    "model",
+    "context_window",
+    "cost",
+    "effort",
+    "git_branch",
+    "workspace",
+];
 
 /// Every built-in segment id. Used by [`PluginRegistry`] to reject
 /// plugins whose `const ID` shadows a built-in. Add new built-ins
@@ -389,6 +396,7 @@ pub const BUILT_IN_SEGMENT_IDS: &[&str] = &[
     "workspace",
     "cost",
     "effort",
+    "git_branch",
     "rate_limit_5h",
     "rate_limit_7d",
     "rate_limit_5h_reset",
@@ -416,6 +424,7 @@ pub fn built_in_by_id(
         "workspace" => Some(Box::new(workspace::WorkspaceSegment)),
         "cost" => Some(Box::new(cost::CostSegment)),
         "effort" => Some(Box::new(effort::EffortSegment)),
+        "git_branch" => Some(Box::new(git_branch::GitBranchSegment::from_extras(e, warn))),
         "rate_limit_5h" => Some(Box::new(rate_limit_5h::RateLimit5hSegment::from_extras(
             e, warn,
         ))),

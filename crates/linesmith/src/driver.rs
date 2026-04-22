@@ -61,6 +61,11 @@ pub struct CliEnv {
     pub force_color: bool,
     pub terminal_width: Option<u16>,
     pub color_capability: Option<theme::Capability>,
+    /// cwd used for gix repo discovery. `None` skips discovery
+    /// entirely. [`Self::from_process`] sets this to
+    /// `std::env::current_dir()`; [`Self::for_tests`] leaves it
+    /// `None`.
+    pub cwd: Option<std::path::PathBuf>,
 }
 
 impl CliEnv {
@@ -77,6 +82,7 @@ impl CliEnv {
             force_color: force_color_env("FORCE_COLOR"),
             terminal_width: None,
             color_capability: None,
+            cwd: std::env::current_dir().ok(),
         }
     }
 
@@ -95,6 +101,7 @@ impl CliEnv {
             force_color: false,
             terminal_width: Some(200),
             color_capability: Some(theme::Capability::None),
+            cwd: None,
         }
     }
 }
@@ -401,6 +408,7 @@ fn run_cli(
         theme: theme_ref,
         capability,
         terminal_width: width,
+        cwd: env.cwd.clone(),
     };
     if let Err(err) = run_with_context(stdin, stdout, stderr, &segments, &ctx) {
         let _ = writeln!(stderr, "linesmith: {err}");
@@ -1652,6 +1660,7 @@ mod tests {
             force_color: false,
             terminal_width: Some(200),
             color_capability: Some(theme::Capability::None),
+            cwd: None,
         }
     }
 
@@ -1893,6 +1902,7 @@ mod tests {
             force_color: false,
             terminal_width: Some(200),
             color_capability: Some(theme::Capability::None),
+            cwd: None,
         };
         let (code, _stdout, stderr) = run_cli_main(&["presets", "apply", "minimal"], b"", &env);
         assert_eq!(code, 1);

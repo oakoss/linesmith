@@ -271,11 +271,28 @@ fn segment_override_schema(id: &str) -> Option<&'static [&'static str]> {
         "compact",
         "use_days",
     ];
+    // Nested tables like `dirty` are validated shallowly per
+    // `validate_segments_table` — their inner keys pass through
+    // without warning. Inner schemas live in the segment's
+    // `from_extras` validator.
+    const GIT_BRANCH_SEGMENT: &[&str] = &[
+        "priority",
+        "width",
+        "style",
+        "visible_if",
+        "icon",
+        "label",
+        "max_length",
+        "truncation_marker",
+        "short_sha_length",
+        "dirty",
+    ];
     match id {
         "model" | "workspace" | "cost" | "effort" | "context_window" => Some(BUILT_IN_COMMON),
         "rate_limit_5h" | "rate_limit_7d" => Some(PERCENT_SEGMENT),
         "rate_limit_5h_reset" | "rate_limit_7d_reset" => Some(RESET_SEGMENT),
         "extra_usage" => Some(RATE_LIMIT_COMMON),
+        "git_branch" => Some(GIT_BRANCH_SEGMENT),
         _ => None,
     }
 }
@@ -609,7 +626,7 @@ mod tests {
                 foo = "bar"
                 baz = 42
 
-                [segments.git_branch]
+                [segments.another_plugin]
                 show_ahead_behind = true
                 show_dirty = true
             "#,

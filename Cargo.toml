@@ -20,6 +20,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 catppuccin = "2"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+# gix per ADR-0001. Features: repo discovery, HEAD, worktree kind,
+# and status (dirty scan including untracked). No network/TLS/
+# http-transport — the statusline never talks to a remote.
+# `max-performance-safe` pulls `max-control` → `parallel`
+# transitively, which makes `gix::Repository: Send` — useful if the
+# render path ever fans out across threads.
+gix = { version = "0.67", default-features = false, features = ["max-performance-safe", "status"] }
 # HTTP-date parser for `Retry-After` headers per ADR-0011 §Cache stack.
 # Zero-dep, ~200 LOC — smaller than pulling chrono's HTTP-date story.
 httpdate = "1"

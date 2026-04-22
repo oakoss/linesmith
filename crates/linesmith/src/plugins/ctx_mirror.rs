@@ -17,7 +17,10 @@ use std::sync::OnceLock;
 use rhai::{Array, Dynamic, Map};
 use serde_json::Value as JsonValue;
 
-use crate::data_context::{DataContext, DataDep, ExtraUsage, UsageBucket, UsageData, UsageSource};
+use crate::data_context::{
+    DataContext, DataDep, DirtyCounts, DirtyState, ExtraUsage, GitContext, Head, RepoKind,
+    UpstreamState, UsageBucket, UsageData, UsageSource,
+};
 use crate::input::{
     ContextWindow, CostMetrics, GitWorktree, ModelInfo, StatusContext, Tool, WorkspaceInfo,
 };
@@ -75,7 +78,7 @@ pub fn build_ctx(dc: &DataContext, declared_deps: &[DataDep], config: Dynamic) -
             // Ok(Some) → data: <map>; Ok(None) → data: () per
             // plugin-api.md §Special cases (no-git-repo distinct from
             // gix failure).
-            Ok(Some(_)) => tagged_ok(Dynamic::from_map(Map::new())),
+            Ok(Some(gc)) => tagged_ok(build_git_context(gc)),
             Ok(None) => tagged_ok(Dynamic::UNIT),
             Err(e) => tagged_error(e.code()),
         };
@@ -306,6 +309,112 @@ fn build_extra_usage(x: &ExtraUsage) -> Dynamic {
         currency
             .as_deref()
             .map_or(Dynamic::UNIT, |c| Dynamic::from(c.to_string())),
+    );
+    Dynamic::from_map(m)
+}
+
+// --- GitContext mirror ---------------------------------------------------
+
+fn build_git_context(gc: &GitContext) -> Dynamic {
+    // Destructure so adding a field to GitContext surfaces as a
+    // compile error here rather than silently dropping from the rhai
+    // mirror. `..` covers the two private OnceCell fields surfaced
+    // through `gc.dirty()` / `gc.upstream()` below.
+    let GitContext {
+        repo_kind,
+        repo_path,
+        head,
+        ..
+    } = gc;
+    let mut m = Map::new();
+    m.insert("repo_kind".into(), build_repo_kind(repo_kind));
+    m.insert(
+        "repo_path".into(),
+        Dynamic::from(repo_path.to_string_lossy().into_owned()),
+    );
+    m.insert("head".into(), build_head(head));
+    m.insert("dirty".into(), build_dirty(&gc.dirty()));
+    m.insert("upstream".into(), build_upstream(&gc.upstream()));
+    Dynamic::from_map(m)
+}
+
+fn build_repo_kind(kind: &RepoKind) -> Dynamic {
+    let mut m = Map::new();
+    match kind {
+        RepoKind::Main => {
+            m.insert("kind".into(), Dynamic::from("main".to_string()));
+        }
+        RepoKind::Bare => {
+            m.insert("kind".into(), Dynamic::from("bare".to_string()));
+        }
+        RepoKind::Submodule => {
+            m.insert("kind".into(), Dynamic::from("submodule".to_string()));
+        }
+        RepoKind::LinkedWorktree { name } => {
+            m.insert("kind".into(), Dynamic::from("linked_worktree".to_string()));
+            m.insert("name".into(), Dynamic::from(name.clone()));
+        }
+    }
+    Dynamic::from_map(m)
+}
+
+fn build_head(head: &Head) -> Dynamic {
+    let mut m = Map::new();
+    m.insert("kind".into(), Dynamic::from(head.kind_str().to_string()));
+    match head {
+        Head::Branch(name) => {
+            m.insert("name".into(), Dynamic::from(name.clone()));
+        }
+        Head::Detached(oid) => {
+            m.insert("sha".into(), Dynamic::from(oid.to_string()));
+        }
+        Head::Unborn { symbolic_ref } => {
+            m.insert("symbolic_ref".into(), Dynamic::from(symbolic_ref.clone()));
+        }
+        Head::OtherRef { full_name } => {
+            m.insert("full_name".into(), Dynamic::from(full_name.clone()));
+        }
+    }
+    Dynamic::from_map(m)
+}
+
+fn build_dirty(d: &DirtyState) -> Dynamic {
+    let mut m = Map::new();
+    match d {
+        DirtyState::Clean => {
+            m.insert("kind".into(), Dynamic::from("clean".to_string()));
+        }
+        DirtyState::Dirty(None) => {
+            m.insert("kind".into(), Dynamic::from("dirty_uncounted".to_string()));
+        }
+        DirtyState::Dirty(Some(counts)) => {
+            let DirtyCounts {
+                staged,
+                unstaged,
+                untracked,
+            } = counts;
+            m.insert("kind".into(), Dynamic::from("dirty_counted".to_string()));
+            m.insert("staged".into(), Dynamic::from(i64::from(*staged)));
+            m.insert("unstaged".into(), Dynamic::from(i64::from(*unstaged)));
+            m.insert("untracked".into(), Dynamic::from(i64::from(*untracked)));
+        }
+    }
+    Dynamic::from_map(m)
+}
+
+fn build_upstream(u: &Option<UpstreamState>) -> Dynamic {
+    let Some(u) = u else { return Dynamic::UNIT };
+    let UpstreamState {
+        ahead,
+        behind,
+        upstream_branch,
+    } = u;
+    let mut m = Map::new();
+    m.insert("ahead".into(), Dynamic::from(i64::from(*ahead)));
+    m.insert("behind".into(), Dynamic::from(i64::from(*behind)));
+    m.insert(
+        "upstream_branch".into(),
+        Dynamic::from(upstream_branch.clone()),
     );
     Dynamic::from_map(m)
 }
@@ -625,15 +734,75 @@ mod tests {
     }
 
     #[test]
-    fn git_dep_reports_error_variant_on_stub() {
+    fn git_dep_maps_ok_none_to_unit_data() {
+        // "Not in a git repo" surface: kind: "ok", data: () per
+        // plugin-api.md §Special cases.
         let dc = DataContext::new(minimal_status());
+        dc.preseed_git(Ok(None)).expect("seed");
         let ctx = build_and_unwrap_map(&dc, &[DataDep::Git]);
         let git: Map = ctx.get("git").unwrap().clone().try_cast().unwrap();
-        // Stub returns NotImplemented; the Ok(None) → unit path is
-        // covered by a structural test below.
+        assert_eq!(
+            git.get("kind").and_then(|d| d.clone().try_cast::<String>()),
+            Some("ok".to_string())
+        );
+        assert!(git.get("data").expect("data present").is_unit());
+    }
+
+    #[test]
+    fn git_dep_reports_error_variant_when_gix_failed() {
+        use crate::data_context::GitError;
+        let dc = DataContext::new(minimal_status());
+        dc.preseed_git(Err(GitError::CorruptRepo {
+            path: std::path::PathBuf::from("/tmp/bad"),
+            message: "synthetic".into(),
+        }))
+        .expect("seed");
+        let ctx = build_and_unwrap_map(&dc, &[DataDep::Git]);
+        let git: Map = ctx.get("git").unwrap().clone().try_cast().unwrap();
         assert_eq!(
             git.get("kind").and_then(|d| d.clone().try_cast::<String>()),
             Some("error".to_string())
+        );
+        assert_eq!(
+            git.get("error")
+                .and_then(|d| d.clone().try_cast::<String>()),
+            Some("CorruptRepo".to_string())
+        );
+    }
+
+    #[test]
+    fn git_dep_maps_ok_some_to_populated_map() {
+        use crate::data_context::{GitContext, Head, RepoKind};
+        let dc = DataContext::new(minimal_status());
+        dc.preseed_git(Ok(Some(GitContext::new(
+            RepoKind::Main,
+            std::path::PathBuf::from("/repo/.git"),
+            Head::Branch("feature/auth".into()),
+        ))))
+        .expect("seed");
+        let ctx = build_and_unwrap_map(&dc, &[DataDep::Git]);
+        let git: Map = ctx.get("git").unwrap().clone().try_cast().unwrap();
+        assert_eq!(
+            git.get("kind").and_then(|d| d.clone().try_cast::<String>()),
+            Some("ok".to_string())
+        );
+        let data: Map = git.get("data").unwrap().clone().try_cast().unwrap();
+        let kind: Map = data.get("repo_kind").unwrap().clone().try_cast().unwrap();
+        assert_eq!(
+            kind.get("kind")
+                .and_then(|d| d.clone().try_cast::<String>()),
+            Some("main".to_string())
+        );
+        let head: Map = data.get("head").unwrap().clone().try_cast().unwrap();
+        assert_eq!(
+            head.get("kind")
+                .and_then(|d| d.clone().try_cast::<String>()),
+            Some("branch".to_string())
+        );
+        assert_eq!(
+            head.get("name")
+                .and_then(|d| d.clone().try_cast::<String>()),
+            Some("feature/auth".to_string())
         );
     }
 

@@ -48,13 +48,57 @@ macro_rules! stub_error {
     };
 }
 
+use std::path::PathBuf;
+
 stub_error!(
     SettingsError,
     "Errors from reading `~/.claude/settings.json` + overlays."
 );
 stub_error!(ClaudeJsonError, "Errors from reading `~/.claude.json`.");
 stub_error!(SessionError, "Errors from the live sessions directory.");
-stub_error!(GitError, "Errors from `gix` repo inspection.");
+
+/// Errors from `gix` repo inspection. `CorruptRepo` covers
+/// `gix::open` failures; `WalkFailed` covers HEAD / revwalk
+/// failures once the repo is open. Inner causes are stringified at
+/// the construction boundary so the enum stays
+/// `Clone + PartialEq + Eq` — the `Arc<Result<...>>` memoization
+/// boundary requires it. See `docs/specs/git-segments.md` §Change
+/// log (v0.1.1) for the full rationale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GitError {
+    /// `gix::discover` or `gix::open` rejected the path.
+    CorruptRepo { path: PathBuf, message: String },
+    /// HEAD resolution or any post-open walk failed.
+    WalkFailed { path: PathBuf, message: String },
+}
+
+impl GitError {
+    /// Short plugin-facing tag per `docs/specs/plugin-api.md` §ctx
+    /// shape exposed to rhai.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::CorruptRepo { .. } => "CorruptRepo",
+            Self::WalkFailed { .. } => "WalkFailed",
+        }
+    }
+}
+
+impl std::fmt::Display for GitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CorruptRepo { path, message } => {
+                write!(f, "gix failed to open {}: {message}", path.display())
+            }
+            Self::WalkFailed { path, message } => {
+                write!(f, "gix walk at {} failed: {message}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for GitError {}
 
 // `CredentialError` and `JsonlError` are real types from their own
 // modules — re-exported at the data_context module root so

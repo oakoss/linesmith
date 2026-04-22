@@ -22,10 +22,12 @@ pub mod credentials;
 pub mod deps;
 pub mod errors;
 pub mod fetcher;
+pub mod git;
 pub mod jsonl;
 pub mod usage;
 
 use std::cell::OnceCell;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::input::StatusContext;
@@ -35,6 +37,7 @@ pub use deps::DataDep;
 pub use errors::{
     ClaudeJsonError, CredentialError, GitError, JsonlError, SessionError, SettingsError, UsageError,
 };
+pub use git::{DirtyCounts, DirtyState, GitContext, Head, RepoKind, UpstreamState};
 pub use jsonl::{FiveHourBlock, JsonlAggregate, SevenDayWindow, TokenCounts};
 pub use usage::{ExtraUsage, UsageApiResponse, UsageBucket, UsageData, UsageSource};
 
@@ -65,12 +68,6 @@ pub struct ClaudeJson {}
 #[non_exhaustive]
 pub struct LiveSessions {}
 
-/// Git repo inspection state. Stub placeholder; concrete shape lands
-/// with lsm-8jl.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub struct GitContext {}
-
 // --- DataContext ---------------------------------------------------------
 
 /// Bundle of every source a segment may read during a single render
@@ -86,6 +83,11 @@ pub struct DataContext {
     /// Eagerly-parsed stdin payload.
     pub status: StatusContext,
 
+    /// cwd used for git repo discovery. `None` means the process had
+    /// no accessible cwd when the context was constructed and the git
+    /// accessor will return `Ok(None)`.
+    cwd: Option<PathBuf>,
+
     settings: OnceCell<Arc<Result<Settings, SettingsError>>>,
     claude_json: OnceCell<Arc<Result<ClaudeJson, ClaudeJsonError>>>,
     jsonl: OnceCell<Arc<Result<JsonlAggregate, JsonlError>>>,
@@ -97,11 +99,21 @@ pub struct DataContext {
 
 impl DataContext {
     /// Wrap a parsed [`StatusContext`] with lazy accessors for every
-    /// other data source.
+    /// other data source. cwd is `None`, so [`Self::git`] returns
+    /// `Ok(None)` unless the caller switches to [`Self::with_cwd`].
     #[must_use]
     pub fn new(status: StatusContext) -> Self {
+        Self::with_cwd(status, None)
+    }
+
+    /// Construct with an explicit cwd that seeds gix discovery. The
+    /// CLI passes `std::env::current_dir().ok()`; a fixture path
+    /// pins discovery to a known repo.
+    #[must_use]
+    pub fn with_cwd(status: StatusContext, cwd: Option<PathBuf>) -> Self {
         Self {
             status,
+            cwd,
             settings: OnceCell::new(),
             claude_json: OnceCell::new(),
             jsonl: OnceCell::new(),
@@ -213,10 +225,40 @@ impl DataContext {
     /// Git repo inspection via `gix`. `Ok(None)` means cwd is not
     /// inside a git repo; `Ok(Some(_))` covers main checkouts, linked
     /// worktrees, and bare repos; `Err` is a gix failure.
+    ///
+    /// Runs [`git::resolve_repo`] against [`Self::cwd`] on first call
+    /// and memoizes the result. An unset cwd resolves to `Ok(None)`.
     #[must_use]
     pub fn git(&self) -> Arc<Result<Option<GitContext>, GitError>> {
+        // `gix::Repository` is not `Sync`, which trips the
+        // `arc_with_non_send_sync` lint. The render path is
+        // single-threaded (`OnceCell`, not `OnceLock`) and the `Arc`
+        // only ref-counts on one thread — a `Mutex` wrapper would
+        // buy nothing.
+        #[allow(clippy::arc_with_non_send_sync)]
         self.git
-            .get_or_init(|| Arc::new(Err(GitError::NotImplemented)))
+            .get_or_init(|| {
+                let result = match &self.cwd {
+                    Some(cwd) => git::resolve_repo(cwd),
+                    None => Ok(None),
+                };
+                Arc::new(result)
+            })
             .clone()
+    }
+
+    /// Pre-populate the `git` result so [`Self::git`] returns it
+    /// without running `gix::discover` (which would otherwise touch
+    /// the real filesystem). Mirrors [`OnceCell::set`]'s semantics:
+    /// returns `Err` with the already-stored value if the cell was
+    /// already populated by a prior `ctx.git()` read.
+    // Same Arc-not-Sync rationale as `git()` above — render path and
+    // test harness are single-threaded.
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn preseed_git(
+        &self,
+        result: Result<Option<GitContext>, GitError>,
+    ) -> Result<(), Arc<Result<Option<GitContext>, GitError>>> {
+        self.git.set(Arc::new(result))
     }
 }
