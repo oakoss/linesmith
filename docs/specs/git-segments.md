@@ -336,12 +336,14 @@ Each fixture runs the full render pipeline (stdin → config → segment render 
 
 - 2026-04-21 (v0.1.2): ahead/behind counters shipped. `GitContext::upstream`
   resolves the tracking ref via
-  `Reference::remote_tracking_ref_name(Direction::Fetch)`, then counts
-  ancestors via an explicit `merge_base` + BFS instead of
-  `rev_walk().with_pruned(...)` (the latter's commit-time cutoff is
-  non-deterministic when timestamps collide). `[segments.git_branch.ahead_behind]`
-  config table honored per §Config schema; gix feature set now
-  includes `"revision"` for `merge_base`.
+  `Reference::remote_tracking_ref_name(Direction::Fetch)`, computes an
+  explicit `merge_base`, then walks each tip while skipping any OID in
+  the merge-base's ancestor set. Chose this over
+  `rev_walk().with_pruned(...)` because the latter's commit-time cutoff
+  is non-deterministic when two commits share a committer-date second.
+  `[segments.git_branch.ahead_behind]` config table honored per
+  §Config schema; gix feature set now includes `"revision"` for
+  `merge_base`.
 - 2026-04-21 (v0.1.1): reconciliations with the shipped
   implementation:
   - `GitError` variants carry `message: String` instead of

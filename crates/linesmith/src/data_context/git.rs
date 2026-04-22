@@ -185,9 +185,9 @@ impl GitContext {
             .clone()
     }
 
-    /// Pre-populate the `upstream` OnceCell so tests can exercise
-    /// rendering paths without a real fixture repo. Returns `Err`
-    /// via [`OnceCell::set`]'s semantics if the cell was already
+    /// Pre-populate the `upstream` OnceCell with an explicit value,
+    /// bypassing the real walker. Returns `Err` via
+    /// [`OnceCell::set`]'s semantics when the cell was already
     /// populated.
     pub fn preseed_upstream(
         &self,
@@ -197,10 +197,20 @@ impl GitContext {
     }
 
     /// Upstream-tracking state, scanned lazily on first access.
-    /// Returns `Arc<None>` when the branch has no tracking upstream,
-    /// when HEAD is detached / unborn / an `OtherRef`, or when no
-    /// repo handle is held. Ahead/behind renderers treat `Arc<None>`
-    /// the same as "no upstream configured."
+    ///
+    /// Returns `Arc<None>` in four distinct cases:
+    /// 1. HEAD is detached / unborn / an `OtherRef`.
+    /// 2. The branch has no tracking upstream configured.
+    /// 3. The configured tracking ref has no local object (never
+    ///    fetched, or remote pruned).
+    /// 4. `gix` failed partway through (corrupt index, cache open
+    ///    failure, ...). The cause is written to stderr with the
+    ///    `linesmith:` prefix on the first read.
+    ///
+    /// Cases 1-3 render identically to ahead/behind segments (no
+    /// upstream). Case 4 is the deliberate fusion of "walker failed"
+    /// into "no upstream" — distinguishing them in the plugin mirror
+    /// requires a structured variant (follow-up).
     #[must_use]
     pub fn upstream(&self) -> Arc<Option<UpstreamState>> {
         self.upstream
@@ -284,9 +294,13 @@ fn compute_dirty(repo: &gix::Repository) -> Result<DirtyState, Box<dyn std::erro
     Ok(DirtyState::Clean)
 }
 
-/// Resolve upstream tracking branch + count ahead/behind relative to
-/// HEAD. Returns `Ok(None)` when there is no upstream configured or
-/// HEAD cannot tip a branch (detached, unborn, other-ref).
+/// Resolve the tracking branch for `head` and count its ahead/behind
+/// commits relative to HEAD. Returns `Ok(None)` for:
+/// - HEAD not on a local branch
+/// - no upstream configured on the branch
+/// - tracking ref configured but not present locally (never fetched)
+/// - shallow clones, where ancestor walks are truncated at the
+///   shallow frontier and counts would be wrong
 fn compute_upstream(
     repo: &gix::Repository,
     head: &Head,
@@ -294,6 +308,13 @@ fn compute_upstream(
     let Head::Branch(_) = head else {
         return Ok(None);
     };
+
+    // Ancestor walks on a shallow repo terminate at the shallow
+    // frontier without erroring, which silently undercounts both
+    // sides. Hide rather than show wrong numbers.
+    if repo.is_shallow() {
+        return Ok(None);
+    }
 
     let head_ref = match repo.head_ref()? {
         Some(r) => r,
@@ -312,10 +333,10 @@ fn compute_upstream(
     let upstream_oid = upstream_ref.peel_to_id_in_place()?.detach();
     let head_oid = head_ref.id().detach();
 
-    // Explicit merge-base + `selected()` filter avoids gix's
-    // `with_pruned` which is commit-time-based and flakes when
-    // commits share a timestamp. Walk each tip, skipping commits
-    // reachable from the merge-base.
+    // Explicit merge_base + manual exclusion avoids gix's
+    // `with_pruned`: that path's `ByCommitTimeCutoff` sort collides
+    // when two commits share a committer-date second, which breaks
+    // ahead/behind counts non-deterministically.
     let (ahead, behind) = match repo.merge_base(head_oid, upstream_oid) {
         Ok(base) => {
             let base_oid = base.detach();
@@ -323,30 +344,41 @@ fn compute_upstream(
             let behind = count_ancestors_excluding(repo, upstream_oid, base_oid)?;
             (ahead, behind)
         }
-        // No common ancestor (unrelated histories) — treat every
-        // commit on each side as its own divergence.
-        Err(_) => {
-            let ahead = repo.rev_walk([head_oid]).all()?.count();
-            let behind = repo.rev_walk([upstream_oid]).all()?.count();
-            (ahead, behind)
+        // Unrelated histories → hide per spec §Ahead/behind
+        // computation. Other merge_base errors (cache open, walker
+        // crash) bubble so the outer accessor surfaces them.
+        Err(gix::repository::merge_base::Error::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(Box::new(e)),
+    };
+
+    let full_name = upstream_ref_name.as_bstr().to_string();
+    let upstream_branch = match full_name.strip_prefix("refs/remotes/") {
+        Some(short) => short.to_string(),
+        None => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "linesmith: upstream ref {full_name} is outside refs/remotes/; rendering full refname"
+            );
+            full_name
         }
     };
 
-    let upstream_branch = upstream_ref_name.as_bstr().to_string();
-    let upstream_branch = upstream_branch
-        .strip_prefix("refs/remotes/")
-        .map_or(upstream_branch.clone(), str::to_string);
-
     Ok(Some(UpstreamState {
-        ahead: u32::try_from(ahead).unwrap_or(u32::MAX),
-        behind: u32::try_from(behind).unwrap_or(u32::MAX),
+        ahead: u32::try_from(ahead).map_err(|_| {
+            Box::<dyn std::error::Error>::from(format!("ahead count {ahead} overflows u32"))
+        })?,
+        behind: u32::try_from(behind).map_err(|_| {
+            Box::<dyn std::error::Error>::from(format!("behind count {behind} overflows u32"))
+        })?,
         upstream_branch,
     }))
 }
 
 /// Count commits reachable from `tip` but not from `stop` (and not
-/// `stop` itself). BFS from `tip`; queue all parents except those
-/// reachable from `stop`.
+/// `stop` itself). Collects `stop`'s ancestry into a HashSet, then
+/// walks from `tip` counting OIDs not in that set. gix's `rev_walk`
+/// already emits each OID at most once per walk, so no extra dedup
+/// is needed here.
 fn count_ancestors_excluding(
     repo: &gix::Repository,
     tip: gix::ObjectId,
@@ -356,22 +388,15 @@ fn count_ancestors_excluding(
     if tip == stop {
         return Ok(0);
     }
-    // Pre-load every ancestor of `stop` into an exclusion set so we
-    // can short-circuit walks into shared history.
     let mut excluded: HashSet<gix::ObjectId> = HashSet::new();
     excluded.insert(stop);
     for info in repo.rev_walk([stop]).all()? {
         excluded.insert(info?.id);
     }
 
-    let mut visited: HashSet<gix::ObjectId> = HashSet::new();
     let mut count = 0usize;
     for info in repo.rev_walk([tip]).all()? {
-        let info = info?;
-        if excluded.contains(&info.id) {
-            continue;
-        }
-        if visited.insert(info.id) {
+        if !excluded.contains(&info?.id) {
             count += 1;
         }
     }
@@ -491,38 +516,56 @@ mod tests {
     /// tracked ones and re-scan.
     fn fixture_with_commit(tmp: &TempDir) -> &Path {
         use std::fs;
-        use std::process::Command;
         let path = tmp.path();
         // Fixture setup shells out to the `git` binary; fabricating
         // an index + initial commit via gix would take dozens of
         // lines per test. Production code paths stay gix-only.
-        Command::new("git")
+        run_git_init(path);
+        run_git_commit_allow_empty(path, "seed");
+        fs::write(path.join("tracked.txt"), "v1").expect("write");
+        run_git(path, &["add", "tracked.txt"]);
+        run_git_commit(path, "tracked");
+        path
+    }
+
+    fn run_git_init(path: &Path) {
+        use std::process::Command;
+        let mut cmd = Command::new("git");
+        isolated_git_env(&mut cmd);
+        let status = cmd
             .args(["init", "--quiet", "--initial-branch=main"])
             .current_dir(path)
             .status()
             .expect("git init");
-        Command::new("git")
-            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
-            .args(["-C"])
-            .arg(path)
-            .args(["commit", "--allow-empty", "-m", "seed", "--quiet"])
+        assert!(status.success(), "git init failed in {path:?}");
+    }
+
+    fn run_git_init_bare(path: &Path) {
+        use std::process::Command;
+        let mut cmd = Command::new("git");
+        isolated_git_env(&mut cmd);
+        let status = cmd
+            .args(["init", "--bare", "--quiet", "--initial-branch=main"])
+            .current_dir(path)
+            .status()
+            .expect("git init --bare");
+        assert!(status.success(), "git init --bare failed in {path:?}");
+    }
+
+    fn run_git_commit_allow_empty(cwd: &Path, msg: &str) {
+        use std::process::Command;
+        let mut cmd = Command::new("git");
+        isolated_git_env(&mut cmd);
+        let status = cmd
+            .args(["-c", "user.email=t@t", "-c", "user.name=t", "-C"])
+            .arg(cwd)
+            .args(["commit", "--allow-empty", "-m", msg, "--quiet"])
             .status()
             .expect("git commit");
-        fs::write(path.join("tracked.txt"), "v1").expect("write");
-        Command::new("git")
-            .args(["-C"])
-            .arg(path)
-            .args(["add", "tracked.txt"])
-            .status()
-            .expect("git add");
-        Command::new("git")
-            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
-            .args(["-C"])
-            .arg(path)
-            .args(["commit", "-m", "tracked", "--quiet"])
-            .status()
-            .expect("git commit");
-        path
+        assert!(
+            status.success(),
+            "git commit --allow-empty failed in {cwd:?}"
+        );
     }
 
     #[test]
@@ -597,17 +640,8 @@ mod tests {
         use std::process::Command;
         let bare = remote.path();
         let path = local.path();
-        Command::new("git")
-            .args(["init", "--bare", "--quiet", "--initial-branch=main"])
-            .current_dir(bare)
-            .status()
-            .expect("init bare");
-        Command::new("git")
-            .args(["init", "--quiet", "--initial-branch=main"])
-            .current_dir(path)
-            .status()
-            .expect("init local");
-        // Shared base commit.
+        run_git_init_bare(bare);
+        run_git_init(path);
         fs::write(path.join("f"), "base").expect("write base");
         run_git(path, &["add", "f"]);
         run_git_commit(path, "base");
@@ -616,24 +650,26 @@ mod tests {
             &["remote", "add", "origin", bare.to_str().expect("utf8 path")],
         );
         run_git(path, &["push", "-u", "origin", "main", "--quiet"]);
-        // Diverge: stack `local_commits` on HEAD that aren't pushed.
         for i in 0..local_commits {
             fs::write(path.join("f"), format!("local-{i}")).expect("write");
             run_git(path, &["add", "f"]);
             run_git_commit(path, &format!("local {i}"));
         }
-        // Diverge other side: clone from bare into a unique path
-        // (so parallel tests don't collide), add commits, push back,
-        // then fetch in the local repo so origin/main moves ahead.
+        // Diverge from the remote side by cloning into a unique
+        // TempDir (so parallel tests don't collide), adding commits
+        // there, pushing back, and fetching locally.
         if remote_commits > 0 {
             let other_tmp = TempDir::new().expect("other tmp");
             let other = other_tmp.path().join("clone");
-            Command::new("git")
+            let mut clone_cmd = Command::new("git");
+            isolated_git_env(&mut clone_cmd);
+            let status = clone_cmd
                 .args(["clone", "--quiet"])
                 .arg(bare)
                 .arg(&other)
                 .status()
                 .expect("clone");
+            assert!(status.success(), "git clone failed");
             for i in 0..remote_commits {
                 fs::write(other.join("g"), format!("remote-{i}")).expect("write");
                 run_git(&other, &["add", "g"]);
@@ -646,20 +682,32 @@ mod tests {
         path
     }
 
+    /// Env vars that neutralize the test host's global / system git
+    /// config. A dev with `commit.gpgsign = true`, `core.hooksPath`,
+    /// or `safe.directory` denials set globally would otherwise see
+    /// spurious fixture failures unrelated to the code under test.
+    fn isolated_git_env(cmd: &mut std::process::Command) {
+        cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["-c", "commit.gpgsign=false"])
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(["-c", "init.defaultBranch=main"]);
+    }
+
     fn run_git(cwd: &Path, args: &[&str]) {
         use std::process::Command;
-        let status = Command::new("git")
-            .args(["-C"])
-            .arg(cwd)
-            .args(args)
-            .status()
-            .expect("git");
+        let mut cmd = Command::new("git");
+        isolated_git_env(&mut cmd);
+        let status = cmd.args(["-C"]).arg(cwd).args(args).status().expect("git");
         assert!(status.success(), "git {args:?} failed in {cwd:?}");
     }
 
     fn run_git_commit(cwd: &Path, msg: &str) {
         use std::process::Command;
-        let status = Command::new("git")
+        let mut cmd = Command::new("git");
+        isolated_git_env(&mut cmd);
+        let status = cmd
             .args(["-c", "user.email=t@t", "-c", "user.name=t", "-C"])
             .arg(cwd)
             .args(["commit", "-m", msg, "--quiet"])
@@ -686,21 +734,6 @@ mod tests {
         let local = TempDir::new().expect("local");
         let remote = TempDir::new().expect("remote");
         let path = fixture_with_upstream(&local, &remote, 2, 0);
-        use std::process::Command;
-        let log = Command::new("git")
-            .args(["-C"])
-            .arg(path)
-            .args(["log", "--all", "--oneline", "--decorate", "--graph"])
-            .output()
-            .expect("log");
-        eprintln!("{}", String::from_utf8_lossy(&log.stdout));
-        let head = Command::new("git")
-            .args(["-C"])
-            .arg(path)
-            .args(["rev-parse", "HEAD", "origin/main"])
-            .output()
-            .expect("rev-parse");
-        eprintln!("rev-parse: {}", String::from_utf8_lossy(&head.stdout));
         let ctx = resolve_repo(path).expect("resolve").expect("some");
         let upstream = ctx.upstream();
         let state = upstream.as_ref().as_ref().expect("some upstream");

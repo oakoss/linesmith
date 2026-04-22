@@ -48,10 +48,11 @@ pub(crate) struct Config {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub(crate) struct AheadBehindConfig {
     pub(crate) enabled: bool,
-    pub(crate) ahead_format: String,
-    pub(crate) behind_format: String,
+    pub(crate) ahead_format: FormatTemplate,
+    pub(crate) behind_format: FormatTemplate,
     pub(crate) hide_when_zero: bool,
     pub(crate) hide_when_no_upstream: bool,
 }
@@ -60,11 +61,40 @@ impl Default for AheadBehindConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            ahead_format: DEFAULT_AHEAD_FORMAT.into(),
-            behind_format: DEFAULT_BEHIND_FORMAT.into(),
+            ahead_format: FormatTemplate::unchecked(DEFAULT_AHEAD_FORMAT),
+            behind_format: FormatTemplate::unchecked(DEFAULT_BEHIND_FORMAT),
             hide_when_zero: true,
             hide_when_no_upstream: true,
         }
+    }
+}
+
+/// Template string for ahead/behind rendering. Constructor guarantees
+/// `{n}` is present, so a typo like `↑{count}` surfaces at
+/// config-parse time rather than silently rendering with no count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FormatTemplate(String);
+
+impl FormatTemplate {
+    /// Parse a user-supplied template. Returns `None` when `{n}` is
+    /// missing.
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        if s.contains("{n}") {
+            Some(Self(s.to_string()))
+        } else {
+            None
+        }
+    }
+
+    /// Construct without validating — reserved for statically-known
+    /// defaults whose contents contain `{n}`.
+    fn unchecked(s: &'static str) -> Self {
+        debug_assert!(s.contains("{n}"), "unchecked template missing {{n}}: {s}");
+        Self(s.to_string())
+    }
+
+    pub(crate) fn render(&self, n: u32) -> String {
+        self.0.replace("{n}", &n.to_string())
     }
 }
 
@@ -158,10 +188,20 @@ impl GitBranchSegment {
                 cfg.ahead_behind.enabled = v;
             }
             if let Some(v) = ab_map.get("ahead_format").and_then(|v| v.as_str()) {
-                cfg.ahead_behind.ahead_format = v.to_string();
+                match FormatTemplate::parse(v) {
+                    Some(tpl) => cfg.ahead_behind.ahead_format = tpl,
+                    None => warn(&format!(
+                        "segments.{ID}.ahead_behind.ahead_format: missing `{{n}}` placeholder in {v:?}; ignoring"
+                    )),
+                }
             }
             if let Some(v) = ab_map.get("behind_format").and_then(|v| v.as_str()) {
-                cfg.ahead_behind.behind_format = v.to_string();
+                match FormatTemplate::parse(v) {
+                    Some(tpl) => cfg.ahead_behind.behind_format = tpl,
+                    None => warn(&format!(
+                        "segments.{ID}.ahead_behind.behind_format: missing `{{n}}` placeholder in {v:?}; ignoring"
+                    )),
+                }
             }
             if let Some(v) = parse_bool(&ab_map, "hide_when_zero", "git_branch.ahead_behind", warn)
             {
@@ -240,9 +280,10 @@ impl GitBranchSegment {
     }
 
     fn render_ahead_behind(&self, gc: &GitContext) -> Option<String> {
-        // Ahead/behind only makes sense when HEAD is on a local branch.
-        // Detached / Unborn / OtherRef fall through to the no-upstream
-        // hide path.
+        // Ahead/behind only applies to local branches. Detached /
+        // Unborn / OtherRef skip the marker entirely — the `?` that
+        // `hide_when_no_upstream = false` emits is reserved for a
+        // branch whose tracking remote is unconfigured.
         if !matches!(gc.head, Head::Branch(_)) {
             return None;
         }
@@ -260,25 +301,13 @@ impl GitBranchSegment {
                 }
                 let mut out = String::new();
                 if state.ahead > 0 || !self.cfg.ahead_behind.hide_when_zero {
-                    out.push_str(
-                        &self
-                            .cfg
-                            .ahead_behind
-                            .ahead_format
-                            .replace("{n}", &state.ahead.to_string()),
-                    );
+                    out.push_str(&self.cfg.ahead_behind.ahead_format.render(state.ahead));
                 }
                 if state.behind > 0 || !self.cfg.ahead_behind.hide_when_zero {
                     if !out.is_empty() {
                         out.push(' ');
                     }
-                    out.push_str(
-                        &self
-                            .cfg
-                            .ahead_behind
-                            .behind_format
-                            .replace("{n}", &state.behind.to_string()),
-                    );
+                    out.push_str(&self.cfg.ahead_behind.behind_format.render(state.behind));
                 }
                 if out.is_empty() {
                     None
@@ -638,6 +667,42 @@ mod tests {
     }
 
     #[test]
+    fn from_extras_warns_on_ahead_format_missing_placeholder() {
+        let mut extras = BTreeMap::new();
+        let mut ab = toml::value::Table::new();
+        ab.insert(
+            "ahead_format".into(),
+            toml::Value::String("↑{count}".into()),
+        );
+        extras.insert("ahead_behind".into(), toml::Value::Table(ab));
+        let mut warnings = Vec::<String>::new();
+        let seg = GitBranchSegment::from_extras(&extras, &mut |m| warnings.push(m.to_string()));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("ahead_format"));
+        assert!(warnings[0].contains("{n}"));
+        // Default preserved.
+        assert_eq!(seg.cfg.ahead_behind.ahead_format.render(2), "↑2");
+    }
+
+    #[test]
+    fn renders_ahead_with_custom_format() {
+        let mut seg = GitBranchSegment::default();
+        seg.cfg.ahead_behind.ahead_format = FormatTemplate::parse(">>{n}").expect("valid");
+        let rendered = seg
+            .render(&ctx_with_upstream(
+                Head::Branch("main".into()),
+                Some(UpstreamState {
+                    ahead: 5,
+                    behind: 0,
+                    upstream_branch: "origin/main".into(),
+                }),
+            ))
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(rendered.text(), "main >>5");
+    }
+
+    #[test]
     fn from_extras_reads_ahead_behind_knobs() {
         let mut extras = BTreeMap::new();
         let mut ab = toml::value::Table::new();
@@ -651,8 +716,8 @@ mod tests {
         let seg = GitBranchSegment::from_extras(&extras, &mut |m| warnings.push(m.to_string()));
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(seg.cfg.ahead_behind.enabled);
-        assert_eq!(seg.cfg.ahead_behind.ahead_format, ">>{n}");
-        assert_eq!(seg.cfg.ahead_behind.behind_format, "<<{n}");
+        assert_eq!(seg.cfg.ahead_behind.ahead_format.render(3), ">>3");
+        assert_eq!(seg.cfg.ahead_behind.behind_format.render(5), "<<5");
         assert!(!seg.cfg.ahead_behind.hide_when_zero);
         assert!(!seg.cfg.ahead_behind.hide_when_no_upstream);
     }
