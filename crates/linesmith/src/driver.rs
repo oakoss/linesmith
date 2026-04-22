@@ -66,6 +66,11 @@ pub struct CliEnv {
     /// `std::env::current_dir()`; [`Self::for_tests`] leaves it
     /// `None`.
     pub cwd: Option<std::path::PathBuf>,
+    /// Raw `LINESMITH_LOG` value, or `None` if unset. `from_process`
+    /// snapshots the real env; `for_tests`/`default` leave it `None`
+    /// so a developer's ambient `LINESMITH_LOG=debug` can't pollute
+    /// captured-stderr CLI tests.
+    pub log_level_env: Option<String>,
 }
 
 impl CliEnv {
@@ -83,6 +88,7 @@ impl CliEnv {
             terminal_width: None,
             color_capability: None,
             cwd: std::env::current_dir().ok(),
+            log_level_env: std::env::var(crate::logging::ENV_VAR).ok(),
         }
     }
 
@@ -102,6 +108,7 @@ impl CliEnv {
             terminal_width: Some(200),
             color_capability: Some(theme::Capability::None),
             cwd: None,
+            log_level_env: None,
         }
     }
 }
@@ -119,6 +126,8 @@ where
     A: IntoIterator,
     A::Item: Into<std::ffi::OsString>,
 {
+    crate::logging::apply(env.log_level_env.as_deref(), stderr);
+
     let action = match cli::parse(args) {
         Ok(a) => a,
         Err(err) => {
@@ -1653,14 +1662,8 @@ mod tests {
 
     fn env_with_home(dir: &Path) -> CliEnv {
         CliEnv {
-            linesmith_config: None,
-            xdg_config_home: None,
             home: Some(dir.to_string_lossy().into_owned()),
-            no_color: false,
-            force_color: false,
-            terminal_width: Some(200),
-            color_capability: Some(theme::Capability::None),
-            cwd: None,
+            ..CliEnv::for_tests()
         }
     }
 
@@ -1895,14 +1898,8 @@ mod tests {
     #[test]
     fn presets_apply_without_resolvable_path_errors() {
         let env = CliEnv {
-            linesmith_config: None,
-            xdg_config_home: None,
             home: None,
-            no_color: false,
-            force_color: false,
-            terminal_width: Some(200),
-            color_capability: Some(theme::Capability::None),
-            cwd: None,
+            ..CliEnv::for_tests()
         };
         let (code, _stdout, stderr) = run_cli_main(&["presets", "apply", "minimal"], b"", &env);
         assert_eq!(code, 1);

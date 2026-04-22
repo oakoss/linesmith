@@ -60,7 +60,10 @@ impl Segment for RateLimit7dSegment {
                 Some(bucket) => {
                     format_percent(bucket, self.format, self.invert, data.source, &self.config)
                 }
-                None => return Ok(None),
+                None => {
+                    crate::lsm_debug!("rate_limit_7d: usage.seven_day absent; hiding");
+                    return Ok(None);
+                }
             },
             Err(err) => render_error(err, &self.config),
         };

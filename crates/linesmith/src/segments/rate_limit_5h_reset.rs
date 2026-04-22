@@ -62,13 +62,18 @@ impl Segment for RateLimit5hResetSegment {
         let text = match &*usage {
             Ok(data) => {
                 let Some(bucket) = data.five_hour.as_ref() else {
+                    crate::lsm_debug!("rate_limit_5h_reset: usage.five_hour absent; hiding");
                     return Ok(None);
                 };
                 let Some(resets_at) = bucket.resets_at else {
+                    crate::lsm_debug!("rate_limit_5h_reset: five_hour.resets_at absent; hiding");
                     return Ok(None);
                 };
                 let remaining = resets_at.signed_duration_since(chrono::Utc::now());
                 if remaining <= chrono::Duration::zero() {
+                    crate::lsm_debug!(
+                        "rate_limit_5h_reset: five_hour.resets_at in the past ({resets_at}); hiding"
+                    );
                     return Ok(None);
                 }
                 format_duration(

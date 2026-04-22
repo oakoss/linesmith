@@ -49,17 +49,24 @@ impl Segment for ExtraUsageSegment {
         match &*usage {
             Ok(data) => {
                 let Some(extra) = data.extra_usage.as_ref() else {
+                    crate::lsm_debug!("extra_usage: usage.extra_usage absent; hiding");
                     return Ok(None);
                 };
                 // `is_enabled = false` (or missing) hides silently:
                 // the user hasn't opted into overage, so there's no
                 // state worth rendering.
                 if !extra.is_enabled.unwrap_or(false) {
+                    crate::lsm_debug!("extra_usage: extra_usage.is_enabled = false/absent; hiding");
                     return Ok(None);
                 }
                 match format_extra_usage(extra, self.format, data.source, &self.config) {
                     Some(text) => Ok(Some(RenderedSegment::new(text).with_role(Role::Info))),
-                    None => Ok(None),
+                    None => {
+                        crate::lsm_debug!(
+                            "extra_usage: format_extra_usage returned None (missing cost or format suppressed); hiding"
+                        );
+                        Ok(None)
+                    }
                 }
             }
             Err(err) => {

@@ -71,7 +71,10 @@ impl Segment for RateLimit5hSegment {
                 Some(bucket) => {
                     format_percent(bucket, self.format, self.invert, data.source, &self.config)
                 }
-                None => return Ok(None),
+                None => {
+                    crate::lsm_debug!("rate_limit_5h: usage.five_hour absent; hiding");
+                    return Ok(None);
+                }
             },
             Err(err) => render_error(err, &self.config),
         };

@@ -172,26 +172,56 @@ pub fn resolve_usage(
 }
 
 fn read_cache(cache: Option<&CacheStore>) -> Option<CachedUsage> {
-    // Read-side errors (PermissionDenied, EIO on a corrupt filesystem,
-    // parent-not-a-dir after a config mis-edit) collapse to "miss" so
-    // the cascade can still serve the user. Next successful write
-    // overwrites. The write-side helpers below `debug_assert!` because
-    // that's where genuine data loss happens.
-    // TODO(lsm-logger): record via structured logger once one exists.
-    cache.and_then(|c| c.read().ok().flatten())
+    cache.and_then(|c| match c.read() {
+        Ok(hit) => hit,
+        Err(e) => {
+            log_cache_read_failure("cache", &e);
+            None
+        }
+    })
 }
 
 fn read_lock(lock: Option<&LockStore>) -> Option<Lock> {
-    // Same rationale as `read_cache`: collapse to "no lock" on error.
-    // TODO(lsm-logger): record via structured logger once one exists.
-    lock.and_then(|l| l.read().ok().flatten())
+    lock.and_then(|l| match l.read() {
+        Ok(hit) => hit,
+        Err(e) => {
+            log_cache_read_failure("lock", &e);
+            None
+        }
+    })
+}
+
+/// A cache/lock read error always collapses to "miss" so the cascade
+/// keeps serving the user, but not every error is equivalent. Ephemeral
+/// kinds (`NotFound`, truncated-read) are normal cold-start / partial-
+/// write symptoms and stay at debug. Persistent kinds (permission,
+/// ENOSPC, corrupt payload) are config defects that won't self-heal and
+/// silently force every invocation back onto the endpoint — escalate
+/// those so a user chasing "why does my statusline hammer the API"
+/// finds the cause without `LINESMITH_LOG=debug`.
+fn log_cache_read_failure(kind: &str, err: &super::cache::CacheError) {
+    use std::io::ErrorKind;
+    let io_kind = match err {
+        super::cache::CacheError::Io { cause, .. }
+        | super::cache::CacheError::Persist { cause, .. } => cause.kind(),
+    };
+    match io_kind {
+        ErrorKind::NotFound | ErrorKind::UnexpectedEof => {
+            crate::lsm_debug!("cascade: {kind} read failed: {err}; treating as miss");
+        }
+        _ => {
+            crate::lsm_warn!("cascade: {kind} read failed: {err}");
+        }
+    }
 }
 
 fn write_cache(cache: Option<&CacheStore>, entry: CachedUsage) {
     if let Some(c) = cache {
         if let Err(e) = c.write(&entry) {
+            // Warn BEFORE `debug_assert!` so the stderr line survives
+            // the assertion panic in debug builds.
+            crate::lsm_warn!("cascade: cache write failed: {e}");
             debug_assert!(false, "cascade: cache write failed: {e}");
-            // TODO(lsm-logger): forward to structured logger.
         }
     }
 }
@@ -199,8 +229,8 @@ fn write_cache(cache: Option<&CacheStore>, entry: CachedUsage) {
 fn write_lock(lock: Option<&LockStore>, entry: Lock) {
     if let Some(l) = lock {
         if let Err(e) = l.write(&entry) {
+            crate::lsm_warn!("cascade: lock write failed: {e}");
             debug_assert!(false, "cascade: lock write failed: {e}");
-            // TODO(lsm-logger): forward to structured logger.
         }
     }
 }
