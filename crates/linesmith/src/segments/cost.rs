@@ -14,6 +14,7 @@ const PRIORITY: u8 = 192;
 impl Segment for CostSegment {
     fn render(&self, ctx: &DataContext) -> RenderResult {
         let Some(cost) = ctx.status.cost.as_ref() else {
+            crate::lsm_debug!("cost: status.cost absent; hiding");
             return Ok(None);
         };
         Ok(Some(

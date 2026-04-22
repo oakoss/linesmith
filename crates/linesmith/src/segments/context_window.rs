@@ -17,6 +17,7 @@ const PRIORITY: u8 = 32;
 impl Segment for ContextWindowSegment {
     fn render(&self, ctx: &DataContext) -> RenderResult {
         let Some(cw) = ctx.status.context_window.as_ref() else {
+            crate::lsm_debug!("context_window: status.context_window absent; hiding");
             return Ok(None);
         };
         Ok(Some(

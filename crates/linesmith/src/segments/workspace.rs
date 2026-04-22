@@ -31,6 +31,7 @@ impl Segment for WorkspaceSegment {
             .file_name()
             .and_then(|s| s.to_str())
         else {
+            crate::lsm_debug!("workspace: status.workspace.project_dir has no basename; hiding");
             return Ok(None);
         };
 

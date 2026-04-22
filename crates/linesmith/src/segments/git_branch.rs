@@ -237,7 +237,10 @@ impl Segment for GitBranchSegment {
             // Bare repos have no working tree, so branch / dirty
             // state is meaningless. Submodules, linked worktrees, and
             // main checkouts all render normally.
-            Ok(Some(gc)) if matches!(gc.repo_kind, RepoKind::Bare) => Ok(None),
+            Ok(Some(gc)) if matches!(gc.repo_kind, RepoKind::Bare) => {
+                crate::lsm_debug!("git_branch: bare repo; hiding");
+                Ok(None)
+            }
             Ok(Some(gc)) => {
                 let text = self.assemble(gc);
                 if text.is_empty() {

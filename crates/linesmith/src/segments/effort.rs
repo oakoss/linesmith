@@ -21,6 +21,7 @@ const PRIORITY: u8 = 160;
 impl Segment for EffortSegment {
     fn render(&self, ctx: &DataContext) -> RenderResult {
         let Some(effort) = ctx.status.effort else {
+            crate::lsm_debug!("effort: status.effort absent; hiding");
             return Ok(None);
         };
         Ok(Some(
