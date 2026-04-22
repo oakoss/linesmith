@@ -198,19 +198,22 @@ impl GitContext {
 
     /// Upstream-tracking state, scanned lazily on first access.
     ///
-    /// Returns `Arc<None>` in four distinct cases:
+    /// Returns `Arc<None>` in five distinct cases:
     /// 1. HEAD is detached / unborn / an `OtherRef`.
     /// 2. The branch has no tracking upstream configured.
     /// 3. The configured tracking ref has no local object (never
     ///    fetched, or remote pruned).
-    /// 4. `gix` failed partway through (corrupt index, cache open
-    ///    failure, ...). The cause is written to stderr with the
-    ///    `linesmith:` prefix on the first read.
+    /// 4. The repo is shallow — ancestor walks truncate at the
+    ///    shallow frontier and would silently undercount.
+    /// 5. HEAD and upstream share no merge base (unrelated histories)
+    ///    OR `gix` failed partway through (corrupt index, cache open
+    ///    failure, ...). In the failure case the cause is written to
+    ///    stderr with the `linesmith:` prefix on the first read.
     ///
-    /// Cases 1-3 render identically to ahead/behind segments (no
-    /// upstream). Case 4 is the deliberate fusion of "walker failed"
-    /// into "no upstream" — distinguishing them in the plugin mirror
-    /// requires a structured variant (follow-up).
+    /// Cases 1-4 render identically to ahead/behind segments (no
+    /// upstream). Case 5 deliberately fuses "walker failed" into "no
+    /// upstream" — distinguishing them in the plugin mirror requires
+    /// a structured variant (follow-up).
     #[must_use]
     pub fn upstream(&self) -> Arc<Option<UpstreamState>> {
         self.upstream
@@ -301,6 +304,7 @@ fn compute_dirty(repo: &gix::Repository) -> Result<DirtyState, Box<dyn std::erro
 /// - tracking ref configured but not present locally (never fetched)
 /// - shallow clones, where ancestor walks are truncated at the
 ///   shallow frontier and counts would be wrong
+/// - unrelated histories (HEAD and upstream share no merge base)
 fn compute_upstream(
     repo: &gix::Repository,
     head: &Head,
@@ -309,9 +313,6 @@ fn compute_upstream(
         return Ok(None);
     };
 
-    // Ancestor walks on a shallow repo terminate at the shallow
-    // frontier without erroring, which silently undercounts both
-    // sides. Hide rather than show wrong numbers.
     if repo.is_shallow() {
         return Ok(None);
     }
@@ -375,10 +376,8 @@ fn compute_upstream(
 }
 
 /// Count commits reachable from `tip` but not from `stop` (and not
-/// `stop` itself). Collects `stop`'s ancestry into a HashSet, then
-/// walks from `tip` counting OIDs not in that set. gix's `rev_walk`
-/// already emits each OID at most once per walk, so no extra dedup
-/// is needed here.
+/// `stop` itself). No visited-set needed: `gix::rev_walk` emits
+/// each OID at most once per walk.
 fn count_ancestors_excluding(
     repo: &gix::Repository,
     tip: gix::ObjectId,

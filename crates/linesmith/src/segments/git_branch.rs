@@ -61,8 +61,10 @@ impl Default for AheadBehindConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            ahead_format: FormatTemplate::unchecked(DEFAULT_AHEAD_FORMAT),
-            behind_format: FormatTemplate::unchecked(DEFAULT_BEHIND_FORMAT),
+            ahead_format: FormatTemplate::parse(DEFAULT_AHEAD_FORMAT)
+                .expect("DEFAULT_AHEAD_FORMAT must contain FormatTemplate::PLACEHOLDER"),
+            behind_format: FormatTemplate::parse(DEFAULT_BEHIND_FORMAT)
+                .expect("DEFAULT_BEHIND_FORMAT must contain FormatTemplate::PLACEHOLDER"),
             hide_when_zero: true,
             hide_when_no_upstream: true,
         }
@@ -70,31 +72,28 @@ impl Default for AheadBehindConfig {
 }
 
 /// Template string for ahead/behind rendering. Constructor guarantees
-/// `{n}` is present, so a typo like `↑{count}` surfaces at
-/// config-parse time rather than silently rendering with no count.
+/// [`Self::PLACEHOLDER`] is present, so a typo like `↑{count}`
+/// surfaces at config-parse time rather than silently rendering with
+/// no count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FormatTemplate(String);
 
 impl FormatTemplate {
-    /// Parse a user-supplied template. Returns `None` when `{n}` is
-    /// missing.
+    /// The count placeholder every template must contain.
+    pub(crate) const PLACEHOLDER: &'static str = "{n}";
+
+    /// Parse a user-supplied template. Returns `None` when the
+    /// placeholder is missing.
     pub(crate) fn parse(s: &str) -> Option<Self> {
-        if s.contains("{n}") {
+        if s.contains(Self::PLACEHOLDER) {
             Some(Self(s.to_string()))
         } else {
             None
         }
     }
 
-    /// Construct without validating — reserved for statically-known
-    /// defaults whose contents contain `{n}`.
-    fn unchecked(s: &'static str) -> Self {
-        debug_assert!(s.contains("{n}"), "unchecked template missing {{n}}: {s}");
-        Self(s.to_string())
-    }
-
     pub(crate) fn render(&self, n: u32) -> String {
-        self.0.replace("{n}", &n.to_string())
+        self.0.replace(Self::PLACEHOLDER, &n.to_string())
     }
 }
 
@@ -187,11 +186,12 @@ impl GitBranchSegment {
             if let Some(v) = parse_bool(&ab_map, "enabled", "git_branch.ahead_behind", warn) {
                 cfg.ahead_behind.enabled = v;
             }
+            let placeholder = FormatTemplate::PLACEHOLDER;
             if let Some(v) = ab_map.get("ahead_format").and_then(|v| v.as_str()) {
                 match FormatTemplate::parse(v) {
                     Some(tpl) => cfg.ahead_behind.ahead_format = tpl,
                     None => warn(&format!(
-                        "segments.{ID}.ahead_behind.ahead_format: missing `{{n}}` placeholder in {v:?}; ignoring"
+                        "segments.{ID}.ahead_behind.ahead_format: missing `{placeholder}` placeholder in {v:?}; ignoring"
                     )),
                 }
             }
@@ -199,7 +199,7 @@ impl GitBranchSegment {
                 match FormatTemplate::parse(v) {
                     Some(tpl) => cfg.ahead_behind.behind_format = tpl,
                     None => warn(&format!(
-                        "segments.{ID}.ahead_behind.behind_format: missing `{{n}}` placeholder in {v:?}; ignoring"
+                        "segments.{ID}.ahead_behind.behind_format: missing `{placeholder}` placeholder in {v:?}; ignoring"
                     )),
                 }
             }
@@ -680,8 +680,111 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("ahead_format"));
         assert!(warnings[0].contains("{n}"));
-        // Default preserved.
         assert_eq!(seg.cfg.ahead_behind.ahead_format.render(2), "↑2");
+    }
+
+    #[test]
+    fn from_extras_warns_on_behind_format_missing_placeholder() {
+        let mut extras = BTreeMap::new();
+        let mut ab = toml::value::Table::new();
+        ab.insert(
+            "behind_format".into(),
+            toml::Value::String("↓{count}".into()),
+        );
+        extras.insert("ahead_behind".into(), toml::Value::Table(ab));
+        let mut warnings = Vec::<String>::new();
+        let seg = GitBranchSegment::from_extras(&extras, &mut |m| warnings.push(m.to_string()));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("behind_format"));
+        assert!(warnings[0].contains("{n}"));
+        assert_eq!(seg.cfg.ahead_behind.behind_format.render(3), "↓3");
+    }
+
+    #[test]
+    fn format_template_parse_rejects_missing_placeholder() {
+        assert!(FormatTemplate::parse("no placeholder").is_none());
+        assert!(FormatTemplate::parse("↑{count}").is_none());
+        assert!(FormatTemplate::parse("↑{n}").is_some());
+    }
+
+    #[test]
+    fn format_template_render_substitutes_placeholder() {
+        let tpl = FormatTemplate::parse("↑{n} commits").expect("valid");
+        assert_eq!(tpl.render(7), "↑7 commits");
+    }
+
+    #[test]
+    fn default_templates_contain_placeholder() {
+        // AheadBehindConfig::default() panics if the module-private
+        // DEFAULT_*_FORMAT consts drift away from FormatTemplate's
+        // PLACEHOLDER contract. Pin the default build in CI so the
+        // expect() in Default is proven at least once.
+        let default = AheadBehindConfig::default();
+        assert_eq!(default.ahead_format.render(2), "↑2");
+        assert_eq!(default.behind_format.render(3), "↓3");
+    }
+
+    #[test]
+    fn skips_ahead_behind_on_unborn_head() {
+        let rendered = GitBranchSegment::default()
+            .render(&ctx_with_upstream(
+                Head::Unborn {
+                    symbolic_ref: "main".into(),
+                },
+                None,
+            ))
+            .unwrap()
+            .expect("rendered");
+        assert!(
+            !rendered.text().contains('↑')
+                && !rendered.text().contains('↓')
+                && !rendered.text().contains('?'),
+            "expected no ahead/behind marker on Unborn HEAD, got {:?}",
+            rendered.text()
+        );
+    }
+
+    #[test]
+    fn skips_ahead_behind_on_other_ref_head() {
+        let rendered = GitBranchSegment::default()
+            .render(&ctx_with_upstream(
+                Head::OtherRef {
+                    full_name: "refs/remotes/origin/feature".into(),
+                },
+                None,
+            ))
+            .unwrap()
+            .expect("rendered");
+        assert!(
+            !rendered.text().contains('↑')
+                && !rendered.text().contains('↓')
+                && !rendered.text().contains('?'),
+            "expected no ahead/behind marker on OtherRef HEAD, got {:?}",
+            rendered.text()
+        );
+    }
+
+    #[test]
+    fn skips_ahead_behind_on_unborn_head_even_with_hide_when_no_upstream_false() {
+        // The '?' marker is reserved for branches with no configured
+        // tracking remote. Unborn HEAD isn't a branch, so it must not
+        // render '?' regardless of hide_when_no_upstream.
+        let mut seg = GitBranchSegment::default();
+        seg.cfg.ahead_behind.hide_when_no_upstream = false;
+        let rendered = seg
+            .render(&ctx_with_upstream(
+                Head::Unborn {
+                    symbolic_ref: "main".into(),
+                },
+                None,
+            ))
+            .unwrap()
+            .expect("rendered");
+        assert!(
+            !rendered.text().contains('?'),
+            "Unborn HEAD should not render '?' even with hide_when_no_upstream=false; got {:?}",
+            rendered.text()
+        );
     }
 
     #[test]
