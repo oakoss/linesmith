@@ -101,7 +101,7 @@ fn data_deps(&self) -> &'static [DataDep] {
 
 - `Ok(None)` — cwd is not in a git repo; segment hides
 - `Ok(Some(gc))` — repo found, `gc` populated
-- `Err(e)` — gix failed (corrupt repo, permission denied, `safe.directory` trust rejection, &c); segment hides. The error `Display` is written to stderr with the `linesmith:` prefix so a user running from a terminal sees the cause. A future render mode can surface a `[git error]` marker once the structured logger (lsm-cgg) lets segments opt into inline error messaging
+- `Err(e)` — gix failed (corrupt repo, permission denied, `safe.directory` trust rejection, &c); segment hides. The error `Display` is written to stderr with the `linesmith:` prefix so a user running from a terminal sees the cause
 
 Multiple future git segments share the same `Arc<GitContext>` without re-walking the repo.
 
@@ -334,8 +334,8 @@ Each fixture runs the full render pipeline (stdin → config → segment render 
 
 ## Change log
 
-- 2026-04-21 (v0.1.1): several reconciliations between the v0.1
-  draft and the shipped lsm-4cf implementation:
+- 2026-04-21 (v0.1.1): reconciliations with the shipped
+  implementation:
   - `GitError` variants carry `message: String` instead of
     structured `cause: gix::open::Error` / `gix::revwalk::Error`.
     `DataContext` memoizes git state as
@@ -367,7 +367,7 @@ Each fixture runs the full render pipeline (stdin → config → segment render 
     `Repository::is_dirty()` is not used because it excludes
     untracked files and (per its own TODO) doesn't compare HEAD to
     the index. HEAD↔index (staged-only) detection is still missing;
-    tracked in lsm-u5h.
+    tracked in lsm-387.
   - `resolve_repo` now matches `gix::discover::upwards::Error` inner
     variants. Only the three genuine "no repo here" kinds
     (`NoGitRepository*`) become `Ok(None)`; trust rejections

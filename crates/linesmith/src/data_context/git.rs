@@ -27,10 +27,9 @@ pub enum RepoKind {
     /// A bare repository. `git_branch` hides on this kind (no working
     /// tree means no dirty state).
     Bare,
-    /// A submodule checkout. Treated like `Main` for rendering
-    /// purposes — it has a working tree and a HEAD — but carried as a
-    /// distinct variant so segments that need to style submodules
-    /// differently don't have to re-classify.
+    /// A submodule checkout. Has a working tree and HEAD like
+    /// `Main`, but carried as a distinct variant so segments that
+    /// want to style submodules differently don't re-classify.
     Submodule,
 }
 
@@ -67,13 +66,13 @@ impl Head {
 /// Dirty-state result.
 ///
 /// - `Clean` — no tracked modifications and no untracked files.
-/// - `Dirty(None)` — fast-path indicator mode: scan short-circuited on
-///   the first dirty entry, so counts were not collected.
+/// - `Dirty(None)` — indicator mode: scan short-circuited on the
+///   first dirty entry, so counts were not collected.
 /// - `Dirty(Some(counts))` — full-scan counts mode.
 ///
-/// The two `Dirty` forms are distinct plugin-facing states so a
-/// future counts-mode renderer can reliably tell "counts not yet
-/// computed" apart from "zero of this category."
+/// The two `Dirty` forms are distinct plugin-facing states so
+/// counts-mode renderers can tell "counts not yet computed" apart
+/// from "zero of this category."
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DirtyState {
@@ -90,8 +89,8 @@ impl DirtyState {
     }
 }
 
-/// Per-category dirty counts. Populated only in full-scan (counts)
-/// mode; fast-path indicator scans leave this absent.
+/// Per-category dirty counts. Populated only in counts mode;
+/// indicator-mode scans leave this absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DirtyCounts {
@@ -166,17 +165,15 @@ impl GitContext {
     /// [`DirtyState::Clean`] when no repo handle is held.
     ///
     /// The scan covers untracked files and tracked modifications.
-    /// HEAD↔index (staged-only) changes are not detected — gix 0.67
-    /// does not expose that comparison; see lsm-u5h for the
-    /// follow-up.
+    /// HEAD↔index (staged-only) changes are not detected because
+    /// gix 0.67 doesn't expose that comparison.
     #[must_use]
     pub fn dirty(&self) -> Arc<DirtyState> {
         self.dirty
             .get_or_init(|| match &self.repo {
                 Some(repo) => Arc::new(compute_dirty(repo).unwrap_or_else(|err| {
-                    // Diagnostic-only stderr until lsm-cgg (logger)
-                    // lands; a silent false-clean would mask real
-                    // gix failures like index corruption.
+                    // Silent false-clean would mask real gix failures
+                    // (e.g. index corruption); write the cause through.
                     let _ = writeln!(
                         io::stderr().lock(),
                         "linesmith: git dirty scan failed: {err}"
@@ -245,10 +242,9 @@ pub fn resolve_repo(cwd: &Path) -> Result<Option<GitContext>, GitError> {
     }))
 }
 
-/// Fast-path dirty check: short-circuits on the first status entry.
-/// Covers untracked + worktree-vs-index (unstaged). Missing:
-/// HEAD↔index (staged) per gix 0.67's own TODO on `is_dirty`;
-/// tracked in lsm-u5h.
+/// Indicator-mode dirty scan: short-circuits on the first status
+/// entry. Covers untracked + worktree-vs-index (unstaged). Misses
+/// HEAD↔index (staged-only) per gix 0.67's own TODO on `is_dirty`.
 fn compute_dirty(repo: &gix::Repository) -> Result<DirtyState, Box<dyn std::error::Error>> {
     use gix::status::UntrackedFiles;
 
@@ -379,11 +375,9 @@ mod tests {
         use std::fs;
         use std::process::Command;
         let path = tmp.path();
-        // Shelling out to `git` for test-fixture setup is acceptable
-        // per our AGENTS policy: the production code path stays
-        // gix-only, but fabricating an index + HEAD via gix's mid-
-        // level APIs would be dozens of lines of boilerplate per
-        // test. Fixture prep runs once per test and only in `cfg(test)`.
+        // Fixture setup shells out to the `git` binary; fabricating
+        // an index + initial commit via gix would take dozens of
+        // lines per test. Production code paths stay gix-only.
         Command::new("git")
             .args(["init", "--quiet", "--initial-branch=main"])
             .current_dir(path)
