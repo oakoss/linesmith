@@ -28,6 +28,9 @@ const DEFAULT_DIRTY_INDICATOR: &str = "*";
 const DEFAULT_TRUNCATION_MARKER: &str = "…";
 const DEFAULT_SHORT_SHA_LEN: u8 = 7;
 const DEFAULT_MAX_BRANCH_LEN: u16 = 40;
+const DEFAULT_AHEAD_FORMAT: &str = "↑{n}";
+const DEFAULT_BEHIND_FORMAT: &str = "↓{n}";
+const NO_UPSTREAM_MARKER: &str = "?";
 
 /// Resolved runtime config. Defaults match `git-segments.md`
 /// §Config schema.
@@ -41,6 +44,28 @@ pub(crate) struct Config {
     pub(crate) dirty_enabled: bool,
     pub(crate) dirty_indicator: String,
     pub(crate) clean_indicator: String,
+    pub(crate) ahead_behind: AheadBehindConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AheadBehindConfig {
+    pub(crate) enabled: bool,
+    pub(crate) ahead_format: String,
+    pub(crate) behind_format: String,
+    pub(crate) hide_when_zero: bool,
+    pub(crate) hide_when_no_upstream: bool,
+}
+
+impl Default for AheadBehindConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ahead_format: DEFAULT_AHEAD_FORMAT.into(),
+            behind_format: DEFAULT_BEHIND_FORMAT.into(),
+            hide_when_zero: true,
+            hide_when_no_upstream: true,
+        }
+    }
 }
 
 impl Default for Config {
@@ -54,6 +79,7 @@ impl Default for Config {
             dirty_enabled: true,
             dirty_indicator: DEFAULT_DIRTY_INDICATOR.into(),
             clean_indicator: String::new(),
+            ahead_behind: AheadBehindConfig::default(),
         }
     }
 }
@@ -125,6 +151,32 @@ impl GitBranchSegment {
             }
         }
 
+        if let Some(ab) = extras.get("ahead_behind").and_then(|v| v.as_table()) {
+            let ab_map: BTreeMap<String, toml::Value> =
+                ab.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            if let Some(v) = parse_bool(&ab_map, "enabled", "git_branch.ahead_behind", warn) {
+                cfg.ahead_behind.enabled = v;
+            }
+            if let Some(v) = ab_map.get("ahead_format").and_then(|v| v.as_str()) {
+                cfg.ahead_behind.ahead_format = v.to_string();
+            }
+            if let Some(v) = ab_map.get("behind_format").and_then(|v| v.as_str()) {
+                cfg.ahead_behind.behind_format = v.to_string();
+            }
+            if let Some(v) = parse_bool(&ab_map, "hide_when_zero", "git_branch.ahead_behind", warn)
+            {
+                cfg.ahead_behind.hide_when_zero = v;
+            }
+            if let Some(v) = parse_bool(
+                &ab_map,
+                "hide_when_no_upstream",
+                "git_branch.ahead_behind",
+                warn,
+            ) {
+                cfg.ahead_behind.hide_when_no_upstream = v;
+            }
+        }
+
         Self { cfg }
     }
 }
@@ -178,7 +230,63 @@ impl GitBranchSegment {
             }
         }
 
+        if self.cfg.ahead_behind.enabled {
+            if let Some(marker) = self.render_ahead_behind(gc) {
+                parts.push(marker);
+            }
+        }
+
         parts.join(" ")
+    }
+
+    fn render_ahead_behind(&self, gc: &GitContext) -> Option<String> {
+        // Ahead/behind only makes sense when HEAD is on a local branch.
+        // Detached / Unborn / OtherRef fall through to the no-upstream
+        // hide path.
+        if !matches!(gc.head, Head::Branch(_)) {
+            return None;
+        }
+        match &*gc.upstream() {
+            None => {
+                if self.cfg.ahead_behind.hide_when_no_upstream {
+                    None
+                } else {
+                    Some(NO_UPSTREAM_MARKER.to_string())
+                }
+            }
+            Some(state) => {
+                if state.ahead == 0 && state.behind == 0 && self.cfg.ahead_behind.hide_when_zero {
+                    return None;
+                }
+                let mut out = String::new();
+                if state.ahead > 0 || !self.cfg.ahead_behind.hide_when_zero {
+                    out.push_str(
+                        &self
+                            .cfg
+                            .ahead_behind
+                            .ahead_format
+                            .replace("{n}", &state.ahead.to_string()),
+                    );
+                }
+                if state.behind > 0 || !self.cfg.ahead_behind.hide_when_zero {
+                    if !out.is_empty() {
+                        out.push(' ');
+                    }
+                    out.push_str(
+                        &self
+                            .cfg
+                            .ahead_behind
+                            .behind_format
+                            .replace("{n}", &state.behind.to_string()),
+                    );
+                }
+                if out.is_empty() {
+                    None
+                } else {
+                    Some(out)
+                }
+            }
+        }
     }
 
     fn render_head(&self, head: &Head) -> String {
@@ -281,7 +389,7 @@ fn truncate_middle(s: &str, max: u16, marker: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_context::{GitContext, Head, RepoKind};
+    use crate::data_context::{GitContext, Head, RepoKind, UpstreamState};
     use crate::input::{ModelInfo, StatusContext, Tool, WorkspaceInfo};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -395,6 +503,158 @@ mod tests {
             .unwrap()
             .expect("rendered");
         assert_eq!(rendered.text(), "refs/remotes/origin/feature");
+    }
+
+    // --- Ahead/behind rendering ---
+
+    fn ctx_with_upstream(head: Head, upstream: Option<UpstreamState>) -> DataContext {
+        let gc = GitContext::new(RepoKind::Main, PathBuf::from("/repo/.git"), head);
+        gc.preseed_upstream(upstream).expect("fresh onceCell");
+        let dc = DataContext::with_cwd(minimal_status(), None);
+        dc.preseed_git(Ok(Some(gc))).expect("seed");
+        dc
+    }
+
+    #[test]
+    fn renders_ahead_when_local_leads() {
+        let rendered = GitBranchSegment::default()
+            .render(&ctx_with_upstream(
+                Head::Branch("main".into()),
+                Some(UpstreamState {
+                    ahead: 2,
+                    behind: 0,
+                    upstream_branch: "origin/main".into(),
+                }),
+            ))
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(rendered.text(), "main ↑2");
+    }
+
+    #[test]
+    fn renders_behind_when_remote_leads() {
+        let rendered = GitBranchSegment::default()
+            .render(&ctx_with_upstream(
+                Head::Branch("main".into()),
+                Some(UpstreamState {
+                    ahead: 0,
+                    behind: 3,
+                    upstream_branch: "origin/main".into(),
+                }),
+            ))
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(rendered.text(), "main ↓3");
+    }
+
+    #[test]
+    fn renders_both_when_diverged() {
+        let rendered = GitBranchSegment::default()
+            .render(&ctx_with_upstream(
+                Head::Branch("main".into()),
+                Some(UpstreamState {
+                    ahead: 2,
+                    behind: 3,
+                    upstream_branch: "origin/main".into(),
+                }),
+            ))
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(rendered.text(), "main ↑2 ↓3");
+    }
+
+    #[test]
+    fn hides_ahead_behind_when_zero_by_default() {
+        let rendered = GitBranchSegment::default()
+            .render(&ctx_with_upstream(
+                Head::Branch("main".into()),
+                Some(UpstreamState {
+                    ahead: 0,
+                    behind: 0,
+                    upstream_branch: "origin/main".into(),
+                }),
+            ))
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(rendered.text(), "main");
+    }
+
+    #[test]
+    fn shows_zeros_when_configured() {
+        let mut seg = GitBranchSegment::default();
+        seg.cfg.ahead_behind.hide_when_zero = false;
+        let rendered = seg
+            .render(&ctx_with_upstream(
+                Head::Branch("main".into()),
+                Some(UpstreamState {
+                    ahead: 0,
+                    behind: 0,
+                    upstream_branch: "origin/main".into(),
+                }),
+            ))
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(rendered.text(), "main ↑0 ↓0");
+    }
+
+    #[test]
+    fn hides_ahead_behind_when_no_upstream_by_default() {
+        let rendered = GitBranchSegment::default()
+            .render(&ctx_with_upstream(Head::Branch("main".into()), None))
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(rendered.text(), "main");
+    }
+
+    #[test]
+    fn renders_question_mark_when_no_upstream_opted_in() {
+        let mut seg = GitBranchSegment::default();
+        seg.cfg.ahead_behind.hide_when_no_upstream = false;
+        let rendered = seg
+            .render(&ctx_with_upstream(Head::Branch("main".into()), None))
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(rendered.text(), "main ?");
+    }
+
+    #[test]
+    fn skips_ahead_behind_on_detached_head() {
+        let gc = GitContext::new(
+            RepoKind::Main,
+            PathBuf::from("/repo/.git"),
+            Head::Detached(gix::ObjectId::empty_tree(gix::hash::Kind::Sha1)),
+        );
+        let dc = DataContext::with_cwd(minimal_status(), None);
+        dc.preseed_git(Ok(Some(gc))).expect("seed");
+        let rendered = GitBranchSegment::default()
+            .render(&dc)
+            .unwrap()
+            .expect("rendered");
+        assert!(
+            !rendered.text().contains('↑') && !rendered.text().contains('↓'),
+            "expected no ahead/behind on detached HEAD, got {:?}",
+            rendered.text()
+        );
+    }
+
+    #[test]
+    fn from_extras_reads_ahead_behind_knobs() {
+        let mut extras = BTreeMap::new();
+        let mut ab = toml::value::Table::new();
+        ab.insert("enabled".into(), toml::Value::Boolean(true));
+        ab.insert("ahead_format".into(), toml::Value::String(">>{n}".into()));
+        ab.insert("behind_format".into(), toml::Value::String("<<{n}".into()));
+        ab.insert("hide_when_zero".into(), toml::Value::Boolean(false));
+        ab.insert("hide_when_no_upstream".into(), toml::Value::Boolean(false));
+        extras.insert("ahead_behind".into(), toml::Value::Table(ab));
+        let mut warnings = Vec::<String>::new();
+        let seg = GitBranchSegment::from_extras(&extras, &mut |m| warnings.push(m.to_string()));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(seg.cfg.ahead_behind.enabled);
+        assert_eq!(seg.cfg.ahead_behind.ahead_format, ">>{n}");
+        assert_eq!(seg.cfg.ahead_behind.behind_format, "<<{n}");
+        assert!(!seg.cfg.ahead_behind.hide_when_zero);
+        assert!(!seg.cfg.ahead_behind.hide_when_no_upstream);
     }
 
     #[test]

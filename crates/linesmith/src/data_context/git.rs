@@ -185,12 +185,36 @@ impl GitContext {
             .clone()
     }
 
-    /// Upstream-tracking state. Returns `Arc<None>` when no
-    /// upstream has been populated; ahead/behind renderers treat
-    /// `None` the same as "no upstream configured."
+    /// Pre-populate the `upstream` OnceCell so tests can exercise
+    /// rendering paths without a real fixture repo. Returns `Err`
+    /// via [`OnceCell::set`]'s semantics if the cell was already
+    /// populated.
+    pub fn preseed_upstream(
+        &self,
+        value: Option<UpstreamState>,
+    ) -> Result<(), Arc<Option<UpstreamState>>> {
+        self.upstream.set(Arc::new(value))
+    }
+
+    /// Upstream-tracking state, scanned lazily on first access.
+    /// Returns `Arc<None>` when the branch has no tracking upstream,
+    /// when HEAD is detached / unborn / an `OtherRef`, or when no
+    /// repo handle is held. Ahead/behind renderers treat `Arc<None>`
+    /// the same as "no upstream configured."
     #[must_use]
     pub fn upstream(&self) -> Arc<Option<UpstreamState>> {
-        self.upstream.get_or_init(|| Arc::new(None)).clone()
+        self.upstream
+            .get_or_init(|| match &self.repo {
+                Some(repo) => Arc::new(compute_upstream(repo, &self.head).unwrap_or_else(|err| {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "linesmith: git ahead/behind scan failed: {err}"
+                    );
+                    None
+                })),
+                None => Arc::new(None),
+            })
+            .clone()
     }
 }
 
@@ -258,6 +282,100 @@ fn compute_dirty(repo: &gix::Repository) -> Result<DirtyState, Box<dyn std::erro
         }
     }
     Ok(DirtyState::Clean)
+}
+
+/// Resolve upstream tracking branch + count ahead/behind relative to
+/// HEAD. Returns `Ok(None)` when there is no upstream configured or
+/// HEAD cannot tip a branch (detached, unborn, other-ref).
+fn compute_upstream(
+    repo: &gix::Repository,
+    head: &Head,
+) -> Result<Option<UpstreamState>, Box<dyn std::error::Error>> {
+    let Head::Branch(_) = head else {
+        return Ok(None);
+    };
+
+    let head_ref = match repo.head_ref()? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let upstream_ref_name = match head_ref.remote_tracking_ref_name(gix::remote::Direction::Fetch) {
+        Some(Ok(name)) => name.into_owned(),
+        Some(Err(e)) => return Err(Box::new(e)),
+        None => return Ok(None),
+    };
+
+    let mut upstream_ref = match repo.try_find_reference(upstream_ref_name.as_ref())? {
+        Some(r) => r,
+        None => return Ok(None),
+    };
+    let upstream_oid = upstream_ref.peel_to_id_in_place()?.detach();
+    let head_oid = head_ref.id().detach();
+
+    // Explicit merge-base + `selected()` filter avoids gix's
+    // `with_pruned` which is commit-time-based and flakes when
+    // commits share a timestamp. Walk each tip, skipping commits
+    // reachable from the merge-base.
+    let (ahead, behind) = match repo.merge_base(head_oid, upstream_oid) {
+        Ok(base) => {
+            let base_oid = base.detach();
+            let ahead = count_ancestors_excluding(repo, head_oid, base_oid)?;
+            let behind = count_ancestors_excluding(repo, upstream_oid, base_oid)?;
+            (ahead, behind)
+        }
+        // No common ancestor (unrelated histories) — treat every
+        // commit on each side as its own divergence.
+        Err(_) => {
+            let ahead = repo.rev_walk([head_oid]).all()?.count();
+            let behind = repo.rev_walk([upstream_oid]).all()?.count();
+            (ahead, behind)
+        }
+    };
+
+    let upstream_branch = upstream_ref_name.as_bstr().to_string();
+    let upstream_branch = upstream_branch
+        .strip_prefix("refs/remotes/")
+        .map_or(upstream_branch.clone(), str::to_string);
+
+    Ok(Some(UpstreamState {
+        ahead: u32::try_from(ahead).unwrap_or(u32::MAX),
+        behind: u32::try_from(behind).unwrap_or(u32::MAX),
+        upstream_branch,
+    }))
+}
+
+/// Count commits reachable from `tip` but not from `stop` (and not
+/// `stop` itself). BFS from `tip`; queue all parents except those
+/// reachable from `stop`.
+fn count_ancestors_excluding(
+    repo: &gix::Repository,
+    tip: gix::ObjectId,
+    stop: gix::ObjectId,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    use std::collections::HashSet;
+    if tip == stop {
+        return Ok(0);
+    }
+    // Pre-load every ancestor of `stop` into an exclusion set so we
+    // can short-circuit walks into shared history.
+    let mut excluded: HashSet<gix::ObjectId> = HashSet::new();
+    excluded.insert(stop);
+    for info in repo.rev_walk([stop]).all()? {
+        excluded.insert(info?.id);
+    }
+
+    let mut visited: HashSet<gix::ObjectId> = HashSet::new();
+    let mut count = 0usize;
+    for info in repo.rev_walk([tip]).all()? {
+        let info = info?;
+        if excluded.contains(&info.id) {
+            continue;
+        }
+        if visited.insert(info.id) {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 fn classify_kind(repo: &gix::Repository) -> RepoKind {
@@ -444,12 +562,184 @@ mod tests {
     }
 
     #[test]
-    fn upstream_is_none_until_walker_lands() {
+    fn upstream_is_none_when_no_gix_repo_held() {
         let ctx = GitContext::new(
             RepoKind::Main,
             PathBuf::from("/tmp/.git"),
             Head::Branch("main".into()),
         );
+        assert!(ctx.upstream().is_none());
+    }
+
+    #[test]
+    fn upstream_is_none_when_no_tracking_branch_configured() {
+        let tmp = TempDir::new().expect("tmp");
+        let path = fixture_with_commit(&tmp);
+        let ctx = resolve_repo(path).expect("resolve").expect("some");
+        assert!(
+            ctx.upstream().is_none(),
+            "expected None without upstream, got {:?}",
+            ctx.upstream()
+        );
+    }
+
+    /// Build local + bare-remote fixture with HEAD tracking
+    /// `origin/main`. `local_commits` extra commits on top of the
+    /// shared base stay local (ahead); `remote_commits` land in the
+    /// bare remote and are fetched without updating HEAD (behind).
+    fn fixture_with_upstream<'a>(
+        local: &'a TempDir,
+        remote: &'a TempDir,
+        local_commits: usize,
+        remote_commits: usize,
+    ) -> &'a Path {
+        use std::fs;
+        use std::process::Command;
+        let bare = remote.path();
+        let path = local.path();
+        Command::new("git")
+            .args(["init", "--bare", "--quiet", "--initial-branch=main"])
+            .current_dir(bare)
+            .status()
+            .expect("init bare");
+        Command::new("git")
+            .args(["init", "--quiet", "--initial-branch=main"])
+            .current_dir(path)
+            .status()
+            .expect("init local");
+        // Shared base commit.
+        fs::write(path.join("f"), "base").expect("write base");
+        run_git(path, &["add", "f"]);
+        run_git_commit(path, "base");
+        run_git(
+            path,
+            &["remote", "add", "origin", bare.to_str().expect("utf8 path")],
+        );
+        run_git(path, &["push", "-u", "origin", "main", "--quiet"]);
+        // Diverge: stack `local_commits` on HEAD that aren't pushed.
+        for i in 0..local_commits {
+            fs::write(path.join("f"), format!("local-{i}")).expect("write");
+            run_git(path, &["add", "f"]);
+            run_git_commit(path, &format!("local {i}"));
+        }
+        // Diverge other side: clone from bare into a unique path
+        // (so parallel tests don't collide), add commits, push back,
+        // then fetch in the local repo so origin/main moves ahead.
+        if remote_commits > 0 {
+            let other_tmp = TempDir::new().expect("other tmp");
+            let other = other_tmp.path().join("clone");
+            Command::new("git")
+                .args(["clone", "--quiet"])
+                .arg(bare)
+                .arg(&other)
+                .status()
+                .expect("clone");
+            for i in 0..remote_commits {
+                fs::write(other.join("g"), format!("remote-{i}")).expect("write");
+                run_git(&other, &["add", "g"]);
+                run_git_commit(&other, &format!("remote {i}"));
+            }
+            run_git(&other, &["push", "--quiet"]);
+            run_git(path, &["fetch", "--quiet"]);
+            drop(other_tmp);
+        }
+        path
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        use std::process::Command;
+        let status = Command::new("git")
+            .args(["-C"])
+            .arg(cwd)
+            .args(args)
+            .status()
+            .expect("git");
+        assert!(status.success(), "git {args:?} failed in {cwd:?}");
+    }
+
+    fn run_git_commit(cwd: &Path, msg: &str) {
+        use std::process::Command;
+        let status = Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t", "-C"])
+            .arg(cwd)
+            .args(["commit", "-m", msg, "--quiet"])
+            .status()
+            .expect("git commit");
+        assert!(status.success(), "git commit failed in {cwd:?}");
+    }
+
+    #[test]
+    fn upstream_reports_zero_ahead_zero_behind_when_in_sync() {
+        let local = TempDir::new().expect("local");
+        let remote = TempDir::new().expect("remote");
+        let path = fixture_with_upstream(&local, &remote, 0, 0);
+        let ctx = resolve_repo(path).expect("resolve").expect("some");
+        let upstream = ctx.upstream();
+        let state = upstream.as_ref().as_ref().expect("some upstream");
+        assert_eq!(state.ahead, 0);
+        assert_eq!(state.behind, 0);
+        assert_eq!(state.upstream_branch, "origin/main");
+    }
+
+    #[test]
+    fn upstream_reports_ahead_only_when_local_leads() {
+        let local = TempDir::new().expect("local");
+        let remote = TempDir::new().expect("remote");
+        let path = fixture_with_upstream(&local, &remote, 2, 0);
+        use std::process::Command;
+        let log = Command::new("git")
+            .args(["-C"])
+            .arg(path)
+            .args(["log", "--all", "--oneline", "--decorate", "--graph"])
+            .output()
+            .expect("log");
+        eprintln!("{}", String::from_utf8_lossy(&log.stdout));
+        let head = Command::new("git")
+            .args(["-C"])
+            .arg(path)
+            .args(["rev-parse", "HEAD", "origin/main"])
+            .output()
+            .expect("rev-parse");
+        eprintln!("rev-parse: {}", String::from_utf8_lossy(&head.stdout));
+        let ctx = resolve_repo(path).expect("resolve").expect("some");
+        let upstream = ctx.upstream();
+        let state = upstream.as_ref().as_ref().expect("some upstream");
+        assert_eq!(state.ahead, 2);
+        assert_eq!(state.behind, 0);
+    }
+
+    #[test]
+    fn upstream_reports_behind_only_when_remote_leads() {
+        let local = TempDir::new().expect("local");
+        let remote = TempDir::new().expect("remote");
+        let path = fixture_with_upstream(&local, &remote, 0, 3);
+        let ctx = resolve_repo(path).expect("resolve").expect("some");
+        let upstream = ctx.upstream();
+        let state = upstream.as_ref().as_ref().expect("some upstream");
+        assert_eq!(state.ahead, 0);
+        assert_eq!(state.behind, 3);
+    }
+
+    #[test]
+    fn upstream_reports_both_when_diverged() {
+        let local = TempDir::new().expect("local");
+        let remote = TempDir::new().expect("remote");
+        let path = fixture_with_upstream(&local, &remote, 2, 3);
+        let ctx = resolve_repo(path).expect("resolve").expect("some");
+        let upstream = ctx.upstream();
+        let state = upstream.as_ref().as_ref().expect("some upstream");
+        assert_eq!(state.ahead, 2);
+        assert_eq!(state.behind, 3);
+    }
+
+    #[test]
+    fn upstream_is_none_on_detached_head() {
+        let tmp = TempDir::new().expect("tmp");
+        let path = fixture_with_commit(&tmp);
+        // Detach HEAD at the current commit.
+        run_git(path, &["checkout", "--detach", "HEAD"]);
+        let ctx = resolve_repo(path).expect("resolve").expect("some");
+        assert!(matches!(ctx.head, Head::Detached(_)));
         assert!(ctx.upstream().is_none());
     }
 

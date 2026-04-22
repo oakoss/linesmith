@@ -989,12 +989,15 @@ version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ee8eb4088fece3562af4a5d751e069f90e93345524ad730512185234c4b55f1"
 dependencies = [
+ "bitflags",
  "bstr",
  "gix-commitgraph",
  "gix-date",
  "gix-hash",
+ "gix-hashtable",
  "gix-object",
  "gix-revwalk",
+ "gix-trace",
  "thiserror 1.0.69",
 ]
 

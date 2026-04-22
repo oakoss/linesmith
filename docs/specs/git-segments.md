@@ -1,7 +1,7 @@
 # Git Segments
 
 - Status: draft
-- Version: 0.1.1
+- Version: 0.1.2
 - Last updated: 2026-04-21
 - Driving ADRs: [ADR-0001](../adrs/0001-use-rust-for-runtime.md), [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md)
 
@@ -227,8 +227,8 @@ Render output is a single `RenderedSegment` with multiple `StyledRun`s so each p
 
 ### Ahead/behind computation
 
-- If `head` is `Detached` or `Unborn`: no upstream exists; `upstream` OnceCell resolves to `Arc::new(None)`. Segment behavior below applies.
-- If `head` is `Branch`, resolve the upstream ref for the current branch via gix's upstream lookup. On success, use gix's ahead/behind walker with the HEAD and upstream tips and store the result as `Some(UpstreamState { ahead, behind, upstream_branch })`. On missing upstream, store `None`.
+- If `head` is `Detached`, `Unborn`, or `OtherRef`: no upstream exists; `upstream` OnceCell resolves to `Arc::new(None)`. Segment behavior below applies.
+- If `head` is `Branch`, resolve the upstream ref via `Reference::remote_tracking_ref_name(Direction::Fetch)`. When a tracking ref is configured, compute `merge_base(head, upstream)` and count ancestors of each tip that are not reachable from the merge base; the resulting `(ahead, behind)` becomes `Some(UpstreamState { ahead, behind, upstream_branch })`. Missing tracking ref or missing merge base: store `None`. (Why the manual walk: gix 0.67's `rev_walk().with_pruned([...])` uses a commit-time cutoff that flakes when two commits share a timestamp — a real risk in statusline renders against fast-moving test fixtures.)
 - Segment rendering then depends on config:
   - Upstream present, `ahead == 0 && behind == 0`: hidden if `hide_when_zero = true`, otherwise rendered as `↑0 ↓0`
   - Upstream present, non-zero: rendered per `ahead_format` / `behind_format`
@@ -334,6 +334,14 @@ Each fixture runs the full render pipeline (stdin → config → segment render 
 
 ## Change log
 
+- 2026-04-21 (v0.1.2): ahead/behind counters shipped. `GitContext::upstream`
+  resolves the tracking ref via
+  `Reference::remote_tracking_ref_name(Direction::Fetch)`, then counts
+  ancestors via an explicit `merge_base` + BFS instead of
+  `rev_walk().with_pruned(...)` (the latter's commit-time cutoff is
+  non-deterministic when timestamps collide). `[segments.git_branch.ahead_behind]`
+  config table honored per §Config schema; gix feature set now
+  includes `"revision"` for `merge_base`.
 - 2026-04-21 (v0.1.1): reconciliations with the shipped
   implementation:
   - `GitError` variants carry `message: String` instead of

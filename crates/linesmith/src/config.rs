@@ -286,6 +286,7 @@ fn segment_override_schema(id: &str) -> Option<&'static [&'static str]> {
         "truncation_marker",
         "short_sha_length",
         "dirty",
+        "ahead_behind",
     ];
     match id {
         "model" | "workspace" | "cost" | "effort" | "context_window" => Some(BUILT_IN_COMMON),
