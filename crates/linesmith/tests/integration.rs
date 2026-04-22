@@ -1,8 +1,36 @@
 use std::io::Cursor;
+use std::process::Command;
 use std::str::FromStr;
 
 const CLAUDE_MINIMAL: &str = include_str!("fixtures/claude_minimal.json");
 const CLAUDE_WORKTREE: &str = include_str!("fixtures/claude_worktree.json");
+
+/// Run `git <args>` inside `cwd` with an isolated config (global /
+/// system configs bypassed, hooks disabled, signing off, default
+/// branch pinned). Panics with the child's stderr + exit code on
+/// failure so CI logs carry enough context to diagnose without
+/// re-running locally.
+fn run_git(cwd: &std::path::Path, args: &[&str]) {
+    let out = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["-c", "commit.gpgsign=false"])
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(["-c", "init.defaultBranch=main"])
+        .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .expect("spawn git");
+    assert!(
+        out.status.success(),
+        "git {args:?} in {cwd:?} exited {:?}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
 
 #[test]
 fn renders_model_and_workspace_when_outside_worktree() {
@@ -15,10 +43,9 @@ fn renders_model_and_workspace_when_outside_worktree() {
 }
 
 #[test]
-fn renders_full_payload_with_cost_effort_and_worktree() {
-    // The stdin `rate_limits` field is no longer consumed; rate-limit
-    // segments are opt-in so a first-run user doesn't trigger a
-    // Keychain prompt from the default line.
+fn renders_full_payload_with_cost_effort_and_workspace() {
+    // Rate-limit segments are opt-in, so a first-run user doesn't
+    // trigger a Keychain prompt from the default line.
     let mut out = Vec::new();
     linesmith::run(Cursor::new(CLAUDE_WORKTREE), &mut out).expect("run ok");
     let rendered = String::from_utf8(out).expect("utf8");
@@ -28,13 +55,21 @@ fn renders_full_payload_with_cost_effort_and_worktree() {
         "42% · 200k",
         "$1.23",
         "high",
-        "linesmith/feat-segments",
+        "linesmith",
     ] {
         assert!(
             rendered.contains(substring),
             "expected {substring:?} in {rendered:?}"
         );
     }
+    // Guard: workspace sources worktree-name from gix discovery now,
+    // not stdin. `run()` leaves cwd unset, so the hybrid form must
+    // NOT appear here — even though the fixture carries a
+    // `git_worktree` field.
+    assert!(
+        !rendered.contains("linesmith/"),
+        "workspace must not emit hybrid form without a real linked-worktree cwd: {rendered:?}"
+    );
     for absent in ["5h", "7d", "rate_limit"] {
         assert!(
             !rendered.contains(absent),
@@ -53,27 +88,28 @@ fn malformed_json_exits_zero_with_marker_line() {
 
 #[test]
 fn narrow_terminal_drops_cost_and_effort_first() {
-    // Full line is ~95 cells. 50 cells must drop cost and effort (highest
-    // priorities) before it touches context_window or workspace.
+    // Budget chosen so the two highest drop-priorities (cost, effort)
+    // drop before context_window or workspace get touched.
     let mut out = Vec::new();
-    linesmith::run_with_width(Cursor::new(CLAUDE_WORKTREE), &mut out, 50).expect("run ok");
+    linesmith::run_with_width(Cursor::new(CLAUDE_WORKTREE), &mut out, 40).expect("run ok");
     let rendered = String::from_utf8(out).expect("utf8");
-    assert!(!rendered.contains("$1.23"), "cost should drop at 50 cells");
-    assert!(!rendered.contains("high"), "effort should drop at 50 cells");
+    assert!(!rendered.contains("$1.23"), "cost should drop first");
+    assert!(!rendered.contains("high"), "effort should drop second");
     assert!(rendered.contains("42% · 200k"));
-    assert!(rendered.contains("linesmith/feat-segments"));
+    assert!(rendered.contains("linesmith"));
+    assert!(
+        !rendered.contains("linesmith/"),
+        "no worktree cwd here: {rendered:?}"
+    );
 }
 
 #[test]
 fn extreme_narrow_keeps_only_lowest_priority_segments() {
-    // 30 cells: everything above workspace's priority-16 must drop; the
-    // workspace segment ("linesmith/feat-segments") is 23 cells and fits.
+    // Budget tight enough that only workspace (lowest drop-priority)
+    // survives, even though context_window would fit alone.
     let mut out = Vec::new();
-    linesmith::run_with_width(Cursor::new(CLAUDE_WORKTREE), &mut out, 30).expect("run ok");
-    assert_eq!(
-        String::from_utf8(out).expect("utf8"),
-        "linesmith/feat-segments\n"
-    );
+    linesmith::run_with_width(Cursor::new(CLAUDE_WORKTREE), &mut out, 10).expect("run ok");
+    assert_eq!(String::from_utf8(out).expect("utf8"), "linesmith\n");
 }
 
 #[test]
@@ -173,6 +209,116 @@ fn git_branch_renders_unborn_head_via_full_driver_path() {
     );
 }
 
+/// Set up a primary checkout + one linked worktree via `git worktree
+/// add`, returning `(primary_tempdir, worktree_parent_tempdir,
+/// worktree_path)`. Tempdirs are held by the caller so the worktree
+/// stays live for the duration of the test.
+fn linked_worktree_fixture(
+    name: &str,
+) -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
+    use tempfile::TempDir;
+
+    let primary = TempDir::new().expect("primary tempdir");
+    let wt_parent = TempDir::new().expect("worktree tempdir");
+    run_git(primary.path(), &["init", "--quiet"]);
+    run_git(
+        primary.path(),
+        &["commit", "--allow-empty", "-m", "seed", "--quiet"],
+    );
+    let worktree_dir = wt_parent.path().join(name);
+    run_git(
+        primary.path(),
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            name,
+            worktree_dir.to_str().expect("utf8 path"),
+        ],
+    );
+    (primary, wt_parent, worktree_dir)
+}
+
+fn cli_env_with_config(
+    worktree_dir: std::path::PathBuf,
+    config_toml: &str,
+) -> (linesmith::CliEnv, tempfile::TempDir) {
+    use tempfile::TempDir;
+
+    let xdg = TempDir::new().expect("xdg tempdir");
+    let config_dir = xdg.path().join("linesmith");
+    std::fs::create_dir_all(&config_dir).expect("mkdir");
+    std::fs::write(config_dir.join("config.toml"), config_toml).expect("write config");
+
+    let mut env = linesmith::CliEnv::for_tests();
+    env.cwd = Some(worktree_dir);
+    env.xdg_config_home = Some(xdg.path().to_string_lossy().into_owned());
+    (env, xdg)
+}
+
+#[test]
+fn renders_worktree_hybrid_with_real_linked_worktree() {
+    let (_primary, _wt_parent, worktree_dir) = linked_worktree_fixture("feat-segments");
+    let (env, _xdg) = cli_env_with_config(
+        worktree_dir,
+        r#"
+            [line]
+            segments = ["workspace"]
+        "#,
+    );
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = linesmith::cli_main(
+        std::iter::empty::<&str>(),
+        Cursor::new(CLAUDE_MINIMAL),
+        &mut stdout,
+        &mut stderr,
+        &env,
+    );
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        String::from_utf8(stdout).expect("utf8"),
+        "linesmith/feat-segments\n"
+    );
+}
+
+#[test]
+fn workspace_and_git_branch_coexist_on_linked_worktree() {
+    // Spec §Coordination: both segments render distinct payloads on a
+    // linked worktree. `workspace` shows the worktree name, `git_branch`
+    // shows the branch. No suppression.
+    let (_primary, _wt_parent, worktree_dir) = linked_worktree_fixture("feat-segments");
+    let (env, _xdg) = cli_env_with_config(
+        worktree_dir,
+        r#"
+            [line]
+            segments = ["workspace", "git_branch"]
+        "#,
+    );
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = linesmith::cli_main(
+        std::iter::empty::<&str>(),
+        Cursor::new(CLAUDE_MINIMAL),
+        &mut stdout,
+        &mut stderr,
+        &env,
+    );
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&stderr));
+    let rendered = String::from_utf8(stdout).expect("utf8");
+    assert!(
+        rendered.contains("linesmith/feat-segments"),
+        "workspace hybrid missing: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("feat-segments") && rendered.matches("feat-segments").count() >= 2,
+        "git_branch should render the branch name alongside workspace: {rendered:?}"
+    );
+}
+
 #[test]
 fn git_branch_hides_outside_repo() {
     use tempfile::TempDir;
@@ -225,7 +371,7 @@ fn config_reorders_and_filters_segments() {
     linesmith::run_with_segments_and_width(Cursor::new(CLAUDE_WORKTREE), &mut out, &segments, 200)
         .expect("run ok");
     let rendered = String::from_utf8(out).expect("utf8");
-    assert_eq!(rendered, "linesmith/feat-segments Claude Sonnet 4.6\n");
+    assert_eq!(rendered, "linesmith Claude Sonnet 4.6\n");
 }
 
 #[test]

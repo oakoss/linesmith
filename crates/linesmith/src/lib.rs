@@ -267,8 +267,7 @@ mod tests {
         let json = br#"{
             "model": { "display_name": "Claude Sonnet 4.6" },
             "workspace": {
-                "project_dir": "/home/dev/linesmith",
-                "git_worktree": { "name": "feat-auth", "path": "/wt/feat-auth" }
+                "project_dir": "/home/dev/linesmith"
             },
             "context_window": {
                 "used_percentage": 42.5,
@@ -281,7 +280,7 @@ mod tests {
         run(Cursor::new(json), &mut out).expect("run ok");
         assert_eq!(
             String::from_utf8(out).expect("utf8"),
-            "Claude Sonnet 4.6 42% · 200k linesmith/feat-auth\n"
+            "Claude Sonnet 4.6 42% · 200k linesmith\n"
         );
     }
 }

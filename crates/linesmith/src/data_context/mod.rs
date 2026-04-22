@@ -27,6 +27,7 @@ pub mod jsonl;
 pub mod usage;
 
 use std::cell::OnceCell;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -228,6 +229,10 @@ impl DataContext {
     ///
     /// Runs [`git::resolve_repo`] against [`Self::cwd`] on first call
     /// and memoizes the result. An unset cwd resolves to `Ok(None)`.
+    /// On the first `Err`, writes the cause to stderr with the
+    /// `linesmith:` prefix so every consumer inherits the log without
+    /// having to re-emit — the `docs/specs/git-segments.md` §Data
+    /// dependency contract that each segment's render path relies on.
     #[must_use]
     pub fn git(&self) -> Arc<Result<Option<GitContext>, GitError>> {
         // `gix::Repository` is not `Sync`, which trips the
@@ -242,6 +247,12 @@ impl DataContext {
                     Some(cwd) => git::resolve_repo(cwd),
                     None => Ok(None),
                 };
+                if let Err(err) = &result {
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "linesmith: git discovery failed: {err}"
+                    );
+                }
                 Arc::new(result)
             })
             .clone()
