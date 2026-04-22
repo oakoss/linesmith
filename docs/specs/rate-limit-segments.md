@@ -1,9 +1,9 @@
 # Rate-Limit Segments
 
 - Status: draft
-- Version: 0.1
-- Last updated: 2026-04-19
-- Driving ADRs: [ADR-0011](../adrs/0011-rate-limit-data-source.md)
+- Version: 0.2
+- Last updated: 2026-04-22
+- Driving ADRs: [ADR-0011](../adrs/0011-rate-limit-data-source.md), [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md)
 
 ## Overview
 
@@ -32,7 +32,7 @@ Behavior requirements:
 - All five segments declare `DataDep::Usage` via the `Segment` trait ([data-fetching.md](data-fetching.md) §Segment dependency declaration). They do NOT declare `DataDep::Credentials` directly: the `ctx.usage()` implementation pulls in credentials internally only when it needs to hit the endpoint (cache misses), so fresh-cache hits avoid the Keychain subprocess entirely.
 - Each segment reads `ctx.usage()` once per render; never repeats fetch logic
 - Render format per segment is config-driven (percent vs progress bar; duration vs progress bar)
-- When `ctx.usage()` returns the JSONL-derived fallback, display carries a visible marker (`~` prefix by default; configurable)
+- In JSONL mode (`Ok(UsageData::Jsonl(_))`), display shape changes (tokens instead of percent) AND carries a `~` prefix; full signal taxonomy in §JSONL-fallback display
 - Error states (`NoCredentials`, `Timeout`, `RateLimited`, `ApiError`, `ParseError`) render explicit text so users can diagnose without checking logs
 - `extra_usage` is auto-hidden when `is_enabled = false` — no empty-state placeholder
 - The reset segments hide entirely if `resets_at` is missing or in the past (stale data already handled by the cache TTL in ADR-0011)
@@ -40,7 +40,7 @@ Behavior requirements:
 ### Non-functional
 
 - Each segment's render completes in <1ms (data is already in `DataContext`; no I/O in the render path)
-- Forward-compat: segments consume only documented `UsageData` fields; new Anthropic codenamed buckets surface as `UsageData::unknown_buckets` and are ignored
+- Forward-compat: segments consume only documented fields; new Anthropic codenamed buckets surface as `EndpointUsage::unknown_buckets` and are ignored
 - Stable config keys: renaming a segment ID is a breaking change and warrants a v0.2 migration note
 - No allocation-per-render beyond the output `String`
 
@@ -53,18 +53,18 @@ Segments are enabled in the main `[line.segments]` array ([config.md](config.md)
 ```toml
 [segments.rate_limit_5h]
 enabled = true
-format  = "percent"         # "percent" | "progress"
-invert  = false             # false = show elapsed/used; true = show remaining
-progress_width = 20         # cells, when format = "progress"
+format  = "percent"         # "percent" | "progress"; ignored in JSONL mode (tokens only)
+invert  = false             # false = show elapsed/used; true = show remaining; ignored in JSONL mode
+progress_width = 20         # cells, when format = "progress"; ignored in JSONL mode
 icon = ""                   # optional prefix (empty string = no icon)
 label = "5h"                # label text; "" hides the label entirely
-stale_marker = "~"          # prefix for JSONL-fallback values
+stale_marker = "~"          # prefix for JSONL-mode values
 
 [segments.rate_limit_7d]
 enabled = true
-format  = "percent"
-invert  = false
-progress_width = 20
+format  = "percent"         # ignored in JSONL mode
+invert  = false             # ignored in JSONL mode
+progress_width = 20         # ignored in JSONL mode
 icon = ""
 label = "7d"
 stale_marker = "~"
@@ -134,9 +134,10 @@ The render snippets below use `Option<String>` shorthand to focus on the rate-li
 5h: 78%
 7d: 67%
 
-# JSONL fallback (endpoint unreachable)
-~5h: 22%
-~7d: 33%
+# JSONL mode (endpoint unreachable) — raw token counts, no synthesized percentage
+~5h: 420k
+~7d: 1.2M
+~5h reset: 2hr 43m                # derived from FiveHourWindow.ends_at
 
 # Error states
 5h: [No credentials]
@@ -159,43 +160,60 @@ extra: $12.50
 fn render(&self, ctx: &DataContext) -> Option<String> {
     let usage = ctx.usage();            // Arc<Result<UsageData, UsageError>>
     match &*usage {
-        Ok(data) => {
+        Ok(UsageData::Endpoint(e)) => {
             let bucket = if self.id() == "rate_limit_5h" {
-                data.five_hour.as_ref()
+                e.five_hour.as_ref()
             } else {
-                data.seven_day.as_ref()
+                e.seven_day.as_ref()
             };
-            bucket.map(|b| self.format_percent(data, b))
+            bucket.map(|b| self.format_percent(b))
+        }
+        Ok(UsageData::Jsonl(j)) => {
+            // 5h: None when no activity in the current block → hide.
+            // 7d: JsonlUsage::seven_day is always populated (zero-valued
+            // on an empty transcript), so no early-hide here.
+            let tokens = match self.id() {
+                "rate_limit_5h" => j.five_hour.as_ref()?.tokens.total(),
+                "rate_limit_7d" => j.seven_day.tokens.total(),
+                _ => unreachable!(),
+            };
+            Some(self.format_jsonl_tokens(tokens))
         }
         Err(e) => Some(self.render_error(e)),
     }
 }
 ```
 
-`format_percent` applies `invert`, clamps to `[0, 100]`, picks `percent` or `progress` format, applies `stale_marker` if `data.source == UsageSource::Jsonl`, and wraps with `label` / `icon`.
+`format_percent` applies `invert`, clamps to `[0, 100]`, picks `percent` or `progress` format, and wraps with `label` / `icon`. `format_jsonl_tokens` routes the raw token count through `format_tokens` (`420k` / `1.2M` compact form), prepends `stale_marker`, and wraps with `label` / `icon`. The `invert`, `format = "progress"`, and `progress_width` config keys are ignored in JSONL mode: no "used vs remaining" axis exists on a raw count without a ceiling, and a progress bar requires a 0-100 value.
 
 #### `rate_limit_5h_reset` and `rate_limit_7d_reset`
 
 ```rust
 fn render(&self, ctx: &DataContext) -> Option<String> {
     let usage = ctx.usage();
-    match &*usage {
-        Ok(data) => {
+    let (resets_at, is_jsonl) = match &*usage {
+        Ok(UsageData::Endpoint(e)) => {
             let bucket = match self.id() {
-                "rate_limit_5h_reset" => data.five_hour.as_ref()?,
-                "rate_limit_7d_reset" => data.seven_day.as_ref()?,
+                "rate_limit_5h_reset" => e.five_hour.as_ref()?,
+                "rate_limit_7d_reset" => e.seven_day.as_ref()?,
                 _ => unreachable!(),
             };
-            let resets_at = bucket.resets_at.as_ref()?;
-            let now = chrono::Utc::now();
-            let remaining = resets_at.signed_duration_since(now);
-            if remaining <= chrono::Duration::zero() {
-                return None;  // already reset; stale data, hide
-            }
-            Some(self.format_duration(remaining, data.source))
+            (bucket.resets_at?, false)
         }
-        Err(e) => Some(self.render_error(e)),
+        Ok(UsageData::Jsonl(j)) => match self.id() {
+            // 5h reset derives from FiveHourWindow.ends_at (= block.start + 5h).
+            "rate_limit_5h_reset" => (j.five_hour.as_ref()?.ends_at, true),
+            // 7d is a rolling window in JSONL mode — no hard reset.
+            "rate_limit_7d_reset" => return None,
+            _ => unreachable!(),
+        },
+        Err(e) => return Some(self.render_error(e)),
+    };
+    let remaining = resets_at.signed_duration_since(chrono::Utc::now());
+    if remaining <= chrono::Duration::zero() {
+        return None;  // already reset; stale data, hide
     }
+    Some(self.format_duration(remaining, is_jsonl))
 }
 ```
 
@@ -205,19 +223,21 @@ fn render(&self, ctx: &DataContext) -> Option<String> {
 fn render(&self, ctx: &DataContext) -> Option<String> {
     let usage = ctx.usage();
     match &*usage {
-        Ok(data) => {
-            let extra = data.extra_usage.as_ref()?;
+        Ok(UsageData::Endpoint(e)) => {
+            let extra = e.extra_usage.as_ref()?;
             if !extra.is_enabled.unwrap_or(false) {
                 return None; // account-level disabled → hide (no error)
             }
-            Some(self.format_extra_usage(extra, data.source))
+            Some(self.format_extra_usage(extra))
         }
+        // JSONL transcripts carry no overage data; hide silently.
+        Ok(UsageData::Jsonl(_)) => None,
         Err(e) => Some(self.render_error(e)),
     }
 }
 ```
 
-The hide-on-error behavior is deliberately scoped: `extra_usage` hides only when the account has not enabled overage (`is_enabled = false`), not when the fetch fails. A user who enables the segment in their config has opted in to see its state, so endpoint/credential failures render the same `[No credentials]` / `[Timeout]` / `[Keychain error]` strings as the other rate-limit segments. Silent hide on fetch failure would make regressions indistinguishable from the "overage not enabled" case.
+The hide-on-error behavior is deliberately scoped: `extra_usage` hides when the account has not enabled overage (`is_enabled = false`) or when the fallback path is JSONL-only (no overage data in transcripts), not when the fetch fails. A user who enables the segment in their config has opted in to see its state, so endpoint/credential failures render the same `[No credentials]` / `[Timeout]` / `[Keychain error]` strings as the other rate-limit segments. Silent hide on fetch failure would make regressions indistinguishable from the "overage not enabled" case.
 
 ### Error message table
 
@@ -253,11 +273,24 @@ Error strings are intentionally concise to fit within typical statusline widths.
 
 ### JSONL-fallback display
 
-When `UsageData::source == UsageSource::Jsonl`, every rendered value gets the `stale_marker` prefix (default `~`). This is the sole indicator that the OAuth endpoint was unreachable and these values are derived from local transcripts per [jsonl-aggregation.md](jsonl-aggregation.md).
+> Until `lsm-xhu` closes, the crate's cascade still returns `Err(original)` on the JSONL path; `lsm-xhu` phase 2 flips step 7 to `Ok(UsageData::Jsonl(...))` and wires the render branches below. See the bead for status.
 
-For users who prefer no marker, setting `stale_marker = ""` suppresses it. The endpoint and fallback produce equivalent-quality 5h data; the indicator is informational.
+When `ctx.usage()` returns `Ok(UsageData::Jsonl(...))`, segments render a different shape: raw token counts via the `format_tokens` helper (`420k`, `1.2M`), still with the `~` prefix. Two signals — a shape change AND a prefix — so the mode switch survives `NO_COLOR`, 16-color terminals, or a user-set `stale_marker = ""`.
 
-JSONL fallback produces no `seven_day_sonnet` / `seven_day_opus` / `extra_usage` data. Segments that depend on those return `None` during a JSONL fallback.
+Per-segment behavior:
+
+| Segment                                     | Endpoint mode       | JSONL mode                                                   |
+| ------------------------------------------- | ------------------- | ------------------------------------------------------------ |
+| `rate_limit_5h`                             | `5h: 22%`           | `~5h: 420k` (via `FiveHourWindow.tokens.total()`)            |
+| `rate_limit_7d`                             | `7d: 33%`           | `~7d: 1.2M` (via `SevenDayWindow.tokens.total()`)            |
+| `rate_limit_5h_reset`                       | `5h reset: 4hr 37m` | `~5h reset: 4hr 37m` (derived from `FiveHourWindow.ends_at`) |
+| `rate_limit_7d_reset`                       | `7d reset: 2d 14hr` | **hidden** — rolling 7d window has no hard reset             |
+| `extra_usage`                               | `extra: $12.50`     | **hidden** — no overage data in transcripts                  |
+| Per-model (`seven_day_sonnet` etc., future) | varies              | **hidden** — no per-model split in transcripts               |
+
+Why raw tokens and not a synthesized percentage: tier detection is out of scope ([ADR-0011](../adrs/0011-rate-limit-data-source.md) §Tier handling (out of scope)), and faking a percentage against a Max-tier ceiling would ship the wrong number to every Pro/Free user who landed on the fallback path. ccstatusline handles this by emitting its error tags literally (`[No credentials]`, `[Rate limited]`) and CCometixLine by hiding the segment. linesmith's divergence is to show useful partial data instead of nothing; tokens are the unit the aggregator produces without tier inference.
+
+The `rate_limit_5h_reset` JSONL-mode timestamp is `FiveHourWindow.ends_at` (= `block.start + 5h`), matching ccstatusline's `getUsageWindowFromBlockMetrics`. The aggregator also exposes `FiveHourBlock.usage_limit_reset` ([jsonl-aggregation.md](jsonl-aggregation.md)), but its provenance is unverified and segments do not consume it; `lsm-ghpj` tracks verification before wiring.
 
 ### Staleness bounds
 
@@ -293,7 +326,7 @@ The data-fetching layer already enforces a 180s default TTL. Segments don't inde
 - **Integration tests:**
   - Full render with a stubbed `DataContext` (prepopulated `UsageData`); assert output exactly matches expected
   - Error-state rendering with stubbed `UsageError`
-  - JSONL-fallback rendering with `UsageData::source = Jsonl`
+  - JSONL-fallback rendering with `UsageData::Jsonl(_)`: assert token-shaped output, `~` prefix, reset derives from `FiveHourWindow.ends_at`, and the segments spec'd to hide (`rate_limit_7d_reset`, `extra_usage`, per-model) actually return `None`
 
 - **Manual test plan:**
   - Enable all five segments in a config; verify rendering on a live Max account
@@ -310,4 +343,13 @@ The data-fetching layer already enforces a 180s default TTL. Segments don't inde
 
 ## Change log
 
+- 2026-04-22 (v0.2): JSONL mode renders raw `TokenCounts` per
+  [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md).
+  `UsageData` is an enum (`Endpoint` / `Jsonl`); `UsageSource`
+  deleted. `rate_limit_5h` / `_7d` render `~420k` / `~1.2M` under
+  JSONL; `rate_limit_5h_reset` derives its timestamp from
+  `FiveHourWindow.ends_at`; `rate_limit_7d_reset`, `extra_usage`,
+  and future per-model segments hide. `invert` /
+  `format = "progress"` / `progress_width` config keys are ignored
+  in JSONL mode.
 - 2026-04-19: initial draft (v0.1). Defines five segment IDs, their config schemas, render formats (percent/progress/duration/currency), error-state rendering table, JSONL-fallback marker convention, and render semantics. Driven by ADR-0011; cross-references data-fetching.md and credentials.md.

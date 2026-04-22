@@ -1,8 +1,8 @@
 # Data Fetching
 
 - Status: draft
-- Version: 0.1.1
-- Last updated: 2026-04-19
+- Version: 0.1.2
+- Last updated: 2026-04-22
 - Driving ADRs: [ADR-0009](../adrs/0009-json-parsing-stack.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md), [ADR-0012](../adrs/0012-per-process-execution.md)
 
 ## Overview
@@ -189,7 +189,48 @@ Per-process model: `JsonlTailer` is created fresh per invocation; `last_offset =
 
 ### OAuth usage cache stack
 
-Three-tier per [ADR-0010](../adrs/0010-data-fetching-architecture.md):
+`DataContext::usage()` surfaces a `UsageData` enum whose variant encodes provenance. Per [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md):
+
+```rust
+#[non_exhaustive]
+pub enum UsageData {
+    Endpoint(EndpointUsage),
+    Jsonl(JsonlUsage),
+}
+
+#[non_exhaustive]
+pub struct EndpointUsage {
+    pub five_hour:            Option<UsageBucket>,
+    pub seven_day:            Option<UsageBucket>,
+    pub seven_day_opus:       Option<UsageBucket>,
+    pub seven_day_sonnet:     Option<UsageBucket>,
+    pub seven_day_oauth_apps: Option<UsageBucket>,
+    pub extra_usage:          Option<ExtraUsage>,
+    pub unknown_buckets:      HashMap<String, serde_json::Value>,
+}
+
+/// `seven_day` is always populated (zero-valued on empty transcripts);
+/// `five_hour` is `None` when the current 5h block has no activity.
+pub struct JsonlUsage {
+    pub(crate) five_hour: Option<FiveHourWindow>,
+    pub(crate) seven_day: SevenDayWindow,
+}
+
+pub struct FiveHourWindow {
+    pub(crate) tokens:  TokenCounts,   // four-category breakdown owned by aggregator; segments call `.total()`
+    pub(crate) ends_at: DateTime<Utc>, // invariant: ends_at == block.start + Duration::hours(5)
+}
+
+pub struct SevenDayWindow {
+    pub(crate) tokens: TokenCounts,    // no reset_at — rolling window, no hard reset
+}
+```
+
+`JsonlUsage` and the two window types expose `pub(crate)` fields plus smart constructors (`JsonlUsage::new`, `FiveHourWindow::new`, `SevenDayWindow::new`) so the aggregator owns the invariants. `#[non_exhaustive]` sits on `UsageData` (SemVer room for a future variant) and on `EndpointUsage` (upstream Anthropic can ship new bucket categories — `unknown_buckets` is evidence of prior churn); the JSONL-side structs don't need it because their fields are locked by the aggregator contract.
+
+Only `UsageData::Endpoint(...)` is cached on disk. `UsageData::Jsonl(...)` is derived from `~/.claude/projects/**/*.jsonl` — themselves the primary on-disk record — so round-tripping JSONL through a second cache layer buys nothing. The cache schema below carries endpoint fields only; a future `schema_version` bump would be required to introduce a discriminator if that ever changes.
+
+Three-tier cache stack per [ADR-0010](../adrs/0010-data-fetching-architecture.md):
 
 | Tier        | Location                         | TTL  | Purpose                                                                                                        |
 | ----------- | -------------------------------- | ---- | -------------------------------------------------------------------------------------------------------------- |
@@ -289,13 +330,13 @@ The runtime does NOT call accessors for undeclared deps, so those `OnceCell`s st
 3. Check lock file; if active AND disk cache has stale data, return stale (no credential read needed for this path either).
 4. Read credentials via `ctx.credentials()`. Only reached when we genuinely need to call the endpoint.
 5. If credentials missing: record `NoCredentials` error, skip to JSONL fallback (step 7).
-6. Hit the endpoint with 2s timeout. On 200, cache + return. On 429/timeout/network error with no stale cache, skip to JSONL fallback.
-7. JSONL fallback: scan `~/.claude/projects/*/*.jsonl`, aggregate into 5h blocks, 7d windows.
-8. If JSONL also empty: surface the original error (`NoCredentials`, `Timeout`, `RateLimited`, etc.).
+6. Hit the endpoint with 2s timeout. On 200, build `UsageData::Endpoint(...)`, cache + return. On 429/timeout/network error with no stale cache, skip to JSONL fallback.
+7. JSONL fallback: scan `~/.claude/projects/*/*.jsonl`, aggregate into 5h blocks + 7d window, and return `Ok(UsageData::Jsonl(...))` — NOT the masked-as-`Err(original)` path that v0.1.1 used.
+8. If JSONL also empty or errors: surface the original error (`NoCredentials`, `Timeout`, `RateLimited`, etc.).
 
 Credentials are resolved before the endpoint call (step 4 before step 6), preserving the ADR-0011 rule that `NoCredentials` is never masked as `Timeout`. This spec deliberately reorders the pure cache reads (steps 1-3) ahead of credentials compared to ADR-0011's step-2 placement, because cache hits and stale-lock serving have no need of a token — that avoids the Keychain subprocess on cache hits without weakening the `NoCredentials`-distinct-from-`Timeout` guarantee. When ADR-0011's cascade is re-read strictly in order, only the endpoint-fetch path ever reaches credentials anyway, so the behavior is equivalent even though the numbered ordering differs.
 
-JSONL-derived values are tagged `UsageData::source = UsageSource::Jsonl` so segments can display a visible indicator (prefix `~` or dim color per segment spec).
+JSONL-derived values land in the dedicated [`UsageData::Jsonl`](#oauth-usage-cache-stack) variant, which carries raw `TokenCounts` rather than synthesized percentages. Segments switch their render shape on the variant ([rate-limit-segments.md §JSONL-fallback display](rate-limit-segments.md)); no tier ceiling is hardcoded. This intentionally diverges from ccstatusline (returns error-tagged widgets in JSONL mode) and CCometixLine (hides the segment); linesmith ships useful partial data in JSONL mode where both peers do not. Full rationale in [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md).
 
 ### Concurrent processes
 
@@ -353,3 +394,8 @@ Rename-based locking avoids platform-specific `flock`/`LockFileEx` gymnastics an
 
 - 2026-04-19: initial draft (v0.1). Sets out `DataContext` shape, segment dependency declaration, per-source fetch strategies, OAuth fallback cascade, and atomic-write/schema-version conventions. Driven by ADR-0009, ADR-0010, ADR-0012.
 - 2026-04-19: v0.1.1 additive update. Adds `DataDep::Git` + `DataContext::git()` accessor + `GitContext`/`GitError` type pointers to [git-segments.md](git-segments.md). No behavior change for existing sources; git-aware segments opt in via `DataDep::Git`.
+- 2026-04-22: v0.1.2. Cascade step 7 returns `Ok(UsageData::Jsonl(...))`;
+  flat struct + `UsageSource` tag replaced by
+  `UsageData::{Endpoint, Jsonl}` enum carrying `TokenCounts` on the
+  JSONL arm. Per [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md);
+  resolves jsonl-aggregation tier-ceiling open question.

@@ -1,15 +1,15 @@
 # JSONL Aggregation
 
 - Status: draft
-- Version: 0.1
-- Last updated: 2026-04-21
+- Version: 0.2
+- Last updated: 2026-04-22
 - Driving ADRs: [ADR-0009](../adrs/0009-json-parsing-stack.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md), [ADR-0011](../adrs/0011-rate-limit-data-source.md)
 
 ## Overview
 
 The JSONL aggregator is the terminal fallback for the rate-limit data pipeline. When the OAuth `/api/oauth/usage` endpoint is unreachable (no credentials, revoked token, network down, active lock without stale cache), the cascade in [data-fetching.md](data-fetching.md) §OAuth fallback cascade drops to reading Claude Code's own transcript files under `~/.claude/projects/**/*.jsonl`. This spec defines the aggregator's types, record shape, block-math semantics, and project-root discovery.
 
-The aggregator is a read-only port of the math from [`ryoppippi/ccusage`](https://github.com/ryoppippi/ccusage)'s `_session-blocks.ts` (MIT). It produces raw token counts and block boundaries — not rate-limit utilization percentages. Mapping those counts onto [`UsageBucket`](data-fetching.md#oauth-usage-cache-stack) is the orchestrator's responsibility ([Open questions](#open-questions) below).
+The aggregator is a read-only port of the math from [`ryoppippi/ccusage`](https://github.com/ryoppippi/ccusage)'s `_session-blocks.ts` (MIT). It produces raw token counts and block boundaries — not rate-limit utilization percentages. The orchestrator wraps the aggregator's output in [`UsageData::Jsonl`](data-fetching.md#oauth-usage-cache-stack) per [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md); segments render raw `TokenCounts` in JSONL mode rather than synthesizing a percentage against a tier ceiling.
 
 This spec does NOT cover: the `ctx.usage()` fallback orchestration (lives in [data-fetching.md](data-fetching.md) §OAuth fallback cascade), segment rendering of JSONL-derived values ([rate-limit-segments.md](rate-limit-segments.md) §JSONL-fallback display), or the `JsonlTailer` byte-offset incremental reader (covered in [data-fetching.md](data-fetching.md) §JSONL incremental tail).
 
@@ -83,7 +83,14 @@ pub struct FiveHourBlock {
     /// casing variants.
     pub models: Vec<String>,
     /// Claude API reset hint if the most recent entry carried one.
-    /// See [§Open questions](#open-questions) for provenance caveats.
+    /// Provenance is unverified — Claude Code may emit this only
+    /// during rate-limited interactions and the timestamp's semantic
+    /// (next 5h reset vs 429 lift) is not confirmed. Segments do NOT
+    /// consume this field as of v0.2; the `rate_limit_5h_reset`
+    /// JSONL-mode render uses [`FiveHourBlock::end`] instead. Kept on
+    /// the aggregator for future use once `lsm-ghpj` verifies the
+    /// semantic; at that point [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md)
+    /// may be revised to wire this field into the render path.
     pub usage_limit_reset: Option<DateTime<Utc>>,
 }
 
@@ -344,8 +351,6 @@ The working set is bounded by the 7-day window: once an entry falls outside that
 
 ## Open questions
 
-- **Utilization without tier detection.** The JSONL aggregator produces raw token counts but no percentage. [`UsageBucket.utilization`](data-fetching.md#oauth-usage-cache-stack) is `Percent` (required). The orchestrator must decide how to map a count to a percentage when `source = Jsonl` — likely a single hardcoded conservative estimate for v0.1, or skipping the bucket (`Option<UsageBucket>` already is `None`-able), or surfacing a distinct `JsonlTokens { five_hour: u64, seven_day: u64 }` side-channel. Resolution lives with `lsm-wwd` (cascade orchestrator).
-
 - **`usageLimitResetTime` provenance.** ccusage consumes this field, but neither [research/jsonl-data-source.md](../research/jsonl-data-source.md) nor Claude Code's documentation confirms when exactly Claude Code writes it. Empirically it appears only on some rate-limited interactions. The v0.1 aggregator surfaces it when present and lets the orchestrator decide what to do with a `None`.
 
 - **Log rotation.** Claude Code might rotate long-running session transcripts — unverified. If it does, a session's entries span multiple files and dedup across them becomes load-bearing. Current design handles this correctly (dedup is cross-file) but the test fixtures don't explicitly cover the rotation case. File a follow-up if rotation is confirmed.
@@ -358,4 +363,12 @@ The working set is bounded by the 7-day window: once an entry falls outside that
 
 ## Change log
 
+- 2026-04-22 (v0.2): open question "utilization without tier detection" resolved by
+  [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md) — the orchestrator
+  surfaces a distinct [`UsageData::Jsonl`](data-fetching.md#oauth-usage-cache-stack)
+  variant carrying raw `TokenCounts`. Documented
+  [`FiveHourBlock::usage_limit_reset`] as unverified and unconsumed;
+  `lsm-ghpj` tracks verification. See
+  [rate-limit-segments.md §JSONL-fallback display](rate-limit-segments.md)
+  for the per-segment render table.
 - 2026-04-21: initial draft (v0.1). Defines `JsonlAggregate` / `FiveHourBlock` / `SevenDayWindow` / `TokenCounts` / `JsonlError`, per-line record schema, project-root discovery cascade, 5h block math (ccusage `_session-blocks.ts` port), 7d window math, dedup semantics, malformed-line handling. Driving ADRs: ADR-0009, ADR-0010, ADR-0011.

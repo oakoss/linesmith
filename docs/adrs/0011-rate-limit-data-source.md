@@ -1,6 +1,7 @@
 # Use the Anthropic OAuth usage endpoint for rate-limit data, with JSONL and credential-cascade fallbacks
 
 - Status: accepted
+- Amended by: [ADR-0013](0013-jsonl-fallback-carries-token-counts.md) — §Fallback cascade step 5 and the implicit `UsageData` shape. Endpoint, auth, cache, and credential-cascade decisions stand.
 - Date: 2026-04-18
 - Deciders: Jace
 

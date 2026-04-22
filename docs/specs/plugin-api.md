@@ -194,7 +194,7 @@ For source-specific data shapes (`ctx.usage.data`, `ctx.git.data`, etc.), plugin
 
 **`StatusContext` field shape** (accessible as `ctx.status.*`). Same as v0.1's `ctx.*` convention:
 
-**Variant naming convention:** Rust `UpperCamelCase` variants are exposed to rhai as `snake_case` strings. `Tool::ClaudeCode` → `"claude_code"`; `UsageSource::Endpoint` → `"endpoint"`. This convention is uniform across every enum exposed to plugins.
+**Variant naming convention:** Rust `UpperCamelCase` variants are exposed to rhai as `snake_case` strings. `Tool::ClaudeCode` → `"claude_code"`; `RepoKind::LinkedWorktree` → `"linked_worktree"`. This convention is uniform across every enum exposed to plugins.
 
 **Nullability:** Rust `Option<T>` surfaces as rhai `()` when `None` (rhai's unit, equivalent to JSON null). Always check for `()` before accessing sub-fields.
 
