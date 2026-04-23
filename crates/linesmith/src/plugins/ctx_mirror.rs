@@ -17,6 +17,7 @@ use std::sync::OnceLock;
 use rhai::{Array, Dynamic, Map};
 use serde_json::Value as JsonValue;
 
+use super::engine::{MAX_ARRAY_SIZE, MAX_EXPR_DEPTH, MAX_MAP_SIZE, MAX_STRING_SIZE};
 use crate::data_context::{
     DataContext, DataDep, DirtyCounts, DirtyState, EndpointUsage, ExtraUsage, FiveHourWindow,
     GitContext, Head, JsonlUsage, RepoKind, SevenDayWindow, TokenCounts, UpstreamState,
@@ -27,6 +28,100 @@ use crate::input::{
 };
 
 const ENV_WHITELIST: &[&str] = &["TERM", "COLORTERM", "NO_COLOR", "FORCE_COLOR", "LANG"];
+
+/// Max nesting depth when converting server- or stdin-supplied JSON
+/// into a rhai `Dynamic`. Caps host-side recursion so a nested-object
+/// bomb cannot blow the stack — rhai's `MAX_EXPR_DEPTH` gates script
+/// parsing, not the mirror walk. Tied to the same ceiling so script
+/// and host walks share a consistent policy.
+const MAX_JSON_DEPTH: usize = MAX_EXPR_DEPTH;
+
+/// Controls which host-side caps apply during a JSON → rhai
+/// conversion. The escape-hatch variant preserves the documented
+/// round-trip of `ctx.status.raw` (see `docs/specs/plugin-api.md`);
+/// stack safety is non-negotiable so the depth guard fires in both
+/// postures, but breadth/string/key caps would silently break
+/// plugins reading tool-specific fields through the escape hatch.
+#[derive(Clone, Copy)]
+enum CapPosture {
+    /// Full caps: depth, map breadth, array breadth, string size, key
+    /// size. For server-controlled payloads such as
+    /// `ctx.usage.unknown_buckets` values where the source has no
+    /// reason to emit unbounded content.
+    Strict,
+    /// Depth cap only. For `ctx.status.raw` — the escape hatch that
+    /// must round-trip whatever the upstream tool emits.
+    EscapeHatch,
+}
+
+impl CapPosture {
+    fn is_strict(self) -> bool {
+        matches!(self, CapPosture::Strict)
+    }
+}
+
+/// Accumulated counts of host-side cap hits during one JSON conversion.
+/// The walk mutates this in place so a pathological payload emits at
+/// most one aggregated `lsm_warn!` per top-level call — a single line
+/// instead of one per offending subtree. Counters use `saturating_add`
+/// to stay correct on adversarial payloads even if the same category
+/// fires more than `usize::MAX` times.
+#[derive(Default)]
+struct ConversionLimits {
+    depth_collapsed: usize,
+    map_truncated: usize,
+    array_truncated: usize,
+    string_truncated: usize,
+    map_key_dropped: usize,
+}
+
+impl ConversionLimits {
+    fn is_empty(&self) -> bool {
+        self.depth_collapsed == 0
+            && self.map_truncated == 0
+            && self.array_truncated == 0
+            && self.string_truncated == 0
+            && self.map_key_dropped == 0
+    }
+
+    fn emit_warn(&self, label: &str) {
+        if self.is_empty() {
+            return;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if self.depth_collapsed > 0 {
+            parts.push(format!(
+                "{} subtree(s) collapsed at depth {MAX_JSON_DEPTH}",
+                self.depth_collapsed
+            ));
+        }
+        if self.map_truncated > 0 {
+            parts.push(format!(
+                "{} map(s) truncated at {MAX_MAP_SIZE} entries",
+                self.map_truncated
+            ));
+        }
+        if self.array_truncated > 0 {
+            parts.push(format!(
+                "{} array(s) truncated at {MAX_ARRAY_SIZE} items",
+                self.array_truncated
+            ));
+        }
+        if self.string_truncated > 0 {
+            parts.push(format!(
+                "{} string(s) truncated at {MAX_STRING_SIZE} bytes",
+                self.string_truncated
+            ));
+        }
+        if self.map_key_dropped > 0 {
+            parts.push(format!(
+                "{} entries dropped for keys longer than {MAX_STRING_SIZE} bytes",
+                self.map_key_dropped
+            ));
+        }
+        crate::lsm_warn!("{label}: {}", parts.join("; "));
+    }
+}
 
 /// Build the `ctx` value a plugin's `render(ctx)` function sees.
 ///
@@ -319,10 +414,51 @@ fn build_token_counts(t: &TokenCounts) -> Dynamic {
 }
 
 fn build_unknown_buckets(map: &std::collections::HashMap<String, JsonValue>) -> Dynamic {
+    // Server-controlled payload: cap entry count at MAX_MAP_SIZE and
+    // skip keys longer than MAX_STRING_SIZE. rhai's script-side limits
+    // don't apply to host-constructed Maps, so a buggy or malicious
+    // /api/oauth/usage response has to be bounded here. Sort keys so
+    // truncation is deterministic across renders — HashMap iteration
+    // order is process-randomized, and without sorting the surviving
+    // subset would rotate per render, flickering a specific bucket in
+    // and out of a plugin's view.
+    let mut sorted: Vec<(&String, &JsonValue)> = map.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(b.0));
+
     let mut m = Map::new();
-    for (k, v) in map {
-        m.insert(k.as_str().into(), json_to_dynamic(v));
+    let mut dropped_oversize_keys: usize = 0;
+    let mut truncated = false;
+    let mut limits = ConversionLimits::default();
+    for (k, v) in sorted {
+        // INVARIANT: the breadth and key-size guards must fire *before*
+        // `json_to_dynamic_walk`. Reorder and this scope's `limits`
+        // would double-count top-level truncation against the per-value
+        // counters the `(values)` warn reports.
+        if m.len() >= MAX_MAP_SIZE {
+            truncated = true;
+            break;
+        }
+        if k.len() > MAX_STRING_SIZE {
+            dropped_oversize_keys = dropped_oversize_keys.saturating_add(1);
+            continue;
+        }
+        m.insert(
+            k.as_str().into(),
+            json_to_dynamic_walk(v, 0, CapPosture::Strict, &mut limits),
+        );
     }
+    if truncated {
+        crate::lsm_warn!(
+            "ctx.usage.unknown_buckets: truncated to {MAX_MAP_SIZE} entries (source had {})",
+            map.len(),
+        );
+    }
+    if dropped_oversize_keys > 0 {
+        crate::lsm_warn!(
+            "ctx.usage.unknown_buckets: dropped {dropped_oversize_keys} entries with keys longer than {MAX_STRING_SIZE} bytes",
+        );
+    }
+    limits.emit_warn("ctx.usage.unknown_buckets (values)");
     Dynamic::from_map(m)
 }
 
@@ -529,8 +665,31 @@ where
 
 /// `Arc<serde_json::Value>` is the stdin escape hatch exposed as
 /// `ctx.status.raw`. Convert recursively so plugins can read tool-
-/// specific fields the canonical `StatusContext` doesn't model.
+/// specific fields the canonical `StatusContext` doesn't model. The
+/// depth guard runs so recursion is stack-safe, but no other cap
+/// applies — see `CapPosture::EscapeHatch` and the plugin-api spec.
 fn json_to_dynamic(v: &JsonValue) -> Dynamic {
+    let mut limits = ConversionLimits::default();
+    let out = json_to_dynamic_walk(v, 0, CapPosture::EscapeHatch, &mut limits);
+    limits.emit_warn("ctx.status.raw");
+    out
+}
+
+fn json_to_dynamic_walk(
+    v: &JsonValue,
+    depth: usize,
+    posture: CapPosture,
+    limits: &mut ConversionLimits,
+) -> Dynamic {
+    if depth >= MAX_JSON_DEPTH {
+        // A nested-object bomb hits this guard before it blows the
+        // Rust stack. Collapse the subtree to `()` so the rest of the
+        // mirror survives. Note: `JsonValue::Null` also maps to `()`,
+        // so plugins cannot distinguish truncated from genuinely-null
+        // without the aggregated warn emitted by `emit_warn`.
+        limits.depth_collapsed = limits.depth_collapsed.saturating_add(1);
+        return Dynamic::UNIT;
+    }
     match v {
         JsonValue::Null => Dynamic::UNIT,
         JsonValue::Bool(b) => Dynamic::from(*b),
@@ -548,19 +707,65 @@ fn json_to_dynamic(v: &JsonValue) -> Dynamic {
                 Dynamic::from(n.as_u64().map_or(0.0_f64, |u| u as f64))
             }
         }
-        JsonValue::String(s) => Dynamic::from(s.clone()),
+        JsonValue::String(s) => {
+            if posture.is_strict() && s.len() > MAX_STRING_SIZE {
+                limits.string_truncated = limits.string_truncated.saturating_add(1);
+                Dynamic::from(truncate_utf8(s, MAX_STRING_SIZE))
+            } else {
+                Dynamic::from(s.clone())
+            }
+        }
         JsonValue::Array(arr) => {
-            let items: Array = arr.iter().map(json_to_dynamic).collect();
+            let cap = if posture.is_strict() {
+                MAX_ARRAY_SIZE
+            } else {
+                usize::MAX
+            };
+            let items: Array = arr
+                .iter()
+                .take(cap)
+                .map(|item| json_to_dynamic_walk(item, depth + 1, posture, limits))
+                .collect();
+            if posture.is_strict() && arr.len() > MAX_ARRAY_SIZE {
+                limits.array_truncated = limits.array_truncated.saturating_add(1);
+            }
             Dynamic::from_array(items)
         }
         JsonValue::Object(obj) => {
+            let strict = posture.is_strict();
             let mut m = Map::new();
+            let mut iter_broke = false;
             for (k, val) in obj {
-                m.insert(k.as_str().into(), json_to_dynamic(val));
+                if strict && m.len() >= MAX_MAP_SIZE {
+                    iter_broke = true;
+                    break;
+                }
+                if strict && k.len() > MAX_STRING_SIZE {
+                    limits.map_key_dropped = limits.map_key_dropped.saturating_add(1);
+                    continue;
+                }
+                m.insert(
+                    k.as_str().into(),
+                    json_to_dynamic_walk(val, depth + 1, posture, limits),
+                );
+            }
+            if iter_broke {
+                limits.map_truncated = limits.map_truncated.saturating_add(1);
             }
             Dynamic::from_map(m)
         }
     }
+}
+
+fn truncate_utf8(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
 }
 
 fn int_from_u64(n: u64) -> Dynamic {
@@ -1231,6 +1436,601 @@ mod tests {
         assert!(arr.is_empty());
         let obj: Map = raw_map.get("obj").unwrap().clone().try_cast().unwrap();
         assert!(obj.is_empty());
+    }
+
+    #[test]
+    fn unknown_buckets_drop_oversize_keys() {
+        // Keys longer than MAX_STRING_SIZE are skipped — rhai's engine
+        // limit is enforced script-side, not on host-built maps, so
+        // the mirror is the only place a key bomb can be caught.
+        use crate::data_context::{EndpointUsage, UsageData};
+        let mut unknown = std::collections::HashMap::new();
+        let huge_key = "x".repeat(MAX_STRING_SIZE + 1);
+        unknown.insert(huge_key.clone(), serde_json::Value::Null);
+        unknown.insert("ok_key".to_string(), serde_json::Value::Bool(true));
+        let data = UsageData::Endpoint(EndpointUsage {
+            five_hour: None,
+            seven_day: None,
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            seven_day_oauth_apps: None,
+            extra_usage: None,
+            unknown_buckets: unknown,
+        });
+        let dc = DataContext::new(minimal_status());
+        dc.preseed_usage(Ok(data)).expect("seed");
+        let ctx = build_and_unwrap_map(&dc, &[DataDep::Usage]);
+        let payload: Map = ctx
+            .get("usage")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("data")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        let mirrored: Map = payload
+            .get("unknown_buckets")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        assert!(
+            mirrored.contains_key("ok_key"),
+            "normal-sized key must survive",
+        );
+        assert!(
+            !mirrored.contains_key(huge_key.as_str()),
+            "oversize key must be dropped",
+        );
+    }
+
+    fn build_nested_object_chain(depth_links: usize, leaf: JsonValue) -> JsonValue {
+        // Wrap a leaf value in `depth_links` layers of `{"nest": ...}`,
+        // so the root is a Map and the value at depth `depth_links` is
+        // `leaf`. Caller chooses the exact position relative to the cap.
+        let mut v = leaf;
+        for _ in 0..depth_links {
+            v = serde_json::json!({ "nest": v });
+        }
+        v
+    }
+
+    #[test]
+    fn raw_json_at_exact_max_depth_survives_one_deeper_collapses() {
+        // Pin the `>=` boundary: the value at depth MAX_JSON_DEPTH - 1
+        // must still be a real Dynamic, and the value at depth
+        // MAX_JSON_DEPTH must collapse to `()`. A future refactor to
+        // `>` would survive the "beyond the cap" test but break this
+        // one.
+        let leaf = serde_json::json!({ "leaf": "bottom" });
+        // Root is depth 0. `build_nested_object_chain(N, leaf)` puts
+        // `leaf` at depth N. Build exactly MAX_JSON_DEPTH links so the
+        // deepest Map in the input sits at depth MAX_JSON_DEPTH.
+        let nested = build_nested_object_chain(MAX_JSON_DEPTH, leaf);
+        let mut s = minimal_status();
+        s.raw = Arc::new(nested);
+        let dc = DataContext::new(s);
+        let ctx = build_and_unwrap_map(&dc, &[]);
+        let mut cursor = status_map(&ctx)
+            .get("raw")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap();
+        // Walk MAX_JSON_DEPTH - 1 links. After each `.get("nest")` +
+        // cast, cursor sits one level deeper. After MAX_JSON_DEPTH - 1
+        // iterations we are at depth MAX_JSON_DEPTH - 1 (still a Map).
+        for _ in 0..(MAX_JSON_DEPTH - 1) {
+            let next = cursor.get("nest").expect("nest key below cap").clone();
+            cursor = next.try_cast::<Map>().expect("map below cap");
+        }
+        // Depth MAX_JSON_DEPTH - 1 is still below the cap: `.get("nest")`
+        // returns the value at depth MAX_JSON_DEPTH, which is where the
+        // guard fires.
+        let capped = cursor.get("nest").expect("nest at cap").clone();
+        assert!(
+            capped.is_unit(),
+            "value at depth MAX_JSON_DEPTH must collapse to ()",
+        );
+    }
+
+    #[test]
+    fn raw_json_nested_arrays_beyond_max_depth_collapse_to_unit() {
+        // The depth guard runs in the Array arm too; pin it with a
+        // pure-array chain so a refactor that drops the array-side
+        // increment is caught.
+        let mut nested = serde_json::json!("leaf");
+        for _ in 0..(MAX_JSON_DEPTH + 2) {
+            nested = serde_json::json!([nested]);
+        }
+        let mut s = minimal_status();
+        s.raw = Arc::new(nested);
+        let dc = DataContext::new(s);
+        let ctx = build_and_unwrap_map(&dc, &[]);
+        let mut cursor: Array = status_map(&ctx)
+            .get("raw")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        for _ in 0..(MAX_JSON_DEPTH - 1) {
+            let next = cursor[0].clone();
+            cursor = next.try_cast::<Array>().expect("array below cap");
+        }
+        assert!(
+            cursor[0].is_unit(),
+            "array element at depth MAX_JSON_DEPTH must collapse to ()",
+        );
+    }
+
+    #[test]
+    fn raw_json_nested_object_preserves_all_entries_as_escape_hatch() {
+        // `ctx.status.raw` is the documented escape hatch for tool-
+        // specific fields; breadth caps would silently break plugins
+        // that read through it. Under EscapeHatch posture, every
+        // entry of a nested object must round-trip.
+        let mut obj = serde_json::Map::new();
+        for i in 0..(MAX_MAP_SIZE + 50) {
+            obj.insert(format!("key_{i:04}"), serde_json::Value::Bool(true));
+        }
+        let expected = obj.len();
+        let mut s = minimal_status();
+        s.raw = Arc::new(serde_json::Value::Object(obj));
+        let dc = DataContext::new(s);
+        let ctx = build_and_unwrap_map(&dc, &[]);
+        let raw_map: Map = status_map(&ctx)
+            .get("raw")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        assert_eq!(raw_map.len(), expected);
+    }
+
+    #[test]
+    fn raw_json_nested_array_preserves_all_items_as_escape_hatch() {
+        // Symmetric with the nested-object EscapeHatch test above:
+        // array breadth must round-trip on `ctx.status.raw` so plugins
+        // reading tool-specific lists (e.g. diagnostic traces) see the
+        // full payload.
+        let arr: Vec<JsonValue> = (0..(MAX_ARRAY_SIZE + 50))
+            .map(|i| serde_json::Value::from(i as i64))
+            .collect();
+        let expected = arr.len();
+        let mut s = minimal_status();
+        s.raw = Arc::new(serde_json::Value::Array(arr));
+        let dc = DataContext::new(s);
+        let ctx = build_and_unwrap_map(&dc, &[]);
+        let raw_arr: Array = status_map(&ctx)
+            .get("raw")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        assert_eq!(raw_arr.len(), expected);
+    }
+
+    #[test]
+    fn raw_json_oversize_string_preserves_full_content_as_escape_hatch() {
+        // Strings on the raw path must round-trip regardless of size
+        // — see the `ctx.status.raw` resource-posture note in
+        // docs/specs/plugin-api.md.
+        let oversized = "a".repeat(MAX_STRING_SIZE * 2);
+        let mut s = minimal_status();
+        s.raw = Arc::new(serde_json::json!({ "big": oversized.clone() }));
+        let dc = DataContext::new(s);
+        let ctx = build_and_unwrap_map(&dc, &[]);
+        let raw_map: Map = status_map(&ctx)
+            .get("raw")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        let big = raw_map
+            .get("big")
+            .unwrap()
+            .clone()
+            .try_cast::<String>()
+            .unwrap();
+        assert_eq!(big.len(), oversized.len());
+    }
+
+    #[test]
+    fn unknown_buckets_value_nested_object_truncates_under_strict() {
+        // Strict posture (bucket values): nested objects are breadth-
+        // capped. Server-controlled data has no escape-hatch exemption.
+        use crate::data_context::{EndpointUsage, UsageData};
+        let mut obj = serde_json::Map::new();
+        for i in 0..(MAX_MAP_SIZE + 50) {
+            obj.insert(format!("key_{i:04}"), serde_json::Value::Bool(true));
+        }
+        let mut unknown = std::collections::HashMap::new();
+        unknown.insert("wide_value".to_string(), serde_json::Value::Object(obj));
+        let data = UsageData::Endpoint(EndpointUsage {
+            five_hour: None,
+            seven_day: None,
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            seven_day_oauth_apps: None,
+            extra_usage: None,
+            unknown_buckets: unknown,
+        });
+        let dc = DataContext::new(minimal_status());
+        dc.preseed_usage(Ok(data)).expect("seed");
+        let ctx = build_and_unwrap_map(&dc, &[DataDep::Usage]);
+        let value: Map = ctx
+            .get("usage")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("data")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("unknown_buckets")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("wide_value")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        assert_eq!(value.len(), MAX_MAP_SIZE);
+    }
+
+    #[test]
+    fn unknown_buckets_value_nested_array_truncates_under_strict() {
+        use crate::data_context::{EndpointUsage, UsageData};
+        let arr: Vec<JsonValue> = (0..(MAX_ARRAY_SIZE + 50))
+            .map(|i| serde_json::Value::from(i as i64))
+            .collect();
+        let mut unknown = std::collections::HashMap::new();
+        unknown.insert("wide_array".to_string(), serde_json::Value::Array(arr));
+        let data = UsageData::Endpoint(EndpointUsage {
+            five_hour: None,
+            seven_day: None,
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            seven_day_oauth_apps: None,
+            extra_usage: None,
+            unknown_buckets: unknown,
+        });
+        let dc = DataContext::new(minimal_status());
+        dc.preseed_usage(Ok(data)).expect("seed");
+        let ctx = build_and_unwrap_map(&dc, &[DataDep::Usage]);
+        let value: Array = ctx
+            .get("usage")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("data")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("unknown_buckets")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("wide_array")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        assert_eq!(value.len(), MAX_ARRAY_SIZE);
+    }
+
+    #[test]
+    fn unknown_buckets_value_oversize_string_is_truncated_under_strict() {
+        use crate::data_context::{EndpointUsage, UsageData};
+        let oversized = "a".repeat(MAX_STRING_SIZE * 2);
+        let mut unknown = std::collections::HashMap::new();
+        unknown.insert(
+            "big".to_string(),
+            serde_json::Value::String(oversized.clone()),
+        );
+        let data = UsageData::Endpoint(EndpointUsage {
+            five_hour: None,
+            seven_day: None,
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            seven_day_oauth_apps: None,
+            extra_usage: None,
+            unknown_buckets: unknown,
+        });
+        let dc = DataContext::new(minimal_status());
+        dc.preseed_usage(Ok(data)).expect("seed");
+        let ctx = build_and_unwrap_map(&dc, &[DataDep::Usage]);
+        let big: String = ctx
+            .get("usage")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("data")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("unknown_buckets")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("big")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        assert_eq!(big.len(), MAX_STRING_SIZE);
+    }
+
+    #[test]
+    fn unknown_buckets_value_multibyte_string_truncates_at_utf8_boundary() {
+        // 3-byte char ('€' = 0xE2 0x82 0xAC). MAX_STRING_SIZE = 1024
+        // does not align with 3 bytes (1024 = 341*3 + 1), so a byte-
+        // index-1024 truncation lands mid-codepoint. `truncate_utf8`
+        // must back up to the nearest char boundary — byte index 1023,
+        // which retains 341 full characters. A `s[..max_bytes]` naïve
+        // slice would panic; `from_utf8_lossy` would contaminate with
+        // replacement chars.
+        use crate::data_context::{EndpointUsage, UsageData};
+        let char_bytes = "€".len();
+        let char_count = MAX_STRING_SIZE / char_bytes + 1;
+        let oversized: String = "€".repeat(char_count);
+        let mut unknown = std::collections::HashMap::new();
+        unknown.insert(
+            "euros".to_string(),
+            serde_json::Value::String(oversized.clone()),
+        );
+        let data = UsageData::Endpoint(EndpointUsage {
+            five_hour: None,
+            seven_day: None,
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            seven_day_oauth_apps: None,
+            extra_usage: None,
+            unknown_buckets: unknown,
+        });
+        let dc = DataContext::new(minimal_status());
+        dc.preseed_usage(Ok(data)).expect("seed");
+        let ctx = build_and_unwrap_map(&dc, &[DataDep::Usage]);
+        let euros: String = ctx
+            .get("usage")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("data")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("unknown_buckets")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("euros")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        assert!(
+            euros.len() <= MAX_STRING_SIZE,
+            "truncation must not exceed MAX_STRING_SIZE",
+        );
+        assert!(
+            euros.chars().all(|c| c == '€'),
+            "truncation must land on a UTF-8 char boundary",
+        );
+        assert_eq!(
+            euros.len() % char_bytes,
+            0,
+            "byte length divisible by char size"
+        );
+    }
+
+    #[test]
+    fn unknown_buckets_at_exact_max_map_size_are_not_truncated() {
+        // Pin the `>=` off-by-one: exactly MAX_MAP_SIZE entries must
+        // all survive. One fewer than this count was the bug vector
+        // for the upstream `>` vs `>=` corner.
+        use crate::data_context::{EndpointUsage, UsageData};
+        let mut unknown = std::collections::HashMap::new();
+        for i in 0..MAX_MAP_SIZE {
+            unknown.insert(format!("bucket_{i:04}"), serde_json::Value::Null);
+        }
+        let data = UsageData::Endpoint(EndpointUsage {
+            five_hour: None,
+            seven_day: None,
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            seven_day_oauth_apps: None,
+            extra_usage: None,
+            unknown_buckets: unknown,
+        });
+        let dc = DataContext::new(minimal_status());
+        dc.preseed_usage(Ok(data)).expect("seed");
+        let ctx = build_and_unwrap_map(&dc, &[DataDep::Usage]);
+        let mirrored: Map = ctx
+            .get("usage")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("data")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("unknown_buckets")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        assert_eq!(mirrored.len(), MAX_MAP_SIZE);
+    }
+
+    #[test]
+    fn unknown_buckets_key_at_exact_max_string_size_survives() {
+        // The key check uses `>`, so a key of exactly MAX_STRING_SIZE
+        // must pass through. This pins that boundary against a future
+        // `>=` refactor.
+        use crate::data_context::{EndpointUsage, UsageData};
+        let boundary_key = "x".repeat(MAX_STRING_SIZE);
+        let mut unknown = std::collections::HashMap::new();
+        unknown.insert(boundary_key.clone(), serde_json::Value::Bool(true));
+        let data = UsageData::Endpoint(EndpointUsage {
+            five_hour: None,
+            seven_day: None,
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            seven_day_oauth_apps: None,
+            extra_usage: None,
+            unknown_buckets: unknown,
+        });
+        let dc = DataContext::new(minimal_status());
+        dc.preseed_usage(Ok(data)).expect("seed");
+        let ctx = build_and_unwrap_map(&dc, &[DataDep::Usage]);
+        let mirrored: Map = ctx
+            .get("usage")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("data")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("unknown_buckets")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        assert!(mirrored.contains_key(boundary_key.as_str()));
+    }
+
+    #[test]
+    fn unknown_buckets_truncation_survives_deterministically() {
+        // HashMap iteration is process-randomized; without the sort in
+        // `build_unknown_buckets` the survivor set would rotate across
+        // renders and plugins would see specific buckets flicker in
+        // and out. This test freezes the expected survivor set.
+        use crate::data_context::{EndpointUsage, UsageData};
+        let mut unknown = std::collections::HashMap::new();
+        for i in 0..(MAX_MAP_SIZE + 10) {
+            unknown.insert(format!("bucket_{i:04}"), serde_json::Value::Null);
+        }
+        let data = UsageData::Endpoint(EndpointUsage {
+            five_hour: None,
+            seven_day: None,
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            seven_day_oauth_apps: None,
+            extra_usage: None,
+            unknown_buckets: unknown,
+        });
+        let dc = DataContext::new(minimal_status());
+        dc.preseed_usage(Ok(data)).expect("seed");
+        let ctx = build_and_unwrap_map(&dc, &[DataDep::Usage]);
+        let mirrored: Map = ctx
+            .get("usage")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("data")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("unknown_buckets")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        // Sorted lexicographically; MAX_MAP_SIZE survivors are the
+        // first MAX_MAP_SIZE lex-ordered keys.
+        for i in 0..MAX_MAP_SIZE {
+            let key = format!("bucket_{i:04}");
+            assert!(
+                mirrored.contains_key(key.as_str()),
+                "deterministic-sort survivor {key} missing",
+            );
+        }
+        for i in MAX_MAP_SIZE..(MAX_MAP_SIZE + 10) {
+            let key = format!("bucket_{i:04}");
+            assert!(
+                !mirrored.contains_key(key.as_str()),
+                "lex-larger key {key} should have been truncated",
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_buckets_value_depth_resets_per_entry() {
+        // Each bucket value gets its own MAX_JSON_DEPTH budget — the
+        // walk is called with depth=0 per value so siblings don't
+        // share recursion budget. A bucket value nested to exactly
+        // MAX_JSON_DEPTH - 1 levels must fully survive.
+        use crate::data_context::{EndpointUsage, UsageData};
+        let leaf = serde_json::json!("leaf");
+        // Place `leaf` at exactly depth MAX_JSON_DEPTH - 1 so the
+        // walk's depth counter reaches MAX_JSON_DEPTH - 1 on the leaf
+        // and does not fire the guard.
+        let deep_value = build_nested_object_chain(MAX_JSON_DEPTH - 1, leaf);
+        let mut unknown = std::collections::HashMap::new();
+        unknown.insert("deep".to_string(), deep_value);
+        let data = UsageData::Endpoint(EndpointUsage {
+            five_hour: None,
+            seven_day: None,
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            seven_day_oauth_apps: None,
+            extra_usage: None,
+            unknown_buckets: unknown,
+        });
+        let dc = DataContext::new(minimal_status());
+        dc.preseed_usage(Ok(data)).expect("seed");
+        let ctx = build_and_unwrap_map(&dc, &[DataDep::Usage]);
+        let mirrored: Map = ctx
+            .get("usage")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("data")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("unknown_buckets")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        let mut cursor: Map = mirrored.get("deep").unwrap().clone().try_cast().unwrap();
+        for _ in 0..(MAX_JSON_DEPTH - 2) {
+            let next = cursor.get("nest").expect("nest key").clone();
+            cursor = next.try_cast::<Map>().expect("map below cap");
+        }
+        let leaf_value = cursor.get("nest").expect("leaf node").clone();
+        assert_eq!(
+            leaf_value.try_cast::<String>().as_deref(),
+            Some("leaf"),
+            "value nested to depth MAX_JSON_DEPTH - 1 must fully survive because each bucket gets its own depth budget",
+        );
     }
 
     #[test]

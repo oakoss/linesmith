@@ -244,6 +244,8 @@ if ctx.status.context_window != () {
 ctx.status.raw.some_custom_field
 ```
 
+**`ctx.status.raw` resource posture.** The host mirrors `raw` with a stack-safety depth cap (the same `MAX_EXPR_DEPTH` the engine uses for script parsing); any JSON subtree nested deeper collapses to `()` and surfaces as an aggregated `lsm_warn!` on stderr. Map breadth, array breadth, string size, and key size are **not** capped on this path — `raw` is the escape hatch and must round-trip tool-specific payloads. Server-controlled sources (`ctx.usage.unknown_buckets` values, etc.) apply the full cap set.
+
 **`ctx.usage` shape** (present only when the plugin declared `@data_deps = ["usage"]`). The `data` payload mirrors `UsageData`. Per [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md), `UsageData` is an enum (`Endpoint` / `Jsonl`); the variant is discriminated by `data.kind` following the same tagged-map convention used by every other enum mirror (`repo_kind.kind`, `head.kind`, etc.). The two variants carry different fields — branch on `data.kind` before reading variant-specific keys.
 
 ```rhai
