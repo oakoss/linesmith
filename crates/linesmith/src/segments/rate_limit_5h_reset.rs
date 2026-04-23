@@ -10,7 +10,7 @@ use super::rate_limit_format::{
     CommonRateLimitConfig, DurationFormat, ResetWindow,
 };
 use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
-use crate::data_context::{DataContext, DataDep};
+use crate::data_context::{DataContext, DataDep, UsageData};
 use crate::theme::Role;
 
 #[non_exhaustive]
@@ -61,18 +61,40 @@ impl Segment for RateLimit5hResetSegment {
         let usage = ctx.usage();
         let text = match &*usage {
             Ok(data) => {
-                let Some(bucket) = data.five_hour.as_ref() else {
-                    crate::lsm_debug!("rate_limit_5h_reset: usage.five_hour absent; hiding");
-                    return Ok(None);
-                };
-                let Some(resets_at) = bucket.resets_at else {
-                    crate::lsm_debug!("rate_limit_5h_reset: five_hour.resets_at absent; hiding");
-                    return Ok(None);
+                let (resets_at, jsonl) = match data {
+                    UsageData::Endpoint(e) => {
+                        let Some(bucket) = e.five_hour.as_ref() else {
+                            crate::lsm_debug!(
+                                "rate_limit_5h_reset: endpoint usage.five_hour absent; hiding"
+                            );
+                            return Ok(None);
+                        };
+                        let Some(resets_at) = bucket.resets_at else {
+                            crate::lsm_debug!(
+                                "rate_limit_5h_reset: five_hour.resets_at absent; hiding"
+                            );
+                            return Ok(None);
+                        };
+                        (resets_at, false)
+                    }
+                    UsageData::Jsonl(j) => {
+                        // Spec §JSONL-fallback display: derive the
+                        // reset timestamp from the active block's
+                        // `ends_at` (= block.start + 5h). Hide when no
+                        // active block — same hide rule as endpoint.
+                        let Some(window) = j.five_hour.as_ref() else {
+                            crate::lsm_debug!(
+                                "rate_limit_5h_reset: jsonl five_hour block inactive; hiding"
+                            );
+                            return Ok(None);
+                        };
+                        (window.ends_at(), true)
+                    }
                 };
                 let remaining = resets_at.signed_duration_since(chrono::Utc::now());
                 if remaining <= chrono::Duration::zero() {
                     crate::lsm_debug!(
-                        "rate_limit_5h_reset: five_hour.resets_at in the past ({resets_at}); hiding"
+                        "rate_limit_5h_reset: resets_at in the past ({resets_at}); hiding"
                     );
                     return Ok(None);
                 }
@@ -82,7 +104,7 @@ impl Segment for RateLimit5hResetSegment {
                     self.compact,
                     self.use_days,
                     ResetWindow::FiveHour,
-                    data.source,
+                    jsonl,
                     &self.config,
                 )
             }
@@ -103,7 +125,10 @@ impl Segment for RateLimit5hResetSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_context::{UsageBucket, UsageData, UsageError, UsageSource};
+    use crate::data_context::{
+        EndpointUsage, FiveHourWindow, JsonlUsage, SevenDayWindow, TokenCounts, UsageBucket,
+        UsageData, UsageError,
+    };
     use crate::input::{ModelInfo, Percent, StatusContext, Tool, WorkspaceInfo};
     use chrono::Duration;
     use std::path::PathBuf;
@@ -137,8 +162,7 @@ mod tests {
         } else {
             Duration::zero()
         };
-        UsageData {
-            source: UsageSource::Endpoint,
+        UsageData::Endpoint(EndpointUsage {
             five_hour: Some(UsageBucket {
                 utilization: Percent::new(42.0).unwrap(),
                 resets_at: Some(chrono::Utc::now() + Duration::minutes(minutes) + slack),
@@ -148,7 +172,23 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
-        }
+            unknown_buckets: std::collections::HashMap::new(),
+        })
+    }
+
+    fn jsonl_data_with_reset_in(minutes: i64) -> UsageData {
+        let slack = if minutes > 0 {
+            Duration::seconds(30)
+        } else {
+            Duration::zero()
+        };
+        // Block must start 5h before the desired reset because
+        // `FiveHourWindow::ends_at()` is derived as `start + 5h`.
+        let start = chrono::Utc::now() + Duration::minutes(minutes) + slack - Duration::hours(5);
+        UsageData::Jsonl(JsonlUsage::new(
+            Some(FiveHourWindow::new(TokenCounts::default(), start)),
+            SevenDayWindow::new(TokenCounts::default()),
+        ))
     }
 
     #[test]
@@ -172,8 +212,7 @@ mod tests {
 
     #[test]
     fn hidden_when_resets_at_missing() {
-        let data = UsageData {
-            source: UsageSource::Endpoint,
+        let data = UsageData::Endpoint(EndpointUsage {
             five_hour: Some(UsageBucket {
                 utilization: Percent::new(42.0).unwrap(),
                 resets_at: None,
@@ -183,7 +222,8 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
-        };
+            unknown_buckets: std::collections::HashMap::new(),
+        });
         assert_eq!(
             RateLimit5hResetSegment::default()
                 .render(&ctx_with_usage(Ok(data)))
@@ -194,15 +234,15 @@ mod tests {
 
     #[test]
     fn hidden_when_five_hour_bucket_absent() {
-        let data = UsageData {
-            source: UsageSource::Endpoint,
+        let data = UsageData::Endpoint(EndpointUsage {
             five_hour: None,
             seven_day: None,
             seven_day_opus: None,
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
-        };
+            unknown_buckets: std::collections::HashMap::new(),
+        });
         assert_eq!(
             RateLimit5hResetSegment::default()
                 .render(&ctx_with_usage(Ok(data)))
@@ -258,15 +298,43 @@ mod tests {
     }
 
     #[test]
-    fn prefixes_stale_marker_on_jsonl_source() {
-        let mut data = data_with_reset_in(4 * 60 + 37);
-        data.source = UsageSource::Jsonl;
-        let dc = ctx_with_usage(Ok(data));
+    fn jsonl_mode_derives_reset_from_five_hour_window_ends_at() {
+        // Spec §JSONL-fallback display: reset timestamp derives from
+        // `FiveHourWindow.ends_at` (= block.start + 5h) rather than
+        // the endpoint's `resets_at`.
+        let dc = ctx_with_usage(Ok(jsonl_data_with_reset_in(4 * 60 + 37)));
         let rendered = RateLimit5hResetSegment::default()
             .render(&dc)
             .unwrap()
             .expect("visible");
         assert_eq!(rendered.text(), "~5h reset: 4hr 37m");
+    }
+
+    #[test]
+    fn jsonl_mode_hides_when_block_inactive() {
+        let dc = ctx_with_usage(Ok(UsageData::Jsonl(JsonlUsage::new(
+            None,
+            SevenDayWindow::new(TokenCounts::default()),
+        ))));
+        assert_eq!(
+            RateLimit5hResetSegment::default().render(&dc).unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn jsonl_mode_hides_when_ends_at_in_past() {
+        // The aggregator's active-block invariant should prevent this
+        // (compute_active_block hides blocks whose last activity is
+        // >5h old), but the segment's `remaining <= 0` gate must also
+        // apply to the JSONL branch as defense in depth. Regression
+        // this catches: a future aggregator loosening that lets stale
+        // blocks through must not render "0m" or a negative duration.
+        let dc = ctx_with_usage(Ok(jsonl_data_with_reset_in(-10)));
+        assert_eq!(
+            RateLimit5hResetSegment::default().render(&dc).unwrap(),
+            None,
+        );
     }
 
     #[test]

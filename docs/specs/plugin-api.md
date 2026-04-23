@@ -171,13 +171,21 @@ Plugins check `kind` before accessing `data` or `error`:
 ```rhai
 switch ctx.usage.kind {
     "ok" => {
-        let pct = ctx.usage.data.five_hour.utilization;
-        ...
+        if ctx.usage.data.kind == "endpoint" && ctx.usage.data.five_hour != () {
+            let pct = ctx.usage.data.five_hour.utilization;
+            ...
+        }
+        // See the §ctx.usage shape block below for the full jsonl branch.
     }
     "error" => {
-        // ctx.usage.error is one of: "NoCredentials" | "SubprocessFailed" |
-        //   "IoError" | "Timeout" | "RateLimited" | "NetworkError" |
-        //   "ParseError" | "Unauthorized"
+        // ctx.usage.error is one of:
+        //   "NoCredentials" | "SubprocessFailed" | "IoError" | "ParseError" |
+        //   "MissingField" | "EmptyToken" | "Timeout" | "RateLimited" |
+        //   "NetworkError" | "Unauthorized" | "NoEntries" | "DirectoryMissing"
+        // `MissingField` / `EmptyToken` come from the credentials layer;
+        // `NoEntries` / `DirectoryMissing` from the JSONL aggregator.
+        // `IoError` and `ParseError` can originate from either layer —
+        // the tag alone doesn't disambiguate provenance.
         render_error(ctx.usage.error)
     }
 }
@@ -188,7 +196,7 @@ For source-specific data shapes (`ctx.usage.data`, `ctx.git.data`, etc.), plugin
 **Special cases:**
 
 - **`ctx.git`**: the Rust accessor is `Arc<Result<Option<GitContext>, GitError>>` — a nested `Option` distinguishes "no git repo at cwd" from "gix failed." The rhai mirror collapses `Ok(None)` to `kind: "ok"` + `data: ()`. Plugins check `ctx.git.kind == "ok" && ctx.git.data != ()` before accessing fields like `ctx.git.data.head`.
-- **`ctx.usage` error codes** mirror the `UsageError` variants from [rate-limit-segments.md](rate-limit-segments.md): `"NoCredentials" | "SubprocessFailed" | "IoError" | "Timeout" | "RateLimited" | "NetworkError" | "ParseError" | "Unauthorized"`. Plugins can distinguish credential-layer failures from endpoint-layer failures via these codes without the raw credentials being exposed.
+- **`ctx.usage` error codes** mirror the `UsageError` variants from [rate-limit-segments.md](rate-limit-segments.md) plus the delegated tags from `CredentialError::code()` and `JsonlError::code()`: `"NoCredentials" | "SubprocessFailed" | "IoError" | "ParseError" | "MissingField" | "EmptyToken" | "Timeout" | "RateLimited" | "NetworkError" | "Unauthorized" | "NoEntries" | "DirectoryMissing"`. `MissingField` / `EmptyToken` surface from malformed credentials; `NoEntries` / `DirectoryMissing` from the JSONL aggregator; `IoError` and `ParseError` can originate from either layer (the tag doesn't disambiguate provenance). Plugins can branch on these codes without raw credentials being exposed.
 
 **Legacy `ctx.*` access pre-v0.2.** Scripts written against v0.1 accessed stdin fields directly (`ctx.model.display_name`, `ctx.cost`, etc.). v0.2 moves those under `ctx.status.*` to make room for the DataContext sources. Plugin authors updating existing scripts do a one-time rename from `ctx.X` → `ctx.status.X` for every stdin field. `ctx.raw` (escape hatch for tool-specific fields) stays at `ctx.status.raw` in v0.2.
 
@@ -236,28 +244,46 @@ if ctx.status.context_window != () {
 ctx.status.raw.some_custom_field
 ```
 
-**`ctx.usage` shape** (present only when the plugin declared `@data_deps = ["usage"]`). The `data` payload mirrors `UsageData`:
+**`ctx.usage` shape** (present only when the plugin declared `@data_deps = ["usage"]`). The `data` payload mirrors `UsageData`. Per [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md), `UsageData` is an enum (`Endpoint` / `Jsonl`); the variant is discriminated by `data.kind` following the same tagged-map convention used by every other enum mirror (`repo_kind.kind`, `head.kind`, etc.). The two variants carry different fields — branch on `data.kind` before reading variant-specific keys.
 
 ```rhai
 if ctx.usage.kind == "ok" {
-    ctx.usage.data.source               // "endpoint" | "jsonl"
-    if ctx.usage.data.five_hour != () {
-        ctx.usage.data.five_hour.utilization   // f64 in 0.0..=100.0
-        ctx.usage.data.five_hour.resets_at     // RFC 3339 string or ()
-    }
-    // Same shape for seven_day, seven_day_opus, seven_day_sonnet, seven_day_oauth_apps
-    if ctx.usage.data.extra_usage != () {
-        ctx.usage.data.extra_usage.is_enabled     // bool or ()
-        ctx.usage.data.extra_usage.monthly_limit  // f64 or ()
-        ctx.usage.data.extra_usage.used_credits   // f64 or ()
-        ctx.usage.data.extra_usage.currency       // ISO 4217 string or ()
+    if ctx.usage.data.kind == "endpoint" {
+        if ctx.usage.data.five_hour != () {
+            ctx.usage.data.five_hour.utilization   // f64 in 0.0..=100.0
+            ctx.usage.data.five_hour.resets_at     // RFC 3339 string or ()
+        }
+        // Same shape for seven_day, seven_day_opus, seven_day_sonnet, seven_day_oauth_apps
+        if ctx.usage.data.extra_usage != () {
+            ctx.usage.data.extra_usage.is_enabled     // bool or ()
+            ctx.usage.data.extra_usage.monthly_limit  // f64 or ()
+            ctx.usage.data.extra_usage.used_credits   // f64 or ()
+            ctx.usage.data.extra_usage.currency       // ISO 4217 string or ()
+        }
+        // ctx.usage.data.unknown_buckets is a map of any codenamed
+        // buckets Anthropic shipped that the core segments don't
+        // recognize — plugins may inspect it, core segments ignore it.
+    } else if ctx.usage.data.kind == "jsonl" {
+        // JSONL fallback: raw token counts, no utilization percentage.
+        // `seven_day` is always populated (zero-valued on an empty
+        // transcript); `five_hour` is () when no active 5h block.
+        if ctx.usage.data.five_hour != () {
+            ctx.usage.data.five_hour.tokens.total          // i64 sum across all categories
+            ctx.usage.data.five_hour.tokens.input          // i64 per category
+            ctx.usage.data.five_hour.tokens.output
+            ctx.usage.data.five_hour.tokens.cache_creation
+            ctx.usage.data.five_hour.tokens.cache_read
+            ctx.usage.data.five_hour.start                 // RFC 3339 string; block start
+            ctx.usage.data.five_hour.ends_at               // RFC 3339 string; start + 5h
+        }
+        ctx.usage.data.seven_day.tokens.total              // same shape; always present
     }
 }
 // When ctx.usage.kind == "error", ctx.usage.error is a short tag
 // string (e.g. "NoCredentials", "Timeout", "RateLimited").
 ```
 
-Use `format_countdown_until(ctx.usage.data.five_hour.resets_at)` to render a human-friendly countdown.
+Under `data.kind == "endpoint"` use `format_countdown_until(ctx.usage.data.five_hour.resets_at)` to render a human-friendly countdown. Under `data.kind == "jsonl"` use `ctx.usage.data.five_hour.ends_at` instead — `resets_at` is not present because the JSONL aggregator has no tier-aware reset timestamp.
 
 **Immutability enforcement:** `ctx` is built once per render from a `&DataContext` reference. The host configures the rhai engine so the script scope cannot mutate `ctx`: `Engine::disable_symbol("=")` is disabled for identifiers starting with `ctx`, and `ctx` is passed as an immutable `Dynamic`. Attempts to assign (`ctx.foo = bar`) are rejected at parse or runtime as a `PluginError::Runtime`.
 

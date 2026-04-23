@@ -18,8 +18,9 @@ use rhai::{Array, Dynamic, Map};
 use serde_json::Value as JsonValue;
 
 use crate::data_context::{
-    DataContext, DataDep, DirtyCounts, DirtyState, ExtraUsage, GitContext, Head, RepoKind,
-    UpstreamState, UsageBucket, UsageData, UsageSource,
+    DataContext, DataDep, DirtyCounts, DirtyState, EndpointUsage, ExtraUsage, FiveHourWindow,
+    GitContext, Head, JsonlUsage, RepoKind, SevenDayWindow, TokenCounts, UpstreamState,
+    UsageBucket, UsageData,
 };
 use crate::input::{
     ContextWindow, CostMetrics, GitWorktree, ModelInfo, StatusContext, Tool, WorkspaceInfo,
@@ -205,28 +206,30 @@ fn build_cost(c: &CostMetrics) -> Dynamic {
 }
 
 fn build_usage_data(data: &UsageData) -> Dynamic {
-    // Destructure so adding a field to UsageData surfaces as a compile
-    // error here rather than silently dropping from the rhai mirror.
-    let UsageData {
-        source,
+    // Tagged-map shape per `plugin-api.md` §ctx shape + ADR-0013:
+    // `kind` discriminates the variant; the sibling fields differ
+    // between `endpoint` and `jsonl`. Adding a new `UsageData`
+    // variant surfaces here as a non-exhaustive match error.
+    match data {
+        UsageData::Endpoint(e) => build_endpoint_usage(e),
+        UsageData::Jsonl(j) => build_jsonl_usage(j),
+    }
+}
+
+fn build_endpoint_usage(e: &EndpointUsage) -> Dynamic {
+    // Destructure so adding a field to EndpointUsage surfaces as a
+    // compile error rather than silently dropping from the rhai mirror.
+    let EndpointUsage {
         five_hour,
         seven_day,
         seven_day_opus,
         seven_day_sonnet,
         seven_day_oauth_apps,
         extra_usage,
-    } = data;
+        unknown_buckets,
+    } = e;
     let mut m = Map::new();
-    m.insert(
-        "source".into(),
-        Dynamic::from(
-            match source {
-                UsageSource::Endpoint => "endpoint",
-                UsageSource::Jsonl => "jsonl",
-            }
-            .to_string(),
-        ),
-    );
+    m.insert("kind".into(), Dynamic::from("endpoint".to_string()));
     m.insert(
         "five_hour".into(),
         five_hour.as_ref().map_or(Dynamic::UNIT, build_usage_bucket),
@@ -259,6 +262,67 @@ fn build_usage_data(data: &UsageData) -> Dynamic {
             .as_ref()
             .map_or(Dynamic::UNIT, build_extra_usage),
     );
+    m.insert(
+        "unknown_buckets".into(),
+        build_unknown_buckets(unknown_buckets),
+    );
+    Dynamic::from_map(m)
+}
+
+fn build_jsonl_usage(j: &JsonlUsage) -> Dynamic {
+    let mut m = Map::new();
+    m.insert("kind".into(), Dynamic::from("jsonl".to_string()));
+    m.insert(
+        "five_hour".into(),
+        j.five_hour
+            .as_ref()
+            .map_or(Dynamic::UNIT, build_five_hour_window),
+    );
+    m.insert("seven_day".into(), build_seven_day_window(&j.seven_day));
+    Dynamic::from_map(m)
+}
+
+fn build_five_hour_window(w: &FiveHourWindow) -> Dynamic {
+    // Destructure so adding a field to FiveHourWindow forces a mirror
+    // update. `ends_at` is derived from `start` per the type's invariant
+    // — we expose it to plugins alongside `start` since scripts rarely
+    // want to recompute the derivation themselves.
+    let FiveHourWindow { tokens, start } = w;
+    let mut m = Map::new();
+    m.insert("tokens".into(), build_token_counts(tokens));
+    m.insert("start".into(), Dynamic::from(start.to_rfc3339()));
+    m.insert("ends_at".into(), Dynamic::from(w.ends_at().to_rfc3339()));
+    Dynamic::from_map(m)
+}
+
+fn build_seven_day_window(w: &SevenDayWindow) -> Dynamic {
+    let SevenDayWindow { tokens } = w;
+    let mut m = Map::new();
+    m.insert("tokens".into(), build_token_counts(tokens));
+    Dynamic::from_map(m)
+}
+
+fn build_token_counts(t: &TokenCounts) -> Dynamic {
+    let TokenCounts {
+        input,
+        output,
+        cache_creation,
+        cache_read,
+    } = t;
+    let mut m = Map::new();
+    m.insert("input".into(), int_from_u64(*input));
+    m.insert("output".into(), int_from_u64(*output));
+    m.insert("cache_creation".into(), int_from_u64(*cache_creation));
+    m.insert("cache_read".into(), int_from_u64(*cache_read));
+    m.insert("total".into(), int_from_u64(t.total()));
+    Dynamic::from_map(m)
+}
+
+fn build_unknown_buckets(map: &std::collections::HashMap<String, JsonValue>) -> Dynamic {
+    let mut m = Map::new();
+    for (k, v) in map {
+        m.insert(k.as_str().into(), json_to_dynamic(v));
+    }
     Dynamic::from_map(m)
 }
 
@@ -564,16 +628,17 @@ mod tests {
     }
 
     #[test]
-    fn usage_ok_mirror_preserves_every_field_plugins_depend_on() {
+    fn usage_endpoint_mirror_preserves_every_field_plugins_depend_on() {
         // Plugin-facing contract: `ctx.usage.data.*` field names and
         // their scalar types are load-bearing. A rename in
-        // `UsageData` / `UsageBucket` / `ExtraUsage` must either break
-        // this test or update it so spec drift surfaces in CI.
-        use crate::data_context::{ExtraUsage, UsageBucket, UsageData, UsageSource};
+        // `EndpointUsage` / `UsageBucket` / `ExtraUsage` must either
+        // break this test or update it so spec drift surfaces in CI.
+        use crate::data_context::{EndpointUsage, ExtraUsage, UsageBucket, UsageData};
         use chrono::{TimeZone, Utc};
 
-        let data = UsageData {
-            source: UsageSource::Endpoint,
+        let mut unknown_buckets = std::collections::HashMap::new();
+        unknown_buckets.insert("iguana_necktie".to_string(), serde_json::Value::Null);
+        let data = UsageData::Endpoint(EndpointUsage {
             five_hour: Some(UsageBucket {
                 utilization: Percent::new(42.0).unwrap(),
                 resets_at: Some(Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap()),
@@ -592,7 +657,8 @@ mod tests {
                 used_credits: Some(40.0),
                 currency: Some("EUR".into()),
             }),
-        };
+            unknown_buckets,
+        });
 
         let dc = DataContext::new(minimal_status());
         dc.preseed_usage(Ok(data)).expect("seed");
@@ -619,7 +685,7 @@ mod tests {
 
         assert_eq!(
             payload
-                .get("source")
+                .get("kind")
                 .and_then(|d| d.clone().try_cast::<String>()),
             Some("endpoint".to_string()),
         );
@@ -667,20 +733,33 @@ mod tests {
                 .and_then(|d| d.clone().try_cast::<String>()),
             Some("EUR".to_string()),
         );
+        let unknown: Map = payload
+            .get("unknown_buckets")
+            .expect("unknown_buckets present")
+            .clone()
+            .try_cast()
+            .unwrap();
+        assert!(unknown.contains_key("iguana_necktie"));
     }
 
     #[test]
-    fn usage_jsonl_source_renders_as_snake_case_string() {
-        use crate::data_context::{UsageData, UsageSource};
-        let data = UsageData {
-            source: UsageSource::Jsonl,
-            five_hour: None,
-            seven_day: None,
-            seven_day_opus: None,
-            seven_day_sonnet: None,
-            seven_day_oauth_apps: None,
-            extra_usage: None,
+    fn usage_jsonl_variant_mirrors_tokens_and_ends_at() {
+        // ADR-0013 + plugin-api.md §ctx shape: jsonl variant exposes
+        // `kind: "jsonl"` with raw token counts and the 5h window's
+        // `ends_at`. Plugins read this to render the JSONL fallback
+        // — changes must break this test.
+        use crate::data_context::{
+            FiveHourWindow, JsonlUsage, SevenDayWindow, TokenCounts, UsageData,
         };
+        use chrono::{TimeZone, Utc};
+        let tokens = TokenCounts::from_parts(400_000, 20_000, 0, 0);
+        // `start + 5h` = ends_at; encode as `start` per the invariant.
+        let start = Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
+        let ends_at = Utc.with_ymd_and_hms(2099, 1, 1, 5, 0, 0).unwrap();
+        let data = UsageData::Jsonl(JsonlUsage::new(
+            Some(FiveHourWindow::new(tokens, start)),
+            SevenDayWindow::new(TokenCounts::from_parts(1_000_000, 0, 0, 0)),
+        ));
         let dc = DataContext::new(minimal_status());
         dc.preseed_usage(Ok(data)).expect("seed");
         let ctx = build_and_unwrap_map(&dc, &[DataDep::Usage]);
@@ -697,10 +776,87 @@ mod tests {
             .unwrap();
         assert_eq!(
             payload
-                .get("source")
+                .get("kind")
                 .and_then(|d| d.clone().try_cast::<String>()),
             Some("jsonl".to_string()),
         );
+        let five: Map = payload
+            .get("five_hour")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        assert_eq!(
+            five.get("ends_at")
+                .and_then(|d| d.clone().try_cast::<String>()),
+            Some(ends_at.to_rfc3339()),
+        );
+        let token_map: Map = five.get("tokens").unwrap().clone().try_cast().unwrap();
+        assert_eq!(
+            token_map
+                .get("total")
+                .and_then(|d| d.clone().try_cast::<i64>()),
+            Some(420_000),
+        );
+        let seven: Map = payload
+            .get("seven_day")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        let seven_tokens: Map = seven.get("tokens").unwrap().clone().try_cast().unwrap();
+        assert_eq!(
+            seven_tokens
+                .get("input")
+                .and_then(|d| d.clone().try_cast::<i64>()),
+            Some(1_000_000),
+        );
+        // Every token category must round-trip so plugin scripts that
+        // read `tokens.cache_read` etc. don't silently get `()`.
+        for key in ["output", "cache_creation", "cache_read"] {
+            assert!(
+                seven_tokens.contains_key(key),
+                "expected tokens.{key} on jsonl mirror",
+            );
+        }
+        // `unknown_buckets` is Endpoint-only per ADR-0013. A plugin
+        // that reads `ctx.usage.data.unknown_buckets` unconditionally
+        // against JSONL data must see it missing, not an empty map.
+        assert!(
+            !payload.contains_key("unknown_buckets"),
+            "jsonl variant must not expose unknown_buckets",
+        );
+    }
+
+    #[test]
+    fn usage_jsonl_variant_with_no_active_block_exposes_unit_five_hour() {
+        // JSONL with `five_hour: None` (inactive block) must mirror as
+        // `()` so rhai scripts can short-circuit with `if ctx.usage.data.five_hour != () { ... }`.
+        use crate::data_context::{JsonlUsage, SevenDayWindow, TokenCounts, UsageData};
+        let data = UsageData::Jsonl(JsonlUsage::new(
+            None,
+            SevenDayWindow::new(TokenCounts::default()),
+        ));
+        let dc = DataContext::new(minimal_status());
+        dc.preseed_usage(Ok(data)).expect("seed");
+        let ctx = build_and_unwrap_map(&dc, &[DataDep::Usage]);
+        let payload: Map = ctx
+            .get("usage")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("data")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        assert!(
+            payload.get("five_hour").unwrap().is_unit(),
+            "jsonl five_hour=None must mirror as rhai ()",
+        );
+        // seven_day is always present even on an empty transcript.
+        assert!(!payload.get("seven_day").unwrap().is_unit());
     }
 
     #[test]

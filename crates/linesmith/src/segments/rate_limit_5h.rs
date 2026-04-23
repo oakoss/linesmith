@@ -9,11 +9,11 @@
 use std::collections::BTreeMap;
 
 use super::rate_limit_format::{
-    apply_common_extras, format_percent, parse_bool, parse_percent_format, render_error,
-    CommonRateLimitConfig, PercentFormat,
+    apply_common_extras, format_jsonl_tokens, format_percent, parse_bool, parse_percent_format,
+    render_error, CommonRateLimitConfig, PercentFormat,
 };
 use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
-use crate::data_context::{DataContext, DataDep};
+use crate::data_context::{DataContext, DataDep, UsageData};
 use crate::theme::Role;
 
 /// Between model (64) and effort (160). Rate-limit visibility is
@@ -67,12 +67,17 @@ impl Segment for RateLimit5hSegment {
     fn render(&self, ctx: &DataContext) -> RenderResult {
         let usage = ctx.usage();
         let text = match &*usage {
-            Ok(data) => match &data.five_hour {
-                Some(bucket) => {
-                    format_percent(bucket, self.format, self.invert, data.source, &self.config)
-                }
+            Ok(UsageData::Endpoint(e)) => match &e.five_hour {
+                Some(bucket) => format_percent(bucket, self.format, self.invert, &self.config),
                 None => {
-                    crate::lsm_debug!("rate_limit_5h: usage.five_hour absent; hiding");
+                    crate::lsm_debug!("rate_limit_5h: endpoint usage.five_hour absent; hiding");
+                    return Ok(None);
+                }
+            },
+            Ok(UsageData::Jsonl(j)) => match &j.five_hour {
+                Some(window) => format_jsonl_tokens(window.tokens.total(), &self.config),
+                None => {
+                    crate::lsm_debug!("rate_limit_5h: jsonl five_hour block inactive; hiding");
                     return Ok(None);
                 }
             },
@@ -93,8 +98,12 @@ impl Segment for RateLimit5hSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_context::{ExtraUsage, UsageBucket, UsageData, UsageError, UsageSource};
+    use crate::data_context::{
+        EndpointUsage, ExtraUsage, FiveHourWindow, JsonlUsage, SevenDayWindow, TokenCounts,
+        UsageBucket, UsageData, UsageError,
+    };
     use crate::input::{ModelInfo, Percent, StatusContext, Tool, WorkspaceInfo};
+    use chrono::{Duration as ChronoDuration, Utc};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -117,9 +126,8 @@ mod tests {
         dc
     }
 
-    fn data_with_five_hour(pct: f32, source: UsageSource) -> UsageData {
-        UsageData {
-            source,
+    fn endpoint_data_with_five_hour(pct: f32) -> UsageData {
+        UsageData::Endpoint(EndpointUsage {
             five_hour: Some(UsageBucket {
                 utilization: Percent::new(pct).unwrap(),
                 resets_at: None,
@@ -129,29 +137,43 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
-        }
+            unknown_buckets: std::collections::HashMap::new(),
+        })
     }
 
-    #[test]
-    fn hidden_when_five_hour_bucket_absent() {
-        let data = UsageData {
-            source: UsageSource::Endpoint,
+    fn endpoint_empty() -> UsageData {
+        UsageData::Endpoint(EndpointUsage {
             five_hour: None,
             seven_day: None,
             seven_day_opus: None,
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
-        };
+            unknown_buckets: std::collections::HashMap::new(),
+        })
+    }
+
+    fn jsonl_with_five_hour_tokens(total: u64) -> UsageData {
+        let tokens = TokenCounts::from_parts(total, 0, 0, 0);
+        // Block start ~1h ago → ends_at() lands ~4h in the future.
+        let start = Utc::now() - ChronoDuration::hours(1);
+        UsageData::Jsonl(JsonlUsage::new(
+            Some(FiveHourWindow::new(tokens, start)),
+            SevenDayWindow::new(TokenCounts::default()),
+        ))
+    }
+
+    #[test]
+    fn hidden_when_five_hour_bucket_absent() {
         let rendered = RateLimit5hSegment::default()
-            .render(&ctx_with_usage(Ok(data)))
+            .render(&ctx_with_usage(Ok(endpoint_empty())))
             .expect("render ok");
         assert_eq!(rendered, None);
     }
 
     #[test]
     fn renders_percent_happy_path() {
-        let dc = ctx_with_usage(Ok(data_with_five_hour(22.0, UsageSource::Endpoint)));
+        let dc = ctx_with_usage(Ok(endpoint_data_with_five_hour(22.0)));
         let rendered = RateLimit5hSegment::default()
             .render(&dc)
             .expect("render ok")
@@ -161,7 +183,7 @@ mod tests {
 
     #[test]
     fn renders_inverted_percent_when_configured() {
-        let dc = ctx_with_usage(Ok(data_with_five_hour(22.0, UsageSource::Endpoint)));
+        let dc = ctx_with_usage(Ok(endpoint_data_with_five_hour(22.0)));
         let seg = RateLimit5hSegment {
             invert: true,
             ..Default::default()
@@ -171,18 +193,44 @@ mod tests {
     }
 
     #[test]
-    fn prefixes_stale_marker_on_jsonl_source() {
-        let dc = ctx_with_usage(Ok(data_with_five_hour(22.0, UsageSource::Jsonl)));
+    fn jsonl_mode_renders_compact_tokens_with_stale_marker() {
+        let dc = ctx_with_usage(Ok(jsonl_with_five_hour_tokens(420_000)));
         let rendered = RateLimit5hSegment::default()
             .render(&dc)
             .unwrap()
             .expect("visible");
-        assert_eq!(rendered.text(), "~5h: 22.0%");
+        assert_eq!(rendered.text(), "~5h: 420k");
+    }
+
+    #[test]
+    fn jsonl_mode_hides_when_no_active_block() {
+        // Inactive block → aggregator returns None for the 5h window,
+        // which matches endpoint's "bucket absent" semantic.
+        let dc = ctx_with_usage(Ok(UsageData::Jsonl(JsonlUsage::new(
+            None,
+            SevenDayWindow::new(TokenCounts::default()),
+        ))));
+        assert_eq!(RateLimit5hSegment::default().render(&dc).unwrap(), None);
+    }
+
+    #[test]
+    fn jsonl_mode_ignores_invert_and_progress_knobs() {
+        // Invert/progress only make sense against a 0-100 axis; under
+        // JSONL there's no ceiling so the segment still renders raw
+        // tokens with just the stale marker.
+        let dc = ctx_with_usage(Ok(jsonl_with_five_hour_tokens(1_200_000)));
+        let seg = RateLimit5hSegment {
+            format: PercentFormat::Progress,
+            invert: true,
+            ..Default::default()
+        };
+        let rendered = seg.render(&dc).unwrap().expect("visible");
+        assert_eq!(rendered.text(), "~5h: 1.2M");
     }
 
     #[test]
     fn renders_progress_bar_when_format_is_progress() {
-        let dc = ctx_with_usage(Ok(data_with_five_hour(50.0, UsageSource::Endpoint)));
+        let dc = ctx_with_usage(Ok(endpoint_data_with_five_hour(50.0)));
         let seg = RateLimit5hSegment {
             format: PercentFormat::Progress,
             ..Default::default()
@@ -195,7 +243,7 @@ mod tests {
 
     #[test]
     fn progress_bar_at_zero_is_entirely_empty_cells() {
-        let dc = ctx_with_usage(Ok(data_with_five_hour(0.0, UsageSource::Endpoint)));
+        let dc = ctx_with_usage(Ok(endpoint_data_with_five_hour(0.0)));
         let seg = RateLimit5hSegment {
             format: PercentFormat::Progress,
             ..Default::default()
@@ -208,7 +256,7 @@ mod tests {
 
     #[test]
     fn progress_bar_at_one_hundred_is_entirely_filled_cells() {
-        let dc = ctx_with_usage(Ok(data_with_five_hour(100.0, UsageSource::Endpoint)));
+        let dc = ctx_with_usage(Ok(endpoint_data_with_five_hour(100.0)));
         let seg = RateLimit5hSegment {
             format: PercentFormat::Progress,
             ..Default::default()
@@ -285,8 +333,7 @@ mod tests {
     fn does_not_read_extra_usage_field() {
         // Regression guard: the 5h segment must not accidentally
         // render extra_usage state when its own bucket is absent.
-        let data = UsageData {
-            source: UsageSource::Endpoint,
+        let data = UsageData::Endpoint(EndpointUsage {
             five_hour: None,
             seven_day: None,
             seven_day_opus: None,
@@ -299,7 +346,8 @@ mod tests {
                 used_credits: Some(50.0),
                 currency: Some("USD".into()),
             }),
-        };
+            unknown_buckets: std::collections::HashMap::new(),
+        });
         let rendered = RateLimit5hSegment::default()
             .render(&ctx_with_usage(Ok(data)))
             .unwrap();

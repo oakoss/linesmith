@@ -7,20 +7,25 @@
 //!   §Endpoint contract. Recognized buckets sit in named `Option`
 //!   fields; codenamed/unreleased buckets land in `unknown_buckets`
 //!   via `#[serde(flatten)]` so forward-compat is lossless.
-//! - [`UsageData`] is what segments consume after the fallback cascade
-//!   (endpoint OR JSONL) lands. It adds a [`UsageSource`] tag so
-//!   segments can prefix a `stale_marker` on JSONL-sourced values per
-//!   `docs/specs/rate-limit-segments.md` §JSONL-fallback display.
+//! - [`UsageData`] is the enum segments consume after the fallback
+//!   cascade lands. Per [ADR-0013](../../../../docs/adrs/0013-jsonl-fallback-carries-token-counts.md),
+//!   the variant IS the provenance tag: `Endpoint(EndpointUsage)`
+//!   carries authoritative endpoint data; `Jsonl(JsonlUsage)` carries
+//!   raw token counts aggregated from transcripts so segments can
+//!   render `~5h: 420k` instead of synthesizing a percentage against a
+//!   tier ceiling we don't know.
 //!
 //! The endpoint client converts wire → internal via
-//! [`UsageApiResponse::into_usage_data`]; the JSONL aggregator builds
-//! [`UsageData`] directly with `source = UsageSource::Jsonl`.
+//! [`UsageApiResponse::into_endpoint_usage`]; the JSONL-mode cascade
+//! constructs a [`JsonlUsage`] directly from the aggregator output in
+//! `cascade.rs`.
 
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::jsonl::TokenCounts;
 use crate::input::Percent;
 
 // --- Wire shape ---------------------------------------------------------
@@ -106,49 +111,122 @@ pub struct ExtraUsage {
 
 // --- Internal shape -----------------------------------------------------
 
-/// Which path of the fallback cascade produced the [`UsageData`] a
-/// segment sees. The endpoint path yields authoritative data; the
-/// JSONL fallback is aggregated locally from transcripts and is less
-/// rich (no per-model weekly buckets, no `extra_usage`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UsageSource {
-    /// OAuth `/api/oauth/usage` endpoint.
-    Endpoint,
-    /// Local JSONL transcript aggregation (ccusage-style 5h blocks).
-    Jsonl,
-}
-
 /// What [`DataContext::usage`](super::DataContext::usage) surfaces
 /// after the cascade in `docs/specs/data-fetching.md` §OAuth fallback
-/// cascade finishes. The `source` tag drives the `stale_marker` prefix
-/// in rate-limit segment rendering.
+/// cascade finishes. The variant IS the provenance tag per
+/// [ADR-0013](../../../../docs/adrs/0013-jsonl-fallback-carries-token-counts.md):
+/// segments dispatch on it to pick between percent rendering
+/// (endpoint) and raw-token rendering (JSONL). `#[non_exhaustive]`
+/// leaves room for a future third source without a SemVer break.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
-pub struct UsageData {
-    pub source: UsageSource,
+pub enum UsageData {
+    Endpoint(EndpointUsage),
+    Jsonl(JsonlUsage),
+}
+
+/// Data from a successful OAuth `/api/oauth/usage` response (possibly
+/// served from cache). `unknown_buckets` carries codenamed buckets
+/// forward so plugins can inspect them; core segments don't read it.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct EndpointUsage {
     pub five_hour: Option<UsageBucket>,
     pub seven_day: Option<UsageBucket>,
     pub seven_day_opus: Option<UsageBucket>,
     pub seven_day_sonnet: Option<UsageBucket>,
     pub seven_day_oauth_apps: Option<UsageBucket>,
     pub extra_usage: Option<ExtraUsage>,
+    pub unknown_buckets: HashMap<String, serde_json::Value>,
+}
+
+/// Data derived from the JSONL transcript aggregator. `seven_day` is
+/// always populated (zero-valued on an empty transcript); `five_hour`
+/// is `None` when the current 5h block has no recent activity, per
+/// `docs/specs/jsonl-aggregation.md`. Fields are `pub(crate)` so the
+/// aggregator+cascade own the construction invariants; segments in
+/// this crate read them directly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JsonlUsage {
+    pub(crate) five_hour: Option<FiveHourWindow>,
+    pub(crate) seven_day: SevenDayWindow,
+}
+
+impl JsonlUsage {
+    #[must_use]
+    pub(crate) fn new(five_hour: Option<FiveHourWindow>, seven_day: SevenDayWindow) -> Self {
+        Self {
+            five_hour,
+            seven_day,
+        }
+    }
+}
+
+/// Active-block window surfaced to segments under JSONL fallback.
+///
+/// # Invariants
+///
+/// - `ends_at()` is derived as `start + 5h`, so the "block lasts 5
+///   hours" invariant is structural rather than prose — the window
+///   cannot drift from its anchor after construction.
+/// - `start` is expected to be UTC-floor-to-hour in production,
+///   matching [`FiveHourBlock::start`] from the aggregator. The
+///   cascade honors this precondition; `FiveHourWindow::new` itself
+///   does not enforce it because legitimate test fixtures pass
+///   mid-hour starts to exercise minute-level countdown rendering
+///   that wouldn't occur with a real (hour-aligned) aggregator output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FiveHourWindow {
+    pub(crate) tokens: TokenCounts,
+    pub(crate) start: DateTime<Utc>,
+}
+
+impl FiveHourWindow {
+    #[must_use]
+    pub(crate) fn new(tokens: TokenCounts, start: DateTime<Utc>) -> Self {
+        Self { tokens, start }
+    }
+
+    /// Nominal close of the block: `start + 5h`. When the window was
+    /// built from a `FiveHourBlock` via the cascade, this equals
+    /// [`FiveHourBlock::end`]; otherwise it's just the direct
+    /// derivation from whatever `start` the caller passed.
+    #[must_use]
+    pub(crate) fn ends_at(&self) -> DateTime<Utc> {
+        self.start + chrono::Duration::hours(5)
+    }
+}
+
+/// Rolling 7-day window under JSONL fallback. No `resets_at`: this is
+/// a rolling window, not a hard-reset bucket, so the `rate_limit_7d_reset`
+/// segment hides entirely under JSONL per
+/// `docs/specs/rate-limit-segments.md` §JSONL-fallback display.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SevenDayWindow {
+    pub(crate) tokens: TokenCounts,
+}
+
+impl SevenDayWindow {
+    #[must_use]
+    pub(crate) fn new(tokens: TokenCounts) -> Self {
+        Self { tokens }
+    }
 }
 
 impl UsageApiResponse {
-    /// Drop the forward-compat `unknown_buckets` map and tag the
-    /// result with a [`UsageSource`]. The OAuth client calls this with
-    /// [`UsageSource::Endpoint`]; the JSONL aggregator builds
-    /// [`UsageData`] directly without going through the wire type.
+    /// Convert the wire shape into the internal [`EndpointUsage`].
+    /// Unknown buckets are preserved so plugin-facing mirrors can
+    /// surface them; the wire `UsageApiResponse` is not retained.
     #[must_use]
-    pub fn into_usage_data(self, source: UsageSource) -> UsageData {
-        UsageData {
-            source,
+    pub fn into_endpoint_usage(self) -> EndpointUsage {
+        EndpointUsage {
             five_hour: self.five_hour,
             seven_day: self.seven_day,
             seven_day_opus: self.seven_day_opus,
             seven_day_sonnet: self.seven_day_sonnet,
             seven_day_oauth_apps: self.seven_day_oauth_apps,
             extra_usage: self.extra_usage,
+            unknown_buckets: self.unknown_buckets,
         }
     }
 }
@@ -325,28 +403,25 @@ mod tests {
     }
 
     #[test]
-    fn into_usage_data_carries_source_and_drops_unknown_buckets() {
+    fn into_endpoint_usage_preserves_unknown_buckets() {
+        // Forward-compat: codenamed buckets survive the wire→internal
+        // hop so plugin ctx mirrors can surface them. The pre-ADR-0013
+        // shape dropped `unknown_buckets` at this boundary.
         let resp: UsageApiResponse = serde_json::from_str(LIVE_CAPTURE).expect("parse");
         assert_eq!(resp.unknown_buckets.len(), 4);
 
-        let data = resp.into_usage_data(UsageSource::Endpoint);
-        assert_eq!(data.source, UsageSource::Endpoint);
-        assert!(data.five_hour.is_some());
-        assert!(data.seven_day.is_some());
-        assert!(data.extra_usage.is_some());
+        let endpoint = resp.into_endpoint_usage();
+        assert!(endpoint.five_hour.is_some());
+        assert!(endpoint.seven_day.is_some());
+        assert!(endpoint.extra_usage.is_some());
+        assert_eq!(endpoint.unknown_buckets.len(), 4);
     }
 
     #[test]
-    fn usage_data_built_directly_tags_source_jsonl() {
-        let data = UsageData {
-            source: UsageSource::Jsonl,
-            five_hour: None,
-            seven_day: None,
-            seven_day_opus: None,
-            seven_day_sonnet: None,
-            seven_day_oauth_apps: None,
-            extra_usage: None,
-        };
-        assert_eq!(data.source, UsageSource::Jsonl);
+    fn jsonl_usage_smart_ctor_stores_windows() {
+        let seven = SevenDayWindow::new(TokenCounts::default());
+        let jsonl = JsonlUsage::new(None, seven.clone());
+        assert!(jsonl.five_hour.is_none());
+        assert_eq!(jsonl.seven_day, seven);
     }
 }

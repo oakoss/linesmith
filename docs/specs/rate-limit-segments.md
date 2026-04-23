@@ -1,8 +1,8 @@
 # Rate-Limit Segments
 
 - Status: draft
-- Version: 0.2
-- Last updated: 2026-04-22
+- Version: 0.2.1
+- Last updated: 2026-04-23
 - Driving ADRs: [ADR-0011](../adrs/0011-rate-limit-data-source.md), [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md)
 
 ## Overview
@@ -243,16 +243,18 @@ The hide-on-error behavior is deliberately scoped: `extra_usage` hides when the 
 
 Maps `UsageError` variants to rendered strings:
 
-| `UsageError`       | Rendered                   | When                                                              |
-| ------------------ | -------------------------- | ----------------------------------------------------------------- |
-| `NoCredentials`    | `[No credentials]`         | No OAuth token found in any cascade path AND JSONL also empty     |
-| `SubprocessFailed` | `[Keychain error]`         | macOS `security` subprocess failed AND no file fallback succeeded |
-| `IoError`          | `[Credentials unreadable]` | Credentials file present but unreadable (permission, IO failure)  |
-| `Timeout`          | `[Timeout]`                | Endpoint took >2s AND no stale cache                              |
-| `RateLimited`      | `[Rate limited]`           | Endpoint returned 429 AND no stale cache                          |
-| `NetworkError`     | `[Network error]`          | Connection failed AND no stale cache                              |
-| `ParseError`       | `[Parse error]`            | Endpoint returned malformed JSON                                  |
-| `Unauthorized`     | `[Unauthorized]`           | Endpoint returned 401 (token expired or revoked)                  |
+| `UsageError`                           | Rendered                   | When                                                                                                               |
+| -------------------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `NoCredentials`                        | `[No credentials]`         | No OAuth token found in any cascade path AND JSONL also empty                                                      |
+| `SubprocessFailed`                     | `[Keychain error]`         | macOS `security` subprocess failed AND no file fallback succeeded                                                  |
+| `IoError`                              | `[Credentials unreadable]` | Credentials file present but unreadable (permission, IO failure)                                                   |
+| `Timeout`                              | `[Timeout]`                | Endpoint took >2s AND no stale cache AND JSONL empty                                                               |
+| `RateLimited`                          | `[Rate limited]`           | Endpoint returned 429 AND no stale cache AND JSONL empty                                                           |
+| `NetworkError`                         | `[Network error]`          | Connection failed AND no stale cache AND JSONL empty                                                               |
+| `ParseError`                           | `[Parse error]`            | Endpoint returned malformed JSON                                                                                   |
+| `Unauthorized`                         | `[Unauthorized]`           | Endpoint returned 401 (token expired or revoked) AND JSONL empty                                                   |
+| `Jsonl(NoEntries \| DirectoryMissing)` | `[No data]`                | Reserved for future direct-JSONL segments; today only reachable if the endpoint layer wraps a `Jsonl` error itself |
+| `Jsonl(IoError \| ParseError)`         | `[Parse error]`            | Same as above — aggregator systemic failures collapse to `NoEntries` at the cascade boundary with a `warn!` trace  |
 
 Error strings are intentionally concise to fit within typical statusline widths. Users run `linesmith doctor` for full diagnostics.
 
@@ -272,8 +274,6 @@ Error strings are intentionally concise to fit within typical statusline widths.
 - Currency values: `extra_usage.monthly_limit - used_credits` → dollars with 2 decimal places; never show negative (clamp to `$0.00`). If `extra_usage.currency` is present and not `"USD"`, render the ISO code prefix instead of `$` (e.g. `"EUR 12.50"`); if `currency` is null/missing, default to `$`. v0.1 does not do live FX conversion — we report the currency Anthropic returns.
 
 ### JSONL-fallback display
-
-> Until `lsm-xhu` closes, the crate's cascade still returns `Err(original)` on the JSONL path; `lsm-xhu` phase 2 flips step 7 to `Ok(UsageData::Jsonl(...))` and wires the render branches below. See the bead for status.
 
 When `ctx.usage()` returns `Ok(UsageData::Jsonl(...))`, segments render a different shape: raw token counts via the `format_tokens` helper (`420k`, `1.2M`), still with the `~` prefix. Two signals — a shape change AND a prefix — so the mode switch survives `NO_COLOR`, 16-color terminals, or a user-set `stale_marker = ""`.
 
@@ -343,6 +343,15 @@ The data-fetching layer already enforces a 180s default TTL. Segments don't inde
 
 ## Change log
 
+- 2026-04-23 (v0.2.1): implementation landed — cascade returns
+  `Ok(UsageData::Jsonl(...))` on every endpoint-failure path (401,
+  timeout, network error, rate-limited, no credentials) when the
+  aggregator produces data. `NoCredentials` and `Unauthorized` now
+  fall through to JSONL instead of surfacing the error unconditionally
+  (previously blocked on `lsm-xhu`). `block.start` is clamped to
+  `floor_to_hour(now)` before surfacing so future-dated transcript
+  entries (mild clock skew) can't inflate `ends_at` beyond the
+  current window's nominal close.
 - 2026-04-22 (v0.2): JSONL mode renders raw `TokenCounts` per
   [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md).
   `UsageData` is an enum (`Endpoint` / `Jsonl`); `UsageSource`

@@ -10,7 +10,7 @@ use super::rate_limit_format::{
     CommonRateLimitConfig, ExtraUsageFormat,
 };
 use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
-use crate::data_context::{DataContext, DataDep};
+use crate::data_context::{DataContext, DataDep, UsageData};
 use crate::theme::Role;
 
 #[non_exhaustive]
@@ -47,9 +47,9 @@ impl Segment for ExtraUsageSegment {
     fn render(&self, ctx: &DataContext) -> RenderResult {
         let usage = ctx.usage();
         match &*usage {
-            Ok(data) => {
-                let Some(extra) = data.extra_usage.as_ref() else {
-                    crate::lsm_debug!("extra_usage: usage.extra_usage absent; hiding");
+            Ok(UsageData::Endpoint(e)) => {
+                let Some(extra) = e.extra_usage.as_ref() else {
+                    crate::lsm_debug!("extra_usage: endpoint extra_usage absent; hiding");
                     return Ok(None);
                 };
                 // `is_enabled = false` (or missing) hides silently:
@@ -59,7 +59,7 @@ impl Segment for ExtraUsageSegment {
                     crate::lsm_debug!("extra_usage: extra_usage.is_enabled = false/absent; hiding");
                     return Ok(None);
                 }
-                match format_extra_usage(extra, self.format, data.source, &self.config) {
+                match format_extra_usage(extra, self.format, &self.config) {
                     Some(text) => Ok(Some(RenderedSegment::new(text).with_role(Role::Info))),
                     None => {
                         crate::lsm_debug!(
@@ -68,6 +68,12 @@ impl Segment for ExtraUsageSegment {
                         Ok(None)
                     }
                 }
+            }
+            // Spec §JSONL-fallback display: transcripts carry no
+            // overage data, so the segment hides silently under JSONL.
+            Ok(UsageData::Jsonl(_)) => {
+                crate::lsm_debug!("extra_usage: jsonl fallback has no overage data; hiding");
+                Ok(None)
             }
             Err(err) => {
                 // User opted in by enabling this segment; a fetch
@@ -92,7 +98,9 @@ impl Segment for ExtraUsageSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_context::{ExtraUsage, UsageData, UsageError, UsageSource};
+    use crate::data_context::{
+        EndpointUsage, ExtraUsage, JsonlUsage, SevenDayWindow, TokenCounts, UsageData, UsageError,
+    };
     use crate::input::{ModelInfo, StatusContext, Tool, WorkspaceInfo};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -117,15 +125,15 @@ mod tests {
     }
 
     fn data_with_extra(extra: Option<ExtraUsage>) -> UsageData {
-        UsageData {
-            source: UsageSource::Endpoint,
+        UsageData::Endpoint(EndpointUsage {
             five_hour: None,
             seven_day: None,
             seven_day_opus: None,
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: extra,
-        }
+            unknown_buckets: std::collections::HashMap::new(),
+        })
     }
 
     fn enabled_extra(limit: Option<f64>, used: Option<f64>) -> ExtraUsage {
@@ -203,15 +211,17 @@ mod tests {
     }
 
     #[test]
-    fn prefixes_stale_marker_on_jsonl_source() {
-        let mut data = data_with_extra(Some(enabled_extra(Some(100.0), Some(40.0))));
-        data.source = UsageSource::Jsonl;
+    fn hidden_under_jsonl_fallback() {
+        // Spec §JSONL-fallback display: transcripts carry no overage
+        // data so the segment hides, not errors. ADR-0013 makes this a
+        // type-level guarantee — `UsageData::Jsonl` can't carry
+        // `extra_usage`.
+        let data = UsageData::Jsonl(JsonlUsage::new(
+            None,
+            SevenDayWindow::new(TokenCounts::default()),
+        ));
         let dc = ctx_with_usage(Ok(data));
-        let rendered = ExtraUsageSegment::default()
-            .render(&dc)
-            .unwrap()
-            .expect("visible");
-        assert_eq!(rendered.text(), "~extra: $60.00");
+        assert_eq!(ExtraUsageSegment::default().render(&dc).unwrap(), None);
     }
 
     #[test]

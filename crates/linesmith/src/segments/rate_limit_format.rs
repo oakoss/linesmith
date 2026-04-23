@@ -7,9 +7,7 @@ use std::collections::BTreeMap;
 
 use chrono::Duration;
 
-use crate::data_context::{
-    CredentialError, ExtraUsage, JsonlError, UsageBucket, UsageError, UsageSource,
-};
+use crate::data_context::{CredentialError, ExtraUsage, JsonlError, UsageBucket, UsageError};
 
 /// Config-driven rendering format for the percent/progress segments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,15 +209,17 @@ pub(crate) fn parse_bool(
     }
 }
 
-/// Render `rate_limit_5h` / `rate_limit_7d`: apply `invert`, clamp,
-/// pick the percent/progress form, prepend the stale marker on JSONL
-/// source, wrap in label + icon.
+/// Render `rate_limit_5h` / `rate_limit_7d` from endpoint-sourced data:
+/// apply `invert`, clamp, and pick the percent/progress form, then wrap
+/// in label + icon. JSONL-sourced renders use [`format_jsonl_tokens`]
+/// instead — the two shapes diverge in both unit (`%` vs compact tokens)
+/// and modifier support (`invert` / `progress` don't apply without a
+/// ceiling).
 #[must_use]
 pub(crate) fn format_percent(
     bucket: &UsageBucket,
     format: PercentFormat,
     invert: bool,
-    source: UsageSource,
     cfg: &CommonRateLimitConfig,
 ) -> String {
     let raw = f64::from(bucket.utilization.value());
@@ -228,12 +228,24 @@ pub(crate) fn format_percent(
         PercentFormat::Percent => format!("{shown:.1}%"),
         PercentFormat::Progress => format_progress_bar(shown, cfg.progress_width),
     };
-    wrap(&value, source, cfg)
+    wrap(&value, false, cfg)
+}
+
+/// Render the JSONL-mode token total for `rate_limit_5h` / `rate_limit_7d`
+/// per `docs/specs/rate-limit-segments.md` §JSONL-fallback display.
+/// Applies the `stale_marker` prefix. Callers skip `invert` /
+/// `progress_width` when routing to this function — those knobs
+/// require a 0-100 axis JSONL lacks — so they never reach the
+/// signature.
+#[must_use]
+pub(crate) fn format_jsonl_tokens(total: u64, cfg: &CommonRateLimitConfig) -> String {
+    wrap(&format_tokens(total), true, cfg)
 }
 
 /// Render `rate_limit_5h_reset` / `rate_limit_7d_reset`. Assumes the
 /// caller already gated on `remaining > 0`. `window` identifies the
 /// rolling window so the progress bar divides by the right total.
+/// `jsonl` adds the stale-marker prefix.
 #[must_use]
 pub(crate) fn format_duration(
     remaining: Duration,
@@ -241,7 +253,7 @@ pub(crate) fn format_duration(
     compact: bool,
     use_days: bool,
     window: ResetWindow,
-    source: UsageSource,
+    jsonl: bool,
     cfg: &CommonRateLimitConfig,
 ) -> String {
     let value = match format {
@@ -250,16 +262,17 @@ pub(crate) fn format_duration(
             format_progress_bar(reset_progress_pct(remaining, window), cfg.progress_width)
         }
     };
-    wrap(&value, source, cfg)
+    wrap(&value, jsonl, cfg)
 }
 
-/// Render `extra_usage`. Falls back from currency → percent when the
-/// account is missing `monthly_limit` (spec §Edge cases).
+/// Render `extra_usage` (endpoint only). Falls back from currency →
+/// percent when the account is missing `monthly_limit` (spec §Edge
+/// cases). Returns `None` when no value can be rendered; callers hide
+/// the segment in that case.
 #[must_use]
 pub(crate) fn format_extra_usage(
     extra: &ExtraUsage,
     format: ExtraUsageFormat,
-    source: UsageSource,
     cfg: &CommonRateLimitConfig,
 ) -> Option<String> {
     let value = match format {
@@ -271,7 +284,7 @@ pub(crate) fn format_extra_usage(
         },
         ExtraUsageFormat::Percent => extra.utilization.map(|p| format!("{:.1}%", p.value())),
     }?;
-    Some(wrap(&value, source, cfg))
+    Some(wrap(&value, false, cfg))
 }
 
 /// Render a `UsageError` to the user-facing bracket string from
@@ -304,12 +317,8 @@ pub(crate) fn render_error(err: &UsageError, cfg: &CommonRateLimitConfig) -> Str
     wrap_label_only(body, cfg)
 }
 
-fn wrap(value: &str, source: UsageSource, cfg: &CommonRateLimitConfig) -> String {
-    let marker = if matches!(source, UsageSource::Jsonl) {
-        cfg.stale_marker.as_str()
-    } else {
-        ""
-    };
+fn wrap(value: &str, jsonl: bool, cfg: &CommonRateLimitConfig) -> String {
+    let marker = if jsonl { cfg.stale_marker.as_str() } else { "" };
     let label_sep = if cfg.label.is_empty() { "" } else { ": " };
     let icon_sep = if cfg.icon.is_empty() { "" } else { " " };
     format!(
@@ -431,6 +440,41 @@ fn reset_progress_pct(remaining: Duration, window: ResetWindow) -> f64 {
     (elapsed.num_milliseconds() as f64 / total.num_milliseconds() as f64).clamp(0.0, 1.0) * 100.0
 }
 
+/// Compact token formatting matching the spec's JSONL-mode examples
+/// (`420k`, `1.2M`). Under 1k renders as a bare integer; k/M/G use one
+/// decimal only when it adds precision (i.e. the integer part has < 2
+/// significant digits) so values like `420_000` render as `420k`, not
+/// `420.0k`.
+#[must_use]
+pub(crate) fn format_tokens(total: u64) -> String {
+    const K: u64 = 1_000;
+    const M: u64 = 1_000_000;
+    const G: u64 = 1_000_000_000;
+    if total < K {
+        return total.to_string();
+    }
+    if total < M {
+        return format_unit(total, K, 'k');
+    }
+    if total < G {
+        return format_unit(total, M, 'M');
+    }
+    format_unit(total, G, 'G')
+}
+
+fn format_unit(total: u64, divisor: u64, unit: char) -> String {
+    // Keep one decimal for values below 10× the divisor (`5.4k`,
+    // `1.2M`); drop it above so `420_000` → `420k` matches the spec
+    // example exactly.
+    if total < divisor * 10 {
+        let scaled = (total as f64) / (divisor as f64);
+        format!("{scaled:.1}{unit}")
+    } else {
+        let scaled = total / divisor;
+        format!("{scaled}{unit}")
+    }
+}
+
 /// Render `amount` as "$X.XX" for USD, or "CODE X.XX" for any other
 /// ISO currency (spec §Precision and clamping). Negatives clamp to
 /// zero.
@@ -461,37 +505,19 @@ mod tests {
 
     #[test]
     fn percent_format_rounds_to_one_decimal_with_label() {
-        let s = format_percent(
-            &bucket(22.0),
-            PercentFormat::Percent,
-            false,
-            UsageSource::Endpoint,
-            &cfg(),
-        );
+        let s = format_percent(&bucket(22.0), PercentFormat::Percent, false, &cfg());
         assert_eq!(s, "5h: 22.0%");
     }
 
     #[test]
     fn percent_format_inverts_when_configured() {
-        let s = format_percent(
-            &bucket(22.0),
-            PercentFormat::Percent,
-            true,
-            UsageSource::Endpoint,
-            &cfg(),
-        );
+        let s = format_percent(&bucket(22.0), PercentFormat::Percent, true, &cfg());
         assert_eq!(s, "5h: 78.0%");
     }
 
     #[test]
     fn percent_format_progress_bar_at_50pct() {
-        let s = format_percent(
-            &bucket(50.0),
-            PercentFormat::Progress,
-            false,
-            UsageSource::Endpoint,
-            &cfg(),
-        );
+        let s = format_percent(&bucket(50.0), PercentFormat::Progress, false, &cfg());
         assert!(s.starts_with("5h: "), "{s}");
         assert!(s.contains("█"));
         assert!(s.contains("░"));
@@ -499,42 +525,32 @@ mod tests {
     }
 
     #[test]
-    fn percent_format_prefixes_stale_marker_for_jsonl_source() {
-        let s = format_percent(
-            &bucket(22.0),
-            PercentFormat::Percent,
-            false,
-            UsageSource::Jsonl,
-            &cfg(),
-        );
-        assert_eq!(s, "~5h: 22.0%");
+    fn jsonl_tokens_compact_format_with_stale_marker() {
+        // Spec §JSONL-fallback display: under JSONL `rate_limit_5h`
+        // renders raw tokens with the `~` prefix.
+        let s = format_jsonl_tokens(420_000, &cfg());
+        assert_eq!(s, "~5h: 420k");
     }
 
     #[test]
-    fn empty_stale_marker_suppresses_jsonl_indicator() {
+    fn jsonl_tokens_renders_megabytes_when_above_one_million() {
+        let s = format_jsonl_tokens(1_200_000, &cfg());
+        assert_eq!(s, "~5h: 1.2M");
+    }
+
+    #[test]
+    fn jsonl_tokens_empty_stale_marker_suppresses_prefix() {
         let mut c = cfg();
         c.stale_marker = String::new();
-        let s = format_percent(
-            &bucket(22.0),
-            PercentFormat::Percent,
-            false,
-            UsageSource::Jsonl,
-            &c,
-        );
-        assert_eq!(s, "5h: 22.0%");
+        let s = format_jsonl_tokens(420_000, &c);
+        assert_eq!(s, "5h: 420k");
     }
 
     #[test]
     fn empty_label_drops_colon_separator() {
         let mut c = cfg();
         c.label = String::new();
-        let s = format_percent(
-            &bucket(22.0),
-            PercentFormat::Percent,
-            false,
-            UsageSource::Endpoint,
-            &c,
-        );
+        let s = format_percent(&bucket(22.0), PercentFormat::Percent, false, &c);
         assert_eq!(s, "22.0%");
     }
 
@@ -542,14 +558,58 @@ mod tests {
     fn icon_renders_with_space_separator() {
         let mut c = cfg();
         c.icon = "⏱".into();
-        let s = format_percent(
-            &bucket(22.0),
-            PercentFormat::Percent,
-            false,
-            UsageSource::Endpoint,
-            &c,
-        );
+        let s = format_percent(&bucket(22.0), PercentFormat::Percent, false, &c);
         assert_eq!(s, "⏱ 5h: 22.0%");
+    }
+
+    #[test]
+    fn format_tokens_under_one_thousand_renders_integer() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+    }
+
+    #[test]
+    fn format_tokens_single_decimal_for_small_k_values() {
+        assert_eq!(format_tokens(5_400), "5.4k");
+        assert_eq!(format_tokens(1_200), "1.2k");
+    }
+
+    #[test]
+    fn format_tokens_drops_decimal_at_ten_k_and_above() {
+        assert_eq!(format_tokens(10_000), "10k");
+        assert_eq!(format_tokens(420_000), "420k");
+    }
+
+    #[test]
+    fn format_tokens_switches_to_megabytes_and_gigabytes() {
+        assert_eq!(format_tokens(1_200_000), "1.2M");
+        assert_eq!(format_tokens(10_000_000), "10M");
+        assert_eq!(format_tokens(1_200_000_000), "1.2G");
+    }
+
+    #[test]
+    fn format_tokens_pins_unit_boundaries() {
+        // Exact unit thresholds: 1k, 1M, 1G must flip branches cleanly.
+        assert_eq!(format_tokens(1_000), "1.0k");
+        assert_eq!(format_tokens(1_000_000), "1.0M");
+        assert_eq!(format_tokens(1_000_000_000), "1.0G");
+        // Just under the decimal-drop threshold renders `10.0k` (one
+        // decimal) rather than `10k`; at 10_000 the branch flips.
+        assert_eq!(format_tokens(9_999), "10.0k");
+        // Integer truncation on the no-decimal branch: 999_999 / 1_000
+        // = 999, not rounded up to 1000. Acceptable UX (the next unit
+        // flips at the exact boundary), pinned so future rounding
+        // changes are deliberate.
+        assert_eq!(format_tokens(999_999), "999k");
+    }
+
+    #[test]
+    fn format_tokens_handles_u64_max_without_panic() {
+        // Past any realistic aggregation but the u64 cast path must
+        // stay panic-free. Precision decays past f64's 53-bit mantissa
+        // (~9e15) — the value becomes an approximation, not a wrap.
+        let s = format_tokens(u64::MAX);
+        assert!(s.ends_with('G'), "expected G suffix, got {s}");
     }
 
     #[test]
@@ -665,8 +725,7 @@ mod tests {
         let e = enabled_extra(Some(100.0), Some(40.0), None);
         let mut c = cfg();
         c.label = "extra".into();
-        let s = format_extra_usage(&e, ExtraUsageFormat::Currency, UsageSource::Endpoint, &c)
-            .expect("renders");
+        let s = format_extra_usage(&e, ExtraUsageFormat::Currency, &c).expect("renders");
         assert_eq!(s, "extra: $60.00");
     }
 
@@ -677,20 +736,14 @@ mod tests {
         let e = enabled_extra(None, Some(40.0), Some(42.5));
         let mut c = cfg();
         c.label = "extra".into();
-        let s = format_extra_usage(&e, ExtraUsageFormat::Currency, UsageSource::Endpoint, &c)
-            .expect("renders");
+        let s = format_extra_usage(&e, ExtraUsageFormat::Currency, &c).expect("renders");
         assert_eq!(s, "extra: 42.5%");
     }
 
     #[test]
     fn extra_returns_none_when_no_data_available() {
         let e = enabled_extra(None, None, None);
-        let s = format_extra_usage(
-            &e,
-            ExtraUsageFormat::Currency,
-            UsageSource::Endpoint,
-            &cfg(),
-        );
+        let s = format_extra_usage(&e, ExtraUsageFormat::Currency, &cfg());
         assert_eq!(s, None);
     }
 

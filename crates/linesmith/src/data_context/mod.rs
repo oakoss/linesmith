@@ -38,8 +38,11 @@ pub use errors::{
     ClaudeJsonError, CredentialError, GitError, JsonlError, SessionError, SettingsError, UsageError,
 };
 pub use git::{DirtyCounts, DirtyState, GitContext, Head, RepoKind, UpstreamState};
-pub use jsonl::{FiveHourBlock, JsonlAggregate, SevenDayWindow, TokenCounts};
-pub use usage::{ExtraUsage, UsageApiResponse, UsageBucket, UsageData, UsageSource};
+pub use jsonl::{FiveHourBlock, JsonlAggregate, TokenCounts};
+pub use usage::{
+    EndpointUsage, ExtraUsage, FiveHourWindow, JsonlUsage, SevenDayWindow, UsageApiResponse,
+    UsageBucket, UsageData,
+};
 
 // --- Stub source types ---------------------------------------------------
 //
@@ -178,10 +181,38 @@ impl DataContext {
             lock_store.as_ref(),
             &transport,
             &|| self.credentials(),
-            // Cheap no-op closure: the cascade currently ignores JSONL
-            // per lsm-xhu; this avoids triggering a full transcript
-            // scan through `self.jsonl()` that would be discarded.
-            &|| Err(JsonlError::NoEntries),
+            // Delegate to the memoized aggregator. The closure fires
+            // only on endpoint-failure paths, so a fresh disk cache
+            // short-circuits before we touch transcripts. The cascade
+            // discards the specific `JsonlError` variant — every
+            // `Err` collapses to `None` in `build_jsonl_usage` — and
+            // `JsonlError` isn't `Clone` (io::Error / serde_json::Error
+            // inners), so error variants collapse to `NoEntries` here.
+            // Systemic `IoError` (EACCES / ENOSPC / corrupt fs across
+            // the transcripts dir) would otherwise vanish entirely —
+            // the user would see the endpoint-path error `[Timeout]` /
+            // `[Network error]` with no hint that JSONL was unreachable.
+            // Warn here so the real cause leaves a trace without
+            // requiring debug logs.
+            &|| match &*self.jsonl() {
+                Ok(agg) => Ok(agg.clone()),
+                Err(JsonlError::IoError { path, cause }) => {
+                    crate::lsm_warn!(
+                        "cascade: JSONL aggregator IoError at {}: {} ({cause}); surfacing the original endpoint error since JSONL is unavailable",
+                        path.display(),
+                        cause.kind(),
+                    );
+                    Err(JsonlError::NoEntries)
+                }
+                Err(JsonlError::ParseError { path, line, cause }) => {
+                    crate::lsm_warn!(
+                        "cascade: JSONL aggregator ParseError at {}:{line}: {cause}; surfacing the original endpoint error since JSONL is unavailable",
+                        path.display(),
+                    );
+                    Err(JsonlError::NoEntries)
+                }
+                Err(_) => Err(JsonlError::NoEntries),
+            },
             &chrono::Utc::now,
             &config,
         )

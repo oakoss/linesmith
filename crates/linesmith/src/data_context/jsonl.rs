@@ -71,15 +71,65 @@ pub struct SevenDayWindow {
     pub token_counts: TokenCounts,
 }
 
+/// Per-category token counts aggregated from the transcript.
+///
+/// # Invariants
+///
+/// - All mutations go through [`Self::accumulate`] so additions
+///   saturate at `u64::MAX` rather than wrapping. Fields are
+///   `pub(crate)` so in-crate code can read them; writes are
+///   funnelled through the one private path that preserves the
+///   saturating discipline. External crates read via [`Self::total`]
+///   / [`Self::input`] / [`Self::output`] / [`Self::cache_creation`]
+///   / [`Self::cache_read`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenCounts {
-    pub input: u64,
-    pub output: u64,
-    pub cache_creation: u64,
-    pub cache_read: u64,
+    pub(crate) input: u64,
+    pub(crate) output: u64,
+    pub(crate) cache_creation: u64,
+    pub(crate) cache_read: u64,
 }
 
 impl TokenCounts {
+    /// Test / fixture constructor. Not exposed to runtime callers —
+    /// production `TokenCounts` values come from the aggregator's
+    /// `accumulate` loop, which preserves the saturating invariant.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn from_parts(
+        input: u64,
+        output: u64,
+        cache_creation: u64,
+        cache_read: u64,
+    ) -> Self {
+        Self {
+            input,
+            output,
+            cache_creation,
+            cache_read,
+        }
+    }
+
+    #[must_use]
+    pub fn input(&self) -> u64 {
+        self.input
+    }
+
+    #[must_use]
+    pub fn output(&self) -> u64 {
+        self.output
+    }
+
+    #[must_use]
+    pub fn cache_creation(&self) -> u64 {
+        self.cache_creation
+    }
+
+    #[must_use]
+    pub fn cache_read(&self) -> u64 {
+        self.cache_read
+    }
+
     /// Saturating sum across all four categories. Saturating to
     /// match the spec's open-question note: `u64` overflow is
     /// practically unreachable, but wrap-on-overflow is surprising.
@@ -400,23 +450,74 @@ fn collect_from_root(
             })
         }
     };
-    for project in top.flatten() {
+    for project in top {
+        let project = match project {
+            Ok(entry) => entry,
+            Err(cause) => {
+                crate::lsm_warn!(
+                    "jsonl: dirent iteration under {} failed: {} ({cause}); skipping",
+                    root.display(),
+                    cause.kind(),
+                );
+                continue;
+            }
+        };
         let project_path = project.path();
         if !project_path.is_dir() {
             continue;
         }
         let session_iter = match fs::read_dir(&project_path) {
             Ok(iter) => iter,
-            Err(_) => continue,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(cause) => {
+                // EACCES / EIO on a specific workspace dir — the
+                // top-level project-root fix in resolve_usage_default
+                // only catches root-level failures. Without this warn,
+                // a stale/unreadable workspace silently poisons the
+                // JSONL fallback and users see the endpoint-path error
+                // with no diagnostic trail.
+                crate::lsm_warn!(
+                    "jsonl: read_dir {} failed: {} ({cause}); skipping workspace",
+                    project_path.display(),
+                    cause.kind(),
+                );
+                continue;
+            }
         };
-        for session in session_iter.flatten() {
+        for session in session_iter {
+            let session = match session {
+                Ok(entry) => entry,
+                Err(cause) => {
+                    crate::lsm_warn!(
+                        "jsonl: dirent iteration under {} failed: {} ({cause}); skipping",
+                        project_path.display(),
+                        cause.kind(),
+                    );
+                    continue;
+                }
+            };
             let session_path = session.path();
             if session_path.extension().is_none_or(|ext| ext != "jsonl") {
                 continue;
             }
             let mut tailer = JsonlTailer::new(session_path.clone());
-            let Ok(file_entries) = tailer.read_new() else {
-                continue;
+            let file_entries = match tailer.read_new() {
+                Ok(entries) => entries,
+                Err(JsonlError::IoError { path, cause }) => {
+                    crate::lsm_warn!(
+                        "jsonl: tailer read {} failed: {} ({cause}); skipping file",
+                        path.display(),
+                        cause.kind(),
+                    );
+                    continue;
+                }
+                Err(other) => {
+                    crate::lsm_warn!(
+                        "jsonl: tailer read {} failed: {other}; skipping file",
+                        session_path.display(),
+                    );
+                    continue;
+                }
             };
             source_paths.push(session_path);
             for entry in file_entries {
@@ -465,6 +566,14 @@ fn build_aggregate(entries: &[UsageEntry], source_paths: Vec<PathBuf>) -> JsonlA
 /// gap from the previous entry exceeds `BLOCK_DURATION_HOURS`.
 /// Returns the latest block only if it's still active (last activity
 /// within `BLOCK_DURATION_HOURS` of `now`).
+///
+/// Future-dated entries (clock skew) are deliberately NOT filtered
+/// here — their tokens still count so a user with a slightly-fast
+/// clock doesn't lose their current session under JSONL fallback.
+/// The cascade's [`build_jsonl_usage`](super::cascade::build_jsonl_usage)
+/// clamps `block.start` to `now`'s hour-floor before surfacing the
+/// window to segments, which neutralizes skewed `ends_at` without
+/// corrupting the token totals.
 fn compute_active_block(entries: &[UsageEntry], now: DateTime<Utc>) -> Option<FiveHourBlock> {
     let block_duration = Duration::hours(BLOCK_DURATION_HOURS);
     let mut current: Option<FiveHourBlock> = None;
@@ -516,7 +625,7 @@ fn extend_block(block: &mut FiveHourBlock, entry: &UsageEntry) {
     block.actual_last_activity = entry.timestamp;
 }
 
-fn floor_to_hour(ts: DateTime<Utc>) -> DateTime<Utc> {
+pub(super) fn floor_to_hour(ts: DateTime<Utc>) -> DateTime<Utc> {
     // `duration_trunc(hours(1))` only errors on zero / overflow
     // durations, which can't arise from a 1-hour grain.
     ts.duration_trunc(Duration::hours(1))
@@ -941,13 +1050,24 @@ mod tests {
 
     #[test]
     fn token_counts_total_saturates_on_overflow() {
-        let counts = TokenCounts {
-            input: u64::MAX - 5,
-            output: 10,
-            cache_creation: 0,
-            cache_read: 0,
-        };
+        let counts = TokenCounts::from_parts(u64::MAX - 5, 10, 0, 0);
         assert_eq!(counts.total(), u64::MAX);
+    }
+
+    #[test]
+    fn token_counts_from_parts_pins_positional_argument_order() {
+        // Regression guard: every in-crate test calls this constructor
+        // with specific values in specific positions (e.g. the cascade
+        // `jsonl_ok` fixture uses 1_000_000 input + 200_000 output).
+        // If the argument order is ever reshuffled, the `total()`
+        // assertions downstream still pass (sums are order-invariant)
+        // so a typed-field check here is the only structural guard.
+        let t = TokenCounts::from_parts(1, 2, 3, 4);
+        assert_eq!(t.input(), 1);
+        assert_eq!(t.output(), 2);
+        assert_eq!(t.cache_creation(), 3);
+        assert_eq!(t.cache_read(), 4);
+        assert_eq!(t.total(), 10);
     }
 
     // --- Error taxonomy -----------------------------------------------

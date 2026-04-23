@@ -7,11 +7,11 @@ use super::rate_limit_5h::PRIORITY;
 use std::collections::BTreeMap;
 
 use super::rate_limit_format::{
-    apply_common_extras, format_percent, parse_bool, parse_percent_format, render_error,
-    CommonRateLimitConfig, PercentFormat,
+    apply_common_extras, format_jsonl_tokens, format_percent, parse_bool, parse_percent_format,
+    render_error, CommonRateLimitConfig, PercentFormat,
 };
 use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
-use crate::data_context::{DataContext, DataDep};
+use crate::data_context::{DataContext, DataDep, UsageData};
 use crate::theme::Role;
 
 #[non_exhaustive]
@@ -56,15 +56,18 @@ impl Segment for RateLimit7dSegment {
     fn render(&self, ctx: &DataContext) -> RenderResult {
         let usage = ctx.usage();
         let text = match &*usage {
-            Ok(data) => match &data.seven_day {
-                Some(bucket) => {
-                    format_percent(bucket, self.format, self.invert, data.source, &self.config)
-                }
+            Ok(UsageData::Endpoint(e)) => match &e.seven_day {
+                Some(bucket) => format_percent(bucket, self.format, self.invert, &self.config),
                 None => {
-                    crate::lsm_debug!("rate_limit_7d: usage.seven_day absent; hiding");
+                    crate::lsm_debug!("rate_limit_7d: endpoint usage.seven_day absent; hiding");
                     return Ok(None);
                 }
             },
+            // 7d window is always populated under JSONL (zero-valued
+            // on empty transcripts), so this branch never hides.
+            Ok(UsageData::Jsonl(j)) => {
+                format_jsonl_tokens(j.seven_day.tokens.total(), &self.config)
+            }
             Err(err) => render_error(err, &self.config),
         };
         Ok(Some(RenderedSegment::new(text).with_role(Role::Info)))
@@ -82,7 +85,9 @@ impl Segment for RateLimit7dSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_context::{UsageBucket, UsageData, UsageError, UsageSource};
+    use crate::data_context::{
+        EndpointUsage, JsonlUsage, SevenDayWindow, TokenCounts, UsageBucket, UsageData, UsageError,
+    };
     use crate::input::{ModelInfo, Percent, StatusContext, Tool, WorkspaceInfo};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -106,9 +111,8 @@ mod tests {
         dc
     }
 
-    fn data_with_seven_day(pct: f32, source: UsageSource) -> UsageData {
-        UsageData {
-            source,
+    fn endpoint_data_with_seven_day(pct: f32) -> UsageData {
+        UsageData::Endpoint(EndpointUsage {
             five_hour: None,
             seven_day: Some(UsageBucket {
                 utilization: Percent::new(pct).unwrap(),
@@ -118,20 +122,26 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
-        }
+            unknown_buckets: std::collections::HashMap::new(),
+        })
+    }
+
+    fn jsonl_data_with_seven_day_tokens(total: u64) -> UsageData {
+        let tokens = TokenCounts::from_parts(total, 0, 0, 0);
+        UsageData::Jsonl(JsonlUsage::new(None, SevenDayWindow::new(tokens)))
     }
 
     #[test]
     fn hidden_when_seven_day_bucket_absent() {
-        let data = UsageData {
-            source: UsageSource::Endpoint,
+        let data = UsageData::Endpoint(EndpointUsage {
             five_hour: None,
             seven_day: None,
             seven_day_opus: None,
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
-        };
+            unknown_buckets: std::collections::HashMap::new(),
+        });
         assert_eq!(
             RateLimit7dSegment::default()
                 .render(&ctx_with_usage(Ok(data)))
@@ -142,7 +152,7 @@ mod tests {
 
     #[test]
     fn renders_percent_happy_path() {
-        let dc = ctx_with_usage(Ok(data_with_seven_day(33.0, UsageSource::Endpoint)));
+        let dc = ctx_with_usage(Ok(endpoint_data_with_seven_day(33.0)));
         let rendered = RateLimit7dSegment::default()
             .render(&dc)
             .unwrap()
@@ -152,7 +162,7 @@ mod tests {
 
     #[test]
     fn renders_inverted_percent_when_configured() {
-        let dc = ctx_with_usage(Ok(data_with_seven_day(33.0, UsageSource::Endpoint)));
+        let dc = ctx_with_usage(Ok(endpoint_data_with_seven_day(33.0)));
         let seg = RateLimit7dSegment {
             invert: true,
             ..Default::default()
@@ -162,13 +172,26 @@ mod tests {
     }
 
     #[test]
-    fn prefixes_stale_marker_on_jsonl_source() {
-        let dc = ctx_with_usage(Ok(data_with_seven_day(33.0, UsageSource::Jsonl)));
+    fn jsonl_mode_renders_compact_tokens_with_stale_marker() {
+        let dc = ctx_with_usage(Ok(jsonl_data_with_seven_day_tokens(1_200_000)));
         let rendered = RateLimit7dSegment::default()
             .render(&dc)
             .unwrap()
             .expect("visible");
-        assert_eq!(rendered.text(), "~7d: 33.0%");
+        assert_eq!(rendered.text(), "~7d: 1.2M");
+    }
+
+    #[test]
+    fn jsonl_mode_still_renders_on_zero_tokens() {
+        // The 7d window is always populated under JSONL (zero-valued
+        // on empty transcripts per `docs/specs/jsonl-aggregation.md`),
+        // so an empty-transcript user still sees `~7d: 0`, not a hide.
+        let dc = ctx_with_usage(Ok(jsonl_data_with_seven_day_tokens(0)));
+        let rendered = RateLimit7dSegment::default()
+            .render(&dc)
+            .unwrap()
+            .expect("visible");
+        assert_eq!(rendered.text(), "~7d: 0");
     }
 
     #[test]
@@ -179,28 +202,6 @@ mod tests {
             .unwrap()
             .expect("visible");
         assert_eq!(rendered.text(), "7d: [Unauthorized]");
-    }
-
-    #[test]
-    fn jsonl_source_still_hides_seven_day_when_bucket_missing() {
-        // JSONL fallback doesn't populate `seven_day` (see
-        // `docs/specs/jsonl-aggregation.md`); hide rather than render
-        // the stale marker on an empty bucket.
-        let data = UsageData {
-            source: UsageSource::Jsonl,
-            five_hour: None,
-            seven_day: None,
-            seven_day_opus: None,
-            seven_day_sonnet: None,
-            seven_day_oauth_apps: None,
-            extra_usage: None,
-        };
-        assert_eq!(
-            RateLimit7dSegment::default()
-                .render(&ctx_with_usage(Ok(data)))
-                .unwrap(),
-            None,
-        );
     }
 
     #[test]

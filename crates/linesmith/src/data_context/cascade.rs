@@ -22,8 +22,8 @@ use super::cache::{CacheStore, CachedUsage, Lock, LockStore};
 use super::credentials::Credentials;
 use super::errors::{CredentialError, JsonlError, UsageError};
 use super::fetcher::{self, UsageTransport};
-use super::jsonl::JsonlAggregate;
-use super::usage::{UsageApiResponse, UsageData, UsageSource};
+use super::jsonl::{self, JsonlAggregate};
+use super::usage::{FiveHourWindow, JsonlUsage, SevenDayWindow, UsageApiResponse, UsageData};
 
 /// Default cache freshness window per
 /// `docs/specs/data-fetching.md` §OAuth usage cache stack.
@@ -81,11 +81,6 @@ pub fn resolve_usage(
     now: &dyn Fn() -> DateTime<Utc>,
     config: &UsageCascadeConfig,
 ) -> Result<UsageData, UsageError> {
-    // v0.1 can't render JSONL-derived data (tier-aware utilization is
-    // unavailable, see lsm-xhu), so we never invoke the closure. The
-    // parameter stays on the signature as the lsm-xhu wiring point.
-    let _ = jsonl;
-
     let cache_entry = read_cache(cache);
     let lock_entry = read_lock(lock);
     let now_ts = now();
@@ -93,7 +88,7 @@ pub fn resolve_usage(
     if let Some(entry) = &cache_entry {
         if is_fresh(entry, now_ts, config.cache_duration) {
             if let Some(data) = entry.data.clone() {
-                return Ok(cached_to_usage_data(data, UsageSource::Endpoint));
+                return Ok(cached_to_usage_data(data));
             }
         }
     }
@@ -106,34 +101,44 @@ pub fn resolve_usage(
         // process is in backoff and we must honor it.
         if let Some(entry) = &cache_entry {
             if let Some(data) = entry.data.clone() {
-                return Ok(cached_to_usage_data(data, UsageSource::Endpoint));
+                return Ok(cached_to_usage_data(data));
             }
             if let Some(cached) = &entry.error {
-                return Err(usage_error_from_code(&cached.code));
+                return jsonl_or(jsonl, now_ts, usage_error_from_code(&cached.code));
             }
         }
-        // No cache content at all: surface the lock's own error hint
-        // (typically "RateLimited"). Crucially, we do NOT reach the
+        // No cache content at all: try JSONL before surfacing the
+        // lock's own error hint. Crucially, we still do NOT reach the
         // endpoint — that would defeat the cross-process spam guard
         // on cold-cache starts.
-        return Err(lock_entry
+        let lock_err = lock_entry
             .as_ref()
             .and_then(|l| l.error.as_deref())
             .map(usage_error_from_code)
-            .unwrap_or(UsageError::RateLimited { retry_after: None }));
+            .unwrap_or(UsageError::RateLimited { retry_after: None });
+        return jsonl_or(jsonl, now_ts, lock_err);
     }
 
     let creds_arc = credentials();
     let creds = match &*creds_arc {
         Ok(c) => c.clone(),
-        Err(CredentialError::NoCredentials) => return Err(UsageError::NoCredentials),
+        // INVARIANT: credential failures never write a failure-lock.
+        // They're not network transients — the same error will recur
+        // on every invocation until the user fixes their creds file /
+        // Keychain ACL, so a lock would just replay the error and
+        // delay recovery. If a future CredentialError variant becomes
+        // genuinely retry-stable, add a matching `write_failure_lock`
+        // here and update the test suite accordingly.
+        Err(CredentialError::NoCredentials) => {
+            return jsonl_or(jsonl, now_ts, UsageError::NoCredentials)
+        }
         Err(other) => {
             // Preserve the specific variant so `rate-limit-segments.md`
             // §Error message table can render `[Keychain error]` /
             // `[Credentials unreadable]` etc. The `Clone` impl on
             // `CredentialError` is lossy for io/serde inner errors but
             // keeps the variant tag (all segments key off) intact.
-            return Err(UsageError::Credentials(other.clone()));
+            return jsonl_or(jsonl, now_ts, UsageError::Credentials(other.clone()));
         }
     };
 
@@ -147,14 +152,17 @@ pub fn resolve_usage(
                     error: None,
                 },
             );
-            Ok(response.into_usage_data(UsageSource::Endpoint))
+            Ok(UsageData::Endpoint(response.into_endpoint_usage()))
         }
         // 401 is the sole failure-path exception to "serve stale on
         // error": the cached payload is tied to a no-longer-valid
-        // token, so reusing it would mislead the user.
+        // token, so reusing it would mislead the user. JSONL, however,
+        // is independent of token validity — fall through to it before
+        // surfacing the error so a user with a revoked token still
+        // sees their local transcript totals.
         Err(UsageError::Unauthorized) => {
             write_failure_lock(lock, now_ts, &UsageError::Unauthorized);
-            Err(UsageError::Unauthorized)
+            jsonl_or(jsonl, now_ts, UsageError::Unauthorized)
         }
         Err(err) => {
             // Persist the backoff so concurrent processes honor it —
@@ -163,12 +171,69 @@ pub fn resolve_usage(
             write_failure_lock(lock, now_ts, &err);
             if let Some(entry) = &cache_entry {
                 if let Some(data) = entry.data.clone() {
-                    return Ok(cached_to_usage_data(data, UsageSource::Endpoint));
+                    return Ok(cached_to_usage_data(data));
                 }
             }
-            Err(err)
+            jsonl_or(jsonl, now_ts, err)
         }
     }
+}
+
+/// Build a [`UsageData::Jsonl`] from the aggregator if it produced any
+/// data; otherwise surface `fallback` unchanged. Callers pass the
+/// endpoint-path error they would have returned, so a JSONL miss
+/// preserves the original failure reason the user sees. `now` is
+/// threaded through so the mapping can clamp future-dated block
+/// starts (clock skew) to a sane bound — see [`build_jsonl_usage`].
+fn jsonl_or(
+    jsonl: &dyn Fn() -> Result<JsonlAggregate, JsonlError>,
+    now: DateTime<Utc>,
+    fallback: UsageError,
+) -> Result<UsageData, UsageError> {
+    match build_jsonl_usage(jsonl(), now) {
+        Some(data) => Ok(UsageData::Jsonl(data)),
+        None => Err(fallback),
+    }
+}
+
+fn build_jsonl_usage(
+    result: Result<JsonlAggregate, JsonlError>,
+    now: DateTime<Utc>,
+) -> Option<JsonlUsage> {
+    let agg = match result {
+        Ok(agg) => agg,
+        Err(JsonlError::NoEntries | JsonlError::DirectoryMissing) => return None,
+        Err(other) => {
+            // `DataContext::resolve_usage_default` already collapses
+            // IoError / ParseError to NoEntries with a warn trace, so
+            // this arm is only reachable from direct test callers. Warn
+            // anyway so any future cascade caller that threads the real
+            // aggregator error through leaves a stderr breadcrumb.
+            crate::lsm_warn!(
+                "cascade: JSONL fallback unavailable ({other}); surfacing endpoint error"
+            );
+            return None;
+        }
+    };
+    // Clamp `block.start` to `floor_to_hour(now)` so a future-dated
+    // entry (clock skew) can't produce an `ends_at` further out than
+    // the current window's nominal close. The aggregator deliberately
+    // keeps token counts intact under mild skew so users don't lose
+    // their current session; this clamp normalizes the reset-timer
+    // surface without corrupting those totals.
+    let now_floor = jsonl::floor_to_hour(now);
+    let five_hour = agg.five_hour.as_ref().map(|block| {
+        let start = block.start.min(now_floor);
+        FiveHourWindow::new(block.token_counts, start)
+    });
+    let seven_day = SevenDayWindow::new(agg.seven_day.token_counts);
+    // Reaching here implies the aggregator returned `Ok(...)`; any
+    // aggregator failure (including the mod.rs-collapsed variants)
+    // kept us out of this branch. Token counts may still be zero —
+    // a parseable record can lie outside the 7d window or outside
+    // any active 5h block — so `five_hour: None` and/or a
+    // zero-valued `seven_day` are valid post-conditions here.
+    Some(JsonlUsage::new(five_hour, seven_day))
 }
 
 fn read_cache(cache: Option<&CacheStore>) -> Option<CachedUsage> {
@@ -218,9 +283,14 @@ fn log_cache_read_failure(kind: &str, err: &super::cache::CacheError) {
 fn write_cache(cache: Option<&CacheStore>, entry: CachedUsage) {
     if let Some(c) = cache {
         if let Err(e) = c.write(&entry) {
-            // Warn BEFORE `debug_assert!` so the stderr line survives
-            // the assertion panic in debug builds.
-            crate::lsm_warn!("cascade: cache write failed: {e}");
+            // Use `lsm_error!` (bypasses the level gate) so a user
+            // who's silenced logs via `LINESMITH_LOG=off` still sees
+            // structural persistence failures — these are the
+            // "statusline hammers the API" class of defect and must
+            // not be silenceable alongside chatter. Emitted BEFORE
+            // `debug_assert!` so the stderr line survives the panic
+            // in debug builds.
+            crate::lsm_error!("cascade: cache write failed: {e}");
             debug_assert!(false, "cascade: cache write failed: {e}");
         }
     }
@@ -229,7 +299,7 @@ fn write_cache(cache: Option<&CacheStore>, entry: CachedUsage) {
 fn write_lock(lock: Option<&LockStore>, entry: Lock) {
     if let Some(l) = lock {
         if let Err(e) = l.write(&entry) {
-            crate::lsm_warn!("cascade: lock write failed: {e}");
+            crate::lsm_error!("cascade: lock write failed: {e}");
             debug_assert!(false, "cascade: lock write failed: {e}");
         }
     }
@@ -269,6 +339,17 @@ fn add_secs(base_ts: i64, secs: Duration) -> i64 {
 /// just saw X" and we want to honor that semantic downstream without
 /// having the full error payload. Unknown codes fall back to
 /// `NetworkError` — the most generic transient failure.
+///
+/// INVARIANT: credential-layer codes (`SubprocessFailed`, `MissingField`,
+/// `EmptyToken`, `IoError`) and JSONL-layer codes (`NoEntries`,
+/// `DirectoryMissing`) are intentionally NOT matched here and collapse
+/// to `NetworkError`. They're unreachable today because the credential
+/// arm at `resolve_usage` returns before any `write_failure_lock` call
+/// (see the matching "credential failures never write a failure-lock"
+/// invariant in `resolve_usage`), and JSONL errors never enter the
+/// cache's error-code path. If a future change persists one of those
+/// codes to the cache or lock, extend this match — the lsm-50fs bead
+/// tracks the structural fix.
 fn usage_error_from_code(code: &str) -> UsageError {
     match code {
         "NoCredentials" => UsageError::NoCredentials,
@@ -289,9 +370,9 @@ fn is_fresh(entry: &CachedUsage, now: DateTime<Utc>, ttl: Duration) -> bool {
     }
 }
 
-fn cached_to_usage_data(data: super::cache::CachedData, source: UsageSource) -> UsageData {
+fn cached_to_usage_data(data: super::cache::CachedData) -> UsageData {
     let response: UsageApiResponse = data.into();
-    response.into_usage_data(source)
+    UsageData::Endpoint(response.into_endpoint_usage())
 }
 
 #[cfg(test)]
@@ -307,7 +388,9 @@ mod tests {
     use crate::data_context::credentials::Credentials;
     use crate::data_context::errors::CredentialError;
     use crate::data_context::fetcher::{HttpResponse, UsageTransport};
-    use crate::data_context::jsonl::{JsonlAggregate, SevenDayWindow, TokenCounts};
+    use crate::data_context::jsonl::{
+        FiveHourBlock, JsonlAggregate, SevenDayWindow as JsonlSevenDayWindow, TokenCounts,
+    };
 
     struct FakeTransport {
         response: RefCell<io::Result<HttpResponse>>,
@@ -378,12 +461,37 @@ mod tests {
         Err(JsonlError::NoEntries)
     }
 
+    /// 7d-only JSONL aggregate. Exercises the case where the cascade
+    /// falls back to JSONL and the 7d window is populated but no 5h
+    /// block is active (e.g. the user hasn't coded in the last 5h).
     fn jsonl_ok() -> Result<JsonlAggregate, JsonlError> {
         Ok(JsonlAggregate {
             five_hour: None,
-            seven_day: SevenDayWindow {
+            seven_day: JsonlSevenDayWindow {
                 window_start: Utc::now() - ChronoDuration::days(7),
-                token_counts: TokenCounts::default(),
+                token_counts: TokenCounts::from_parts(1_000_000, 200_000, 0, 0),
+            },
+            source_paths: Vec::new(),
+        })
+    }
+
+    /// JSONL aggregate with an active 5h block. Start is `now - 1h` so
+    /// the block's `end()` (= start + 5h) lies ~4h in the future, a
+    /// realistic reset-timer window for the 5h-reset segment tests.
+    fn jsonl_ok_with_active_block() -> Result<JsonlAggregate, JsonlError> {
+        let now = Utc::now();
+        let start = now - ChronoDuration::hours(1);
+        Ok(JsonlAggregate {
+            five_hour: Some(FiveHourBlock {
+                start,
+                actual_last_activity: now,
+                token_counts: TokenCounts::from_parts(400_000, 20_000, 0, 0),
+                models: vec!["claude-opus-4-7".into()],
+                usage_limit_reset: None,
+            }),
+            seven_day: JsonlSevenDayWindow {
+                window_start: now - ChronoDuration::days(7),
+                token_counts: TokenCounts::from_parts(1_000_000, 200_000, 0, 0),
             },
             source_paths: Vec::new(),
         })
@@ -393,6 +501,28 @@ mod tests {
         let mut entry = CachedUsage::with_data(sample_response());
         entry.cached_at = Utc::now() - age;
         entry
+    }
+
+    /// Assert that `data` is the `Jsonl` variant built from the
+    /// [`jsonl_ok`] fixture (no active 5h block, 7d window
+    /// populated with `1_000_000 + 200_000` tokens).
+    ///
+    /// Fallthrough tests use this instead of `matches!(data, UsageData::Jsonl(_))`
+    /// so that a cascade bug serving `SevenDayWindow::default()` or
+    /// dropping the window entirely gets caught.
+    fn assert_jsonl_matches_ok_fixture(data: &UsageData) {
+        let UsageData::Jsonl(j) = data else {
+            panic!("expected UsageData::Jsonl, got {data:?}");
+        };
+        assert!(
+            j.five_hour.is_none(),
+            "jsonl_ok fixture has no active 5h block",
+        );
+        assert_eq!(
+            j.seven_day.tokens.total(),
+            1_200_000,
+            "7d total must match jsonl_ok fixture (1M input + 200k output)",
+        );
     }
 
     #[test]
@@ -426,8 +556,10 @@ mod tests {
         )
         .expect("ok");
 
-        assert_eq!(data.source, UsageSource::Endpoint);
-        assert_eq!(data.five_hour.unwrap().utilization.value(), 42.0);
+        let UsageData::Endpoint(endpoint) = &data else {
+            panic!("expected endpoint variant, got {data:?}");
+        };
+        assert_eq!(endpoint.five_hour.unwrap().utilization.value(), 42.0);
         assert_eq!(cred_calls.get(), 0, "credentials must not be called");
         assert_eq!(jsonl_calls.get(), 0, "jsonl must not be called");
         assert_eq!(transport.calls.get(), 0, "no HTTP on cache hit");
@@ -454,7 +586,7 @@ mod tests {
         )
         .expect("ok");
 
-        assert_eq!(data.source, UsageSource::Endpoint);
+        assert!(matches!(data, UsageData::Endpoint(_)));
         assert_eq!(transport.calls.get(), 1);
         let refreshed = cache.read().unwrap().unwrap();
         let age = Utc::now().signed_duration_since(refreshed.cached_at);
@@ -493,7 +625,7 @@ mod tests {
         )
         .expect("ok");
 
-        assert_eq!(data.source, UsageSource::Endpoint);
+        assert!(matches!(data, UsageData::Endpoint(_)));
         assert_eq!(
             cred_calls.get(),
             0,
@@ -520,17 +652,35 @@ mod tests {
     }
 
     #[test]
-    fn no_credentials_surfaces_original_error_even_when_jsonl_has_data() {
-        // v0.1: JSONL aggregator data doesn't populate `UsageBucket`
-        // because tier-aware utilization is unavailable (lsm-xhu),
-        // so the cascade surfaces the endpoint-path error regardless
-        // of JSONL result.
-        let err = resolve_usage(
+    fn no_credentials_falls_through_to_jsonl_when_available() {
+        // ADR-0013: JSONL aggregation is the terminal fallback. A
+        // user with no OAuth credentials who still has Claude Code
+        // transcript history should see their local token totals
+        // rather than `[No credentials]`.
+        let data = resolve_usage(
             None,
             None,
             &FakeTransport::ok(200, "", None),
             &no_creds,
             &jsonl_ok,
+            &now_fn(),
+            &config(),
+        )
+        .expect("ok");
+        assert_jsonl_matches_ok_fixture(&data);
+    }
+
+    #[test]
+    fn no_credentials_with_empty_jsonl_still_surfaces_nocredentials() {
+        // JSONL unavailable → original endpoint-path error wins so
+        // users on a clean machine see the actionable `[No credentials]`
+        // rather than a silent hide.
+        let err = resolve_usage(
+            None,
+            None,
+            &FakeTransport::ok(200, "", None),
+            &no_creds,
+            &jsonl_empty,
             &now_fn(),
             &config(),
         )
@@ -556,7 +706,7 @@ mod tests {
         )
         .expect("ok");
 
-        assert_eq!(data.source, UsageSource::Endpoint);
+        assert!(matches!(data, UsageData::Endpoint(_)));
         assert!(cache.read().unwrap().is_some(), "cache must be populated");
         let persisted_lock = lock.read().unwrap().unwrap();
         let expected_blocked_until =
@@ -570,26 +720,137 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_401_surfaces_unauthorized_regardless_of_jsonl() {
-        // With JSONL aggregation unusable in v0.1 (lsm-xhu), both
-        // jsonl-empty and jsonl-ok paths must surface the original
-        // `Unauthorized` error rather than hiding rate-limit segments.
-        for jsonl in [
-            &jsonl_empty as &dyn Fn() -> Result<JsonlAggregate, JsonlError>,
+    fn endpoint_401_falls_through_to_jsonl_when_available() {
+        // ADR-0013: a revoked/expired token invalidates the endpoint
+        // response but not the local transcript. JSONL has to kick in
+        // on 401 too, otherwise a user who rotates their token but
+        // hasn't re-auth'd sees `[Unauthorized]` instead of real data
+        // they could otherwise surface locally.
+        let transport = FakeTransport::ok(401, "", None);
+        let data = resolve_usage(
+            None,
+            None,
+            &transport,
+            &ok_creds,
             &jsonl_ok,
-        ] {
-            let err = resolve_usage(
-                None,
-                None,
-                &FakeTransport::ok(401, "", None),
-                &ok_creds,
-                jsonl,
-                &now_fn(),
-                &config(),
-            )
-            .unwrap_err();
-            assert!(matches!(err, UsageError::Unauthorized));
-        }
+            &now_fn(),
+            &config(),
+        )
+        .expect("ok");
+        assert_jsonl_matches_ok_fixture(&data);
+        // Endpoint is still hit first — JSONL is a fallback, not a
+        // short-circuit. Regression guard against a future refactor
+        // that inverts the ordering.
+        assert_eq!(transport.calls.get(), 1);
+    }
+
+    #[test]
+    fn jsonl_fallback_clamps_future_dated_block_start_to_now() {
+        // Clock-skew regression (Codex P2, 2026-04-22): a future-dated
+        // entry makes `block.start = floor_to_hour(future_timestamp)`,
+        // which lies beyond `now`. Without clamping, `FiveHourWindow`
+        // would derive an `ends_at` further in the future than 5h,
+        // inflating the reset countdown and distorting `rate_limit_5h`
+        // tokens. The aggregator keeps the skewed block so mild-skew
+        // users don't lose their session; the cascade clamps
+        // `block.start` to `floor_to_hour(now)` before surfacing.
+        let now = Utc::now();
+        // Build a skewed block at +2h so `block.start` starts in the
+        // future and `ends_at = start + 5h` would land ~7h out.
+        let skewed_start = now + ChronoDuration::hours(2);
+        let skewed: Result<JsonlAggregate, JsonlError> = Ok(JsonlAggregate {
+            five_hour: Some(FiveHourBlock {
+                start: skewed_start,
+                actual_last_activity: now + ChronoDuration::minutes(30),
+                token_counts: TokenCounts::from_parts(100, 0, 0, 0),
+                models: vec!["claude-opus-4-7".into()],
+                usage_limit_reset: None,
+            }),
+            seven_day: JsonlSevenDayWindow {
+                window_start: now - ChronoDuration::days(7),
+                token_counts: TokenCounts::from_parts(100, 0, 0, 0),
+            },
+            source_paths: Vec::new(),
+        });
+        let skewed_closure = || match &skewed {
+            Ok(agg) => Ok(agg.clone()),
+            Err(_) => Err(JsonlError::NoEntries),
+        };
+        let now_clock = move || now;
+        let data = resolve_usage(
+            None,
+            None,
+            &FakeTransport::err(io::ErrorKind::TimedOut),
+            &ok_creds,
+            &skewed_closure,
+            &now_clock,
+            &config(),
+        )
+        .expect("ok");
+        let UsageData::Jsonl(j) = &data else {
+            panic!("expected jsonl variant, got {data:?}");
+        };
+        let window = j
+            .five_hour
+            .as_ref()
+            .expect("active block should populate five_hour window");
+        // Clamped: start cannot exceed floor_to_hour(now), so
+        // ends_at <= floor_to_hour(now) + 5h <= now + 5h.
+        assert!(
+            window.ends_at() <= now + ChronoDuration::hours(5),
+            "ends_at={:?} must be clamped at/before now + 5h ({:?})",
+            window.ends_at(),
+            now + ChronoDuration::hours(5),
+        );
+    }
+
+    #[test]
+    fn jsonl_fallback_surfaces_five_hour_window_with_ends_at() {
+        // End-to-end: under endpoint failure + active JSONL block, the
+        // cascade wraps `block.end()` as `FiveHourWindow.ends_at` so
+        // `rate_limit_5h_reset` can derive its countdown without a
+        // tier-aware `resets_at`.
+        let data = resolve_usage(
+            None,
+            None,
+            &FakeTransport::err(io::ErrorKind::TimedOut),
+            &ok_creds,
+            &jsonl_ok_with_active_block,
+            &now_fn(),
+            &config(),
+        )
+        .expect("ok");
+        let UsageData::Jsonl(j) = &data else {
+            panic!("expected jsonl variant, got {data:?}");
+        };
+        let window = j
+            .five_hour
+            .as_ref()
+            .expect("active block should populate five_hour window");
+        let expected_ends_at = Utc::now() + ChronoDuration::hours(4);
+        let drift = (window.ends_at() - expected_ends_at).num_seconds().abs();
+        assert!(
+            drift < 5,
+            "ends_at={:?} drifted {drift}s from expected",
+            window.ends_at(),
+        );
+        // Total from the active-block fixture (400_000 + 20_000 input+output).
+        assert_eq!(window.tokens.total(), 420_000);
+    }
+
+    #[test]
+    fn endpoint_401_with_empty_jsonl_surfaces_unauthorized() {
+        let err = resolve_usage(
+            None,
+            None,
+            &FakeTransport::ok(401, "", None),
+            &ok_creds,
+            &jsonl_empty,
+            &now_fn(),
+            &config(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, UsageError::Unauthorized));
     }
 
     #[test]
@@ -742,12 +1003,16 @@ mod tests {
             &config(),
         )
         .expect("ok");
-        assert_eq!(data.source, UsageSource::Endpoint);
-        assert_eq!(data.five_hour.unwrap().utilization.value(), 42.0);
+        let UsageData::Endpoint(endpoint) = &data else {
+            panic!("expected endpoint variant, got {data:?}");
+        };
+        assert_eq!(endpoint.five_hour.unwrap().utilization.value(), 42.0);
     }
 
     #[test]
-    fn endpoint_429_without_stale_falls_through_to_jsonl() {
+    fn endpoint_429_with_empty_jsonl_surfaces_ratelimited() {
+        // Endpoint + JSONL both empty → original rate-limit error wins
+        // so the user sees `[Rate limited]` rather than a silent hide.
         let err = resolve_usage(
             None,
             None,
@@ -759,6 +1024,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, UsageError::RateLimited { .. }));
+    }
+
+    #[test]
+    fn endpoint_429_falls_through_to_jsonl_when_available() {
+        // ADR-0013: rate-limited users with a local transcript see
+        // `~5h: ...` / `~7d: ...` rather than `[Rate limited]`.
+        let transport = FakeTransport::ok(429, "", None);
+        let data = resolve_usage(
+            None,
+            None,
+            &transport,
+            &ok_creds,
+            &jsonl_ok,
+            &now_fn(),
+            &config(),
+        )
+        .expect("ok");
+        assert_jsonl_matches_ok_fixture(&data);
+        assert_eq!(transport.calls.get(), 1);
     }
 
     #[test]
@@ -778,29 +1062,30 @@ mod tests {
             &config(),
         )
         .expect("ok");
-        assert_eq!(data.source, UsageSource::Endpoint);
+        assert!(matches!(data, UsageData::Endpoint(_)));
     }
 
     #[test]
-    fn endpoint_timeout_without_stale_surfaces_timeout_regardless_of_jsonl() {
-        // lsm-xhu: JSONL aggregator data can't populate UsageBucket
-        // in v0.1, so jsonl-ok and jsonl-empty both surface Timeout.
-        for jsonl in [
-            &jsonl_empty as &dyn Fn() -> Result<JsonlAggregate, JsonlError>,
+    fn endpoint_timeout_without_stale_falls_through_to_jsonl() {
+        // ADR-0013: Timeout / NetworkError falls through to JSONL so
+        // an offline user still sees their local token totals.
+        let transport = FakeTransport::err(io::ErrorKind::TimedOut);
+        let data = resolve_usage(
+            None,
+            None,
+            &transport,
+            &ok_creds,
             &jsonl_ok,
-        ] {
-            let err = resolve_usage(
-                None,
-                None,
-                &FakeTransport::err(io::ErrorKind::TimedOut),
-                &ok_creds,
-                jsonl,
-                &now_fn(),
-                &config(),
-            )
-            .unwrap_err();
-            assert!(matches!(err, UsageError::Timeout));
-        }
+            &now_fn(),
+            &config(),
+        )
+        .expect("ok");
+        assert_jsonl_matches_ok_fixture(&data);
+        assert_eq!(
+            transport.calls.get(),
+            1,
+            "endpoint must be attempted before JSONL fallback",
+        );
     }
 
     #[test]
@@ -863,7 +1148,7 @@ mod tests {
             &config(),
         )
         .expect("ok");
-        assert_eq!(data.source, UsageSource::Endpoint);
+        assert!(matches!(data, UsageData::Endpoint(_)));
     }
 
     #[test]
@@ -935,6 +1220,40 @@ mod tests {
     }
 
     #[test]
+    fn active_lock_falls_through_to_jsonl_when_available() {
+        // ADR-0013: even when gated by another process's backoff lock,
+        // a populated JSONL aggregate wins over the lock-hint error so
+        // rate-limited users with local transcripts see `~5h: ...`.
+        // The lock still gates the endpoint — no HTTP call may happen.
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheStore::new(tmp.path().to_path_buf());
+        let lock = LockStore::new(tmp.path().to_path_buf());
+        lock.write(&Lock {
+            blocked_until: Utc::now().timestamp() + 60,
+            error: Some("RateLimited".into()),
+        })
+        .unwrap();
+
+        let transport = FakeTransport::ok(200, SAMPLE_BODY, None);
+        let data = resolve_usage(
+            Some(&cache),
+            Some(&lock),
+            &transport,
+            &ok_creds,
+            &jsonl_ok,
+            &now_fn(),
+            &config(),
+        )
+        .expect("ok");
+        assert_jsonl_matches_ok_fixture(&data);
+        assert_eq!(
+            transport.calls.get(),
+            0,
+            "active lock must still gate the endpoint even with JSONL data"
+        );
+    }
+
+    #[test]
     fn active_lock_serves_cached_error_without_hitting_endpoint() {
         // When the cache carries a specific error tag (e.g. Unauthorized
         // from a prior 401), the lock-active path must surface that
@@ -964,6 +1283,41 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, UsageError::Unauthorized));
+        assert_eq!(transport.calls.get(), 0);
+    }
+
+    #[test]
+    fn active_lock_with_cached_error_falls_through_to_jsonl_when_available() {
+        // ADR-0013 + silent-failure review: when the cache carries a
+        // specific error code AND the lock is active AND JSONL has
+        // data, the JSONL fallback wins. Otherwise users with a
+        // cached `Unauthorized` plus a valid transcript would see
+        // `[Unauthorized]` instead of their local totals — the exact
+        // failure mode the ADR rejects.
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheStore::new(tmp.path().to_path_buf());
+        cache
+            .write(&CachedUsage::with_error("Unauthorized"))
+            .unwrap();
+        let lock = LockStore::new(tmp.path().to_path_buf());
+        lock.write(&Lock {
+            blocked_until: Utc::now().timestamp() + 60,
+            error: Some("RateLimited".into()),
+        })
+        .unwrap();
+
+        let transport = FakeTransport::ok(200, "", None);
+        let data = resolve_usage(
+            Some(&cache),
+            Some(&lock),
+            &transport,
+            &ok_creds,
+            &jsonl_ok,
+            &now_fn(),
+            &config(),
+        )
+        .expect("ok");
+        assert_jsonl_matches_ok_fixture(&data);
         assert_eq!(transport.calls.get(), 0);
     }
 
@@ -1021,6 +1375,29 @@ mod tests {
         assert_eq!(err.code(), "SubprocessFailed");
     }
 
+    #[test]
+    fn credential_variant_falls_through_to_jsonl_when_available() {
+        // ADR-0013: non-`NoCredentials` cred failures (broken Keychain,
+        // malformed credentials.json) still fall through to JSONL when
+        // the transcript is readable, rather than hard-returning the
+        // cred error variant. Common degraded-environment scenario.
+        let creds_err: Arc<Result<Credentials, CredentialError>> = Arc::new(Err(
+            CredentialError::SubprocessFailed(io::Error::new(io::ErrorKind::PermissionDenied, "x")),
+        ));
+        let credentials = || creds_err.clone();
+        let data = resolve_usage(
+            None,
+            None,
+            &FakeTransport::err(io::ErrorKind::TimedOut),
+            &credentials,
+            &jsonl_ok,
+            &now_fn(),
+            &config(),
+        )
+        .expect("ok");
+        assert_jsonl_matches_ok_fixture(&data);
+    }
+
     // Release-only: cascade must still return fetched data when
     // persistence breaks. In debug builds the write-side helpers
     // `debug_assert!` on the error (intentional, per silent-failure
@@ -1046,7 +1423,7 @@ mod tests {
             &config(),
         )
         .expect("ok");
-        assert_eq!(data.source, UsageSource::Endpoint);
+        assert!(matches!(data, UsageData::Endpoint(_)));
     }
 
     #[cfg(debug_assertions)]
@@ -1091,7 +1468,7 @@ mod tests {
             &config(),
         )
         .expect("ok");
-        assert_eq!(data.source, UsageSource::Endpoint);
+        assert!(matches!(data, UsageData::Endpoint(_)));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use super::rate_limit_format::{
     CommonRateLimitConfig, DurationFormat, ResetWindow,
 };
 use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
-use crate::data_context::{DataContext, DataDep};
+use crate::data_context::{DataContext, DataDep, UsageData};
 use crate::theme::Role;
 
 #[non_exhaustive]
@@ -59,9 +59,11 @@ impl Segment for RateLimit7dResetSegment {
     fn render(&self, ctx: &DataContext) -> RenderResult {
         let usage = ctx.usage();
         let text = match &*usage {
-            Ok(data) => {
-                let Some(bucket) = data.seven_day.as_ref() else {
-                    crate::lsm_debug!("rate_limit_7d_reset: usage.seven_day absent; hiding");
+            Ok(UsageData::Endpoint(e)) => {
+                let Some(bucket) = e.seven_day.as_ref() else {
+                    crate::lsm_debug!(
+                        "rate_limit_7d_reset: endpoint usage.seven_day absent; hiding"
+                    );
                     return Ok(None);
                 };
                 let Some(resets_at) = bucket.resets_at else {
@@ -81,9 +83,16 @@ impl Segment for RateLimit7dResetSegment {
                     self.compact,
                     self.use_days,
                     ResetWindow::SevenDay,
-                    data.source,
+                    false,
                     &self.config,
                 )
+            }
+            // Spec §JSONL-fallback display: rolling 7d window has no
+            // hard reset, so this segment hides entirely under JSONL.
+            // ADR-0013 explicitly rejects synthesizing one.
+            Ok(UsageData::Jsonl(_)) => {
+                crate::lsm_debug!("rate_limit_7d_reset: jsonl fallback has no hard reset; hiding");
+                return Ok(None);
             }
             Err(err) => render_error(err, &self.config),
         };
@@ -102,7 +111,9 @@ impl Segment for RateLimit7dResetSegment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_context::{UsageBucket, UsageData, UsageError, UsageSource};
+    use crate::data_context::{
+        EndpointUsage, JsonlUsage, SevenDayWindow, TokenCounts, UsageBucket, UsageData, UsageError,
+    };
     use crate::input::{ModelInfo, Percent, StatusContext, Tool, WorkspaceInfo};
     use chrono::Duration;
     use std::path::PathBuf;
@@ -135,8 +146,7 @@ mod tests {
         } else {
             Duration::zero()
         };
-        UsageData {
-            source: UsageSource::Endpoint,
+        UsageData::Endpoint(EndpointUsage {
             five_hour: None,
             seven_day: Some(UsageBucket {
                 utilization: Percent::new(33.0).unwrap(),
@@ -146,7 +156,8 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
-        }
+            unknown_buckets: std::collections::HashMap::new(),
+        })
     }
 
     #[test]
@@ -185,15 +196,15 @@ mod tests {
 
     #[test]
     fn hidden_when_seven_day_bucket_absent() {
-        let data = UsageData {
-            source: UsageSource::Endpoint,
+        let data = UsageData::Endpoint(EndpointUsage {
             five_hour: None,
             seven_day: None,
             seven_day_opus: None,
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
-        };
+            unknown_buckets: std::collections::HashMap::new(),
+        });
         assert_eq!(
             RateLimit7dResetSegment::default()
                 .render(&ctx_with_usage(Ok(data)))
@@ -213,15 +224,20 @@ mod tests {
     }
 
     #[test]
-    fn prefixes_stale_marker_on_jsonl_source() {
-        let mut data = data_with_reset_in(Duration::days(4) + Duration::hours(8));
-        data.source = UsageSource::Jsonl;
+    fn hidden_under_jsonl_fallback() {
+        // Spec §JSONL-fallback display: 7d reset hides entirely
+        // under JSONL because the 7d window is rolling (no hard reset).
+        // ADR-0013 §Decision drivers: faking one is the exact failure
+        // mode the ADR rejects.
+        let data = UsageData::Jsonl(JsonlUsage::new(
+            None,
+            SevenDayWindow::new(TokenCounts::default()),
+        ));
         let dc = ctx_with_usage(Ok(data));
-        let rendered = RateLimit7dResetSegment::default()
-            .render(&dc)
-            .unwrap()
-            .expect("visible");
-        assert_eq!(rendered.text(), "~7d reset: 4d 8hr");
+        assert_eq!(
+            RateLimit7dResetSegment::default().render(&dc).unwrap(),
+            None,
+        );
     }
 
     #[test]
@@ -252,10 +268,9 @@ mod tests {
 
     #[test]
     fn hidden_when_resets_at_missing() {
-        let data = UsageData {
-            source: UsageSource::Endpoint,
+        let data = UsageData::Endpoint(EndpointUsage {
             five_hour: None,
-            seven_day: Some(crate::data_context::UsageBucket {
+            seven_day: Some(UsageBucket {
                 utilization: Percent::new(33.0).unwrap(),
                 resets_at: None,
             }),
@@ -263,7 +278,8 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
-        };
+            unknown_buckets: std::collections::HashMap::new(),
+        });
         assert_eq!(
             RateLimit7dResetSegment::default()
                 .render(&ctx_with_usage(Ok(data)))
