@@ -99,21 +99,29 @@ pub fn resolve_usage(
     if lock_active {
         // Serve whatever we have without touching credentials: another
         // process is in backoff and we must honor it.
+        let lock_error = lock_entry.as_ref().and_then(|l| l.error.as_deref());
+        let lock_from_401 = lock_error == Some("Unauthorized");
         if let Some(entry) = &cache_entry {
-            if let Some(data) = entry.data.clone() {
-                return Ok(cached_to_usage_data(data));
+            // A lock from a 401 means the cached `data` was fetched
+            // with a now-revoked token; skip the stale-serve so
+            // invocation B (after A's 401) doesn't return the pre-401
+            // payload through this branch. Other lock errors (429,
+            // timeout) still serve stale — those are transient and
+            // the cached data was legitimately valid when fetched.
+            if !lock_from_401 {
+                if let Some(data) = entry.data.clone() {
+                    return Ok(cached_to_usage_data(data));
+                }
             }
             if let Some(cached) = &entry.error {
                 return jsonl_or(jsonl, now_ts, usage_error_from_code(&cached.code));
             }
         }
-        // No cache content at all: try JSONL before surfacing the
-        // lock's own error hint. Crucially, we still do NOT reach the
-        // endpoint — that would defeat the cross-process spam guard
-        // on cold-cache starts.
-        let lock_err = lock_entry
-            .as_ref()
-            .and_then(|l| l.error.as_deref())
+        // No cache content (or a 401-lock bypassed the data entry):
+        // try JSONL before surfacing the lock's own error hint.
+        // Crucially, we still do NOT reach the endpoint — that would
+        // defeat the cross-process spam guard on cold-cache starts.
+        let lock_err = lock_error
             .map(usage_error_from_code)
             .unwrap_or(UsageError::RateLimited { retry_after: None });
         return jsonl_or(jsonl, now_ts, lock_err);
@@ -159,7 +167,12 @@ pub fn resolve_usage(
         // token, so reusing it would mislead the user. JSONL, however,
         // is independent of token validity — fall through to it before
         // surfacing the error so a user with a revoked token still
-        // sees their local transcript totals.
+        // sees their local transcript totals. The next invocation's
+        // lock-active branch refuses the stale data via the
+        // `lock_from_401` guard; we deliberately do NOT write an
+        // "Unauthorized" error into the cache here, because the
+        // cached error would then outlive the lock and mask a
+        // subsequent unrelated lock (e.g. a 429 after token refresh).
         Err(UsageError::Unauthorized) => {
             write_failure_lock(lock, now_ts, &UsageError::Unauthorized);
             jsonl_or(jsonl, now_ts, UsageError::Unauthorized)
@@ -871,6 +884,133 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, UsageError::Unauthorized));
+    }
+
+    #[test]
+    fn invocation_after_401_does_not_serve_stale_cache_via_lock_active() {
+        // A→B sequence: invocation A gets a 401 that wrote a failure-
+        // lock with error="Unauthorized". Invocation B within the
+        // lock TTL must NOT serve the pre-401 cached `data: Some(...)`
+        // through the lock-active branch — the `lock_from_401` guard
+        // catches it. Same "401 does not serve stale" contract as
+        // endpoint_401_does_not_serve_stale_cache, but via the A→B
+        // code path that test doesn't exercise.
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheStore::new(tmp.path().to_path_buf());
+        cache
+            .write(&stale_cache_entry(ChronoDuration::minutes(10)))
+            .unwrap();
+        let lock = LockStore::new(tmp.path().to_path_buf());
+
+        // Invocation A: 401.
+        let transport_a = FakeTransport::ok(401, "", None);
+        let err_a = resolve_usage(
+            Some(&cache),
+            Some(&lock),
+            &transport_a,
+            &ok_creds,
+            &jsonl_empty,
+            &now_fn(),
+            &config(),
+        )
+        .unwrap_err();
+        assert!(matches!(err_a, UsageError::Unauthorized));
+
+        // Invocation B: lock active, cache still holds pre-401 data.
+        // Transport returns fresh 200 data if hit; we assert it isn't.
+        let transport_b = FakeTransport::ok(200, SAMPLE_BODY, None);
+        let err_b = resolve_usage(
+            Some(&cache),
+            Some(&lock),
+            &transport_b,
+            &ok_creds,
+            &jsonl_empty,
+            &now_fn(),
+            &config(),
+        )
+        .unwrap_err();
+        assert!(matches!(err_b, UsageError::Unauthorized));
+        assert_eq!(
+            transport_b.calls.get(),
+            0,
+            "active lock must still gate the endpoint on invocation B",
+        );
+    }
+
+    #[test]
+    fn invocation_after_401_falls_through_to_jsonl_when_available() {
+        // ADR-0013 parity for the A→B sequence: when invocation A
+        // 401'd and invocation B has JSONL data, B gets local
+        // transcript totals instead of either the stale cache or the
+        // Unauthorized error.
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheStore::new(tmp.path().to_path_buf());
+        cache
+            .write(&stale_cache_entry(ChronoDuration::minutes(10)))
+            .unwrap();
+        let lock = LockStore::new(tmp.path().to_path_buf());
+
+        let data_a = resolve_usage(
+            Some(&cache),
+            Some(&lock),
+            &FakeTransport::ok(401, "", None),
+            &ok_creds,
+            &jsonl_ok,
+            &now_fn(),
+            &config(),
+        )
+        .expect("A falls through to JSONL with jsonl_ok");
+        assert_jsonl_matches_ok_fixture(&data_a);
+
+        let transport_b = FakeTransport::ok(200, SAMPLE_BODY, None);
+        let data_b = resolve_usage(
+            Some(&cache),
+            Some(&lock),
+            &transport_b,
+            &ok_creds,
+            &jsonl_ok,
+            &now_fn(),
+            &config(),
+        )
+        .expect("B returns JSONL on lock-active path");
+        assert_jsonl_matches_ok_fixture(&data_b);
+        assert_eq!(transport_b.calls.get(), 0);
+    }
+
+    #[test]
+    fn active_unauthorized_lock_rejects_stale_cached_data() {
+        // Isolates the `lock_from_401` guard: seeds `cache.data =
+        // Some(stale)` + `lock.error = Some("Unauthorized")` directly,
+        // bypassing the A→B integration path. The seeded state is
+        // realistic because a different process could have run the
+        // 401 (writing the lock) while leaving our cache untouched.
+        // Verifies the guard refuses to serve the stale data without
+        // depending on the 401 handler's own write ordering.
+        let tmp = TempDir::new().unwrap();
+        let cache = CacheStore::new(tmp.path().to_path_buf());
+        cache
+            .write(&stale_cache_entry(ChronoDuration::minutes(10)))
+            .unwrap();
+        let lock = LockStore::new(tmp.path().to_path_buf());
+        lock.write(&Lock {
+            blocked_until: Utc::now().timestamp() + 30,
+            error: Some("Unauthorized".into()),
+        })
+        .unwrap();
+
+        let transport = FakeTransport::ok(200, SAMPLE_BODY, None);
+        let err = resolve_usage(
+            Some(&cache),
+            Some(&lock),
+            &transport,
+            &ok_creds,
+            &jsonl_empty,
+            &now_fn(),
+            &config(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, UsageError::Unauthorized));
+        assert_eq!(transport.calls.get(), 0);
     }
 
     #[test]
