@@ -51,13 +51,20 @@ To be filled in by running linesmith against a live Claude Code session in each 
 3. Compare `context_window.used_percentage` to what Claude Code's own `/context` command reports.
 4. Record the delta and any rendering anomaly in the linesmith output.
 
-| #   | Scenario                                        | `used_percentage` (stdin) | `/context` truth | `context_window_size` correct? | Render anomaly? | Pass/Fail |
-| --- | ----------------------------------------------- | ------------------------- | ---------------- | ------------------------------ | --------------- | --------- |
-| 1   | 200k-context session, ~40-60% fill, pre-compact | TBD                       | TBD              | TBD                            | TBD             | TBD       |
-| 2   | Same session after `/compact`                   | TBD                       | TBD              | TBD                            | TBD             | TBD       |
-| 3   | Session resumed via `/resume`                   | TBD                       | TBD              | TBD                            | TBD             | TBD       |
-| 4   | During a 429 rate-limit response                | TBD                       | TBD              | TBD                            | TBD             | TBD       |
-| 5   | 1M-context variant (Opus 4.7 1M)                | TBD                       | TBD              | TBD                            | TBD             | TBD       |
+| #   | Scenario                                        | `used_percentage` (stdin) | `/context` truth | `context_window_size` correct?          | Render anomaly?                                                              | Pass/Fail |
+| --- | ----------------------------------------------- | ------------------------- | ---------------- | --------------------------------------- | ---------------------------------------------------------------------------- | --------- |
+| 1   | 200k-context session, ~40-60% fill, pre-compact | TBD                       | TBD              | TBD                                     | TBD                                                                          | TBD       |
+| 2   | Same session after `/compact`                   | TBD                       | TBD              | TBD                                     | TBD                                                                          | TBD       |
+| 3   | Session resumed via `/resume`                   | TBD                       | TBD              | TBD                                     | TBD                                                                          | TBD       |
+| 4   | During a 429 rate-limit response                | TBD                       | TBD              | TBD                                     | TBD                                                                          | TBD       |
+| 5   | 1M-context variant (Opus 4.7 1M)                | 34                        | 34%              | yes — `1_000_000`, not stuck at 200_000 | none once [lsm-ts7k](../../.beads/issues.jsonl) (effort parser) is installed | **Pass**  |
+
+Row 5 notes:
+
+- `model.id = "claude-opus-4-7[1m]"` — the `[1m]` suffix marks the 1M variant. ccstatusline PR #265 reported the hint dropped from `model.display_name`; `model.id` is unaffected.
+- Capture timestamps: `2026-04-24T18:46:50Z` through `2026-04-24T19:52:42Z` in `~/.linesmith-captures/stdin.jsonl`; percentages stepped 34→35 as the session grew, consistent with the `/context` output.
+- All captures fell within `[0, 100]`; no `>100` post-compact drift of the kind reported in Anthropic #37163 observed at this fill level.
+- Before the effort-parser fix (lsm-ts7k), linesmith rendered `?` even though the percentage itself was correct — a separate issue the capture surfaced.
 
 Additional sanity checks to run while capturing each stdin:
 
@@ -91,7 +98,7 @@ Provisional positions to confirm or reject after live tests:
 ## Open questions
 
 - What does `used_percentage` actually output during an in-progress `/compact`? Is there a transition state (both 0 and 100 have been reported)?
-- Does `context_window_size` change to 1_000_000 immediately when switching to a 1M model, or is it stuck at 200_000 until the next stdin refresh?
+- ~~Does `context_window_size` change to 1_000_000 immediately when switching to a 1M model, or is it stuck at 200_000 until the next stdin refresh?~~ **Resolved 2026-04-24 via row 5:** `context_window_size` reports `1_000_000` on every 1M-model capture; the ccstatusline PR #265 bug (payload stuck at 200k) does not reproduce in CC 2.1.119.
 - Is there an observable `/resume` marker in the stdin payload, or does the percentage just "jump" on the next post-resume message?
 - Are 429 responses even visible at the statusline layer, or are they intercepted upstream and never produce a stdin event?
 - Does `current_usage` reflect the _current turn_ only, or the cumulative session? (Naming suggests current turn; would clarify the relationship to `total_input_tokens`.)
