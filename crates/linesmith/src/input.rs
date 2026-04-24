@@ -147,6 +147,21 @@ impl Percent {
         }
     }
 
+    /// Construct from an `f64`, clamping finite out-of-range values into
+    /// `0.0..=100.0`. Returns `None` only for NaN. Use this when a field's
+    /// upstream producer is known to emit values slightly past 100 (e.g.
+    /// Claude Code's `context_window.used_percentage` post-`/compact`,
+    /// see claude-code#37163). Callers that want visibility into the
+    /// clamp should compare the raw value against the range before
+    /// invoking and emit a diagnostic — this helper is silent.
+    #[must_use]
+    pub fn from_f64_clamped(value: f64) -> Option<Self> {
+        if value.is_nan() {
+            return None;
+        }
+        Some(Self(value.clamp(0.0, 100.0) as f32))
+    }
+
     #[must_use]
     pub fn value(self) -> f32 {
         self.0
@@ -210,7 +225,8 @@ pub enum ParseError {
         got: JsonType,
     },
     /// JSON kind matched but the value violates a canonical-model
-    /// invariant (e.g. `Percent::new` rejected a number outside `0..=100`).
+    /// invariant (e.g. a percentage field was NaN or below 0, or an
+    /// enum-like string carried an unknown variant).
     InvalidValue {
         tool: Tool,
         path: String,
@@ -404,12 +420,24 @@ mod claude {
         let cw = expect_object(value, "context_window")?;
 
         let used_raw = require_f64(cw, "context_window.used_percentage")?;
-        let used = Percent::from_f64(used_raw).ok_or_else(|| {
-            invalid_value(
-                "context_window.used_percentage",
-                "percentage must be in 0.0..=100.0",
-            )
-        })?;
+        // Asymmetric handling. Claude Code has been observed emitting
+        // values slightly past 100 post-/compact (claude-code#37163)
+        // so an above-100 value is a known upstream bug: clamp to 100
+        // and warn, rather than degrade the whole statusline to `?`.
+        // A below-zero value is NOT a documented Claude Code state —
+        // it points at a corrupted payload or a misrouted upstream —
+        // so let it surface as InvalidValue so the failure is loud.
+        let used = if used_raw > 100.0 {
+            crate::lsm_warn!("context_window.used_percentage = {used_raw} > 100; clamping to 100",);
+            Percent::from_f64_clamped(used_raw).expect("non-NaN value > 100 clamps successfully")
+        } else {
+            Percent::from_f64(used_raw).ok_or_else(|| {
+                invalid_value(
+                    "context_window.used_percentage",
+                    "percentage must be a number in [0, 100]",
+                )
+            })?
+        };
 
         let size = require_u64(cw, "context_window.context_window_size")?;
         let total_input_tokens = require_u64(cw, "context_window.total_input_tokens")?;
@@ -552,6 +580,42 @@ mod tests {
     }
 
     #[test]
+    fn percent_from_f64_clamped_clamps_finite_values_and_rejects_nan() {
+        assert_eq!(Percent::from_f64_clamped(150.0).unwrap().value(), 100.0);
+        assert_eq!(Percent::from_f64_clamped(-5.0).unwrap().value(), 0.0);
+        assert_eq!(Percent::from_f64_clamped(100.0).unwrap().value(), 100.0);
+        assert_eq!(Percent::from_f64_clamped(0.0).unwrap().value(), 0.0);
+        assert_eq!(Percent::from_f64_clamped(42.5).unwrap().value(), 42.5);
+        // Tiny overshoot is the shape claude-code#37163 actually emits.
+        // Strict `from_f64` rejects this because its range check runs
+        // on the f64 before narrowing, so `100.0000001` is flagged
+        // even though it would narrow to exactly `100.0` as f32. The
+        // clamped variant accepts the out-of-range value and pins it
+        // to 100.0.
+        assert_eq!(
+            Percent::from_f64_clamped(100.0000001).unwrap().value(),
+            100.0
+        );
+        // NaN is the only input that still fails: `f64::clamp` treats
+        // NaN as identity, which would poison downstream math. Reject
+        // so the caller can surface InvalidValue.
+        assert!(Percent::from_f64_clamped(f64::NAN).is_none());
+        // Infinity clamps to the nearest bound under IEEE-754 ordering
+        // — pinning explicitly in case a future stdlib change shifts
+        // the semantics.
+        assert_eq!(
+            Percent::from_f64_clamped(f64::INFINITY).unwrap().value(),
+            100.0
+        );
+        assert_eq!(
+            Percent::from_f64_clamped(f64::NEG_INFINITY)
+                .unwrap()
+                .value(),
+            0.0
+        );
+    }
+
+    #[test]
     fn percent_from_f64_rejects_values_that_would_narrow_into_range() {
         // 100.0000001 as f32 rounds to exactly 100.0. from_f64 validates
         // before narrowing so this is rejected rather than silently passing.
@@ -639,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_out_of_range_percentage_as_invalid_value() {
+    fn used_percentage_above_100_clamps_instead_of_rejecting() {
         let json = br#"{
             "model": { "display_name": "X" },
             "workspace": { "project_dir": "/repo" },
@@ -650,13 +714,71 @@ mod tests {
                 "total_output_tokens": 0
             }
         }"#;
+        let ctx = parse(json).expect("clamp succeeds");
+        let cw = ctx.context_window.expect("context_window present");
+        assert_eq!(cw.used.value(), 100.0);
+    }
+
+    #[test]
+    fn used_percentage_fractional_overshoot_clamps_to_100() {
+        // Catch a regression that routes the raw f64 through `as i64`
+        // or `.floor()` before clamping.
+        let json = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/repo" },
+            "context_window": {
+                "used_percentage": 101.7,
+                "context_window_size": 200000,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+            }
+        }"#;
+        let ctx = parse(json).expect("clamp succeeds");
+        let cw = ctx.context_window.expect("context_window present");
+        assert_eq!(cw.used.value(), 100.0);
+    }
+
+    #[test]
+    fn used_percentage_below_0_rejects_as_invalid_value() {
+        // Negative percentages aren't a documented Claude Code state —
+        // treat them as a corrupted payload and surface InvalidValue
+        // so the failure is loud, instead of silently clamping to 0%.
+        // The above-100 case is different (known upstream bug in
+        // claude-code#37163) and clamps via the companion test.
+        let json = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/repo" },
+            "context_window": {
+                "used_percentage": -5.0,
+                "context_window_size": 200000,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+            }
+        }"#;
         match parse(json).expect_err("should reject") {
-            ParseError::InvalidValue { path, reason, .. } => {
+            ParseError::InvalidValue { path, .. } => {
                 assert_eq!(path, "context_window.used_percentage");
-                assert!(reason.contains("0.0..=100.0"));
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn used_percentage_in_range_passes_through_unchanged() {
+        // Clamp must not distort values that were already in range.
+        let json = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/repo" },
+            "context_window": {
+                "used_percentage": 42.5,
+                "context_window_size": 200000,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+            }
+        }"#;
+        let ctx = parse(json).expect("in-range succeeds");
+        let cw = ctx.context_window.expect("context_window present");
+        assert_eq!(cw.used.value(), 42.5);
     }
 
     #[test]
