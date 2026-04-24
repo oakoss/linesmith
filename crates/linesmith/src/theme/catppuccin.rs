@@ -25,7 +25,11 @@ const fn flavor_to_theme_colors(p: &catppuccin::FlavorColors) -> [Option<Color>;
     let mut c = [None; Role::COUNT];
     c[Role::Foreground as usize] = Some(rgb(p.text.rgb));
     c[Role::Background as usize] = Some(rgb(p.base.rgb));
-    c[Role::Muted as usize] = Some(rgb(p.overlay0.rgb));
+    // `subtext0` is Catppuccin's canonical "secondary text that still
+    // reads clearly." `overlay0` is the UI-overlay grey (borders,
+    // dividers) and sits too dim on dark flavors to carry statusline
+    // text like cost/effort.
+    c[Role::Muted as usize] = Some(rgb(p.subtext0.rgb));
     c[Role::Primary as usize] = Some(rgb(p.mauve.rgb));
     c[Role::Accent as usize] = Some(rgb(p.blue.rgb));
     c[Role::Success as usize] = Some(rgb(p.green.rgb));
