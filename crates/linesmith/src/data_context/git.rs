@@ -325,7 +325,7 @@ fn compute_upstream(
         Some(r) => r,
         None => return Ok(None),
     };
-    let upstream_oid = upstream_ref.peel_to_id_in_place()?.detach();
+    let upstream_oid = upstream_ref.peel_to_id()?.detach();
     let head_oid = head_ref.id().detach();
 
     // Explicit merge_base + manual exclusion avoids gix's
@@ -396,10 +396,15 @@ fn count_ancestors_excluding(
 }
 
 fn classify_kind(repo: &gix::Repository) -> RepoKind {
+    // gix 0.82 consolidated `Kind::Bare` and `Kind::WorkTree { is_linked: false }`
+    // into `Kind::Common`; bare-ness now reads from `Repository::is_bare()`
+    // which consults the loaded config rather than the directory layout.
+    if repo.is_bare() {
+        return RepoKind::Bare;
+    }
     match repo.kind() {
-        gix::repository::Kind::Bare => RepoKind::Bare,
-        gix::repository::Kind::WorkTree { is_linked: false } => RepoKind::Main,
-        gix::repository::Kind::WorkTree { is_linked: true } => {
+        gix::repository::Kind::Common => RepoKind::Main,
+        gix::repository::Kind::LinkedWorkTree => {
             // `.git/worktrees/<name>/` — basename of the gitdir is the
             // per-worktree label.
             let name = repo

@@ -25,7 +25,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 # http-transport — the statusline never talks to a remote.
 # `max-performance-safe` transitively enables `parallel`, which
 # makes `gix::Repository: Send`.
-gix = { version = "0.67", default-features = false, features = ["max-performance-safe", "status", "revision"] }
+gix = { version = "0.82", default-features = false, features = ["max-performance-safe", "status", "revision", "sha1"] }
 # HTTP-date parser for `Retry-After` headers per ADR-0011 §Cache stack.
 # Zero-dep, ~200 LOC — smaller than pulling chrono's HTTP-date story.
 httpdate = "1"
