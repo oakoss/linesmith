@@ -194,7 +194,9 @@ impl Capability {
 
     /// Raw terminal capability from `supports-color`, ignoring
     /// `NO_COLOR`. The color-policy precedence chain uses this so a
-    /// `--force-color` flag can outrank the env var.
+    /// `--force-color` flag can outrank the env var. Returns `None`
+    /// when stdout isn't a TTY so `color = "auto"` stays plain-text
+    /// under pipes and redirects.
     #[must_use]
     pub fn from_terminal() -> Self {
         match supports_color::on(supports_color::Stream::Stdout) {
@@ -203,6 +205,42 @@ impl Capability {
             Some(_) => Self::Palette16,
             None => Self::None,
         }
+    }
+
+    /// Env-only capability probe from the `COLORTERM` and `TERM`
+    /// values carried on `CliEnv`. Used by the force-color path to
+    /// recover a tier when `supports-color` gives up (e.g. piped
+    /// stdout under Claude Code). Never reads the live process env;
+    /// callers must snapshot into `CliEnv::from_process` first so
+    /// tests and embedders stay hermetic.
+    ///
+    /// Returns `None` for `TERM=dumb`, empty `TERM`, or no `TERM` at
+    /// all.
+    #[must_use]
+    pub(crate) fn from_env_vars(colorterm: Option<&str>, term: Option<&str>) -> Self {
+        if let Some(c) = colorterm {
+            if c.eq_ignore_ascii_case("truecolor") || c.eq_ignore_ascii_case("24bit") {
+                return Self::TrueColor;
+            }
+        }
+        match term.map(str::trim) {
+            None | Some("") => Self::None,
+            Some(t) if t.eq_ignore_ascii_case("dumb") => Self::None,
+            Some(t) if t.contains("256color") => Self::Palette256,
+            _ => Self::Palette16,
+        }
+    }
+
+    /// Combine a TTY probe (from `supports-color`) and an env probe
+    /// (from `COLORTERM` / `TERM`) into a capability under force-color
+    /// intent. Picks the richer of the two, flooring at `Palette16`
+    /// so an explicit `color = "always"` / `--force-color` / `FORCE_COLOR`
+    /// never collapses to no-color. The `Palette16` floor overrides
+    /// `TERM=dumb` — the user explicitly asked for color, so a dumb
+    /// terminal signal loses.
+    #[must_use]
+    pub(crate) fn force_from(tty: Self, env: Self) -> Self {
+        tty.max(env).max(Self::Palette16)
     }
 }
 
@@ -917,5 +955,137 @@ mod tests {
         };
         let t = built_in("minimal").expect("minimal");
         assert_eq!(sgr_open(&s, t, Capability::TrueColor), "\x1b[1m");
+    }
+
+    // --- env-fallback capability probe ---
+
+    #[test]
+    fn from_env_vars_prefers_colorterm_truecolor() {
+        assert_eq!(
+            Capability::from_env_vars(Some("truecolor"), Some("xterm")),
+            Capability::TrueColor
+        );
+        assert_eq!(
+            Capability::from_env_vars(Some("24bit"), Some("xterm")),
+            Capability::TrueColor
+        );
+        assert_eq!(
+            Capability::from_env_vars(Some("TRUECOLOR"), None),
+            Capability::TrueColor
+        );
+    }
+
+    #[test]
+    fn from_env_vars_falls_back_to_term_256color() {
+        assert_eq!(
+            Capability::from_env_vars(None, Some("xterm-256color")),
+            Capability::Palette256
+        );
+        assert_eq!(
+            Capability::from_env_vars(None, Some("tmux-256color")),
+            Capability::Palette256
+        );
+    }
+
+    #[test]
+    fn from_env_vars_unknown_term_is_palette16() {
+        assert_eq!(
+            Capability::from_env_vars(None, Some("xterm")),
+            Capability::Palette16
+        );
+        assert_eq!(
+            Capability::from_env_vars(None, Some("vt100")),
+            Capability::Palette16
+        );
+    }
+
+    #[test]
+    fn from_env_vars_dumb_or_missing_term_is_none() {
+        assert_eq!(
+            Capability::from_env_vars(None, Some("dumb")),
+            Capability::None
+        );
+        // Case-insensitive on TERM=dumb to mirror the COLORTERM check.
+        assert_eq!(
+            Capability::from_env_vars(None, Some("DUMB")),
+            Capability::None
+        );
+        assert_eq!(
+            Capability::from_env_vars(None, Some("  dumb  ")),
+            Capability::None
+        );
+        assert_eq!(Capability::from_env_vars(None, Some("")), Capability::None);
+        assert_eq!(Capability::from_env_vars(None, None), Capability::None);
+    }
+
+    #[test]
+    fn from_env_vars_colorterm_truecolor_overrides_term_dumb() {
+        // COLORTERM=truecolor is the stronger signal and wins over TERM=dumb.
+        assert_eq!(
+            Capability::from_env_vars(Some("truecolor"), Some("dumb")),
+            Capability::TrueColor
+        );
+    }
+
+    // --- force-color combinator ---
+
+    #[test]
+    fn force_from_picks_max_of_both_inputs() {
+        assert_eq!(
+            Capability::force_from(Capability::Palette256, Capability::TrueColor),
+            Capability::TrueColor
+        );
+        assert_eq!(
+            Capability::force_from(Capability::TrueColor, Capability::Palette256),
+            Capability::TrueColor
+        );
+        assert_eq!(
+            Capability::force_from(Capability::Palette16, Capability::Palette256),
+            Capability::Palette256
+        );
+    }
+
+    #[test]
+    fn force_from_truecolor_from_either_side_wins() {
+        assert_eq!(
+            Capability::force_from(Capability::None, Capability::TrueColor),
+            Capability::TrueColor
+        );
+        assert_eq!(
+            Capability::force_from(Capability::TrueColor, Capability::None),
+            Capability::TrueColor
+        );
+    }
+
+    #[test]
+    fn force_from_floors_at_palette16_when_both_inputs_are_none() {
+        // Force-color intent must emit something; the user opted in
+        // explicitly via --force-color or `color = "always"`.
+        assert_eq!(
+            Capability::force_from(Capability::None, Capability::None),
+            Capability::Palette16
+        );
+    }
+
+    #[test]
+    fn force_from_floor_overrides_dumb_term_when_env_probe_returns_none() {
+        // Even when TERM=dumb made the env probe return None, force-color
+        // intent wins — the user knows what they're doing.
+        let env = Capability::from_env_vars(None, Some("dumb"));
+        assert_eq!(env, Capability::None);
+        assert_eq!(
+            Capability::force_from(Capability::None, env),
+            Capability::Palette16
+        );
+    }
+
+    #[test]
+    fn from_env_vars_colorterm_garbage_falls_through_to_term() {
+        // COLORTERM=yes (some terminals set this as a boolean hint) does
+        // not claim truecolor; fall through to the TERM probe.
+        assert_eq!(
+            Capability::from_env_vars(Some("yes"), Some("xterm-256color")),
+            Capability::Palette256
+        );
     }
 }

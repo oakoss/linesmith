@@ -59,6 +59,16 @@ pub struct CliEnv {
     pub home: Option<String>,
     pub no_color: bool,
     pub force_color: bool,
+    /// Raw `COLORTERM`, or `None` if unset. Threaded to the
+    /// force-color resolver so it can justify TrueColor when the TTY
+    /// probe gives up (e.g. piped stdout under Claude Code).
+    /// `from_process` snapshots the real env; `for_tests`/`default`
+    /// leave it `None` so ambient `COLORTERM=truecolor` can't leak
+    /// into captured-output tests.
+    pub colorterm: Option<String>,
+    /// Raw `TERM`, or `None` if unset. Same snapshot discipline as
+    /// `colorterm`.
+    pub term: Option<String>,
     pub terminal_width: Option<u16>,
     pub color_capability: Option<theme::Capability>,
     /// cwd used for gix repo discovery. `None` skips discovery
@@ -85,6 +95,8 @@ impl CliEnv {
             home: std::env::var("HOME").ok(),
             no_color: no_color_env("NO_COLOR"),
             force_color: force_color_env("FORCE_COLOR"),
+            colorterm: std::env::var("COLORTERM").ok(),
+            term: std::env::var("TERM").ok(),
             terminal_width: None,
             color_capability: None,
             cwd: std::env::current_dir().ok(),
@@ -105,6 +117,8 @@ impl CliEnv {
             home: None,
             no_color: false,
             force_color: false,
+            colorterm: None,
+            term: None,
             terminal_width: Some(200),
             color_capability: Some(theme::Capability::None),
             cwd: None,
@@ -472,31 +486,40 @@ fn resolve_color_capability(
     }
     match cli_override {
         Some(cli::ColorOverride::Never) => return theme::Capability::None,
-        Some(cli::ColorOverride::Always) => return force_color_detect(),
+        Some(cli::ColorOverride::Always) => return force_color_detect(env),
         None => {}
     }
     if env.no_color {
         return theme::Capability::None;
     }
     if env.force_color {
-        return force_color_detect();
+        return force_color_detect(env);
     }
     match layout_options(cfg).map(|l| l.color).unwrap_or_default() {
         config::ColorPolicy::Never => theme::Capability::None,
-        config::ColorPolicy::Always => force_color_detect(),
+        config::ColorPolicy::Always => force_color_detect(env),
         config::ColorPolicy::Auto => theme::Capability::from_terminal(),
     }
 }
 
-/// Under "force color" intent, pick the richest supported tier; if the
-/// terminal reports no color support (typical when stdout isn't a TTY),
-/// fall back to `Palette16` so the user sees something rather than
-/// nothing.
-fn force_color_detect() -> theme::Capability {
-    match theme::Capability::from_terminal() {
-        theme::Capability::None => theme::Capability::Palette16,
-        other => other,
-    }
+/// Under "force color" intent, pick the richest tier either the
+/// `supports-color` TTY probe or the `COLORTERM` / `TERM` snapshot
+/// on `CliEnv` can justify. See `theme::Capability::force_from` for
+/// the full semantics (including the `Palette16` floor that overrides
+/// `TERM=dumb` when the user explicitly asks for color).
+///
+/// The env branch is load-bearing for Claude Code: CC spawns linesmith
+/// with piped stdout, so `supports-color` returns `None`; without the
+/// env rescue, `color = "always"` would collapse to `Palette16` and
+/// every TrueColor theme would render as its 16-color downgrade.
+///
+/// Reads env only from `CliEnv`, never from the live process, so
+/// tests and embedders stay hermetic.
+fn force_color_detect(env: &CliEnv) -> theme::Capability {
+    theme::Capability::force_from(
+        theme::Capability::from_terminal(),
+        theme::Capability::from_env_vars(env.colorterm.as_deref(), env.term.as_deref()),
+    )
 }
 
 /// Resolve the active theme from config. Unknown names fall back to
@@ -1518,7 +1541,26 @@ mod tests {
         // The Palette16 floor is the whole point of force_color_detect;
         // pin it directly so a regression dropping the fallback match
         // arm is visible without chasing through resolver assertions.
-        assert_ne!(force_color_detect(), theme::Capability::None);
+        // Pass an empty CliEnv so the result is deterministic regardless
+        // of the host terminal.
+        assert_ne!(
+            force_color_detect(&CliEnv::default()),
+            theme::Capability::None
+        );
+    }
+
+    #[test]
+    fn force_color_detect_reads_colorterm_from_cli_env_not_ambient_process() {
+        // Hermeticity guard. force_color_detect must read only from
+        // CliEnv; a direct std::env::var or a module-level ambient
+        // reader would bypass the snapshot and make the resolver
+        // non-deterministic for tests and embedders.
+        let env = CliEnv {
+            colorterm: Some("truecolor".to_string()),
+            term: Some("xterm-ghostty".to_string()),
+            ..CliEnv::default()
+        };
+        assert_eq!(force_color_detect(&env), theme::Capability::TrueColor);
     }
 
     #[test]
