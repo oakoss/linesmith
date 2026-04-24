@@ -35,5 +35,5 @@
       "resets_at": "2099-04-24T15:00:00Z"
     }
   },
-  "effort": "high"
+  "effort": { "level": "high" }
 }

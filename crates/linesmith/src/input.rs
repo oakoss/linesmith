@@ -533,12 +533,32 @@ mod claude {
         if value.is_null() {
             return Ok(None);
         }
-        let raw = value
-            .as_str()
-            .ok_or_else(|| type_mismatch("effort", JsonType::String, JsonType::of(value)))?;
+        // Claude Code 2.1.x emits `effort: { level: "xhigh" }`; the object
+        // form is canonical. A bare string is tolerated for forward/backward
+        // compat with other tools or earlier contracts.
+        let (raw, path): (&str, &'static str) = match value {
+            serde_json::Value::Object(obj) => {
+                let level = obj.get("level").ok_or_else(|| missing("effort.level"))?;
+                if level.is_null() {
+                    return Ok(None);
+                }
+                let s = level.as_str().ok_or_else(|| {
+                    type_mismatch("effort.level", JsonType::String, JsonType::of(level))
+                })?;
+                (s, "effort.level")
+            }
+            serde_json::Value::String(s) => (s.as_str(), "effort"),
+            other => {
+                return Err(type_mismatch(
+                    "effort",
+                    JsonType::Object,
+                    JsonType::of(other),
+                ));
+            }
+        };
         raw.parse::<EffortLevel>()
             .map(Some)
-            .map_err(|()| invalid_value("effort", "expected one of: low, medium, high, max, xhigh"))
+            .map_err(|()| invalid_value(path, "expected one of: low, medium, high, max, xhigh"))
     }
 
     // --- helpers ------------------------------------------------------
@@ -1157,12 +1177,99 @@ mod tests {
     // --- effort error paths ---
 
     #[test]
-    fn effort_non_string_rejected_as_type_mismatch() {
+    fn effort_object_form_parses() {
+        // Canonical shape as of Claude Code 2.1.x.
+        let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"effort":{"level":"xhigh"}}"#;
+        let ctx = parse(bytes).expect("parse ok");
+        assert_eq!(ctx.effort, Some(EffortLevel::XHigh));
+    }
+
+    #[test]
+    fn effort_bare_string_still_parses() {
+        // Back-compat for tools that emit a bare-string form.
+        let bytes =
+            br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"effort":"high"}"#;
+        let ctx = parse(bytes).expect("parse ok");
+        assert_eq!(ctx.effort, Some(EffortLevel::High));
+    }
+
+    #[test]
+    fn effort_object_missing_level_surfaces_missing_field_with_full_path() {
+        let bytes =
+            br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"effort":{}}"#;
+        match parse(bytes).expect_err("rejected") {
+            ParseError::MissingField { path, .. } => assert_eq!(path, "effort.level"),
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effort_object_non_string_level_surfaces_type_mismatch_with_full_path() {
+        let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"effort":{"level":42}}"#;
+        match parse(bytes).expect_err("rejected") {
+            ParseError::TypeMismatch {
+                path,
+                expected,
+                got,
+                ..
+            } => {
+                assert_eq!(path, "effort.level");
+                assert_eq!(expected, JsonType::String);
+                assert_eq!(got, JsonType::Number);
+            }
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effort_object_null_level_maps_to_none() {
+        let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"effort":{"level":null}}"#;
+        let ctx = parse(bytes).expect("parse ok");
+        assert_eq!(ctx.effort, None);
+    }
+
+    #[test]
+    fn effort_top_level_null_maps_to_none() {
+        // Locks the outer early-return in parse_effort. A refactor that
+        // dropped the explicit is_null() check and delegated to the
+        // object/string match would regress this into a TypeMismatch.
+        let bytes =
+            br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"effort":null}"#;
+        let ctx = parse(bytes).expect("parse ok");
+        assert_eq!(ctx.effort, None);
+    }
+
+    #[test]
+    fn effort_non_object_non_string_rejected_as_type_mismatch() {
         let bytes =
             br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"effort":42}"#;
         match parse(bytes).expect_err("rejected") {
-            ParseError::TypeMismatch { path, .. } => assert_eq!(path, "effort"),
+            ParseError::TypeMismatch {
+                path,
+                expected,
+                got,
+                ..
+            } => {
+                assert_eq!(path, "effort");
+                assert_eq!(expected, JsonType::Object);
+                assert_eq!(got, JsonType::Number);
+            }
             other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effort_object_unknown_level_rejected_as_invalid_value_with_full_path() {
+        let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"effort":{"level":"ultra"}}"#;
+        match parse(bytes).expect_err("rejected") {
+            ParseError::InvalidValue { path, reason, .. } => {
+                assert_eq!(path, "effort.level");
+                assert!(
+                    reason.contains("low"),
+                    "reason should list known values, got {reason:?}"
+                );
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
         }
     }
 

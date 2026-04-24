@@ -355,7 +355,10 @@ If heuristic matching is ambiguous, emit a warning-level log line once (to stder
 | `cost.total_cost_usd` present but `0.0`      | Emit as-is (zero is valid, not missing)                                                          |
 | `context_window.size` is `0`                 | Parse as-is; segments decide whether to render                                                   |
 | `used_percentage` out of `0.0..=100.0`       | `ParseError::TypeMismatch { path: "context_window.used_percentage", ... }`                       |
-| `effort` field not in Claude payload         | `StatusContext.effort = None` (Claude Code doesn't emit yet; see user-demand research)           |
+| `effort` field absent or `null`              | `StatusContext.effort = None`                                                                    |
+| `effort` is object `{"level": "xhigh"}`      | Canonical shape as of Claude Code 2.1.x; parse `effort.level` (bare-string form also accepted)   |
+| `effort.level` absent in object form         | `ParseError::MissingField { path: "effort.level" }`                                              |
+| `effort.level` is explicit `null`            | `StatusContext.effort = None` (same as absent outer `effort`)                                    |
 
 ### Input-level
 
