@@ -60,6 +60,10 @@ pub struct ContextWindow {
     pub size: u64,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    /// Tokens consumed by the most recent API call; `None` before the
+    /// first call in a session. Distinct from `total_*_tokens` above,
+    /// which are cumulative across the whole session.
+    pub current_usage: Option<TurnUsage>,
 }
 
 impl ContextWindow {
@@ -68,6 +72,18 @@ impl ContextWindow {
     pub fn remaining(&self) -> Percent {
         self.used.complement()
     }
+}
+
+/// Per-turn token breakdown from `context_window.current_usage`. All
+/// counts are for the most recent API call only — use `ContextWindow`'s
+/// `total_*_tokens` for cumulative session values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TurnUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -339,7 +355,7 @@ impl std::error::Error for ParseError {}
 mod claude {
     use super::{
         ContextWindow, CostMetrics, EffortLevel, GitWorktree, JsonType, ModelInfo, ParseError,
-        Percent, StatusContext, Tool, WorkspaceInfo,
+        Percent, StatusContext, Tool, TurnUsage, WorkspaceInfo,
     };
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -442,12 +458,43 @@ mod claude {
         let size = require_u64(cw, "context_window.context_window_size")?;
         let total_input_tokens = require_u64(cw, "context_window.total_input_tokens")?;
         let total_output_tokens = require_u64(cw, "context_window.total_output_tokens")?;
+        let current_usage = parse_current_usage(cw)?;
 
         Ok(Some(ContextWindow {
             used,
             size,
             total_input_tokens,
             total_output_tokens,
+            current_usage,
+        }))
+    }
+
+    fn parse_current_usage(
+        cw: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<TurnUsage>, ParseError> {
+        // Claude Code emits `current_usage: null` before the first API
+        // call in a session (see docs/research/claude-code-statusline-api.md).
+        // The key's presence isn't guaranteed by the schema either, so
+        // tolerate outright omission as defense-in-depth; both map to
+        // Option::None.
+        let Some(value) = cw.get("current_usage") else {
+            return Ok(None);
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        let obj = expect_object(value, "context_window.current_usage")?;
+        Ok(Some(TurnUsage {
+            input_tokens: require_u64(obj, "context_window.current_usage.input_tokens")?,
+            output_tokens: require_u64(obj, "context_window.current_usage.output_tokens")?,
+            cache_creation_input_tokens: require_u64(
+                obj,
+                "context_window.current_usage.cache_creation_input_tokens",
+            )?,
+            cache_read_input_tokens: require_u64(
+                obj,
+                "context_window.current_usage.cache_read_input_tokens",
+            )?,
         }))
     }
 
@@ -836,6 +883,151 @@ mod tests {
         }"#;
         let ctx = parse(json).expect("parse ok");
         assert!(ctx.context_window.is_none());
+    }
+
+    #[test]
+    fn current_usage_absent_is_none() {
+        // Schema doesn't guarantee the key is present inside a
+        // context_window object; treat missing the same as explicit
+        // `null` so a future schema variation parses cleanly.
+        let json = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/repo" },
+            "context_window": {
+                "used_percentage": 42.5,
+                "context_window_size": 200000,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+            }
+        }"#;
+        let ctx = parse(json).expect("parse ok");
+        let cw = ctx.context_window.expect("context_window present");
+        assert!(cw.current_usage.is_none());
+    }
+
+    #[test]
+    fn current_usage_null_is_none() {
+        // Claude Code emits `current_usage: null` before the first API
+        // call in a session; round-trip to Option::None.
+        let json = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/repo" },
+            "context_window": {
+                "used_percentage": 0,
+                "context_window_size": 200000,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "current_usage": null
+            }
+        }"#;
+        let ctx = parse(json).expect("parse ok");
+        let cw = ctx.context_window.expect("context_window present");
+        assert!(cw.current_usage.is_none());
+    }
+
+    #[test]
+    fn current_usage_present_parses_all_four_fields() {
+        let json = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/repo" },
+            "context_window": {
+                "used_percentage": 12.4,
+                "context_window_size": 200000,
+                "total_input_tokens": 24800,
+                "total_output_tokens": 3200,
+                "current_usage": {
+                    "input_tokens": 2000,
+                    "output_tokens": 500,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 500
+                }
+            }
+        }"#;
+        let ctx = parse(json).expect("parse ok");
+        let cw = ctx.context_window.expect("context_window present");
+        let usage = cw.current_usage.expect("current_usage present");
+        assert_eq!(usage.input_tokens, 2000);
+        assert_eq!(usage.output_tokens, 500);
+        assert_eq!(usage.cache_creation_input_tokens, 0);
+        assert_eq!(usage.cache_read_input_tokens, 500);
+    }
+
+    #[test]
+    fn current_usage_non_object_is_type_mismatch() {
+        let json = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/repo" },
+            "context_window": {
+                "used_percentage": 0,
+                "context_window_size": 200000,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "current_usage": "not an object"
+            }
+        }"#;
+        match parse(json).expect_err("should reject") {
+            ParseError::TypeMismatch { path, .. } => {
+                assert_eq!(path, "context_window.current_usage");
+            }
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn current_usage_missing_inner_field_is_missing_field() {
+        let json = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/repo" },
+            "context_window": {
+                "used_percentage": 0,
+                "context_window_size": 200000,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "current_usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50
+                }
+            }
+        }"#;
+        match parse(json).expect_err("should reject") {
+            ParseError::MissingField { path, .. } => {
+                assert_eq!(
+                    path,
+                    "context_window.current_usage.cache_creation_input_tokens"
+                );
+            }
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn current_usage_inner_wrong_type_is_type_mismatch_at_nested_path() {
+        // Lock the error-path provenance for nested fields: a non-
+        // number inner value should surface as TypeMismatch with the
+        // full `context_window.current_usage.<field>` path, not the
+        // outer `context_window.current_usage`.
+        let json = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/repo" },
+            "context_window": {
+                "used_percentage": 0,
+                "context_window_size": 200000,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "current_usage": {
+                    "input_tokens": "200",
+                    "output_tokens": 50,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
+                }
+            }
+        }"#;
+        match parse(json).expect_err("should reject") {
+            ParseError::TypeMismatch { path, .. } => {
+                assert_eq!(path, "context_window.current_usage.input_tokens");
+            }
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
     }
 
     #[test]

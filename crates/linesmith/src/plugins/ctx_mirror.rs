@@ -24,7 +24,8 @@ use crate::data_context::{
     UsageBucket, UsageData,
 };
 use crate::input::{
-    ContextWindow, CostMetrics, GitWorktree, ModelInfo, StatusContext, Tool, WorkspaceInfo,
+    ContextWindow, CostMetrics, GitWorktree, ModelInfo, StatusContext, Tool, TurnUsage,
+    WorkspaceInfo,
 };
 
 const ENV_WHITELIST: &[&str] = &["TERM", "COLORTERM", "NO_COLOR", "FORCE_COLOR", "LANG"];
@@ -274,6 +275,35 @@ fn build_context_window(cw: &ContextWindow) -> Dynamic {
     m.insert(
         "total_output_tokens".into(),
         int_from_u64(cw.total_output_tokens),
+    );
+    m.insert(
+        "current_usage".into(),
+        cw.current_usage
+            .as_ref()
+            .map_or(Dynamic::UNIT, build_turn_usage),
+    );
+    Dynamic::from_map(m)
+}
+
+fn build_turn_usage(u: &TurnUsage) -> Dynamic {
+    // Destructure so a new field on TurnUsage fails to compile here
+    // rather than silently dropping from the rhai mirror.
+    let TurnUsage {
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+    } = u;
+    let mut m = Map::new();
+    m.insert("input_tokens".into(), int_from_u64(*input_tokens));
+    m.insert("output_tokens".into(), int_from_u64(*output_tokens));
+    m.insert(
+        "cache_creation_input_tokens".into(),
+        int_from_u64(*cache_creation_input_tokens),
+    );
+    m.insert(
+        "cache_read_input_tokens".into(),
+        int_from_u64(*cache_read_input_tokens),
     );
     Dynamic::from_map(m)
 }
@@ -1327,6 +1357,7 @@ mod tests {
             size: 200_000,
             total_input_tokens: 1_000,
             total_output_tokens: 2_000,
+            current_usage: None,
         });
         let dc = DataContext::new(s);
         let ctx = build_and_unwrap_map(&dc, &[]);
@@ -1351,6 +1382,75 @@ mod tests {
         assert_eq!(
             cw.get("size").unwrap().clone().try_cast::<i64>().unwrap(),
             200_000
+        );
+        // None current_usage mirrors as rhai `()` so plugins can check
+        // `if ctx.status.context_window.current_usage != () { ... }`.
+        assert!(cw.get("current_usage").unwrap().is_unit());
+    }
+
+    #[test]
+    fn context_window_current_usage_mirrors_all_four_fields() {
+        let mut s = minimal_status();
+        s.context_window = Some(ContextWindow {
+            used: Percent::new(12.4).unwrap(),
+            size: 200_000,
+            total_input_tokens: 24_800,
+            total_output_tokens: 3_200,
+            current_usage: Some(TurnUsage {
+                input_tokens: 2_000,
+                output_tokens: 500,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 500,
+            }),
+        });
+        let dc = DataContext::new(s);
+        let ctx = build_and_unwrap_map(&dc, &[]);
+        let usage: Map = status_map(&ctx)
+            .get("context_window")
+            .unwrap()
+            .clone()
+            .try_cast::<Map>()
+            .unwrap()
+            .get("current_usage")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        assert_eq!(
+            usage
+                .get("input_tokens")
+                .unwrap()
+                .clone()
+                .try_cast::<i64>()
+                .unwrap(),
+            2_000
+        );
+        assert_eq!(
+            usage
+                .get("output_tokens")
+                .unwrap()
+                .clone()
+                .try_cast::<i64>()
+                .unwrap(),
+            500
+        );
+        assert_eq!(
+            usage
+                .get("cache_creation_input_tokens")
+                .unwrap()
+                .clone()
+                .try_cast::<i64>()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            usage
+                .get("cache_read_input_tokens")
+                .unwrap()
+                .clone()
+                .try_cast::<i64>()
+                .unwrap(),
+            500
         );
     }
 

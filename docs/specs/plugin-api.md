@@ -229,10 +229,20 @@ ctx.status.workspace.git_worktree.name
 
 // Nullable fields — check for () before accessing sub-fields
 if ctx.status.context_window != () {
-    ctx.status.context_window.used          // f32 in 0.0..=100.0 (Percent unwrapped)
-    ctx.status.context_window.remaining     // f32 in 0.0..=100.0 (pre-computed host-side)
-    ctx.status.context_window.size
-    ctx.status.context_window.current_usage // map or ()
+    ctx.status.context_window.used                  // f32 in 0.0..=100.0 (Percent unwrapped)
+    ctx.status.context_window.remaining             // f32 in 0.0..=100.0 (pre-computed host-side)
+    ctx.status.context_window.size                  // i64 (context_window_size)
+    ctx.status.context_window.total_input_tokens    // i64 cumulative session total
+    ctx.status.context_window.total_output_tokens   // i64 cumulative session total
+    // `current_usage` is the per-turn breakdown of the most recent
+    // API call; `()` before the first call in a session. Distinct
+    // from the cumulative `total_*_tokens` above.
+    if ctx.status.context_window.current_usage != () {
+        ctx.status.context_window.current_usage.input_tokens                 // i64
+        ctx.status.context_window.current_usage.output_tokens                // i64
+        ctx.status.context_window.current_usage.cache_creation_input_tokens  // i64
+        ctx.status.context_window.current_usage.cache_read_input_tokens      // i64
+    }
 }
 
 // Rate-limit data is not on ctx.status — read ctx.usage instead

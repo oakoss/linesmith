@@ -53,6 +53,7 @@ fn format_size_for(size: u64) -> String {
         size,
         total_input_tokens: 0,
         total_output_tokens: 0,
+        current_usage: None,
     })
 }
 
@@ -86,6 +87,7 @@ mod tests {
             size,
             total_input_tokens: 0,
             total_output_tokens: 0,
+            current_usage: None,
         }
     }
 
