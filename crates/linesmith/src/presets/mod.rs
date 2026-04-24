@@ -135,6 +135,7 @@ mod tests {
                 "rate_limit_7d",
                 "cost",
                 "effort",
+                "tokens_total",
             ]
         );
     }

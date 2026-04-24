@@ -20,6 +20,7 @@ pub mod rate_limit_5h_reset;
 pub mod rate_limit_7d;
 pub mod rate_limit_7d_reset;
 pub mod rate_limit_format;
+pub mod tokens;
 pub mod workspace;
 
 /// Output of a successful segment render.
@@ -402,6 +403,10 @@ pub const BUILT_IN_SEGMENT_IDS: &[&str] = &[
     "rate_limit_5h_reset",
     "rate_limit_7d_reset",
     "extra_usage",
+    "tokens_input",
+    "tokens_output",
+    "tokens_cached",
+    "tokens_total",
 ];
 
 /// Construct a built-in segment by its config id. Unknown ids return
@@ -440,6 +445,10 @@ pub fn built_in_by_id(
         "extra_usage" => Some(Box::new(extra_usage::ExtraUsageSegment::from_extras(
             e, warn,
         ))),
+        "tokens_input" => Some(Box::new(tokens::TokensInputSegment)),
+        "tokens_output" => Some(Box::new(tokens::TokensOutputSegment)),
+        "tokens_cached" => Some(Box::new(tokens::TokensCachedSegment)),
+        "tokens_total" => Some(Box::new(tokens::TokensTotalSegment)),
         _ => None,
     }
 }
@@ -695,6 +704,10 @@ mod layout_type_tests {
             "rate_limit_5h_reset",
             "rate_limit_7d_reset",
             "extra_usage",
+            "tokens_input",
+            "tokens_output",
+            "tokens_cached",
+            "tokens_total",
         ] {
             assert!(
                 built_in_by_id(id, None, &mut |_| {}).is_some(),
