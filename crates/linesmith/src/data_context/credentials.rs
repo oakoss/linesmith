@@ -28,6 +28,7 @@ use secrecy::{ExposeSecret, SecretString};
 /// to defend against pathological inputs.
 const MAX_FILE_SIZE: u64 = 1_000_000;
 
+#[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
 // --- Types --------------------------------------------------------------
