@@ -54,7 +54,7 @@ To be filled in by running linesmith against a live Claude Code session in each 
 | #   | Scenario                                    | `used_percentage` (stdin) | `/context` truth | `context_window_size` correct?          | Render anomaly?                                                              | Pass/Fail |
 | --- | ------------------------------------------- | ------------------------- | ---------------- | --------------------------------------- | ---------------------------------------------------------------------------- | --------- |
 | 1   | 200k-context session, low fill, pre-compact | 21                        | 21%              | yes — `200_000`                         | none                                                                         | **Pass**  |
-| 2   | Same session after `/compact`               | TBD                       | TBD              | TBD                                     | TBD                                                                          | TBD       |
+| 2   | Same session after `/compact`               | 28                        | 28%              | yes — `200_000`                         | none                                                                         | **Pass**  |
 | 3   | Session resumed via `/resume`               | TBD                       | TBD              | TBD                                     | TBD                                                                          | TBD       |
 | 4   | During a 429 rate-limit response            | TBD                       | TBD              | TBD                                     | TBD                                                                          | TBD       |
 | 5   | 1M-context variant (Opus 4.7 1M)            | 34                        | 34%              | yes — `1_000_000`, not stuck at 200_000 | none once [lsm-ts7k](../../.beads/issues.jsonl) (effort parser) is installed | **Pass**  |
@@ -70,6 +70,14 @@ Row 1 notes:
 
 - `model.id = "claude-sonnet-4-6"` (no `[1m]` suffix); `model.display_name = "Sonnet 4.6"`. `exceeds_200k_tokens = false` corroborates the 200k window.
 - Confirmed against a fresh CC instance opened on the standard 200k Sonnet 4.6 with 19 captures clustered between `2026-04-25T02:55:09Z` and `2026-04-25T02:57:56Z`. Reported `42.2k/200k tokens (21%)` in `/context`; stdin reported pct=21 in lockstep. Delta: 0. Higher-fill 200k captures (post-`/compact` and beyond) would tighten the row further but the 21% point already validates the integer-percentage and 200k-denominator contracts.
+
+Row 2 notes:
+
+- Same Sonnet 4.6 session as Row 1 (`session_id = "2bf04083-3add-4dcd-818b-25a8e3d0ae8a"`). Captured at `2026-04-25T03:34:24Z` (first post-compact stdin) and stable through `2026-04-25T04:09:09Z`. Reported `56.8k/200k tokens (28%)` in `/context` after `/compact`; stdin reported pct=28 in lockstep. Delta: 0.
+- **Transition signature.** Last pre-compact capture at `03:19:20Z` had `pct=41`, `total_input_tokens=472`, `total_output_tokens=11_616`. First post-compact capture at `03:34:24Z` had `pct=28`, `total_input_tokens=14_742`, `total_output_tokens=15_029`. The pct dropped 13 points (41→28) while `total_input_tokens` jumped from 472 to 14_742 (~14k token leap) — consistent with CC's `/compact` summarizing the conversation and stuffing the summary into the next input as a cached block.
+- **`current_usage` post-compact.** `cache_creation_input_tokens=43_329` (the freshly-created cache for the summary) and `cache_read_input_tokens=13_502` (already-cached prior content). The cache totals exceed the predicted-vs-actual gap (`28 × 200_000 / 100 = 56_000` predicted vs `total_in + total_out = 30_113` actual; gap `~25_887`), consistent with the dataset finding in §Sanity checks against the capture dataset that `used_percentage` counts cache-resident tokens that `total_*_tokens` exclude.
+- **No `>100` clamp triggers across the compact transition.** The Anthropic #37163 post-`/compact` `>100` drift did not reproduce on Sonnet 4.6 / CC 2.1.120 in this session. The bug may still occur on other CC versions, models, or transition shapes; this run only proves the combination above is unaffected.
+- **No mid-compact transition state observed.** CC's statusline only fires on prompts (per the API contract), not during `/compact` itself. We see "before" and "after" captures but no intermediate state, so Open Question #1's "is there a transition state?" sub-question can't be answered from stdin captures alone — `/compact` is atomic from the statusline's perspective.
 
 ### Sanity checks against the capture dataset
 
@@ -112,7 +120,7 @@ Provisional positions to confirm or reject after live tests:
 
 ## Open questions
 
-- What does `used_percentage` actually output during an in-progress `/compact`? Is there a transition state (both 0 and 100 have been reported)?
+- ~~What does `used_percentage` actually output during an in-progress `/compact`? Is there a transition state (both 0 and 100 have been reported)?~~ **Partially resolved 2026-04-25 via row 2:** the before/after across `/compact` is clean (pct=41 → pct=28 on Sonnet 4.6 / CC 2.1.120, no `>100` drift). The "in-progress transition state" sub-question can't be answered from stdin alone — CC's statusline only fires on prompts, not during `/compact` itself, so `/compact` is atomic from the statusline's perspective. The upstream reports of "both 0 and 100" weren't reproduced here; reproduction conditions remain unknown.
 - ~~Does `context_window_size` change to 1_000_000 immediately when switching to a 1M model, or is it stuck at 200_000 until the next stdin refresh?~~ **Resolved 2026-04-24 via row 5:** `context_window_size` reports `1_000_000` on every 1M-model capture; the ccstatusline PR #265 bug (payload stuck at 200k) does not reproduce in CC 2.1.119.
 - Is there an observable `/resume` marker in the stdin payload, or does the percentage just "jump" on the next post-resume message?
 - Are 429 responses even visible at the statusline layer, or are they intercepted upstream and never produce a stdin event?
