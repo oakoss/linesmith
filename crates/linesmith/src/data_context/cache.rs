@@ -564,22 +564,41 @@ mod tests {
 
         let store_a = Arc::clone(&store);
         let handle_a = thread::spawn(move || {
+            let mut succeeded = 0;
             for _ in 0..10 {
-                store_a
-                    .write(&CachedUsage::with_error("Timeout"))
-                    .expect("write");
+                if store_a.write(&CachedUsage::with_error("Timeout")).is_ok() {
+                    succeeded += 1;
+                }
             }
+            succeeded
         });
         let store_b = Arc::clone(&store);
         let handle_b = thread::spawn(move || {
+            let mut succeeded = 0;
             for _ in 0..10 {
-                store_b
+                if store_b
                     .write(&CachedUsage::with_data(sample_response()))
-                    .expect("write");
+                    .is_ok()
+                {
+                    succeeded += 1;
+                }
             }
+            succeeded
         });
-        handle_a.join().unwrap();
-        handle_b.join().unwrap();
+        let succeeded = handle_a.join().unwrap() + handle_b.join().unwrap();
+
+        // Documented contract is final-state integrity, not per-call
+        // success. POSIX rename(2) never fails on concurrent renames,
+        // so on Unix every write must succeed — a regression that
+        // introduced spurious failures should fail loud here. Windows
+        // MoveFileEx returns ERROR_ACCESS_DENIED to the racing loser
+        // (surfaces as PermissionDenied), so on Windows we only require
+        // at least one writer to win (otherwise the final-state
+        // assertion below is meaningless).
+        #[cfg(unix)]
+        assert_eq!(succeeded, 20, "POSIX rename(2) should never fail");
+        #[cfg(not(unix))]
+        assert!(succeeded > 0, "at least one concurrent write must win");
 
         // Final state is one of the two writers — never an interleaved
         // torn write. Parse must succeed.

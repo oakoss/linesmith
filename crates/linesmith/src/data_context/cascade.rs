@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use super::cache::{CacheStore, CachedUsage, Lock, LockStore};
+use super::cache::{CacheError, CacheStore, CachedUsage, Lock, LockStore};
 use super::credentials::Credentials;
 use super::errors::{CredentialError, JsonlError, UsageError};
 use super::fetcher::{self, UsageTransport};
@@ -68,10 +68,12 @@ impl Default for UsageCascadeConfig {
 /// preserving the "no Keychain subprocess on cache hits" guarantee.
 /// `cache` and `lock` being `None` is equivalent to pointing at paths
 /// that don't exist: reads degrade to "miss" and writes are skipped.
-/// Write failures against a real store `debug_assert!` in debug
-/// builds (where they're likely a test-setup bug) and silently
-/// fallthrough in release (where breaking persistence must not break
-/// the statusline).
+/// Write failures fall into two classes. Real bugs (disk full,
+/// missing parent dir, EACCES) log via `lsm_error!` (bypasses the
+/// level gate). The documented Windows MoveFileEx race-loser case
+/// logs via `lsm_debug!` (suppressible) so multi-terminal Windows
+/// users don't get persistent stderr noise on healthy runs. Either
+/// way the cascade still returns fetched data.
 pub fn resolve_usage(
     cache: Option<&CacheStore>,
     lock: Option<&LockStore>,
@@ -296,15 +298,7 @@ fn log_cache_read_failure(kind: &str, err: &super::cache::CacheError) {
 fn write_cache(cache: Option<&CacheStore>, entry: CachedUsage) {
     if let Some(c) = cache {
         if let Err(e) = c.write(&entry) {
-            // Use `lsm_error!` (bypasses the level gate) so a user
-            // who's silenced logs via `LINESMITH_LOG=off` still sees
-            // structural persistence failures — these are the
-            // "statusline hammers the API" class of defect and must
-            // not be silenceable alongside chatter. Emitted BEFORE
-            // `debug_assert!` so the stderr line survives the panic
-            // in debug builds.
-            crate::lsm_error!("cascade: cache write failed: {e}");
-            debug_assert!(false, "cascade: cache write failed: {e}");
+            log_persist_error("cache", &e);
         }
     }
 }
@@ -312,10 +306,41 @@ fn write_cache(cache: Option<&CacheStore>, entry: CachedUsage) {
 fn write_lock(lock: Option<&LockStore>, entry: Lock) {
     if let Some(l) = lock {
         if let Err(e) = l.write(&entry) {
-            crate::lsm_error!("cascade: lock write failed: {e}");
-            debug_assert!(false, "cascade: lock write failed: {e}");
+            log_persist_error("lock", &e);
         }
     }
+}
+
+/// Real bugs (disk full, missing parent dir, EACCES) route through
+/// `lsm_error!`, which bypasses the level gate so a user with
+/// `LINESMITH_LOG=off` still sees the "statusline hammers the API"
+/// class of defect. The documented Windows MoveFileEx race-loser case
+/// (concurrent processes both calling `atomic_write_json`, the loser
+/// gets `PermissionDenied`) is expected per the cache.rs contract;
+/// route it through `lsm_debug!` so multi-terminal Windows users
+/// don't get persistent stderr noise on otherwise-healthy runs.
+fn log_persist_error(kind: &str, err: &CacheError) {
+    if is_transient_persist_race(err) {
+        crate::lsm_debug!("cascade: {kind} write race-loser (Windows MoveFileEx): {err}");
+    } else {
+        crate::lsm_error!("cascade: {kind} write failed: {err}");
+    }
+}
+
+#[cfg(windows)]
+fn is_transient_persist_race(err: &CacheError) -> bool {
+    matches!(
+        err,
+        CacheError::Persist { cause, .. }
+            if cause.kind() == std::io::ErrorKind::PermissionDenied
+    )
+}
+
+#[cfg(not(windows))]
+fn is_transient_persist_race(_err: &CacheError) -> bool {
+    // Unix `rename(2)` doesn't expose this race; PermissionDenied on
+    // Unix is always a real perm bug and stays loud.
+    false
 }
 
 fn write_failure_lock(lock: Option<&LockStore>, now_ts: DateTime<Utc>, err: &UsageError) {
@@ -1538,16 +1563,12 @@ mod tests {
         assert_jsonl_matches_ok_fixture(&data);
     }
 
-    // Release-only: cascade must still return fetched data when
-    // persistence breaks. In debug builds the write-side helpers
-    // `debug_assert!` on the error (intentional, per silent-failure
-    // review), so the graceful-fallthrough contract is only observable
-    // in release mode. Without this split, `cargo test` (debug) would
-    // panic on the exact anchor sites that silent-failure review asked
-    // us to make loud.
-    #[cfg(not(debug_assertions))]
+    // Cascade must still return fetched data when persistence breaks.
+    // The write-side helpers log via `lsm_error!` and continue (the
+    // cache.rs contract permits per-call failures), so this contract
+    // is observable in both debug and release builds.
     #[test]
-    fn cache_write_failure_does_not_block_returned_data_in_release() {
+    fn cache_write_failure_does_not_block_returned_data() {
         let tmp = TempDir::new().unwrap();
         let blocking_file = tmp.path().join("blocked");
         std::fs::write(&blocking_file, "x").unwrap();
@@ -1564,26 +1585,6 @@ mod tests {
         )
         .expect("ok");
         assert!(matches!(data, UsageData::Endpoint(_)));
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "cache write failed")]
-    fn cache_write_failure_panics_in_debug() {
-        let tmp = TempDir::new().unwrap();
-        let blocking_file = tmp.path().join("blocked");
-        std::fs::write(&blocking_file, "x").unwrap();
-        let cache = CacheStore::new(blocking_file.join("nested"));
-
-        let _ = resolve_usage(
-            Some(&cache),
-            None,
-            &FakeTransport::ok(200, SAMPLE_BODY, None),
-            &ok_creds,
-            &jsonl_empty,
-            &now_fn(),
-            &config(),
-        );
     }
 
     #[test]
