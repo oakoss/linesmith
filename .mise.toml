@@ -62,26 +62,31 @@ depends = ["cargo:bench"]
 description = "Run all checks (format + lint + Rust)"
 depends = ["fmt:check", "lint", "cargo:fmt:check", "cargo:clippy", "cargo:check"]
 
-# --- Local binary management -----------------------------------------
-# Switch ~/.cargo/bin/linesmith (what the mise shim resolves to) between
-# the dev source tree and the latest published release. CC's statusline
-# spawns the shim, so a successful install is live on the next prompt.
+# CC's statusline spawns the mise shim (~/.cargo/bin/linesmith), so a
+# successful `install:*` task is live on the next prompt.
 
 [tasks."install:dev"]
 description = "Install linesmith from this source tree (dev iteration loop)"
-run = "cargo install --path crates/linesmith --locked --offline"
+# --force is required: cargo install skips reinstalling the same version,
+# so without it install:dev silently no-ops when a published 0.x.y binary
+# already occupies ~/.cargo/bin/linesmith.
+run = "cargo install --path crates/linesmith --locked --force"
 
 [tasks."install:dev:checked"]
 description = "cargo check first; install dev binary only if check passes"
-run = "cargo check --workspace --all-targets && cargo install --path crates/linesmith --locked --offline"
+run = "cargo check --workspace --all-targets && cargo install --path crates/linesmith --locked --force"
 
 [tasks."install:release"]
 description = "Install latest published linesmith from crates.io (compiles)"
 run = "cargo install linesmith --locked --force"
 
-[tasks."install:release:fast"]
-description = "Install latest published linesmith via cargo-dist installer (prebuilt, no compile)"
+[tasks."install:release:fast:sh"]
+description = "Install latest linesmith release via cargo-dist sh installer (Unix only, prebuilt)"
 run = "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/oakoss/linesmith/releases/latest/download/linesmith-installer.sh | sh"
+
+[tasks."install:release:fast:ps1"]
+description = "Install latest linesmith release via cargo-dist PowerShell installer (Windows x86_64 only, prebuilt)"
+run = "powershell -ExecutionPolicy ByPass -c \"irm https://github.com/oakoss/linesmith/releases/latest/download/linesmith-installer.ps1 | iex\""
 
 [tasks."install:status"]
 description = "Show which linesmith binary is active (shim path, version, mtime)"
