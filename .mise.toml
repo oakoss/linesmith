@@ -36,15 +36,19 @@ run = "cargo fmt --all -- --check"
 
 [tasks."cargo:clippy"]
 description = "Run clippy lints"
-run = "cargo clippy --workspace --all-targets -- -D warnings"
+run = "cargo clippy --locked --workspace --all-targets -- -D warnings"
 
 [tasks."cargo:check"]
 description = "Type-check Rust code"
-run = "cargo check --workspace --all-targets"
+run = "cargo check --locked --workspace --all-targets"
 
 [tasks."cargo:test"]
 description = "Run Rust tests"
-run = "cargo test --workspace"
+run = "cargo test --locked --workspace"
+
+[tasks."cargo:test:doc"]
+description = "Run Rust doc tests (excluded by --all-targets)"
+run = "cargo test --locked --workspace --doc"
 
 [tasks."cargo:bench"]
 description = "Run Rust benchmarks"
@@ -52,7 +56,10 @@ run = "cargo bench --workspace"
 
 [tasks.test]
 description = "Run all tests"
-depends = ["cargo:test"]
+# Sequential, not parallel-via-depends, so the two cargo invocations
+# don't fight over target/ (cargo's per-target lock serializes them
+# anyway, but parallel here would just be slower with no upside).
+run = ["mise run cargo:test", "mise run cargo:test:doc"]
 
 [tasks.bench]
 description = "Run all benchmarks"
@@ -74,7 +81,7 @@ run = "cargo install --path crates/linesmith --locked --force"
 
 [tasks."install:dev:checked"]
 description = "cargo check first; install dev binary only if check passes"
-run = "cargo check --workspace --all-targets && cargo install --path crates/linesmith --locked --force"
+run = "cargo check --locked --workspace --all-targets && cargo install --path crates/linesmith --locked --force"
 
 [tasks."install:release"]
 description = "Install latest published linesmith from crates.io (compiles)"

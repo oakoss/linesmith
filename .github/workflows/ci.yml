@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  static-analysis:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup
+        uses: ./.github/actions/setup
+
+      - name: Check formatting
+        run: mise run fmt:check
+
+      - name: Lint markdown
+        run: mise run lint:md
+
+      - name: Check Rust formatting
+        run: mise run cargo:fmt:check
+
+      - name: Clippy
+        run: mise run cargo:clippy
+
+      - name: Type check
+        run: mise run cargo:check
+
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Setup
+        uses: ./.github/actions/setup
+
+      - name: Run tests
+        run: mise run cargo:test
+
+      - name: Run doc tests
+        run: mise run cargo:test:doc
+
+  ci-summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: always()
+    needs: [static-analysis, tests]
+    steps:
+      - name: Summarize results
+        run: |
+          {
+            echo "## CI Summary"
+            echo ""
+            echo "| Job | Status | Required |"
+            echo "| --- | --- | --- |"
+            echo "| Static analysis | \`${{ needs.static-analysis.result }}\` | Yes |"
+            echo "| Tests | \`${{ needs.tests.result }}\` | Yes |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          fail_unless_success() {
+            if [ "$2" != "success" ]; then
+              echo "Job '$1' did not succeed (result: $2)"
+              exit 1
+            fi
+          }
+
+          fail_unless_success "static-analysis" "${{ needs.static-analysis.result }}"
+          fail_unless_success "tests" "${{ needs.tests.result }}"
