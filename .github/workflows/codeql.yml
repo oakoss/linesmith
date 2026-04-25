@@ -1,0 +1,69 @@
+name: CodeQL
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: Analyze
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      security-events: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # CodeQL covers code-level vulns (injection, crypto misuse,
+        # unsafe data flows). audit.yml + deny.toml cover the supply-
+        # chain / vulnerable-dependency surface (OWASP A06) that
+        # CodeQL doesn't. Both are load-bearing.
+        # Rust went GA in CodeQL 2.23.3 (2025-10) with build-mode: none
+        # (rust-analyzer-based, no cargo build needed). The `actions`
+        # language is public preview (since Dec 2024) — functional on
+        # github.com today, expected to GA. Actions ignores build-mode
+        # but accepts the field, so set it uniformly.
+        language: [actions, rust]
+    steps:
+      # In audit mode: logs unauthorized egress without blocking; promote to
+      # `egress-policy: block` once a stable allowlist emerges from runs.
+      - name: Harden Runner
+        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      # CodeQL with build-mode: none can silently report 0 alerts if
+      # rust-analyzer fails to load the workspace (e.g., Cargo.toml
+      # syntax error). ci.yml's `Type check` step (mise run cargo:check)
+      # is the load-bearing gate that fails first on broken Cargo state,
+      # so a green CodeQL run can't mask broken extraction here.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@95e58e9a2cdfd71adc6e0353d5c52f41a045d225 # v4
+        with:
+          category: /language:${{ matrix.language }}
