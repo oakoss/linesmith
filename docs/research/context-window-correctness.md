@@ -51,13 +51,13 @@ To be filled in by running linesmith against a live Claude Code session in each 
 3. Compare `context_window.used_percentage` to what Claude Code's own `/context` command reports.
 4. Record the delta and any rendering anomaly in the linesmith output.
 
-| #   | Scenario                                        | `used_percentage` (stdin) | `/context` truth | `context_window_size` correct?          | Render anomaly?                                                              | Pass/Fail |
-| --- | ----------------------------------------------- | ------------------------- | ---------------- | --------------------------------------- | ---------------------------------------------------------------------------- | --------- |
-| 1   | 200k-context session, ~40-60% fill, pre-compact | TBD                       | TBD              | TBD                                     | TBD                                                                          | TBD       |
-| 2   | Same session after `/compact`                   | TBD                       | TBD              | TBD                                     | TBD                                                                          | TBD       |
-| 3   | Session resumed via `/resume`                   | TBD                       | TBD              | TBD                                     | TBD                                                                          | TBD       |
-| 4   | During a 429 rate-limit response                | TBD                       | TBD              | TBD                                     | TBD                                                                          | TBD       |
-| 5   | 1M-context variant (Opus 4.7 1M)                | 34                        | 34%              | yes — `1_000_000`, not stuck at 200_000 | none once [lsm-ts7k](../../.beads/issues.jsonl) (effort parser) is installed | **Pass**  |
+| #   | Scenario                                    | `used_percentage` (stdin) | `/context` truth | `context_window_size` correct?          | Render anomaly?                                                              | Pass/Fail |
+| --- | ------------------------------------------- | ------------------------- | ---------------- | --------------------------------------- | ---------------------------------------------------------------------------- | --------- |
+| 1   | 200k-context session, low fill, pre-compact | 21                        | 21%              | yes — `200_000`                         | none                                                                         | **Pass**  |
+| 2   | Same session after `/compact`               | TBD                       | TBD              | TBD                                     | TBD                                                                          | TBD       |
+| 3   | Session resumed via `/resume`               | TBD                       | TBD              | TBD                                     | TBD                                                                          | TBD       |
+| 4   | During a 429 rate-limit response            | TBD                       | TBD              | TBD                                     | TBD                                                                          | TBD       |
+| 5   | 1M-context variant (Opus 4.7 1M)            | 34                        | 34%              | yes — `1_000_000`, not stuck at 200_000 | none once [lsm-ts7k](../../.beads/issues.jsonl) (effort parser) is installed | **Pass**  |
 
 Row 5 notes:
 
@@ -66,15 +66,30 @@ Row 5 notes:
 - All captures fell within `[0, 100]`; no `>100` post-compact drift of the kind reported in Anthropic #37163 observed at this fill level.
 - Before the effort-parser fix (lsm-ts7k), linesmith rendered `?` even though the percentage itself was correct — a separate issue the capture surfaced.
 
-Additional sanity checks to run while capturing each stdin:
+Row 1 notes:
 
-- Does `used_percentage + remaining_percentage` equal 100 (the one Claude Code doc claims)?
-- Is `total_input_tokens + total_output_tokens` consistent with `used_percentage * context_window_size / 100`?
-- Does `current_usage` ever contradict the rolled-up `total_*` values?
+- `model.id = "claude-sonnet-4-6"` (no `[1m]` suffix); `model.display_name = "Sonnet 4.6"`. `exceeds_200k_tokens = false` corroborates the 200k window.
+- Confirmed against a fresh CC instance opened on the standard 200k Sonnet 4.6 with 19 captures clustered between `2026-04-25T02:55:09Z` and `2026-04-25T02:57:56Z`. Reported `42.2k/200k tokens (21%)` in `/context`; stdin reported pct=21 in lockstep. Delta: 0. Higher-fill 200k captures (post-`/compact` and beyond) would tighten the row further but the 21% point already validates the integer-percentage and 200k-denominator contracts.
 
-### Observed failures (to populate after live tests)
+### Sanity checks against the capture dataset
 
-Each confirmed failure becomes a follow-up bead referenced here. Template:
+Findings from `~/.linesmith-captures/stdin.jsonl` after the lsm-mdd7 wrapper accumulated 710 records (all-integer percentages) across one extended Claude Code session on Opus 4.7 1M (fill range 15%→72%, no `/compact` or `/resume` triggered):
+
+- **`used_percentage + remaining_percentage = 100` holds for 708/710 captures.** The two outliers are pre-API-call records where the entire `context_window` object is `null` (expected per the contract; `current_usage` is also null in those records).
+- **`total_input_tokens + total_output_tokens` does NOT equal `used_percentage × context_window_size / 100`.** At pct=15 with size=1M the formula predicts 150,000 tokens; the actual record had `total_in=1913`, `total_out=47304` (sum 49,217). The 100,783-token gap is more than covered by `cache_read_input_tokens=144,775` plus `cache_creation_input_tokens=1313` (the cache totals exceed the gap by ~45k, so the residual isn't cleanly explained by cache alone). **Likely implication** (interpretation, not CC-documented): `used_percentage` is consistent with counting cache-resident tokens against the window while `total_*_tokens` count only billable (non-cache-hit) tokens. **Affects the P2 `context_usable` segment formula** in §Conclusions; revisit before implementing.
+- **`current_usage` is per-turn, not cumulative.** Per-turn `input_tokens=1` against cumulative `total_input_tokens=1913` at the same capture confirms the naming. Resolves open question #5.
+- **No `>100` clamp triggers across the dataset.** The fill range only reached 72%; the Anthropic #37163 post-`/compact` drift didn't reproduce because `/compact` was never invoked. Row 2 of the matrix still needs a live capture to test that scenario.
+
+### Observed failures (none in lsm-mdd7 dataset, 710 captures)
+
+In the 15-72% fill range on Opus 4.7 1M: no `?` renders, no parse errors, no `>100` values, no `current_usage`/`total_*` contradictions.
+
+Two parser bugs DID surface during the capture session, both unrelated to `used_percentage` correctness:
+
+- effort object form rejected by `parse_effort` (filed as lsm-ts7k, fixed)
+- force-color path collapsing TrueColor themes to Palette16 (filed as lsm-05d1, fixed)
+
+Per-failure template for future captures (rows 1-4 of the matrix):
 
 - **Scenario N — `summary of glitch`**: Claude Code sent `X`, real value is `Y`. Filed as `lsm-XXXX`.
 
@@ -101,4 +116,4 @@ Provisional positions to confirm or reject after live tests:
 - ~~Does `context_window_size` change to 1_000_000 immediately when switching to a 1M model, or is it stuck at 200_000 until the next stdin refresh?~~ **Resolved 2026-04-24 via row 5:** `context_window_size` reports `1_000_000` on every 1M-model capture; the ccstatusline PR #265 bug (payload stuck at 200k) does not reproduce in CC 2.1.119.
 - Is there an observable `/resume` marker in the stdin payload, or does the percentage just "jump" on the next post-resume message?
 - Are 429 responses even visible at the statusline layer, or are they intercepted upstream and never produce a stdin event?
-- Does `current_usage` reflect the _current turn_ only, or the cumulative session? (Naming suggests current turn; would clarify the relationship to `total_input_tokens`.)
+- ~~Does `current_usage` reflect the _current turn_ only, or the cumulative session? (Naming suggests current turn; would clarify the relationship to `total_input_tokens`.)~~ **Resolved 2026-04-25 via dataset analysis:** `current_usage` is per-turn. Per-turn `input_tokens=1` against cumulative `total_input_tokens=1913` at the same capture confirms the naming. See §Sanity checks against the capture dataset.
