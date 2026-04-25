@@ -17,7 +17,9 @@ targets = [
   "x86_64-unknown-linux-musl",
   "aarch64-unknown-linux-gnu",
   "x86_64-pc-windows-msvc",
-  "aarch64-pc-windows-msvc",
+  # aarch64-pc-windows-msvc dropped: cargo-xwin emits MSVC `/imsvc /path` as
+  # two args; cc-rs splits them and ring's C build fails. Source install via
+  # `cargo install linesmith` works on Windows ARM64. Tracked in lsm-duv8.
 ]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
