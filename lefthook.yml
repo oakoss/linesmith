@@ -29,7 +29,7 @@ pre-commit:
       run: prettier --write {staged_files}
       stage_fixed: true
     gitleaks:
-      run: gitleaks protect --staged --no-banner --config .gitleaks.toml
+      run: gitleaks protect --staged --no-banner
     shellcheck:
       glob: '**/*.sh'
       run: shellcheck {staged_files}
