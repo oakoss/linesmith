@@ -435,6 +435,34 @@ mod claude {
         }
         let cw = expect_object(value, "context_window")?;
 
+        // Pre-first-API-call payloads (CC 2.1.x) carry a context_window
+        // object with `used_percentage` null — there's no usage data
+        // yet. (`current_usage: null` is the same shape, handled by
+        // parse_current_usage's own guard below.) Treat any required-
+        // leaf null the same as `context_window: null` and hide the
+        // segment for the ~15s pre-first-call window. Defensive sweep
+        // on the other required leaves keeps the next CC schema wobble
+        // (a single `total_*_tokens: null`) from tanking the segment.
+        for key in [
+            "used_percentage",
+            "context_window_size",
+            "total_input_tokens",
+            "total_output_tokens",
+        ] {
+            if cw.get(key).is_some_and(serde_json::Value::is_null) {
+                let version = root
+                    .get("version")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                crate::lsm_debug!(
+                    "context_window.{key} is null (CC {version}); hiding context segment \
+                     — expected during pre-first-API-call window; persistence past the \
+                     first assistant response indicates real schema drift"
+                );
+                return Ok(None);
+            }
+        }
+
         let used_raw = require_f64(cw, "context_window.used_percentage")?;
         // Asymmetric handling. Claude Code has been observed emitting
         // values slightly past 100 post-/compact (claude-code#37163)
@@ -892,6 +920,96 @@ mod tests {
             }
             other => panic!("expected TypeMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pre_first_api_call_payload_renders_other_segments() {
+        // Real captured CC 2.1.119 payload from the ~15s
+        // pre-first-API-call window where `used_percentage` is null.
+        // Asserts structurally (not value-pinned) so re-capturing the
+        // fixture from a different account/session doesn't break the
+        // test for reasons unrelated to the contract under check.
+        let bytes = include_bytes!("../tests/fixtures/claude_pre_first_api_call.json");
+        let ctx = parse(bytes).expect("parse must succeed despite null context_window leaves");
+        assert!(!ctx.model.display_name.is_empty(), "model must parse");
+        assert!(
+            !ctx.workspace.project_dir.as_os_str().is_empty(),
+            "workspace must parse"
+        );
+        assert!(
+            ctx.context_window.is_none(),
+            "context_window with null leaves must hide, not surface bogus zeros"
+        );
+        assert!(ctx.cost.is_some(), "cost segment must still render");
+        assert_eq!(ctx.effort, Some(EffortLevel::XHigh));
+    }
+
+    #[test]
+    fn used_percentage_null_hides_context_window_segment() {
+        let json = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/repo" },
+            "context_window": {
+                "used_percentage": null,
+                "context_window_size": 200000,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+            }
+        }"#;
+        let ctx = parse(json).expect("null used_percentage must not fail the whole parse");
+        assert!(ctx.context_window.is_none());
+    }
+
+    #[test]
+    fn null_context_window_size_hides_segment() {
+        // Defensive-sweep guard: not observed in the wild, but locks in
+        // the contract so a future schema wobble doesn't tank the parse.
+        let json = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/repo" },
+            "context_window": {
+                "used_percentage": 12.5,
+                "context_window_size": null,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+            }
+        }"#;
+        let ctx = parse(json).expect("null size must not fail the whole parse");
+        assert!(ctx.context_window.is_none());
+    }
+
+    #[test]
+    fn null_total_input_tokens_hides_segment() {
+        let json = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/repo" },
+            "context_window": {
+                "used_percentage": 12.5,
+                "context_window_size": 200000,
+                "total_input_tokens": null,
+                "total_output_tokens": 0
+            }
+        }"#;
+        let ctx = parse(json).expect("null total_input_tokens must not fail the whole parse");
+        assert!(ctx.context_window.is_none());
+    }
+
+    #[test]
+    fn null_total_output_tokens_hides_segment() {
+        // Symmetric guard against a copy-paste regression that drops
+        // `total_output_tokens` from the loop array in parse_context_window.
+        let json = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/repo" },
+            "context_window": {
+                "used_percentage": 12.5,
+                "context_window_size": 200000,
+                "total_input_tokens": 0,
+                "total_output_tokens": null
+            }
+        }"#;
+        let ctx = parse(json).expect("null total_output_tokens must not fail the whole parse");
+        assert!(ctx.context_window.is_none());
     }
 
     #[test]
