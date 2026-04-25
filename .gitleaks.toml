@@ -1,0 +1,12 @@
+title = "linesmith gitleaks config"
+
+# Inherit the default ruleset; only narrow the scope.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Machine-generated bead state can match generic-api-key on memory keys (e.g. 'lsm-9zvh-warn-dedupe')."
+paths = [
+  '''^\.beads/issues\.jsonl$''',
+  '''^\.beads/interactions\.jsonl$''',
+]
