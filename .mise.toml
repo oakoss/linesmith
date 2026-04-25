@@ -61,3 +61,33 @@ depends = ["cargo:bench"]
 [tasks.check]
 description = "Run all checks (format + lint + Rust)"
 depends = ["fmt:check", "lint", "cargo:fmt:check", "cargo:clippy", "cargo:check"]
+
+# --- Local binary management -----------------------------------------
+# Switch ~/.cargo/bin/linesmith (what the mise shim resolves to) between
+# the dev source tree and the latest published release. CC's statusline
+# spawns the shim, so a successful install is live on the next prompt.
+
+[tasks."install:dev"]
+description = "Install linesmith from this source tree (dev iteration loop)"
+run = "cargo install --path crates/linesmith --locked --offline"
+
+[tasks."install:dev:checked"]
+description = "cargo check first; install dev binary only if check passes"
+run = "cargo check --workspace --all-targets && cargo install --path crates/linesmith --locked --offline"
+
+[tasks."install:release"]
+description = "Install latest published linesmith from crates.io (compiles)"
+run = "cargo install linesmith --locked --force"
+
+[tasks."install:release:fast"]
+description = "Install latest published linesmith via cargo-dist installer (prebuilt, no compile)"
+run = "curl --proto '=https' --tlsv1.2 -LsSf https://github.com/oakoss/linesmith/releases/latest/download/linesmith-installer.sh | sh"
+
+[tasks."install:status"]
+description = "Show which linesmith binary is active (shim path, version, mtime)"
+run = '''
+echo "shim path:    $(mise which linesmith)"
+echo "version:      $(linesmith --version)"
+# stat -f is BSD/macOS; -c is GNU/Linux. Try both.
+echo "binary mtime: $(stat -f '%Sm' "$(mise which linesmith)" 2>/dev/null || stat -c '%y' "$(mise which linesmith)")"
+'''
