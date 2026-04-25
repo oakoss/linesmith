@@ -75,7 +75,7 @@ Adding a new command, a new segment, a new theme, or a new config field with a d
 
 ### Target platform matrix
 
-Seven targets in the v0.1 release, shipped simultaneously from one tag. This is one target more than lsm-9sa's original scope (6); the extra `x86_64-unknown-linux-musl` build covers Alpine and distroless-container users, and the marginal cost is one additional cargo-dist matrix entry on the same Linux runner.
+Six targets in the v0.1 release, shipped simultaneously from one tag. lsm-9sa scoped six targets; v0.1 added `x86_64-unknown-linux-musl` (Alpine and distroless-container coverage) and dropped `aarch64-pc-windows-msvc` during the v0.1.1 release recovery on a cargo-xwin/cc-rs/ring cross-compile blocker. Net: still six. Windows ARM users install from source via `cargo install linesmith`; lsm-duv8 tracks restoring the prebuilt path.
 
 | Target triple               | Platform      | Install method priority |
 | --------------------------- | ------------- | ----------------------- |
@@ -85,7 +85,6 @@ Seven targets in the v0.1 release, shipped simultaneously from one tag. This is 
 | `x86_64-unknown-linux-musl` | Linux musl    | shell                   |
 | `aarch64-unknown-linux-gnu` | Linux ARM     | brew, shell             |
 | `x86_64-pc-windows-msvc`    | Windows Intel | powershell              |
-| `aarch64-pc-windows-msvc`   | Windows ARM   | powershell              |
 
 Dropping a target from the matrix is a minor-version event (user-visible regression); adding a target is additive.
 
