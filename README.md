@@ -34,17 +34,19 @@ Pick whichever fits your setup:
 # macOS / Linux shell installer (no Rust toolchain needed)
 curl -LsSf https://github.com/oakoss/linesmith/releases/latest/download/linesmith-installer.sh | sh
 
-# Windows PowerShell installer
+# Windows x86_64 PowerShell installer
 powershell -ExecutionPolicy ByPass -c "irm https://github.com/oakoss/linesmith/releases/latest/download/linesmith-installer.ps1 | iex"
 
 # Homebrew (macOS, Linux)
 brew install oakoss/tap/linesmith
 
-# Rust toolchain users
+# Rust toolchain users (any platform, including Windows ARM64)
 cargo install linesmith
 ```
 
-Prebuilt binaries also live on the [GitHub Releases page](https://github.com/oakoss/linesmith/releases/latest) for direct download. Supported target triples: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `aarch64-pc-windows-msvc`, `x86_64-pc-windows-msvc`.
+Prebuilt binaries also live on the [GitHub Releases page](https://github.com/oakoss/linesmith/releases/latest) for direct download. Supported target triples: `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-musl`, `x86_64-pc-windows-msvc`.
+
+**Windows ARM64:** no prebuilt binary yet due to a cross-compile toolchain limitation. Use `cargo install linesmith` instead — building from source works.
 
 **macOS first-run:** unsigned binaries hit Gatekeeper on first launch. Clear the quarantine flag with:
 
