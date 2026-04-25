@@ -5,8 +5,6 @@ git_release_enable = false
 git_tag_enable = true
 # Generate/update CHANGELOG.md from conventional commits (delegates to git-cliff via cliff.toml)
 changelog_update = true
-# Without this, release-plz uses its bundled default template instead of cliff.toml,
-# and the docs/chore/test skip rules silently don't apply.
 changelog_config = "cliff.toml"
 # Update dependency versions in Cargo.lock on release
 dependencies_update = true
