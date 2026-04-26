@@ -311,6 +311,50 @@ fn write_lock(lock: Option<&LockStore>, entry: Lock) {
     }
 }
 
+/// Routing tag for [`classify_persist_error`]. `Error` bypasses the
+/// log level gate (real bugs surface even with `LINESMITH_LOG=off`);
+/// `Debug` is gated (Windows MoveFileEx race losers are expected and
+/// shouldn't pollute stderr on healthy multi-terminal runs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistLogClass {
+    Error,
+    Debug,
+}
+
+/// Pure classification of a persistence failure. Returns the routing
+/// class plus the formatted message. Split from [`log_persist_error`]
+/// so tests can lock in the contract (route + message format) without
+/// touching global log state or capturing process stderr.
+fn classify_persist_error(kind: &str, err: &CacheError) -> (PersistLogClass, String) {
+    if is_transient_persist_race(err) {
+        (
+            PersistLogClass::Debug,
+            format!("cascade: {kind} write race-loser (Windows MoveFileEx): {err}"),
+        )
+    } else {
+        (
+            PersistLogClass::Error,
+            format!("cascade: {kind} write failed: {err}"),
+        )
+    }
+}
+
+/// Dispatch a classified persist error to the right severity sink.
+/// Generic over the emit closures so production callers pass the
+/// `lsm_debug!`/`lsm_error!` macros while tests pass capturing
+/// closures — the match arms themselves are shared, so a future
+/// arm-swap regression fails loud in the routing tests below.
+fn route_persist_error<D, E>(class: PersistLogClass, msg: &str, on_debug: D, on_error: E)
+where
+    D: FnOnce(&str),
+    E: FnOnce(&str),
+{
+    match class {
+        PersistLogClass::Debug => on_debug(msg),
+        PersistLogClass::Error => on_error(msg),
+    }
+}
+
 /// Real bugs (disk full, missing parent dir, EACCES) route through
 /// `lsm_error!`, which bypasses the level gate so a user with
 /// `LINESMITH_LOG=off` still sees the "statusline hammers the API"
@@ -320,11 +364,13 @@ fn write_lock(lock: Option<&LockStore>, entry: Lock) {
 /// route it through `lsm_debug!` so multi-terminal Windows users
 /// don't get persistent stderr noise on otherwise-healthy runs.
 fn log_persist_error(kind: &str, err: &CacheError) {
-    if is_transient_persist_race(err) {
-        crate::lsm_debug!("cascade: {kind} write race-loser (Windows MoveFileEx): {err}");
-    } else {
-        crate::lsm_error!("cascade: {kind} write failed: {err}");
-    }
+    let (class, msg) = classify_persist_error(kind, err);
+    route_persist_error(
+        class,
+        &msg,
+        |s| crate::lsm_debug!("{s}"),
+        |s| crate::lsm_error!("{s}"),
+    );
 }
 
 #[cfg(windows)]
@@ -1638,5 +1684,137 @@ mod tests {
         )
         .expect("ok");
         assert_eq!(transport.calls.get(), 1);
+    }
+
+    // --- classify_persist_error contract ---
+    //
+    // log_persist_error routes via macros (lsm_debug! / lsm_error!) which
+    // write to stderr. classify_persist_error is the pure half. A refactor
+    // that silently dropped EITHER emission path would still pass the
+    // surviving cache_write_failure_does_not_block_* happy-path test
+    // (which only asserts the cascade returns endpoint data); these
+    // tests fail loud on the route + message format so the regression
+    // can't sneak through.
+
+    fn make_io_error(kind: io::ErrorKind) -> CacheError {
+        CacheError::Io {
+            path: std::path::PathBuf::from("/test/path"),
+            cause: io::Error::new(kind, "test"),
+        }
+    }
+
+    fn make_persist_error(kind: io::ErrorKind) -> CacheError {
+        CacheError::Persist {
+            path: std::path::PathBuf::from("/test/path"),
+            cause: io::Error::new(kind, "test"),
+        }
+    }
+
+    #[test]
+    fn classify_persist_error_routes_io_failure_to_error() {
+        let (class, msg) = classify_persist_error("cache", &make_io_error(io::ErrorKind::NotFound));
+        assert_eq!(class, PersistLogClass::Error);
+        assert!(
+            msg.contains("cascade: cache write failed:"),
+            "expected loud-signal prefix, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn classify_persist_error_routes_lock_kind_into_message() {
+        let (class, msg) =
+            classify_persist_error("lock", &make_persist_error(io::ErrorKind::OutOfMemory));
+        assert_eq!(class, PersistLogClass::Error);
+        assert!(
+            msg.contains("cascade: lock write failed:"),
+            "kind label must thread through, got {msg:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_persist_error_routes_permission_denied_to_error_on_unix() {
+        // PermissionDenied on unix is a real perm bug (EACCES), not a
+        // transient race — `is_transient_persist_race` returns false
+        // on cfg(not(windows)) so this stays loud.
+        let (class, msg) = classify_persist_error(
+            "cache",
+            &make_persist_error(io::ErrorKind::PermissionDenied),
+        );
+        assert_eq!(class, PersistLogClass::Error);
+        assert!(msg.contains("cascade: cache write failed:"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn classify_persist_error_routes_persist_permission_denied_to_debug_on_windows() {
+        // The documented MoveFileEx race-loser signature: Persist
+        // variant + PermissionDenied cause. Routes to Debug so multi-
+        // terminal Windows users don't see stderr noise.
+        let (class, msg) = classify_persist_error(
+            "cache",
+            &make_persist_error(io::ErrorKind::PermissionDenied),
+        );
+        assert_eq!(class, PersistLogClass::Debug);
+        assert!(
+            msg.contains("race-loser") && msg.contains("Windows MoveFileEx"),
+            "expected race-loser framing, got {msg:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn classify_persist_error_routes_io_permission_denied_to_error_on_windows() {
+        // Even on Windows, PermissionDenied via the Io variant (not
+        // Persist) is a real bug — only the Persist+PermissionDenied
+        // combination is the MoveFileEx race signature.
+        let (class, _msg) =
+            classify_persist_error("cache", &make_io_error(io::ErrorKind::PermissionDenied));
+        assert_eq!(class, PersistLogClass::Error);
+    }
+
+    // Production `log_persist_error` and these tests share the SAME
+    // `route_persist_error` match block, so a future arm-swap (Debug
+    // routing to Error or vice versa) fails loud here.
+
+    #[test]
+    fn route_persist_error_dispatches_debug_class_to_debug_closure_only() {
+        let mut debug_calls = 0;
+        let mut error_calls = 0;
+        route_persist_error(
+            PersistLogClass::Debug,
+            "msg",
+            |_| debug_calls += 1,
+            |_| error_calls += 1,
+        );
+        assert_eq!((debug_calls, error_calls), (1, 0));
+    }
+
+    #[test]
+    fn route_persist_error_dispatches_error_class_to_error_closure_only() {
+        let mut debug_calls = 0;
+        let mut error_calls = 0;
+        route_persist_error(
+            PersistLogClass::Error,
+            "msg",
+            |_| debug_calls += 1,
+            |_| error_calls += 1,
+        );
+        assert_eq!((debug_calls, error_calls), (0, 1));
+    }
+
+    #[test]
+    fn route_persist_error_passes_msg_through_unchanged() {
+        let mut received: Option<String> = None;
+        route_persist_error(
+            PersistLogClass::Error,
+            "cascade: cache write failed: disk full",
+            |_| {},
+            |s| received = Some(s.to_string()),
+        );
+        assert_eq!(
+            received.as_deref(),
+            Some("cascade: cache write failed: disk full")
+        );
     }
 }
