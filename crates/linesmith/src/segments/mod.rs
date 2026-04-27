@@ -388,6 +388,36 @@ pub trait Segment: Send {
     /// own shape based on available room.
     fn render(&self, ctx: &DataContext, rc: &RenderContext) -> RenderResult;
 
+    /// Layout-pressure-aware compaction hook. The reflow loop calls
+    /// this on any segment under width pressure (truncatable or
+    /// not), asking whether it can produce a render at most `target`
+    /// cells wide. It runs before `truncatable` end-ellipsis
+    /// truncation, so segment-side intelligence beats generic
+    /// string clipping when both apply. Default returns `None` (no
+    /// compact form available; engine falls through to truncatable
+    /// or drop). Segments with structured tail content override to
+    /// shed decoration while keeping the signal-bearing prefix.
+    ///
+    /// The returned render must lie in `[width.min, target]` cells:
+    /// wider violates the layout-fit invariant (engine rejects and
+    /// warns), narrower violates the user's `width.min` contract
+    /// (engine rejects silently, same as `apply_width_bounds`).
+    /// Implementations should return `None` rather than emit a
+    /// render outside this range.
+    ///
+    /// See `docs/specs/segment-system.md` §Layout algorithm for
+    /// the reflow loop's full ordering and target derivation.
+    #[allow(unused_variables)]
+    #[must_use]
+    fn shrink_to_fit(
+        &self,
+        ctx: &DataContext,
+        rc: &RenderContext,
+        target: u16,
+    ) -> Option<RenderedSegment> {
+        None
+    }
+
     /// Declare which data sources this segment reads. The runtime
     /// computes the union across all enabled segments and lazy-fetches
     /// only those sources. Defaults to the stdin payload only; segments
@@ -560,6 +590,19 @@ impl Segment for OverriddenSegment {
             Some(style) => r.with_style(style),
             None => r,
         }))
+    }
+
+    fn shrink_to_fit(
+        &self,
+        ctx: &DataContext,
+        rc: &RenderContext,
+        target: u16,
+    ) -> Option<RenderedSegment> {
+        let inner = self.inner.shrink_to_fit(ctx, rc, target)?;
+        Some(match self.user_style {
+            Some(style) => inner.with_style(style),
+            None => inner,
+        })
     }
 
     fn data_deps(&self) -> &'static [DataDep] {
@@ -860,6 +903,89 @@ mod layout_type_tests {
         let wrapped =
             OverriddenSegment::new(Box::new(Hidden)).with_user_style(Style::role(Role::Primary));
         assert_eq!(wrapped.render(&stub_ctx(), &stub_rc()).unwrap(), None);
+    }
+
+    #[test]
+    fn shrink_to_fit_passthrough_reaches_inner_with_user_style_applied() {
+        // The OverriddenSegment wrapper must forward shrink_to_fit to
+        // the inner segment so user-overridden segments retain their
+        // layout-pressure compaction. The wrapper also has to apply
+        // user_style to the shrunk render the same way it does on
+        // render — otherwise a styled override loses its theme on the
+        // compact path.
+        struct Shrinkable;
+        impl Segment for Shrinkable {
+            fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+                Ok(Some(RenderedSegment::new("full")))
+            }
+            fn shrink_to_fit(
+                &self,
+                _: &DataContext,
+                _: &RenderContext,
+                target: u16,
+            ) -> Option<RenderedSegment> {
+                let r = RenderedSegment::new("c");
+                (r.width <= target).then_some(r)
+            }
+        }
+        let override_style = Style {
+            role: Some(Role::Primary),
+            italic: true,
+            ..Style::default()
+        };
+        let wrapped = OverriddenSegment::new(Box::new(Shrinkable)).with_user_style(override_style);
+        let shrunk = wrapped
+            .shrink_to_fit(&stub_ctx(), &stub_rc(), 5)
+            .expect("inner returned compact form");
+        assert_eq!(shrunk.text, "c");
+        assert_eq!(shrunk.style, override_style);
+    }
+
+    #[test]
+    fn shrink_to_fit_passthrough_keeps_inner_style_when_no_user_override() {
+        // The `None` arm of `match self.user_style` must pass the
+        // inner shrunk render through unchanged. A regression that
+        // unconditionally applies a default style would clobber the
+        // inner segment's role (e.g. `git_branch`'s `Role::Accent`
+        // would silently drop on the compact path for any user
+        // without a configured style override).
+        struct ShrinkableWithRole;
+        impl Segment for ShrinkableWithRole {
+            fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+                Ok(Some(RenderedSegment::new("full").with_role(Role::Accent)))
+            }
+            fn shrink_to_fit(
+                &self,
+                _: &DataContext,
+                _: &RenderContext,
+                _target: u16,
+            ) -> Option<RenderedSegment> {
+                Some(RenderedSegment::new("c").with_role(Role::Accent))
+            }
+        }
+        // No `with_user_style` call — wrapper carries no override.
+        let wrapped = OverriddenSegment::new(Box::new(ShrinkableWithRole));
+        let shrunk = wrapped
+            .shrink_to_fit(&stub_ctx(), &stub_rc(), 10)
+            .expect("inner returned compact form");
+        assert_eq!(shrunk.style.role, Some(Role::Accent));
+    }
+
+    #[test]
+    fn shrink_to_fit_passthrough_returns_none_when_inner_declines() {
+        // Default trait impl returns None; the wrapper must forward
+        // None unchanged rather than emit a stub render of its own.
+        struct Plain;
+        impl Segment for Plain {
+            fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+                Ok(Some(RenderedSegment::new("plain")))
+            }
+        }
+        let wrapped =
+            OverriddenSegment::new(Box::new(Plain)).with_user_style(Style::role(Role::Primary));
+        assert!(wrapped
+            .shrink_to_fit(&stub_ctx(), &stub_rc(), 100)
+            .is_none());
     }
 
     fn stub_ctx() -> DataContext {

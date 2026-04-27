@@ -1,7 +1,7 @@
 # Segment System
 
 - Status: draft
-- Version: 0.5
+- Version: 0.6
 - Last updated: 2026-04-27
 - Driving ADRs: [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0004](../adrs/0004-rhai-for-plugins.md), [ADR-0005](../adrs/0005-role-based-themes.md), [ADR-0008](../adrs/0008-canonical-type-refinements.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md)
 
@@ -74,6 +74,26 @@ pub trait Segment: Send {
     /// — terminal width today, more fields later — for segments that
     /// pick their own shape based on available room.
     fn render(&self, ctx: &DataContext, rc: &RenderContext) -> RenderResult;
+
+    /// Layout-pressure-aware compaction hook. The reflow loop calls
+    /// this on any segment about to be dropped (truncatable or not),
+    /// asking whether it can produce a render at most `target` cells
+    /// wide. Default returns `None` (no compact form; segment drops
+    /// whole). Segments with structured tail content (`git_branch`'s
+    /// `* ↑2 ↓1`) override to shed decoration while keeping the
+    /// signal-bearing prefix. The returned render must be at most
+    /// `target` cells; wider results are rejected and treated as
+    /// `None`. Runs before generic `truncatable` end-ellipsis
+    /// truncation, so segment-side intelligence beats string
+    /// clipping when both apply.
+    fn shrink_to_fit(
+        &self,
+        _ctx: &DataContext,
+        _rc: &RenderContext,
+        _target: u16,
+    ) -> Option<RenderedSegment> {
+        None
+    }
 
     /// Default layout intent. Can be overridden by user config.
     fn defaults(&self) -> SegmentDefaults {
@@ -345,20 +365,24 @@ Input: list of `Option<RenderedSegment>`, each with `SegmentDefaults`, terminal 
 5. Else: priority-based reflow loop:
      a. Find the highest-priority (numerically largest) remaining segment.
         If only priority-0 segments remain, stop.
-     b. Compute `overflow = total - W`.
-     c. If the chosen segment declares `truncatable = true`, attempt to
-        shrink it to `cur_width - overflow` cells (which exactly closes
-        the gap). The shrunk width must be at least `floor`, which is
-        the segment's `width.min` if declared, else `2` (one content
-        cell plus the ellipsis); a declared `width.min` below `2` is
-        clamped up.
-        If feasible, replace the segment with its truncated form and
-        recompute total. The loop exits the next iteration because
-        total now equals W.
-     d. Otherwise (not truncatable, or truncation would fall below
-        `floor`) drop the segment outright.
-     e. Recompute total width.
-     f. Repeat until total <= W or only priority-0 segments remain.
+     b. Compute `overflow = total - W` and `target = cur_width - overflow`.
+     c. Call `segment.shrink_to_fit(ctx, rc, target)`. If it returns
+        `Some(r)` where `r.width` lies in `[width.min, target]` (the
+        configured `width.min` floor, default `0`, is honored the
+        same way `apply_width_bounds` honors it), replace the segment
+        with `r` and recompute total. Segment-side intelligence runs
+        first because the segment knows things the engine doesn't
+        (which decoration to shed, which prefix is signal-bearing).
+     d. Else, if the chosen segment declares `truncatable = true`,
+        attempt to shrink it to `target` cells via end-ellipsis
+        truncation. The shrunk width must be at least `floor`, which
+        is the segment's `width.min` if declared, else `2` (one
+        content cell plus the ellipsis); a declared `width.min` below
+        `2` is clamped up. If feasible, replace and recompute total.
+     e. Else (no compact form, no end-ellipsis, or end-ellipsis would
+        fall below `floor`) drop the segment outright.
+     f. Recompute total width.
+     g. Repeat until total <= W or only priority-0 segments remain.
 6. Emit: for each remaining segment, write its runs, then its right-separator
    (either segment-declared override or theme default), to stdout.
 ```
@@ -415,7 +439,7 @@ Per [`docs/ideas/0001-feature-parity-matrix.md`](../ideas/0001-feature-parity-ma
 4. `cost`: session cost in USD
 5. `duration`: session duration
 6. `workspace`: directory / worktree hybrid
-7. `git_branch`: branch + dirty + ahead/behind (sub-composed). Per-marker `[segments.git_branch.dirty].hide_below_cells` and `[segments.git_branch.ahead_behind].hide_below_cells` knobs shed markers on narrow terminals (default `0` = never auto-hide; pair with `enabled = false` for unconditional hide). The threshold keys on `rc.terminal_width` only, so it fires when the terminal itself is small — **not** when a wide terminal hosts a dense layout where neighboring segments pressure this one. Layout-pressure compaction (shedding markers under any pressure, regardless of terminal size) is tracked separately as a `shrink_to_fit` trait extension; it composes with the existing knob (the threshold becomes a user preference for narrow terminals while `shrink_to_fit` handles real overflow). Generic end-ellipsis truncation isn't safe (the structured tail would be mangled), so `truncatable` stays `false` and further pressure drops the segment whole via priority until that follow-up lands.
+7. `git_branch`: branch + dirty + ahead/behind (sub-composed). Two complementary compaction layers: per-marker `[segments.git_branch.dirty].hide_below_cells` and `[segments.git_branch.ahead_behind].hide_below_cells` knobs (user-preference layer; default `0` = never auto-hide; key on `rc.terminal_width` only — fire on narrow terminals), and engine-driven `shrink_to_fit` (layout-pressure layer; sheds dirty + ahead/behind to keep the `icon + label + head` prefix when neighboring segments pressure the line, regardless of terminal size — `head` is the branch name on a normal checkout, the short SHA on detached HEAD, or the symbolic-ref target on unborn HEAD). Generic end-ellipsis truncation isn't safe (the structured tail would be mangled), so `truncatable` stays `false` — under further pressure even after `shrink_to_fit`, the segment drops whole via priority.
 8. `rate_limit_5h`: 5-hour percentage + resets-at countdown
 9. `rate_limit_7d`: 7-day percentage + resets-at countdown
 10. `rate_limit`: combined 5h/7d view; sub-composed from `rate_limit_5h` and `rate_limit_7d` with a tighter layout (users pick either the combined form or the individual segments, not both)
@@ -497,3 +521,4 @@ Fixtures: lists of `(SegmentId, width, priority)` tuples.
 - 2026-04-19: v0.3 incorporating [ADR-0010](../adrs/0010-data-fetching-architecture.md). Render signature moves from `&StatusContext` to `&DataContext`; `StatusContext` remains accessible via `ctx.status`. Adds `data_deps()` method with a default of `&[DataDep::Status]`. Existing stdin-only segments pick up the default `data_deps()` for free but still migrate their render signature to `&DataContext` and reach stdin fields via `ctx.status`. Rendering pipeline diagram updated to show the dep-union pre-fetch step. See [data-fetching.md](data-fetching.md) for the `DataContext` shape and `DataDep` enum.
 - 2026-04-27: v0.4. Adds `SegmentDefaults.truncatable` opt-in (default `false`); under width pressure the layout engine shrinks `truncatable` segments to `(cur_width - overflow)` cells before dropping, with a floor of `max(width.min, 2)`. `workspace` opts in. Numeric segments stay opt-out so end-ellipsis truncation never produces a wrong number.
 - 2026-04-27: v0.5. Render signature gains `&RenderContext` as a second argument: `fn render(&self, ctx: &DataContext, rc: &RenderContext) -> RenderResult`. The new struct carries `terminal_width` today and is `#[non_exhaustive]` for additive growth (line index, capability, neighbor info). Segments that don't care about layout state ignore the argument; width-aware segments read `rc.terminal_width` to ladder their own output before the engine's reflow pass runs. Rendering pipeline diagram updated to show the per-render `RenderContext` build step.
+- 2026-04-27: v0.6. Adds `Segment::shrink_to_fit(&self, ctx, rc, target) -> Option<RenderedSegment>`. The reflow loop now calls it before falling back to `truncatable` end-ellipsis or drop, letting structured-tail segments (`git_branch`'s `* ↑2 ↓1`) shed decoration while keeping the signal-bearing prefix under layout pressure — not just under terminal narrowness. Default impl returns `None` (current behavior preserved); `git_branch` overrides to suppress its dirty + ahead/behind markers when `target` is below the full-assembly width.

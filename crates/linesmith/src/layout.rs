@@ -50,23 +50,25 @@ pub fn render_with_warn(
 ) -> String {
     let rc = RenderContext::new(terminal_width);
     let items = collect_items_with(segments, ctx, &rc, warn);
-    render_items(items, terminal_width, theme, capability)
+    render_items(items, ctx, &rc, terminal_width, theme, capability)
 }
 
 /// Rendered output paired with the defaults needed to place it (priority,
-/// separator, bounds). Bundled here so drop/emit passes don't re-query the
-/// trait.
-struct Item {
+/// separator, bounds) and a back-reference to the segment so the reflow
+/// loop can call `shrink_to_fit` without re-walking the input slice.
+/// Bundled here so drop/emit passes don't re-query the trait.
+struct Item<'a> {
     rendered: RenderedSegment,
     defaults: SegmentDefaults,
+    segment: &'a dyn Segment,
 }
 
-fn collect_items_with(
-    segments: &[Box<dyn Segment>],
+fn collect_items_with<'a>(
+    segments: &'a [Box<dyn Segment>],
     ctx: &DataContext,
     rc: &RenderContext,
     warn: &mut dyn FnMut(&str),
-) -> Vec<Item> {
+) -> Vec<Item<'a>> {
     segments
         .iter()
         .filter_map(|seg| {
@@ -82,13 +84,16 @@ fn collect_items_with(
             apply_width_bounds(rendered, defaults.width).map(|r| Item {
                 rendered: r,
                 defaults,
+                segment: seg.as_ref(),
             })
         })
         .collect()
 }
 
 fn render_items(
-    mut items: Vec<Item>,
+    mut items: Vec<Item<'_>>,
+    ctx: &DataContext,
+    rc: &RenderContext,
     terminal_width: u16,
     theme: &Theme,
     capability: Capability,
@@ -109,6 +114,14 @@ fn render_items(
             break;
         };
         let overflow = total - budget;
+        // Try segment-side compaction first; the segment knows things
+        // the engine doesn't (which decoration is signal-bearing,
+        // which prefix to keep). Falls through to generic end-ellipsis
+        // truncation only when shrink_to_fit declines.
+        if let Some(shrunk) = try_shrink(&items[drop_idx], ctx, rc, overflow) {
+            items[drop_idx].rendered = shrunk;
+            continue;
+        }
         if items[drop_idx].defaults.truncatable {
             if let Some(reflowed) = try_reflow(&items[drop_idx], overflow) {
                 items[drop_idx] = reflowed;
@@ -139,7 +152,7 @@ fn render_items(
 /// Sum of segment widths plus the separators that sit *between* segments
 /// (no trailing separator). `u32` prevents `u16` overflow on many wide
 /// segments.
-fn total_width(items: &[Item]) -> u32 {
+fn total_width(items: &[Item<'_>]) -> u32 {
     if items.is_empty() {
         return 0;
     }
@@ -152,7 +165,7 @@ fn total_width(items: &[Item]) -> u32 {
     seg_sum + sep_sum
 }
 
-fn effective_separator(item: &Item) -> &Separator {
+fn effective_separator<'i>(item: &'i Item<'_>) -> &'i Separator {
     item.rendered
         .right_separator
         .as_ref()
@@ -187,7 +200,7 @@ fn apply_width_bounds(
 /// the reflow loop exits on its next check; a wide grapheme straddling
 /// the boundary may yield a slightly narrower result, which still
 /// meets the `overflow` requirement.
-fn try_reflow(item: &Item, overflow: u32) -> Option<Item> {
+fn try_reflow<'a>(item: &Item<'a>, overflow: u32) -> Option<Item<'a>> {
     let floor = item.defaults.width.map_or(2, |b| b.min().max(2));
     let cur = item.rendered.width;
     let target = u32::from(cur).checked_sub(overflow)?;
@@ -202,7 +215,54 @@ fn try_reflow(item: &Item, overflow: u32) -> Option<Item> {
     Some(Item {
         rendered: truncated,
         defaults: item.defaults.clone(),
+        segment: item.segment,
     })
+}
+
+/// Ask the segment to produce a render at most `cur_width - overflow`
+/// cells wide. Returns `None` when `shrink_to_fit` itself returns
+/// `None` (default impl, or the segment declined). A segment that
+/// returns `Some(r)` with `r.width > target` violates the documented
+/// contract — the engine rejects the response (to preserve the
+/// layout-fit invariant) and routes the violation through
+/// [`crate::lsm_warn!`] so the misbehavior is visible to the segment
+/// author. The caller falls through to `truncatable` end-ellipsis or
+/// drop on any of these outcomes.
+fn try_shrink(
+    item: &Item<'_>,
+    ctx: &DataContext,
+    rc: &RenderContext,
+    overflow: u32,
+) -> Option<RenderedSegment> {
+    let cur = item.rendered.width;
+    // `cur < overflow` is reachable: one segment frequently can't
+    // absorb the whole overflow alone (e.g. cost=6 when total
+    // overshoots by 12). `checked_sub` returns `None` and the engine
+    // drops the segment so the loop iterates with a smaller total.
+    let target = u16::try_from(u32::from(cur).checked_sub(overflow)?).ok()?;
+    // Honor the user's declared `width.min` floor on the shrunk
+    // render the same way `apply_width_bounds` and `try_reflow` do —
+    // a configured min is a contract that a too-narrow render is
+    // worse than no render. No `+ 2` like `try_reflow`'s floor
+    // because `shrink_to_fit` produces an arbitrary string, not
+    // text + ellipsis.
+    let min_floor = item.defaults.width.map_or(0, |b| b.min());
+    if target < min_floor {
+        return None;
+    }
+    let shrunk = item.segment.shrink_to_fit(ctx, rc, target)?;
+    if shrunk.width > target {
+        crate::lsm_warn!(
+            "segment shrink_to_fit returned width {} > target {}; rejecting",
+            shrunk.width,
+            target,
+        );
+        return None;
+    }
+    if shrunk.width < min_floor {
+        return None;
+    }
+    Some(shrunk)
 }
 
 /// Truncate `rendered` to at most `max_cells` terminal cells, appending
@@ -241,13 +301,54 @@ pub(crate) fn truncate_to(rendered: RenderedSegment, max_cells: u16) -> Rendered
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::{ModelInfo, StatusContext, Tool, WorkspaceInfo};
     use crate::theme;
     use std::borrow::Cow;
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
-    fn item(text: &str, priority: u8) -> Item {
+    /// Stub `Segment` for layout tests that build `Item` literals
+    /// directly. The reflow loop's `shrink_to_fit` callback gets the
+    /// default `None`, so layout tests focused on priority-drop /
+    /// separators / truncatable behavior don't need to mint a fresh
+    /// segment per case.
+    struct NoopSegment;
+    impl Segment for NoopSegment {
+        fn render(&self, _ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
+            Ok(None)
+        }
+    }
+    static NOOP: NoopSegment = NoopSegment;
+    fn noop_segment() -> &'static dyn Segment {
+        &NOOP
+    }
+
+    fn empty_ctx() -> DataContext {
+        DataContext::new(StatusContext {
+            tool: Tool::ClaudeCode,
+            model: ModelInfo {
+                display_name: "X".into(),
+            },
+            workspace: WorkspaceInfo {
+                project_dir: PathBuf::from("/"),
+                git_worktree: None,
+            },
+            context_window: None,
+            cost: None,
+            effort: None,
+            raw: Arc::new(serde_json::Value::Null),
+        })
+    }
+
+    fn empty_rc() -> RenderContext {
+        RenderContext::new(80)
+    }
+
+    fn item(text: &str, priority: u8) -> Item<'static> {
         Item {
             rendered: RenderedSegment::new(text),
             defaults: SegmentDefaults::with_priority(priority),
+            segment: noop_segment(),
         }
     }
 
@@ -255,9 +356,11 @@ mod tests {
     /// no color capability so output is plain text — the invariant most
     /// layout tests actually care about (priority-drop, separators,
     /// truncation behavior) is independent of theming.
-    fn render_plain(items: Vec<Item>, terminal_width: u16) -> String {
+    fn render_plain(items: Vec<Item<'_>>, terminal_width: u16) -> String {
         render_items(
             items,
+            &empty_ctx(),
+            &empty_rc(),
             terminal_width,
             theme::default_theme(),
             theme::Capability::None,
@@ -275,18 +378,23 @@ mod tests {
             Item {
                 rendered: RenderedSegment::new("a"),
                 defaults: SegmentDefaults::with_priority(10),
+                segment: noop_segment(),
             },
             Item {
                 rendered: RenderedSegment::new("b").with_role(Role::Warning),
                 defaults: SegmentDefaults::with_priority(10),
+                segment: noop_segment(),
             },
             Item {
                 rendered: RenderedSegment::new("c"),
                 defaults: SegmentDefaults::with_priority(10),
+                segment: noop_segment(),
             },
         ];
         let out = render_items(
             items,
+            &empty_ctx(),
+            &empty_rc(),
             100,
             theme::default_theme(),
             theme::Capability::Palette16,
@@ -387,10 +495,12 @@ mod tests {
                     default_separator: Separator::Literal(Cow::Borrowed(" | ")),
                     truncatable: false,
                 },
+                segment: noop_segment(),
             },
             Item {
                 rendered: RenderedSegment::new("b"),
                 defaults: SegmentDefaults::with_priority(10),
+                segment: noop_segment(),
             },
         ];
         assert_eq!(render_plain(items, 100), "a | b");
@@ -402,10 +512,12 @@ mod tests {
             Item {
                 rendered: RenderedSegment::with_separator("a", Separator::None),
                 defaults: SegmentDefaults::with_priority(10),
+                segment: noop_segment(),
             },
             Item {
                 rendered: RenderedSegment::new("b"),
                 defaults: SegmentDefaults::with_priority(10),
+                segment: noop_segment(),
             },
         ];
         assert_eq!(render_plain(items, 100), "ab");
@@ -513,14 +625,17 @@ mod tests {
             Item {
                 rendered: RenderedSegment::new("a"),
                 defaults: SegmentDefaults::with_priority(200),
+                segment: noop_segment(),
             },
             Item {
                 rendered: RenderedSegment::with_separator("b", Separator::None),
                 defaults: SegmentDefaults::with_priority(200),
+                segment: noop_segment(),
             },
             Item {
                 rendered: RenderedSegment::new("c"),
                 defaults: SegmentDefaults::with_priority(200),
+                segment: noop_segment(),
             },
         ];
         assert_eq!(render_plain(items, 4), "a bc");
@@ -534,14 +649,17 @@ mod tests {
             Item {
                 rendered: RenderedSegment::new("x".repeat(u16::MAX as usize)),
                 defaults: SegmentDefaults::with_priority(10),
+                segment: noop_segment(),
             },
             Item {
                 rendered: RenderedSegment::new("x".repeat(u16::MAX as usize)),
                 defaults: SegmentDefaults::with_priority(10),
+                segment: noop_segment(),
             },
             Item {
                 rendered: RenderedSegment::new("x".repeat(u16::MAX as usize)),
                 defaults: SegmentDefaults::with_priority(10),
+                segment: noop_segment(),
             },
         ];
         assert_eq!(total_width(&items), 3 * u32::from(u16::MAX) + 2);
@@ -556,10 +674,7 @@ mod tests {
 
     // --- error handling ---
 
-    use crate::input::{ModelInfo, StatusContext, Tool, WorkspaceInfo};
     use crate::segments::{RenderResult, SegmentError};
-    use std::path::PathBuf;
-    use std::sync::Arc;
 
     struct StubSegment(RenderResult);
 
@@ -571,27 +686,6 @@ mod tests {
                 Err(e) => Err(SegmentError::new(e.message.clone())),
             }
         }
-    }
-
-    fn empty_ctx() -> DataContext {
-        DataContext::new(StatusContext {
-            tool: Tool::ClaudeCode,
-            model: ModelInfo {
-                display_name: "X".into(),
-            },
-            workspace: WorkspaceInfo {
-                project_dir: PathBuf::from("/"),
-                git_worktree: None,
-            },
-            context_window: None,
-            cost: None,
-            effort: None,
-            raw: Arc::new(serde_json::Value::Null),
-        })
-    }
-
-    fn empty_rc() -> RenderContext {
-        RenderContext::new(80)
     }
 
     #[test]
@@ -676,10 +770,11 @@ mod tests {
 
     // --- truncate-before-drop (reflow) ---
 
-    fn truncatable_item(text: &str, priority: u8) -> Item {
+    fn truncatable_item(text: &str, priority: u8) -> Item<'static> {
         Item {
             rendered: RenderedSegment::new(text),
             defaults: SegmentDefaults::with_priority(priority).with_truncatable(true),
+            segment: noop_segment(),
         }
     }
 
@@ -773,10 +868,232 @@ mod tests {
             Item {
                 rendered: RenderedSegment::new("untouchable-long-name"),
                 defaults: SegmentDefaults::with_priority(0).with_truncatable(true),
+                segment: noop_segment(),
             },
             item("Sonnet", 0),
         ];
         let out = render_plain(items, 5);
         assert_eq!(out, "untouchable-long-name Sonnet");
+    }
+
+    // --- shrink_to_fit (layout-pressure-aware compaction) ---
+
+    /// Stub segment whose `shrink_to_fit` returns the configured
+    /// compact form unconditionally — the engine's `target` check
+    /// gates whether it's accepted. Higher-than-default priority so
+    /// it's the one the reflow loop selects under pressure.
+    struct ShrinkableSegment {
+        full: &'static str,
+        compact: &'static str,
+    }
+    impl Segment for ShrinkableSegment {
+        fn render(&self, _ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
+            Ok(Some(RenderedSegment::new(self.full)))
+        }
+        fn shrink_to_fit(
+            &self,
+            _ctx: &DataContext,
+            _rc: &RenderContext,
+            target: u16,
+        ) -> Option<RenderedSegment> {
+            let r = RenderedSegment::new(self.compact);
+            (r.width <= target).then_some(r)
+        }
+        fn defaults(&self) -> SegmentDefaults {
+            SegmentDefaults::with_priority(200)
+        }
+    }
+
+    /// Segment that always renders `text` and is priority-0 (never
+    /// dropped under pressure). Used as the "anchor" in shrink tests
+    /// so the reflow loop has only one droppable target.
+    struct AnchorSegment(&'static str);
+    impl Segment for AnchorSegment {
+        fn render(&self, _ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
+            Ok(Some(RenderedSegment::new(self.0)))
+        }
+        fn defaults(&self) -> SegmentDefaults {
+            SegmentDefaults::with_priority(0)
+        }
+    }
+
+    #[test]
+    fn shrink_to_fit_replaces_full_render_when_compact_form_fits() {
+        // Engine-level pin: the reflow loop calls shrink_to_fit
+        // before considering drop. Full = "longbranch * ↑2 ↓1" (18
+        // cells), compact = "longbranch" (10 cells). KEEP is
+        // priority-0 so it can't be the drop target — only the
+        // shrinkable segment is eligible.
+        let segments: Vec<Box<dyn Segment>> = vec![
+            Box::new(ShrinkableSegment {
+                full: "longbranch * ↑2 ↓1",
+                compact: "longbranch",
+            }),
+            Box::new(AnchorSegment("KEEP")),
+        ];
+        let mut warnings = Vec::new();
+        let line = render_with_warn(
+            &segments,
+            &empty_ctx(),
+            17,
+            &mut |m| warnings.push(m.to_string()),
+            theme::default_theme(),
+            theme::Capability::None,
+        );
+        // Full 18 + sep 1 + KEEP 4 = 23. Budget 17 → overflow 6.
+        // shrink target = 18 - 6 = 12. Compact "longbranch" (10)
+        // fits → "longbranch KEEP" (15 cells).
+        assert_eq!(line, "longbranch KEEP");
+    }
+
+    #[test]
+    fn shrink_to_fit_falls_back_to_drop_when_compact_form_too_wide() {
+        // Compact form is wider than target → engine rejects it,
+        // falls through to drop (segment isn't truncatable).
+        let segments: Vec<Box<dyn Segment>> = vec![
+            Box::new(ShrinkableSegment {
+                full: "longbranch",
+                compact: "stilltoolongtruly",
+            }),
+            Box::new(AnchorSegment("X")),
+        ];
+        let mut warnings = Vec::new();
+        let line = render_with_warn(
+            &segments,
+            &empty_ctx(),
+            5,
+            &mut |m| warnings.push(m.to_string()),
+            theme::default_theme(),
+            theme::Capability::None,
+        );
+        // Compact form 17 cells > target → reject → drop. Only the
+        // anchor remains.
+        assert_eq!(line, "X");
+    }
+
+    #[test]
+    fn shrink_to_fit_honors_configured_width_min_floor() {
+        // A segment with `width.min = 8` configured: even though its
+        // compact form is 5 cells (would otherwise fit a target ≥ 5),
+        // the engine must reject the shrunk render and drop the
+        // segment because the user contracted "at least 8 cells or
+        // hide me." Pins parity with `apply_width_bounds` /
+        // `try_reflow`.
+        struct LowFloorShrink;
+        impl Segment for LowFloorShrink {
+            fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+                Ok(Some(RenderedSegment::new("longerprefix")))
+            }
+            fn shrink_to_fit(
+                &self,
+                _: &DataContext,
+                _: &RenderContext,
+                _target: u16,
+            ) -> Option<RenderedSegment> {
+                Some(RenderedSegment::new("five5"))
+            }
+            fn defaults(&self) -> SegmentDefaults {
+                SegmentDefaults::with_priority(200)
+                    .with_width(WidthBounds::new(8, u16::MAX).expect("valid"))
+            }
+        }
+        let segments: Vec<Box<dyn Segment>> =
+            vec![Box::new(LowFloorShrink), Box::new(AnchorSegment("X"))];
+        let line = render_with_warn(
+            &segments,
+            &empty_ctx(),
+            7,
+            &mut |_| {},
+            theme::default_theme(),
+            theme::Capability::None,
+        );
+        // shrunk would deliver 5 cells, but width.min=8 → rejected,
+        // segment drops. Only anchor remains.
+        assert_eq!(line, "X");
+    }
+
+    #[test]
+    fn shrink_to_fit_rejects_too_wide_response_and_drops() {
+        // A misbehaving segment ignores `target` and emits a render
+        // wider than the engine asked for. The engine must reject
+        // the response (preserving the layout-fit invariant) and
+        // fall through to drop. The contract violation also fires
+        // `lsm_warn!` (visible on stderr during test runs); that
+        // side effect isn't captured by the warn closure passed to
+        // `render_with_warn`, which only carries segment-render
+        // errors — asserting layout outcome is the testable
+        // contract here.
+        struct MisbehavingSegment;
+        impl Segment for MisbehavingSegment {
+            fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+                Ok(Some(RenderedSegment::new("longbranch")))
+            }
+            fn shrink_to_fit(
+                &self,
+                _: &DataContext,
+                _: &RenderContext,
+                _target: u16,
+            ) -> Option<RenderedSegment> {
+                Some(RenderedSegment::new("stilltoolongtruly"))
+            }
+            fn defaults(&self) -> SegmentDefaults {
+                SegmentDefaults::with_priority(200)
+            }
+        }
+        let segments: Vec<Box<dyn Segment>> =
+            vec![Box::new(MisbehavingSegment), Box::new(AnchorSegment("X"))];
+        let line = render_with_warn(
+            &segments,
+            &empty_ctx(),
+            5,
+            &mut |_| {},
+            theme::default_theme(),
+            theme::Capability::None,
+        );
+        assert_eq!(line, "X");
+    }
+
+    #[test]
+    fn shrink_to_fit_runs_before_truncatable_end_ellipsis() {
+        // A segment that's both truncatable AND has shrink_to_fit:
+        // segment-side intelligence wins. The compact form replaces
+        // the full render before generic end-ellipsis fires.
+        struct DualSegment;
+        impl Segment for DualSegment {
+            fn render(&self, _ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
+                Ok(Some(RenderedSegment::new("longprefix-with-tail")))
+            }
+            fn shrink_to_fit(
+                &self,
+                _ctx: &DataContext,
+                _rc: &RenderContext,
+                target: u16,
+            ) -> Option<RenderedSegment> {
+                let r = RenderedSegment::new("longprefix");
+                (r.width <= target).then_some(r)
+            }
+            fn defaults(&self) -> SegmentDefaults {
+                SegmentDefaults::with_priority(200).with_truncatable(true)
+            }
+        }
+        let segments: Vec<Box<dyn Segment>> = vec![
+            Box::new(DualSegment),
+            Box::new(StubSegment(Ok(Some(RenderedSegment::new("X"))))),
+        ];
+        let mut warnings = Vec::new();
+        let line = render_with_warn(
+            &segments,
+            &empty_ctx(),
+            13,
+            &mut |m| warnings.push(m.to_string()),
+            theme::default_theme(),
+            theme::Capability::None,
+        );
+        // Full = 20, X = 1, separator = 1 → total 22. Budget 13 →
+        // overflow 9. shrink target = 20 - 9 = 11. Compact
+        // "longprefix" (10) fits → "longprefix X" (12 cells).
+        // No "…" appears because shrink_to_fit ran first.
+        assert!(line.contains("longprefix"), "got {line:?}");
+        assert!(!line.contains('…'), "no end-ellipsis: {line:?}");
     }
 }

@@ -292,6 +292,29 @@ impl Segment for GitBranchSegment {
             }
         }
     }
+
+    fn shrink_to_fit(
+        &self,
+        ctx: &DataContext,
+        _rc: &RenderContext,
+        target: u16,
+    ) -> Option<RenderedSegment> {
+        // Same hide-rules as `render`: outside a repo or in a bare
+        // repo, there's nothing structured to shed and no shorter
+        // form to offer.
+        let arc = ctx.git();
+        let gc = match &*arc {
+            Err(_) | Ok(None) => return None,
+            Ok(Some(gc)) if matches!(gc.repo_kind, RepoKind::Bare) => return None,
+            Ok(Some(gc)) => gc,
+        };
+        let text = self.assemble_compact(gc);
+        if text.is_empty() {
+            return None;
+        }
+        let rendered = RenderedSegment::new(text).with_role(Role::Accent);
+        (rendered.width <= target).then_some(rendered)
+    }
 }
 
 impl GitBranchSegment {
@@ -323,6 +346,26 @@ impl GitBranchSegment {
             }
         }
 
+        parts.join(" ")
+    }
+
+    /// `assemble` with both structured-tail markers (dirty,
+    /// ahead/behind) suppressed regardless of config. The compact
+    /// fallback the engine asks for via `shrink_to_fit` under layout
+    /// pressure: shed decoration, keep the signal-bearing prefix
+    /// (icon + label + head).
+    fn assemble_compact(&self, gc: &GitContext) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if !self.cfg.icon.is_empty() {
+            parts.push(self.cfg.icon.clone());
+        }
+        if !self.cfg.label.is_empty() {
+            parts.push(self.cfg.label.clone());
+        }
+        let head = self.render_head(&gc.head);
+        if !head.is_empty() {
+            parts.push(head);
+        }
         parts.join(" ")
     }
 
@@ -1217,5 +1260,92 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|w| w.contains("segments.git_branch.dirty.hide_below_cells")));
+    }
+
+    // --- shrink_to_fit (layout-pressure-aware compaction) ---
+
+    #[test]
+    fn shrink_to_fit_returns_compact_form_when_target_fits() {
+        // Full assembly is "main * ↑2 ↓1" (12 cells). Compact form
+        // is "main" (4 cells). Target ≥ 4 → engine gets the compact
+        // form; the segment sheds dirty + ahead/behind.
+        let seg = GitBranchSegment::default();
+        let dc = ctx_with_dirty_and_upstream(2, 1);
+        let dummy_rc = RenderContext::new(80);
+        let shrunk = seg
+            .shrink_to_fit(&dc, &dummy_rc, 4)
+            .expect("compact form fits");
+        assert_eq!(shrunk.text(), "main");
+        assert_eq!(shrunk.style().role, Some(Role::Accent));
+    }
+
+    #[test]
+    fn shrink_to_fit_returns_none_when_even_compact_form_overflows() {
+        // Compact form is "main" (4 cells). Target 3 is below that,
+        // so `shrink_to_fit` declines (returns `None`) rather than
+        // emit a too-wide render. The engine's drop-on-decline
+        // behavior is covered separately by the layout-side test.
+        let seg = GitBranchSegment::default();
+        let dc = ctx_with_dirty_and_upstream(2, 1);
+        let dummy_rc = RenderContext::new(80);
+        assert!(seg.shrink_to_fit(&dc, &dummy_rc, 3).is_none());
+    }
+
+    #[test]
+    fn shrink_to_fit_returns_none_outside_repo() {
+        let seg = GitBranchSegment::default();
+        let dc = ctx_with_git(Ok(None));
+        let dummy_rc = RenderContext::new(80);
+        assert!(seg.shrink_to_fit(&dc, &dummy_rc, 100).is_none());
+    }
+
+    #[test]
+    fn shrink_to_fit_returns_none_in_bare_repo() {
+        let seg = GitBranchSegment::default();
+        let gc = GitContext::new(
+            RepoKind::Bare,
+            PathBuf::from("/tmp/bare.git"),
+            Head::Unborn {
+                symbolic_ref: "main".into(),
+            },
+        );
+        let dc = ctx_with_git(Ok(Some(gc)));
+        let dummy_rc = RenderContext::new(80);
+        assert!(seg.shrink_to_fit(&dc, &dummy_rc, 100).is_none());
+    }
+
+    #[test]
+    fn shrink_to_fit_keeps_configured_icon_and_label_in_compact_form() {
+        // The compact form is `icon + label + head` (the
+        // signal-bearing prefix). Default config leaves icon and
+        // label empty, so the existing tests don't exercise the
+        // `if !cfg.icon.is_empty()` / `if !cfg.label.is_empty()`
+        // branches in `assemble_compact`. Configure both and confirm
+        // the prefix survives shedding the structured tail.
+        let mut seg = GitBranchSegment::default();
+        seg.cfg.icon = "@".into();
+        seg.cfg.label = "br:".into();
+        let dc = ctx_with_dirty_and_upstream(2, 1);
+        let dummy_rc = RenderContext::new(80);
+        let shrunk = seg
+            .shrink_to_fit(&dc, &dummy_rc, 50)
+            .expect("compact form fits");
+        assert_eq!(shrunk.text(), "@ br: main");
+    }
+
+    #[test]
+    fn shrink_to_fit_strips_markers_even_when_thresholds_would_keep_them() {
+        // Reflow path: a wide terminal (rc=200) with both
+        // hide_below_cells thresholds at 0 means render() emits the
+        // full assembly. shrink_to_fit is a separate engine-driven
+        // gate that must still produce the compact form when the
+        // engine asks, regardless of the user's threshold preferences.
+        let seg = GitBranchSegment::default();
+        let dc = ctx_with_dirty_and_upstream(2, 1);
+        let wide_rc = RenderContext::new(200);
+        let shrunk = seg
+            .shrink_to_fit(&dc, &wide_rc, 50)
+            .expect("compact form fits 50 cells");
+        assert_eq!(shrunk.text(), "main");
     }
 }
