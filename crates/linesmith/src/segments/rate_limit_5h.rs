@@ -12,7 +12,7 @@ use super::rate_limit_format::{
     apply_common_extras, format_jsonl_tokens, format_percent, parse_bool, parse_percent_format,
     render_error, CommonRateLimitConfig, PercentFormat,
 };
-use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
+use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::{DataContext, DataDep, UsageData};
 use crate::theme::Role;
 
@@ -64,7 +64,7 @@ impl RateLimit5hSegment {
 }
 
 impl Segment for RateLimit5hSegment {
-    fn render(&self, ctx: &DataContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let usage = ctx.usage();
         let text = match &*usage {
             Ok(UsageData::Endpoint(e)) => match &e.five_hour {
@@ -106,6 +106,10 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    fn rc() -> RenderContext {
+        RenderContext::new(80)
+    }
 
     fn ctx_with_usage(usage: Result<UsageData, UsageError>) -> DataContext {
         let dc = DataContext::new(StatusContext {
@@ -166,7 +170,7 @@ mod tests {
     #[test]
     fn hidden_when_five_hour_bucket_absent() {
         let rendered = RateLimit5hSegment::default()
-            .render(&ctx_with_usage(Ok(endpoint_empty())))
+            .render(&ctx_with_usage(Ok(endpoint_empty())), &rc())
             .expect("render ok");
         assert_eq!(rendered, None);
     }
@@ -175,7 +179,7 @@ mod tests {
     fn renders_percent_happy_path() {
         let dc = ctx_with_usage(Ok(endpoint_data_with_five_hour(22.0)));
         let rendered = RateLimit5hSegment::default()
-            .render(&dc)
+            .render(&dc, &rc())
             .expect("render ok")
             .expect("visible");
         assert_eq!(rendered.text(), "5h: 22.0%");
@@ -188,7 +192,7 @@ mod tests {
             invert: true,
             ..Default::default()
         };
-        let rendered = seg.render(&dc).unwrap().expect("visible");
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
         assert_eq!(rendered.text(), "5h: 78.0%");
     }
 
@@ -196,7 +200,7 @@ mod tests {
     fn jsonl_mode_renders_compact_tokens_with_stale_marker() {
         let dc = ctx_with_usage(Ok(jsonl_with_five_hour_tokens(420_000)));
         let rendered = RateLimit5hSegment::default()
-            .render(&dc)
+            .render(&dc, &rc())
             .unwrap()
             .expect("visible");
         assert_eq!(rendered.text(), "~5h: 420k");
@@ -210,7 +214,10 @@ mod tests {
             None,
             SevenDayWindow::new(TokenCounts::default()),
         ))));
-        assert_eq!(RateLimit5hSegment::default().render(&dc).unwrap(), None);
+        assert_eq!(
+            RateLimit5hSegment::default().render(&dc, &rc()).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -224,7 +231,7 @@ mod tests {
             invert: true,
             ..Default::default()
         };
-        let rendered = seg.render(&dc).unwrap().expect("visible");
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
         assert_eq!(rendered.text(), "~5h: 1.2M");
     }
 
@@ -235,7 +242,7 @@ mod tests {
             format: PercentFormat::Progress,
             ..Default::default()
         };
-        let rendered = seg.render(&dc).unwrap().expect("visible");
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
         assert!(rendered.text().starts_with("5h: "), "{}", rendered.text());
         assert!(rendered.text().contains("█"));
         assert!(rendered.text().ends_with("50.0%"), "{}", rendered.text());
@@ -248,7 +255,7 @@ mod tests {
             format: PercentFormat::Progress,
             ..Default::default()
         };
-        let rendered = seg.render(&dc).unwrap().expect("visible");
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
         assert!(rendered.text().contains("░"));
         assert!(!rendered.text().contains("█"));
         assert!(rendered.text().ends_with("0.0%"), "{}", rendered.text());
@@ -261,7 +268,7 @@ mod tests {
             format: PercentFormat::Progress,
             ..Default::default()
         };
-        let rendered = seg.render(&dc).unwrap().expect("visible");
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
         assert!(rendered.text().contains("█"));
         assert!(!rendered.text().contains("░"));
         assert!(rendered.text().ends_with("100.0%"), "{}", rendered.text());
@@ -271,7 +278,7 @@ mod tests {
     fn renders_error_table_strings() {
         let dc = ctx_with_usage(Err(UsageError::Timeout));
         let rendered = RateLimit5hSegment::default()
-            .render(&dc)
+            .render(&dc, &rc())
             .unwrap()
             .expect("visible");
         assert_eq!(rendered.text(), "5h: [Timeout]");
@@ -349,7 +356,7 @@ mod tests {
             unknown_buckets: std::collections::HashMap::new(),
         });
         let rendered = RateLimit5hSegment::default()
-            .render(&ctx_with_usage(Ok(data)))
+            .render(&ctx_with_usage(Ok(data)), &rc())
             .unwrap();
         assert_eq!(rendered, None);
     }

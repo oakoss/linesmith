@@ -10,7 +10,7 @@ use super::rate_limit_format::{
     apply_common_extras, format_jsonl_tokens, format_percent, parse_bool, parse_percent_format,
     render_error, CommonRateLimitConfig, PercentFormat,
 };
-use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
+use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::{DataContext, DataDep, UsageData};
 use crate::theme::Role;
 
@@ -53,7 +53,7 @@ impl RateLimit7dSegment {
 }
 
 impl Segment for RateLimit7dSegment {
-    fn render(&self, ctx: &DataContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let usage = ctx.usage();
         let text = match &*usage {
             Ok(UsageData::Endpoint(e)) => match &e.seven_day {
@@ -91,6 +91,10 @@ mod tests {
     use crate::input::{ModelInfo, Percent, StatusContext, Tool, WorkspaceInfo};
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    fn rc() -> RenderContext {
+        RenderContext::new(80)
+    }
 
     fn ctx_with_usage(usage: Result<UsageData, UsageError>) -> DataContext {
         let dc = DataContext::new(StatusContext {
@@ -144,7 +148,7 @@ mod tests {
         });
         assert_eq!(
             RateLimit7dSegment::default()
-                .render(&ctx_with_usage(Ok(data)))
+                .render(&ctx_with_usage(Ok(data)), &rc())
                 .unwrap(),
             None,
         );
@@ -154,7 +158,7 @@ mod tests {
     fn renders_percent_happy_path() {
         let dc = ctx_with_usage(Ok(endpoint_data_with_seven_day(33.0)));
         let rendered = RateLimit7dSegment::default()
-            .render(&dc)
+            .render(&dc, &rc())
             .unwrap()
             .expect("visible");
         assert_eq!(rendered.text(), "7d: 33.0%");
@@ -167,7 +171,7 @@ mod tests {
             invert: true,
             ..Default::default()
         };
-        let rendered = seg.render(&dc).unwrap().expect("visible");
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
         assert_eq!(rendered.text(), "7d: 67.0%");
     }
 
@@ -175,7 +179,7 @@ mod tests {
     fn jsonl_mode_renders_compact_tokens_with_stale_marker() {
         let dc = ctx_with_usage(Ok(jsonl_data_with_seven_day_tokens(1_200_000)));
         let rendered = RateLimit7dSegment::default()
-            .render(&dc)
+            .render(&dc, &rc())
             .unwrap()
             .expect("visible");
         assert_eq!(rendered.text(), "~7d: 1.2M");
@@ -188,7 +192,7 @@ mod tests {
         // so an empty-transcript user still sees `~7d: 0`, not a hide.
         let dc = ctx_with_usage(Ok(jsonl_data_with_seven_day_tokens(0)));
         let rendered = RateLimit7dSegment::default()
-            .render(&dc)
+            .render(&dc, &rc())
             .unwrap()
             .expect("visible");
         assert_eq!(rendered.text(), "~7d: 0");
@@ -198,7 +202,7 @@ mod tests {
     fn renders_error_when_usage_fails() {
         let dc = ctx_with_usage(Err(UsageError::Unauthorized));
         let rendered = RateLimit7dSegment::default()
-            .render(&dc)
+            .render(&dc, &rc())
             .unwrap()
             .expect("visible");
         assert_eq!(rendered.text(), "7d: [Unauthorized]");

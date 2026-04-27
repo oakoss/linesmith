@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use unicode_width::UnicodeWidthStr;
 
-use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
+use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::DataContext;
 use crate::theme::Role;
 
@@ -182,7 +182,7 @@ impl ContextBarSegment {
 }
 
 impl Segment for ContextBarSegment {
-    fn render(&self, ctx: &DataContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let Some(cw) = ctx.status.context_window.as_ref() else {
             crate::lsm_debug!("context_bar: status.context_window absent; hiding");
             return Ok(None);
@@ -246,6 +246,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    fn rc() -> RenderContext {
+        RenderContext::new(80)
+    }
+
     fn ctx(window: Option<ContextWindow>) -> DataContext {
         DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
@@ -276,7 +280,7 @@ mod tests {
     #[test]
     fn renders_zero_percent_as_all_empty() {
         let r = ContextBarSegment::default()
-            .render(&ctx(Some(window(0.0, 200_000))))
+            .render(&ctx(Some(window(0.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(r.text(), "░░░░░░░░░░");
@@ -286,7 +290,7 @@ mod tests {
     #[test]
     fn renders_full_at_one_hundred() {
         let r = ContextBarSegment::default()
-            .render(&ctx(Some(window(100.0, 200_000))))
+            .render(&ctx(Some(window(100.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(r.text(), "██████████");
@@ -297,7 +301,7 @@ mod tests {
     fn renders_partial_block_when_fraction_geq_half() {
         // 45% of 10 cells = 4.5 → 4 full + 1 partial + 5 empty
         let r = ContextBarSegment::default()
-            .render(&ctx(Some(window(45.0, 200_000))))
+            .render(&ctx(Some(window(45.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(r.text(), "████▓░░░░░");
@@ -307,7 +311,7 @@ mod tests {
     fn rounds_down_when_fraction_lt_half() {
         // 42% of 10 cells = 4.2 → 4 full + 0 partial + 6 empty
         let r = ContextBarSegment::default()
-            .render(&ctx(Some(window(42.0, 200_000))))
+            .render(&ctx(Some(window(42.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(r.text(), "████░░░░░░");
@@ -317,7 +321,7 @@ mod tests {
     fn renders_fifty_percent_at_threshold_boundary_yellow() {
         // pct >= green (50) → Warning; 50% of 10 = 5.0 → 5 full + 5 empty.
         let r = ContextBarSegment::default()
-            .render(&ctx(Some(window(50.0, 200_000))))
+            .render(&ctx(Some(window(50.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(r.text(), "█████░░░░░");
@@ -328,7 +332,7 @@ mod tests {
     fn red_threshold_at_eighty_percent() {
         // pct >= yellow (80) → Error.
         let r = ContextBarSegment::default()
-            .render(&ctx(Some(window(80.0, 200_000))))
+            .render(&ctx(Some(window(80.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(r.style().role, Some(Role::Error));
@@ -337,7 +341,7 @@ mod tests {
     #[test]
     fn green_at_one_below_threshold() {
         let r = ContextBarSegment::default()
-            .render(&ctx(Some(window(49.0, 200_000))))
+            .render(&ctx(Some(window(49.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(r.style().role, Some(Role::Success));
@@ -346,7 +350,7 @@ mod tests {
     #[test]
     fn yellow_at_one_below_red_threshold() {
         let r = ContextBarSegment::default()
-            .render(&ctx(Some(window(79.0, 200_000))))
+            .render(&ctx(Some(window(79.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(r.style().role, Some(Role::Warning));
@@ -355,7 +359,9 @@ mod tests {
     #[test]
     fn hidden_when_context_window_absent() {
         assert_eq!(
-            ContextBarSegment::default().render(&ctx(None)).unwrap(),
+            ContextBarSegment::default()
+                .render(&ctx(None), &rc())
+                .unwrap(),
             None
         );
     }
@@ -369,7 +375,7 @@ mod tests {
     fn rendered_width_matches_configured_cells_for_default_chars() {
         // Default chars are all single-cell, so cell-width == bar-width.
         let r = ContextBarSegment::default()
-            .render(&ctx(Some(window(45.0, 200_000))))
+            .render(&ctx(Some(window(45.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(r.width(), 10);
@@ -506,7 +512,7 @@ mod tests {
         let extras = BTreeMap::from([("characters".to_string(), toml::Value::Table(c))]);
         let seg = ContextBarSegment::from_extras(&extras, &mut |_| {});
         let r = seg
-            .render(&ctx(Some(window(45.0, 200_000))))
+            .render(&ctx(Some(window(45.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(r.text(), "####=-----");
@@ -517,7 +523,7 @@ mod tests {
         let extras = BTreeMap::from([("cells".to_string(), toml::Value::Integer(5))]);
         let seg = ContextBarSegment::from_extras(&extras, &mut |_| {});
         let r = seg
-            .render(&ctx(Some(window(40.0, 200_000))))
+            .render(&ctx(Some(window(40.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         // 40% of 5 = 2.0 → 2 full + 3 empty.
@@ -530,7 +536,7 @@ mod tests {
         // would keep the bar green while the textual segment renders
         // "50%" — the two segments must agree at every boundary.
         let r = ContextBarSegment::default()
-            .render(&ctx(Some(window(49.9, 200_000))))
+            .render(&ctx(Some(window(49.9, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(r.style().role, Some(Role::Warning));
@@ -540,7 +546,7 @@ mod tests {
     fn pct_is_rounded_so_high_fractional_paints_red_with_full_bar() {
         // 99.9 → rounds to 100; bar fully filled, role Error.
         let r = ContextBarSegment::default()
-            .render(&ctx(Some(window(99.9, 200_000))))
+            .render(&ctx(Some(window(99.9, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(r.text(), "██████████");
@@ -554,7 +560,7 @@ mod tests {
         // the same input would produce 5 full blocks and no partial:
         // `█████░░░░░`. The exact-string assertion catches that.
         let r = ContextBarSegment::default()
-            .render(&ctx(Some(window(47.0, 200_000))))
+            .render(&ctx(Some(window(47.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(r.text(), "████▓░░░░░");
@@ -566,7 +572,7 @@ mod tests {
         // 50.5_f32) == "50"`); plain `f32::round` would give 51 and
         // diverge from the textual `context_window` segment.
         let r = ContextBarSegment::default()
-            .render(&ctx(Some(window(50.5, 200_000))))
+            .render(&ctx(Some(window(50.5, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         // 50% → Warning band (50 = green threshold), and 5/10 cells
@@ -585,7 +591,7 @@ mod tests {
         let extras = BTreeMap::from([("cells".to_string(), toml::Value::Integer(1))]);
         let seg = ContextBarSegment::from_extras(&extras, &mut |_| {});
         let r = seg
-            .render(&ctx(Some(window(30.0, 200_000))))
+            .render(&ctx(Some(window(30.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(r.text(), "░");
@@ -597,7 +603,7 @@ mod tests {
         // After rounding, integer pct only: 44 -> 4.4 cells -> 4 full + 0
         // partial. Locks the `>= 0.5` rule against a regression to `> 0.5`.
         let r = ContextBarSegment::default()
-            .render(&ctx(Some(window(44.0, 200_000))))
+            .render(&ctx(Some(window(44.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(r.text(), "████░░░░░░");
@@ -655,12 +661,12 @@ mod tests {
         let extras = BTreeMap::from([("cells".to_string(), toml::Value::Integer(1))]);
         let seg = ContextBarSegment::from_extras(&extras, &mut |_| {});
         let empty = seg
-            .render(&ctx(Some(window(0.0, 200_000))))
+            .render(&ctx(Some(window(0.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(empty.text(), "░");
         let full = seg
-            .render(&ctx(Some(window(100.0, 200_000))))
+            .render(&ctx(Some(window(100.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(full.text(), "█");

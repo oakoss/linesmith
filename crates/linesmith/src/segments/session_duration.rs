@@ -3,7 +3,7 @@
 //! inside the input schema's `cost` block, so the segment hides
 //! whenever `cost` is absent.
 
-use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
+use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::DataContext;
 use crate::theme::Role;
 
@@ -15,7 +15,7 @@ pub struct SessionDurationSegment;
 const PRIORITY: u8 = 192;
 
 impl Segment for SessionDurationSegment {
-    fn render(&self, ctx: &DataContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let Some(cost) = ctx.status.cost.as_ref() else {
             crate::lsm_debug!("session_duration: status.cost absent; hiding");
             return Ok(None);
@@ -59,6 +59,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    fn rc() -> RenderContext {
+        RenderContext::new(80)
+    }
+
     fn ctx(cost: Option<CostMetrics>) -> DataContext {
         DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
@@ -88,7 +92,7 @@ mod tests {
 
     fn render_for(duration_ms: u64) -> Option<RenderedSegment> {
         SessionDurationSegment
-            .render(&ctx(Some(cost_of(duration_ms))))
+            .render(&ctx(Some(cost_of(duration_ms))), &rc())
             .unwrap()
     }
 
@@ -158,7 +162,10 @@ mod tests {
 
     #[test]
     fn hidden_when_cost_absent() {
-        assert_eq!(SessionDurationSegment.render(&ctx(None)).unwrap(), None);
+        assert_eq!(
+            SessionDurationSegment.render(&ctx(None), &rc()).unwrap(),
+            None
+        );
     }
 
     #[test]

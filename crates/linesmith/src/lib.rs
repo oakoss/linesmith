@@ -67,8 +67,8 @@ pub fn run_with_segments_and_width(
     terminal_width: u16,
 ) -> io::Result<()> {
     // `cwd: None` — callers that want gix discovery go through
-    // `run_with_context` with a populated RenderContext.
-    let ctx = RenderContext {
+    // `run_with_context` with a populated RunContext.
+    let ctx = RunContext {
         theme: theme::default_theme(),
         capability: theme::Capability::None,
         terminal_width,
@@ -77,27 +77,29 @@ pub fn run_with_segments_and_width(
     run_with_context(reader, writer, &mut io::stderr().lock(), segments, &ctx)
 }
 
-/// Theme + capability + terminal width + cwd bundled for the render
-/// path. Passed to [`run_with_context`]; the CLI driver builds one
-/// from config (theme name), the color-policy precedence chain (CLI
-/// flags / env / config), `CliEnv.terminal_width` minus any padding,
-/// and the process cwd.
+/// CLI run-state bundle: theme + capability + terminal width + cwd.
+/// Passed to [`run_with_context`]; the CLI driver builds one from
+/// config (theme name), the color-policy precedence chain (CLI flags /
+/// env / config), `CliEnv.terminal_width` minus any padding, and the
+/// process cwd. Distinct from
+/// [`segments::RenderContext`](crate::segments::RenderContext), which
+/// is the per-segment-render layout state.
 ///
 /// `cwd` seeds gix repo discovery. `None` skips discovery entirely;
 /// `Some(path)` runs `gix::discover(path)` on the first `ctx.git()`
 /// read.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct RenderContext<'a> {
+pub struct RunContext<'a> {
     pub theme: &'a theme::Theme,
     pub capability: theme::Capability,
     pub terminal_width: u16,
     pub cwd: Option<std::path::PathBuf>,
 }
 
-/// Full-control entry with injected stderr and explicit render
-/// context. Parse failures render a `?` marker to `writer`; only
-/// stdin/stdout I/O failures surface as errors.
+/// Full-control entry with injected stderr and explicit run context.
+/// Parse failures render a `?` marker to `writer`; only stdin/stdout
+/// I/O failures surface as errors.
 ///
 /// # Errors
 ///
@@ -109,7 +111,7 @@ pub fn run_with_context(
     mut writer: impl Write,
     stderr: &mut dyn Write,
     segments: &[Box<dyn Segment>],
-    ctx: &RenderContext<'_>,
+    ctx: &RunContext<'_>,
 ) -> io::Result<()> {
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;

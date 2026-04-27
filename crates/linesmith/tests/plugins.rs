@@ -15,7 +15,7 @@ use tempfile::TempDir;
 use linesmith::data_context::DataContext;
 use linesmith::input::StatusContext;
 use linesmith::plugins::{build_engine, CompiledPlugin, PluginError, PluginRegistry, RhaiSegment};
-use linesmith::segments::{Segment, BUILT_IN_SEGMENT_IDS};
+use linesmith::segments::{RenderContext, Segment, BUILT_IN_SEGMENT_IDS};
 
 const MINIMAL: &str = include_str!("fixtures/plugins/minimal.rhai");
 const USES_CTX_CONFIG: &str = include_str!("fixtures/plugins/uses_ctx_config.rhai");
@@ -68,6 +68,10 @@ fn first_segment(registry: PluginRegistry, engine: Arc<Engine>) -> RhaiSegment {
 const MINIMAL_PAYLOAD: &[u8] = include_bytes!("fixtures/claude_minimal.json");
 const WORKTREE_PAYLOAD: &[u8] = include_bytes!("fixtures/claude_worktree.json");
 
+fn rc() -> RenderContext {
+    RenderContext::new(80)
+}
+
 fn minimal_status() -> StatusContext {
     linesmith::input::parse(MINIMAL_PAYLOAD).expect("minimal fixture parses")
 }
@@ -88,7 +92,7 @@ fn minimal_fixture_compiles_and_renders_literal_text() {
     );
     let seg = first_segment(registry, engine);
     let dc = DataContext::new(minimal_status());
-    let rendered = seg.render(&dc).unwrap().expect("visible");
+    let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
     assert_eq!(rendered.text(), "minimal");
 }
 
@@ -100,7 +104,7 @@ fn uses_ctx_config_fixture_round_trips_label_from_toml_extras() {
     config.insert("label".into(), Dynamic::from("from-fixture".to_string()));
     let seg = RhaiSegment::from_compiled(plugin, engine, Dynamic::from_map(config));
     let dc = DataContext::new(minimal_status());
-    let rendered = seg.render(&dc).unwrap().expect("visible");
+    let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
     assert_eq!(rendered.text(), "from-fixture");
 }
 
@@ -109,7 +113,7 @@ fn visibility_fixture_hides_when_cost_unset() {
     let (registry, engine, _tmp) = load_isolated("visibility_via_render.rhai", VISIBILITY);
     let seg = first_segment(registry, engine);
     let dc = DataContext::new(minimal_status());
-    assert_eq!(seg.render(&dc).unwrap(), None);
+    assert_eq!(seg.render(&dc, &rc()).unwrap(), None);
 }
 
 #[test]
@@ -117,7 +121,7 @@ fn visibility_fixture_renders_when_cost_present() {
     let (registry, engine, _tmp) = load_isolated("visibility_via_render.rhai", VISIBILITY);
     let seg = first_segment(registry, engine);
     let dc = DataContext::new(worktree_status());
-    let rendered = seg.render(&dc).unwrap().expect("visible");
+    let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
     assert_eq!(rendered.text(), "cost-aware");
 }
 
@@ -133,7 +137,7 @@ fn declares_usage_fixture_sees_delegated_error_code() {
     let dc = DataContext::new(minimal_status());
     dc.preseed_usage(Err(UsageError::Jsonl(JsonlError::NoEntries)))
         .expect("seed before first ctx.usage()");
-    let rendered = seg.render(&dc).unwrap().expect("visible");
+    let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
     assert_eq!(rendered.text(), "NoEntries");
 }
 
@@ -175,7 +179,7 @@ fn runtime_error_fixture_maps_to_segment_error() {
     let (registry, engine, _tmp) = load_isolated("runtime_error.rhai", RUNTIME_ERROR);
     let seg = first_segment(registry, engine);
     let dc = DataContext::new(minimal_status());
-    let err = seg.render(&dc).unwrap_err();
+    let err = seg.render(&dc, &rc()).unwrap_err();
     assert!(
         err.message.contains("runtime_error"),
         "message must name the plugin: {}",
@@ -195,7 +199,7 @@ fn infinite_loop_fixture_aborts_via_op_limit_within_bounded_time() {
     let dc = DataContext::new(minimal_status());
 
     let started = Instant::now();
-    let err = seg.render(&dc).unwrap_err();
+    let err = seg.render(&dc, &rc()).unwrap_err();
     let elapsed = started.elapsed();
 
     assert!(

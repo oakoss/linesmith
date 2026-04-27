@@ -1,7 +1,7 @@
 //! Cost segment: renders session cost in USD. Hidden when the payload
 //! doesn't carry cost metrics (currently always present in Claude Code).
 
-use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
+use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::DataContext;
 use crate::theme::Role;
 
@@ -12,7 +12,7 @@ pub struct CostSegment;
 const PRIORITY: u8 = 192;
 
 impl Segment for CostSegment {
-    fn render(&self, ctx: &DataContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let Some(cost) = ctx.status.cost.as_ref() else {
             crate::lsm_debug!("cost: status.cost absent; hiding");
             return Ok(None);
@@ -33,6 +33,10 @@ mod tests {
     use crate::input::{CostMetrics, ModelInfo, StatusContext, Tool, WorkspaceInfo};
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    fn rc() -> RenderContext {
+        RenderContext::new(80)
+    }
 
     fn ctx(cost: Option<CostMetrics>) -> DataContext {
         DataContext::new(StatusContext {
@@ -64,7 +68,9 @@ mod tests {
     #[test]
     fn renders_two_decimal_places_with_muted_role() {
         assert_eq!(
-            CostSegment.render(&ctx(Some(cost_of(1.234)))).unwrap(),
+            CostSegment
+                .render(&ctx(Some(cost_of(1.234))), &rc())
+                .unwrap(),
             Some(RenderedSegment::new("$1.23").with_role(Role::Muted))
         );
     }
@@ -72,14 +78,14 @@ mod tests {
     #[test]
     fn renders_zero_cost() {
         assert_eq!(
-            CostSegment.render(&ctx(Some(cost_of(0.0)))).unwrap(),
+            CostSegment.render(&ctx(Some(cost_of(0.0))), &rc()).unwrap(),
             Some(RenderedSegment::new("$0.00").with_role(Role::Muted))
         );
     }
 
     #[test]
     fn hidden_when_cost_absent() {
-        assert_eq!(CostSegment.render(&ctx(None)).unwrap(), None);
+        assert_eq!(CostSegment.render(&ctx(None), &rc()).unwrap(), None);
     }
 
     #[test]

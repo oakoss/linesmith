@@ -9,7 +9,7 @@ use super::rate_limit_format::{
     apply_common_extras, format_duration, parse_bool, parse_duration_format, render_error,
     CommonRateLimitConfig, DurationFormat, ResetWindow,
 };
-use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
+use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::{DataContext, DataDep, UsageData};
 use crate::theme::Role;
 
@@ -57,7 +57,7 @@ impl RateLimit5hResetSegment {
 }
 
 impl Segment for RateLimit5hResetSegment {
-    fn render(&self, ctx: &DataContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let usage = ctx.usage();
         let text = match &*usage {
             Ok(data) => {
@@ -134,6 +134,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    fn rc() -> RenderContext {
+        RenderContext::new(80)
+    }
+
     fn ctx_with_usage(usage: Result<UsageData, UsageError>) -> DataContext {
         let dc = DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
@@ -195,7 +199,7 @@ mod tests {
     fn renders_countdown_in_default_format() {
         let dc = ctx_with_usage(Ok(data_with_reset_in(4 * 60 + 37)));
         let rendered = RateLimit5hResetSegment::default()
-            .render(&dc)
+            .render(&dc, &rc())
             .unwrap()
             .expect("visible");
         assert_eq!(rendered.text(), "5h reset: 4hr 37m");
@@ -205,7 +209,9 @@ mod tests {
     fn hidden_when_resets_at_in_past() {
         let dc = ctx_with_usage(Ok(data_with_reset_in(-10)));
         assert_eq!(
-            RateLimit5hResetSegment::default().render(&dc).unwrap(),
+            RateLimit5hResetSegment::default()
+                .render(&dc, &rc())
+                .unwrap(),
             None
         );
     }
@@ -226,7 +232,7 @@ mod tests {
         });
         assert_eq!(
             RateLimit5hResetSegment::default()
-                .render(&ctx_with_usage(Ok(data)))
+                .render(&ctx_with_usage(Ok(data)), &rc())
                 .unwrap(),
             None,
         );
@@ -245,7 +251,7 @@ mod tests {
         });
         assert_eq!(
             RateLimit5hResetSegment::default()
-                .render(&ctx_with_usage(Ok(data)))
+                .render(&ctx_with_usage(Ok(data)), &rc())
                 .unwrap(),
             None,
         );
@@ -258,7 +264,7 @@ mod tests {
             ..Default::default()
         };
         let dc = ctx_with_usage(Ok(data_with_reset_in(4 * 60 + 37)));
-        let rendered = seg.render(&dc).unwrap().expect("visible");
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
         assert_eq!(rendered.text(), "5h reset: 4h37m");
     }
 
@@ -266,7 +272,7 @@ mod tests {
     fn renders_error_when_usage_fails() {
         let dc = ctx_with_usage(Err(UsageError::Timeout));
         let rendered = RateLimit5hResetSegment::default()
-            .render(&dc)
+            .render(&dc, &rc())
             .unwrap()
             .expect("visible");
         assert_eq!(rendered.text(), "5h reset: [Timeout]");
@@ -282,7 +288,7 @@ mod tests {
             format: DurationFormat::Progress,
             ..Default::default()
         };
-        let rendered = seg.render(&dc).unwrap().expect("visible");
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
         let pct_str = rendered
             .text()
             .rsplit(' ')
@@ -304,7 +310,7 @@ mod tests {
         // the endpoint's `resets_at`.
         let dc = ctx_with_usage(Ok(jsonl_data_with_reset_in(4 * 60 + 37)));
         let rendered = RateLimit5hResetSegment::default()
-            .render(&dc)
+            .render(&dc, &rc())
             .unwrap()
             .expect("visible");
         assert_eq!(rendered.text(), "~5h reset: 4hr 37m");
@@ -317,7 +323,9 @@ mod tests {
             SevenDayWindow::new(TokenCounts::default()),
         ))));
         assert_eq!(
-            RateLimit5hResetSegment::default().render(&dc).unwrap(),
+            RateLimit5hResetSegment::default()
+                .render(&dc, &rc())
+                .unwrap(),
             None,
         );
     }
@@ -332,7 +340,9 @@ mod tests {
         // blocks through must not render "0m" or a negative duration.
         let dc = ctx_with_usage(Ok(jsonl_data_with_reset_in(-10)));
         assert_eq!(
-            RateLimit5hResetSegment::default().render(&dc).unwrap(),
+            RateLimit5hResetSegment::default()
+                .render(&dc, &rc())
+                .unwrap(),
             None,
         );
     }

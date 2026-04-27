@@ -27,6 +27,7 @@ use crate::input::{
     ContextWindow, CostMetrics, GitWorktree, ModelInfo, StatusContext, Tool, TurnUsage,
     WorkspaceInfo,
 };
+use crate::segments::RenderContext;
 
 const ENV_WHITELIST: &[&str] = &["TERM", "COLORTERM", "NO_COLOR", "FORCE_COLOR", "LANG"];
 
@@ -129,11 +130,19 @@ impl ConversionLimits {
 /// `declared_deps` gates which lazy sources get mirrored. `config` is
 /// the plugin's `[segments.<id>]` TOML table already converted to a
 /// rhai-compatible `Dynamic` (use `()` when no table is configured).
-pub fn build_ctx(dc: &DataContext, declared_deps: &[DataDep], config: Dynamic) -> Dynamic {
+/// `rc` is the per-render layout state surfaced as `ctx.render` —
+/// `ctx.render.terminal_width` today, more fields later.
+pub fn build_ctx(
+    dc: &DataContext,
+    rc: &RenderContext,
+    declared_deps: &[DataDep],
+    config: Dynamic,
+) -> Dynamic {
     let mut map = Map::new();
     map.insert("status".into(), build_status(&dc.status));
     map.insert("config".into(), config);
     map.insert("env".into(), env_snapshot());
+    map.insert("render".into(), build_render(rc));
 
     let declared = |d: DataDep| declared_deps.contains(&d);
 
@@ -183,6 +192,17 @@ pub fn build_ctx(dc: &DataContext, declared_deps: &[DataDep], config: Dynamic) -
     }
 
     Dynamic::from_map(map)
+}
+
+// --- RenderContext mirror ------------------------------------------------
+
+fn build_render(rc: &RenderContext) -> Dynamic {
+    let mut m = Map::new();
+    m.insert(
+        "terminal_width".into(),
+        Dynamic::from_int(i64::from(rc.terminal_width)),
+    );
+    Dynamic::from_map(m)
 }
 
 // --- StatusContext mirror ------------------------------------------------
@@ -832,7 +852,8 @@ mod tests {
     }
 
     fn build_and_unwrap_map(dc: &DataContext, deps: &[DataDep]) -> Map {
-        let dyn_ctx = build_ctx(dc, deps, Dynamic::UNIT);
+        let rc = RenderContext::new(80);
+        let dyn_ctx = build_ctx(dc, &rc, deps, Dynamic::UNIT);
         dyn_ctx.try_cast::<Map>().expect("ctx is a map")
     }
 
@@ -2240,7 +2261,8 @@ mod tests {
         let dc = DataContext::new(minimal_status());
         let mut config_map = Map::new();
         config_map.insert("threshold".into(), Dynamic::from(42_i64));
-        let ctx: Map = build_ctx(&dc, &[], Dynamic::from_map(config_map))
+        let rc = RenderContext::new(80);
+        let ctx: Map = build_ctx(&dc, &rc, &[], Dynamic::from_map(config_map))
             .try_cast()
             .unwrap();
         let config: Map = ctx.get("config").unwrap().clone().try_cast().unwrap();

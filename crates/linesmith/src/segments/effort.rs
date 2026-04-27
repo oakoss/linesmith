@@ -8,7 +8,7 @@
 //! Segment is shipped now so it lights up automatically when the payload
 //! arrives.
 
-use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
+use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::DataContext;
 use crate::theme::Role;
 
@@ -19,7 +19,7 @@ pub struct EffortSegment;
 const PRIORITY: u8 = 160;
 
 impl Segment for EffortSegment {
-    fn render(&self, ctx: &DataContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let Some(effort) = ctx.status.effort else {
             crate::lsm_debug!("effort: status.effort absent; hiding");
             return Ok(None);
@@ -40,6 +40,10 @@ mod tests {
     use crate::input::{EffortLevel, ModelInfo, StatusContext, Tool, WorkspaceInfo};
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    fn rc() -> RenderContext {
+        RenderContext::new(80)
+    }
 
     fn ctx(effort: Option<EffortLevel>) -> DataContext {
         DataContext::new(StatusContext {
@@ -68,7 +72,7 @@ mod tests {
             (EffortLevel::XHigh, "xhigh"),
         ] {
             assert_eq!(
-                EffortSegment.render(&ctx(Some(level))).unwrap(),
+                EffortSegment.render(&ctx(Some(level)), &rc()).unwrap(),
                 Some(RenderedSegment::new(expected).with_role(Role::Muted))
             );
         }
@@ -76,7 +80,7 @@ mod tests {
 
     #[test]
     fn hidden_when_effort_absent() {
-        assert_eq!(EffortSegment.render(&ctx(None)).unwrap(), None);
+        assert_eq!(EffortSegment.render(&ctx(None), &rc()).unwrap(), None);
     }
 
     #[test]

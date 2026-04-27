@@ -12,7 +12,7 @@
 //! catalog").
 
 use super::rate_limit_format::format_tokens;
-use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
+use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::DataContext;
 use crate::input::TurnUsage;
 use crate::theme::Role;
@@ -28,7 +28,7 @@ pub struct TokensCachedSegment;
 pub struct TokensTotalSegment;
 
 impl Segment for TokensInputSegment {
-    fn render(&self, ctx: &DataContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let Some(usage) = current_usage(ctx) else {
             crate::lsm_debug!("tokens_input: current_usage absent; hiding");
             return Ok(None);
@@ -41,7 +41,7 @@ impl Segment for TokensInputSegment {
 }
 
 impl Segment for TokensOutputSegment {
-    fn render(&self, ctx: &DataContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let Some(usage) = current_usage(ctx) else {
             crate::lsm_debug!("tokens_output: current_usage absent; hiding");
             return Ok(None);
@@ -54,7 +54,7 @@ impl Segment for TokensOutputSegment {
 }
 
 impl Segment for TokensCachedSegment {
-    fn render(&self, ctx: &DataContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let Some(usage) = current_usage(ctx) else {
             crate::lsm_debug!("tokens_cached: current_usage absent; hiding");
             return Ok(None);
@@ -74,7 +74,7 @@ impl Segment for TokensCachedSegment {
 }
 
 impl Segment for TokensTotalSegment {
-    fn render(&self, ctx: &DataContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let Some(usage) = current_usage(ctx) else {
             crate::lsm_debug!("tokens_total: current_usage absent; hiding");
             return Ok(None);
@@ -110,6 +110,10 @@ mod tests {
     };
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    fn rc() -> RenderContext {
+        RenderContext::new(80)
+    }
 
     fn ctx(usage: Option<TurnUsage>) -> DataContext {
         DataContext::new(StatusContext {
@@ -169,7 +173,7 @@ mod tests {
     fn tokens_input_renders_current_usage_input_with_muted_role() {
         assert_eq!(
             TokensInputSegment
-                .render(&ctx(Some(usage(2_000, 500, 0, 500))))
+                .render(&ctx(Some(usage(2_000, 500, 0, 500))), &rc())
                 .unwrap(),
             Some(RenderedSegment::new("in 2.0k").with_role(Role::Muted))
         );
@@ -177,7 +181,7 @@ mod tests {
 
     #[test]
     fn tokens_input_hidden_when_current_usage_absent() {
-        assert_eq!(TokensInputSegment.render(&ctx(None)).unwrap(), None);
+        assert_eq!(TokensInputSegment.render(&ctx(None), &rc()).unwrap(), None);
     }
 
     #[test]
@@ -186,7 +190,7 @@ mod tests {
         // before we even reach current_usage.
         assert_eq!(
             TokensInputSegment
-                .render(&ctx_without_context_window())
+                .render(&ctx_without_context_window(), &rc())
                 .unwrap(),
             None
         );
@@ -198,7 +202,7 @@ mod tests {
     fn tokens_output_renders_current_usage_output_with_muted_role() {
         assert_eq!(
             TokensOutputSegment
-                .render(&ctx(Some(usage(2_000, 500, 0, 500))))
+                .render(&ctx(Some(usage(2_000, 500, 0, 500))), &rc())
                 .unwrap(),
             Some(RenderedSegment::new("out 500").with_role(Role::Muted))
         );
@@ -206,14 +210,14 @@ mod tests {
 
     #[test]
     fn tokens_output_hidden_when_current_usage_absent() {
-        assert_eq!(TokensOutputSegment.render(&ctx(None)).unwrap(), None);
+        assert_eq!(TokensOutputSegment.render(&ctx(None), &rc()).unwrap(), None);
     }
 
     #[test]
     fn tokens_output_hidden_when_context_window_absent() {
         assert_eq!(
             TokensOutputSegment
-                .render(&ctx_without_context_window())
+                .render(&ctx_without_context_window(), &rc())
                 .unwrap(),
             None
         );
@@ -225,7 +229,7 @@ mod tests {
     fn tokens_cached_sums_cache_creation_and_read_with_muted_role() {
         assert_eq!(
             TokensCachedSegment
-                .render(&ctx(Some(usage(2_000, 500, 300, 700))))
+                .render(&ctx(Some(usage(2_000, 500, 300, 700))), &rc())
                 .unwrap(),
             Some(RenderedSegment::new("cache 1.0k").with_role(Role::Muted))
         );
@@ -235,7 +239,7 @@ mod tests {
     fn tokens_cached_renders_zero_when_both_fields_zero() {
         assert_eq!(
             TokensCachedSegment
-                .render(&ctx(Some(usage(2_000, 500, 0, 0))))
+                .render(&ctx(Some(usage(2_000, 500, 0, 0))), &rc())
                 .unwrap(),
             Some(RenderedSegment::new("cache 0").with_role(Role::Muted))
         );
@@ -243,14 +247,14 @@ mod tests {
 
     #[test]
     fn tokens_cached_hidden_when_current_usage_absent() {
-        assert_eq!(TokensCachedSegment.render(&ctx(None)).unwrap(), None);
+        assert_eq!(TokensCachedSegment.render(&ctx(None), &rc()).unwrap(), None);
     }
 
     #[test]
     fn tokens_cached_hidden_when_context_window_absent() {
         assert_eq!(
             TokensCachedSegment
-                .render(&ctx_without_context_window())
+                .render(&ctx_without_context_window(), &rc())
                 .unwrap(),
             None
         );
@@ -262,7 +266,7 @@ mod tests {
     fn tokens_total_sums_all_four_fields() {
         assert_eq!(
             TokensTotalSegment
-                .render(&ctx(Some(usage(2_000, 500, 300, 700))))
+                .render(&ctx(Some(usage(2_000, 500, 300, 700))), &rc())
                 .unwrap(),
             Some(RenderedSegment::new("total 3.5k").with_role(Role::Muted))
         );
@@ -274,7 +278,10 @@ mod tests {
         // the saturating chain must not panic on the adversarial input.
         assert_eq!(
             TokensTotalSegment
-                .render(&ctx(Some(usage(u64::MAX, u64::MAX, u64::MAX, u64::MAX))))
+                .render(
+                    &ctx(Some(usage(u64::MAX, u64::MAX, u64::MAX, u64::MAX))),
+                    &rc()
+                )
                 .unwrap(),
             Some(
                 RenderedSegment::new(format!("total {}", format_tokens(u64::MAX)))
@@ -285,14 +292,14 @@ mod tests {
 
     #[test]
     fn tokens_total_hidden_when_current_usage_absent() {
-        assert_eq!(TokensTotalSegment.render(&ctx(None)).unwrap(), None);
+        assert_eq!(TokensTotalSegment.render(&ctx(None), &rc()).unwrap(), None);
     }
 
     #[test]
     fn tokens_total_hidden_when_context_window_absent() {
         assert_eq!(
             TokensTotalSegment
-                .render(&ctx_without_context_window())
+                .render(&ctx_without_context_window(), &rc())
                 .unwrap(),
             None
         );

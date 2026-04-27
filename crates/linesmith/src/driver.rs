@@ -7,7 +7,7 @@
 use crate::plugins::{build_engine, PluginRegistry};
 use crate::segments::builder::build_segments;
 use crate::segments::BUILT_IN_SEGMENT_IDS;
-use crate::{cli, config, detect_terminal_width, presets, run_with_context, theme, RenderContext};
+use crate::{cli, config, detect_terminal_width, presets, run_with_context, theme, RunContext};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -427,7 +427,7 @@ fn run_cli(
     let width = raw_width.saturating_sub(padding);
     let theme_ref = resolve_theme(cfg.as_ref(), &registry, stderr);
     let capability = resolve_color_capability(args.color_override, env, cfg.as_ref());
-    let ctx = RenderContext {
+    let ctx = RunContext {
         theme: theme_ref,
         capability,
         terminal_width: width,

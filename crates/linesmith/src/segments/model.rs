@@ -1,6 +1,6 @@
 //! Model segment: renders the current model's display name.
 
-use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
+use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::DataContext;
 use crate::theme::Role;
 
@@ -11,7 +11,7 @@ pub struct ModelSegment;
 const PRIORITY: u8 = 64;
 
 impl Segment for ModelSegment {
-    fn render(&self, ctx: &DataContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let name = ctx.status.model.display_name.trim();
         if name.is_empty() {
             return Ok(None);
@@ -30,6 +30,10 @@ mod tests {
     use crate::input::{ModelInfo, StatusContext, Tool, WorkspaceInfo};
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    fn rc() -> RenderContext {
+        RenderContext::new(80)
+    }
 
     fn ctx(display_name: &str) -> DataContext {
         DataContext::new(StatusContext {
@@ -51,19 +55,21 @@ mod tests {
     #[test]
     fn renders_display_name_with_primary_role() {
         assert_eq!(
-            ModelSegment.render(&ctx("Claude Sonnet 4.6")).unwrap(),
+            ModelSegment
+                .render(&ctx("Claude Sonnet 4.6"), &rc())
+                .unwrap(),
             Some(RenderedSegment::new("Claude Sonnet 4.6").with_role(Role::Primary))
         );
     }
 
     #[test]
     fn hidden_when_display_name_is_empty() {
-        assert_eq!(ModelSegment.render(&ctx("")).unwrap(), None);
+        assert_eq!(ModelSegment.render(&ctx(""), &rc()).unwrap(), None);
     }
 
     #[test]
     fn hidden_when_display_name_is_whitespace_only() {
-        assert_eq!(ModelSegment.render(&ctx("   ")).unwrap(), None);
+        assert_eq!(ModelSegment.render(&ctx("   "), &rc()).unwrap(), None);
     }
 
     #[test]

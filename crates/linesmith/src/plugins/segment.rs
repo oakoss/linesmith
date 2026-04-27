@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use rhai::{Dynamic, Engine, EvalAltResult, Scope, AST};
 
 use crate::data_context::{DataContext, DataDep};
-use crate::segments::{RenderResult, Segment, SegmentError};
+use crate::segments::{RenderContext, RenderResult, Segment, SegmentError};
 
 use super::ctx_mirror::build_ctx;
 use super::engine::{
@@ -121,8 +121,8 @@ impl RhaiSegment {
 }
 
 impl Segment for RhaiSegment {
-    fn render(&self, ctx: &DataContext) -> RenderResult {
-        let mirror = build_ctx(ctx, self.declared_deps, self.config.clone());
+    fn render(&self, ctx: &DataContext, rc: &RenderContext) -> RenderResult {
+        let mirror = build_ctx(ctx, rc, self.declared_deps, self.config.clone());
         let deadline = Instant::now() + Duration::from_millis(DEFAULT_RENDER_DEADLINE_MS);
         let _state = RenderState::install(&self.id, deadline);
         let mut scope = Scope::new();
@@ -194,6 +194,32 @@ mod tests {
     }
 
     #[test]
+    fn plugin_can_read_terminal_width_from_ctx_render() {
+        // Single test that exercises the full RenderContext threading
+        // path: layout engine → RhaiSegment::render → build_ctx →
+        // build_render → rhai property read. A regression in any link
+        // (missing key, misnamed field, host-side mirror dropped)
+        // surfaces here. The number `137` is arbitrary; the test pins
+        // that whatever the host passes is what the script sees.
+        let tmp = TempDir::new().expect("tempdir");
+        let (plugin, engine) = load_single(
+            &tmp,
+            "tw.rhai",
+            r#"
+            const ID = "tw";
+            fn render(ctx) {
+                #{ runs: [#{ text: `${ctx.render.terminal_width}` }] }
+            }
+            "#,
+        );
+        let seg = RhaiSegment::from_compiled(plugin, engine, Dynamic::UNIT);
+        let dc = DataContext::new(minimal_status());
+        let rc = RenderContext::new(137);
+        let rendered = seg.render(&dc, &rc).unwrap().expect("rendered");
+        assert_eq!(rendered.text(), "137");
+    }
+
+    #[test]
     fn plugin_returning_unit_hides_segment() {
         let tmp = TempDir::new().expect("tempdir");
         let (plugin, engine) = load_single(
@@ -206,7 +232,8 @@ mod tests {
         );
         let seg = RhaiSegment::from_compiled(plugin, engine, Dynamic::UNIT);
         let dc = DataContext::new(minimal_status());
-        assert_eq!(seg.render(&dc).unwrap(), None);
+        let rc = RenderContext::new(80);
+        assert_eq!(seg.render(&dc, &rc).unwrap(), None);
     }
 
     #[test]
@@ -224,7 +251,8 @@ mod tests {
         );
         let seg = RhaiSegment::from_compiled(plugin, engine, Dynamic::UNIT);
         let dc = DataContext::new(minimal_status());
-        let rendered = seg.render(&dc).unwrap().expect("rendered");
+        let rc = RenderContext::new(80);
+        let rendered = seg.render(&dc, &rc).unwrap().expect("rendered");
         assert_eq!(rendered.text(), "hello");
     }
 
@@ -243,7 +271,8 @@ mod tests {
         );
         let seg = RhaiSegment::from_compiled(plugin, engine, Dynamic::UNIT);
         let dc = DataContext::new(minimal_status());
-        let rendered = seg.render(&dc).unwrap().expect("rendered");
+        let rc = RenderContext::new(80);
+        let rendered = seg.render(&dc, &rc).unwrap().expect("rendered");
         assert_eq!(rendered.text(), "Sonnet");
     }
 
@@ -264,7 +293,8 @@ mod tests {
         config.insert("label".into(), Dynamic::from("configured".to_string()));
         let seg = RhaiSegment::from_compiled(plugin, engine, Dynamic::from_map(config));
         let dc = DataContext::new(minimal_status());
-        let rendered = seg.render(&dc).unwrap().expect("rendered");
+        let rc = RenderContext::new(80);
+        let rendered = seg.render(&dc, &rc).unwrap().expect("rendered");
         assert_eq!(rendered.text(), "configured");
     }
 
@@ -290,7 +320,8 @@ mod tests {
         );
         let seg = RhaiSegment::from_compiled(plugin, engine, Dynamic::UNIT);
         let dc = DataContext::new(minimal_status());
-        let rendered = seg.render(&dc).unwrap().expect("rendered");
+        let rc = RenderContext::new(80);
+        let rendered = seg.render(&dc, &rc).unwrap().expect("rendered");
         // Don't pin to "set" or "unset" — env_snapshot() is
         // process-cached, so test order can decide whether `TERM`
         // was set when the OnceLock was populated. Either label
@@ -335,7 +366,8 @@ mod tests {
         );
         let seg = RhaiSegment::from_compiled(plugin, engine, Dynamic::UNIT);
         let dc = DataContext::new(minimal_status());
-        let err = seg.render(&dc).unwrap_err();
+        let rc = RenderContext::new(80);
+        let err = seg.render(&dc, &rc).unwrap_err();
         assert!(err.message.contains("boom"), "message: {}", err.message);
         assert!(
             err.message.contains("render failed"),
@@ -369,7 +401,8 @@ mod tests {
         );
         let seg = RhaiSegment::from_compiled(plugin, engine, Dynamic::UNIT);
         let dc = DataContext::new(minimal_status());
-        let err = seg.render(&dc).unwrap_err();
+        let rc = RenderContext::new(80);
+        let err = seg.render(&dc, &rc).unwrap_err();
         assert!(
             err.message.contains("render failed"),
             "throw must use the generic branch: {}",
@@ -416,7 +449,8 @@ mod tests {
         );
         let seg = RhaiSegment::from_compiled(plugin, engine, Dynamic::UNIT);
         let dc = DataContext::new(minimal_status());
-        let err = seg.render(&dc).unwrap_err();
+        let rc = RenderContext::new(80);
+        let err = seg.render(&dc, &rc).unwrap_err();
         assert!(
             err.message.contains("bad_shape"),
             "message: {}",
@@ -469,7 +503,8 @@ mod tests {
         );
         let seg = RhaiSegment::from_compiled(plugin, engine, Dynamic::UNIT);
         let dc = DataContext::new(minimal_status());
-        let err = seg.render(&dc).unwrap_err();
+        let rc = RenderContext::new(80);
+        let err = seg.render(&dc, &rc).unwrap_err();
         assert!(
             err.message.to_lowercase().contains("operation") || err.message.contains("loop"),
             "message: {}",

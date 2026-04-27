@@ -350,6 +350,31 @@ impl std::error::Error for SegmentError {
     }
 }
 
+/// Per-render layout state the engine builds once per call and threads
+/// into every [`Segment::render`]. Distinct from [`DataContext`], which
+/// is the data layer (one instance per process invocation, shared
+/// across segments). `RenderContext` is the layout layer: terminal
+/// width today, room for line index / capability / neighbor info as
+/// dynamic-segment work lands.
+///
+/// `#[non_exhaustive]` keeps future additions SemVer-safe; segments
+/// that don't read the field accept it as `_rc: &RenderContext` and
+/// pay nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RenderContext {
+    /// Total cells available to this line. Sourced from the terminal,
+    /// or the schema-defined fallback (200) when stdout is detached.
+    pub terminal_width: u16,
+}
+
+impl RenderContext {
+    #[must_use]
+    pub fn new(terminal_width: u16) -> Self {
+        Self { terminal_width }
+    }
+}
+
 pub trait Segment: Send {
     /// Render this segment for the given context.
     ///
@@ -358,8 +383,10 @@ pub trait Segment: Send {
     /// hidden. See [`RenderResult`]. `ctx` owns the parsed stdin
     /// payload (`ctx.status`) plus lazy accessors for other sources
     /// (`ctx.usage()`, `ctx.git()`, etc.) declared in
-    /// [`data_deps`](Self::data_deps).
-    fn render(&self, ctx: &DataContext) -> RenderResult;
+    /// [`data_deps`](Self::data_deps). `rc` is per-render layout
+    /// state — terminal width today — for segments that pick their
+    /// own shape based on available room.
+    fn render(&self, ctx: &DataContext, rc: &RenderContext) -> RenderResult;
 
     /// Declare which data sources this segment reads. The runtime
     /// computes the union across all enabled segments and lazy-fetches
@@ -527,8 +554,8 @@ impl OverriddenSegment {
 }
 
 impl Segment for OverriddenSegment {
-    fn render(&self, ctx: &DataContext) -> RenderResult {
-        let result = self.inner.render(ctx)?;
+    fn render(&self, ctx: &DataContext, rc: &RenderContext) -> RenderResult {
+        let result = self.inner.render(ctx, rc)?;
         Ok(result.map(|r| match self.user_style {
             Some(style) => r.with_style(style),
             None => r,
@@ -779,7 +806,10 @@ mod layout_type_tests {
         let wrapped =
             OverriddenSegment::new(built_in_by_id("workspace", None, &mut |_| {}).unwrap())
                 .with_priority(0);
-        let rendered = wrapped.render(&stub_ctx()).unwrap().expect("rendered");
+        let rendered = wrapped
+            .render(&stub_ctx(), &stub_rc())
+            .unwrap()
+            .expect("rendered");
         assert_eq!(rendered.text(), "linesmith");
     }
 
@@ -789,7 +819,7 @@ mod layout_type_tests {
         // override must wipe both, not merge with them.
         struct Styled;
         impl Segment for Styled {
-            fn render(&self, _: &DataContext) -> RenderResult {
+            fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
                 Ok(Some(
                     RenderedSegment::new("x")
                         .with_role(Role::Accent)
@@ -809,7 +839,10 @@ mod layout_type_tests {
             ..Style::default()
         };
         let wrapped = OverriddenSegment::new(Box::new(Styled)).with_user_style(override_style);
-        let rendered = wrapped.render(&stub_ctx()).unwrap().expect("rendered");
+        let rendered = wrapped
+            .render(&stub_ctx(), &stub_rc())
+            .unwrap()
+            .expect("rendered");
         assert_eq!(rendered.style, override_style);
     }
 
@@ -817,7 +850,7 @@ mod layout_type_tests {
     fn style_override_preserves_inner_none_return() {
         struct Hidden;
         impl Segment for Hidden {
-            fn render(&self, _: &DataContext) -> RenderResult {
+            fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
                 Ok(None)
             }
             fn defaults(&self) -> SegmentDefaults {
@@ -826,7 +859,7 @@ mod layout_type_tests {
         }
         let wrapped =
             OverriddenSegment::new(Box::new(Hidden)).with_user_style(Style::role(Role::Primary));
-        assert_eq!(wrapped.render(&stub_ctx()).unwrap(), None);
+        assert_eq!(wrapped.render(&stub_ctx(), &stub_rc()).unwrap(), None);
     }
 
     fn stub_ctx() -> DataContext {
@@ -847,5 +880,9 @@ mod layout_type_tests {
             effort: None,
             raw: Arc::new(serde_json::Value::Null),
         })
+    }
+
+    fn stub_rc() -> RenderContext {
+        RenderContext::new(80)
     }
 }

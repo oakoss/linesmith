@@ -8,7 +8,7 @@
 //! than the stdin passthrough, so every git-aware segment agrees on one
 //! source of truth.
 
-use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
+use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::{DataContext, DataDep, RepoKind};
 use crate::theme::Role;
 
@@ -23,7 +23,7 @@ impl Segment for WorkspaceSegment {
         &[DataDep::Git]
     }
 
-    fn render(&self, ctx: &DataContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let Some(repo_name) = ctx
             .status
             .workspace
@@ -82,6 +82,10 @@ mod tests {
         }
     }
 
+    fn rc() -> RenderContext {
+        RenderContext::new(80)
+    }
+
     fn ctx_with_git(project_dir: &str, git: Result<Option<GitContext>, GitError>) -> DataContext {
         let dc = DataContext::with_cwd(status(project_dir), None);
         dc.preseed_git(git).expect("fresh onceCell");
@@ -100,7 +104,7 @@ mod tests {
     fn renders_directory_outside_repo() {
         let dc = ctx_with_git("/home/dev/linesmith", Ok(None));
         assert_eq!(
-            WorkspaceSegment.render(&dc).unwrap(),
+            WorkspaceSegment.render(&dc, &rc()).unwrap(),
             Some(RenderedSegment::new("linesmith").with_role(Role::Info))
         );
     }
@@ -114,7 +118,7 @@ mod tests {
         );
         let dc = ctx_with_git("/home/dev/linesmith", Ok(Some(gc)));
         assert_eq!(
-            WorkspaceSegment.render(&dc).unwrap(),
+            WorkspaceSegment.render(&dc, &rc()).unwrap(),
             Some(RenderedSegment::new("linesmith").with_role(Role::Info))
         );
     }
@@ -126,7 +130,7 @@ mod tests {
             Ok(Some(linked_worktree("feat-segments"))),
         );
         assert_eq!(
-            WorkspaceSegment.render(&dc).unwrap(),
+            WorkspaceSegment.render(&dc, &rc()).unwrap(),
             Some(RenderedSegment::new("linesmith/feat-segments").with_role(Role::Info))
         );
     }
@@ -141,7 +145,7 @@ mod tests {
             Ok(Some(linked_worktree("feature/auth"))),
         );
         assert_eq!(
-            WorkspaceSegment.render(&dc).unwrap(),
+            WorkspaceSegment.render(&dc, &rc()).unwrap(),
             Some(RenderedSegment::new("linesmith/feature/auth").with_role(Role::Info))
         );
     }
@@ -157,7 +161,7 @@ mod tests {
         );
         let dc = ctx_with_git("/home/dev/linesmith", Ok(Some(gc)));
         assert_eq!(
-            WorkspaceSegment.render(&dc).unwrap(),
+            WorkspaceSegment.render(&dc, &rc()).unwrap(),
             Some(RenderedSegment::new("linesmith").with_role(Role::Info))
         );
     }
@@ -171,7 +175,7 @@ mod tests {
         );
         let dc = ctx_with_git("/home/dev/linesmith", Ok(Some(gc)));
         assert_eq!(
-            WorkspaceSegment.render(&dc).unwrap(),
+            WorkspaceSegment.render(&dc, &rc()).unwrap(),
             Some(RenderedSegment::new("linesmith").with_role(Role::Info))
         );
     }
@@ -186,7 +190,7 @@ mod tests {
         };
         let dc = ctx_with_git("/home/dev/linesmith", Err(err));
         assert_eq!(
-            WorkspaceSegment.render(&dc).unwrap(),
+            WorkspaceSegment.render(&dc, &rc()).unwrap(),
             Some(RenderedSegment::new("linesmith").with_role(Role::Info))
         );
     }
@@ -203,7 +207,7 @@ mod tests {
         };
         let dc = ctx_with_git("/home/dev/linesmith", Err(err));
         assert_eq!(
-            WorkspaceSegment.render(&dc).unwrap(),
+            WorkspaceSegment.render(&dc, &rc()).unwrap(),
             Some(RenderedSegment::new("linesmith").with_role(Role::Info))
         );
     }
@@ -211,7 +215,7 @@ mod tests {
     #[test]
     fn hidden_when_project_dir_has_no_basename() {
         let dc = ctx_with_git("/", Ok(None));
-        assert_eq!(WorkspaceSegment.render(&dc).unwrap(), None);
+        assert_eq!(WorkspaceSegment.render(&dc, &rc()).unwrap(), None);
     }
 
     #[test]
@@ -230,7 +234,10 @@ mod tests {
             "/home/dev/linesmith",
             Ok(Some(linked_worktree("evil\x1b[2J"))),
         );
-        let rendered = WorkspaceSegment.render(&dc).unwrap().expect("renders");
+        let rendered = WorkspaceSegment
+            .render(&dc, &rc())
+            .unwrap()
+            .expect("renders");
         assert_eq!(rendered.text(), "linesmith/evil[2J");
         assert!(!rendered.text().contains('\x1b'));
     }
@@ -241,7 +248,10 @@ mod tests {
         // payload varied to OSC-set-title + BEL so the two tests
         // cover distinct escape families.
         let dc = ctx_with_git("/tmp/\x1b]0;pwn\x07evil", Ok(None));
-        let rendered = WorkspaceSegment.render(&dc).unwrap().expect("renders");
+        let rendered = WorkspaceSegment
+            .render(&dc, &rc())
+            .unwrap()
+            .expect("renders");
         assert_eq!(rendered.text(), "]0;pwnevil");
         assert!(!rendered.text().contains('\x1b'));
         assert!(!rendered.text().contains('\x07'));

@@ -9,7 +9,7 @@
 
 use crate::data_context::DataContext;
 use crate::segments::{
-    text_width, RenderedSegment, Segment, SegmentDefaults, Separator, WidthBounds,
+    text_width, RenderContext, RenderedSegment, Segment, SegmentDefaults, Separator, WidthBounds,
 };
 use crate::theme::{self, Capability, Theme};
 use unicode_segmentation::UnicodeSegmentation;
@@ -48,7 +48,8 @@ pub fn render_with_warn(
     theme: &Theme,
     capability: Capability,
 ) -> String {
-    let items = collect_items_with(segments, ctx, warn);
+    let rc = RenderContext::new(terminal_width);
+    let items = collect_items_with(segments, ctx, &rc, warn);
     render_items(items, terminal_width, theme, capability)
 }
 
@@ -63,13 +64,14 @@ struct Item {
 fn collect_items_with(
     segments: &[Box<dyn Segment>],
     ctx: &DataContext,
+    rc: &RenderContext,
     warn: &mut dyn FnMut(&str),
 ) -> Vec<Item> {
     segments
         .iter()
         .filter_map(|seg| {
             let defaults = seg.defaults();
-            let rendered = match seg.render(ctx) {
+            let rendered = match seg.render(ctx, rc) {
                 Ok(Some(r)) => r,
                 Ok(None) => return None,
                 Err(err) => {
@@ -562,7 +564,7 @@ mod tests {
     struct StubSegment(RenderResult);
 
     impl Segment for StubSegment {
-        fn render(&self, _ctx: &DataContext) -> RenderResult {
+        fn render(&self, _ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
             match &self.0 {
                 Ok(Some(r)) => Ok(Some(r.clone())),
                 Ok(None) => Ok(None),
@@ -588,6 +590,10 @@ mod tests {
         })
     }
 
+    fn empty_rc() -> RenderContext {
+        RenderContext::new(80)
+    }
+
     #[test]
     fn segment_error_is_logged_and_hides_segment() {
         let segments: Vec<Box<dyn Segment>> = vec![
@@ -596,7 +602,7 @@ mod tests {
             Box::new(StubSegment(Ok(Some(RenderedSegment::new("ok-after"))))),
         ];
         let mut warnings = Vec::new();
-        let items = collect_items_with(&segments, &empty_ctx(), &mut |msg| {
+        let items = collect_items_with(&segments, &empty_ctx(), &empty_rc(), &mut |msg| {
             warnings.push(msg.to_string());
         });
         // The Err segment vanishes from layout; neighbors survive.
@@ -616,11 +622,56 @@ mod tests {
             Box::new(StubSegment(Ok(None))),
         ];
         let mut warnings = Vec::new();
-        let items = collect_items_with(&segments, &empty_ctx(), &mut |msg| {
+        let items = collect_items_with(&segments, &empty_ctx(), &empty_rc(), &mut |msg| {
             warnings.push(msg.to_string());
         });
         assert_eq!(items.len(), 1);
         assert!(warnings.is_empty());
+    }
+
+    /// `WidthEcho` emits whatever `terminal_width` it receives — used
+    /// by both reflow-threading tests below.
+    struct WidthEcho;
+    impl Segment for WidthEcho {
+        fn render(&self, _ctx: &DataContext, rc: &RenderContext) -> RenderResult {
+            Ok(Some(RenderedSegment::new(rc.terminal_width.to_string())))
+        }
+    }
+
+    #[test]
+    fn render_context_threads_terminal_width_into_segments() {
+        // Asserts the engine threads `RenderContext::new(42)` to the
+        // segment unmodified at the `collect_items_with` layer —
+        // pinning runtime behavior, since type-signature compilation
+        // alone doesn't prove the value moves.
+        let segments: Vec<Box<dyn Segment>> = vec![Box::new(WidthEcho)];
+        let mut warnings = Vec::new();
+        let rc = RenderContext::new(42);
+        let items = collect_items_with(&segments, &empty_ctx(), &rc, &mut |msg| {
+            warnings.push(msg.to_string());
+        });
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].rendered.text, "42");
+    }
+
+    #[test]
+    fn render_with_warn_constructs_render_context_from_terminal_width_arg() {
+        // Pins the construction line in `render_with_warn`: the public
+        // entrypoint must build `RenderContext::new(terminal_width)`
+        // from its argument and pass it to segments. A regression that
+        // hard-coded a default would slip past the
+        // `collect_items_with`-only test above.
+        let segments: Vec<Box<dyn Segment>> = vec![Box::new(WidthEcho)];
+        let mut warnings = Vec::new();
+        let line = render_with_warn(
+            &segments,
+            &empty_ctx(),
+            137,
+            &mut |msg| warnings.push(msg.to_string()),
+            theme::default_theme(),
+            theme::Capability::None,
+        );
+        assert!(line.contains("137"), "got {line:?}");
     }
 
     // --- truncate-before-drop (reflow) ---

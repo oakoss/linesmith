@@ -2,7 +2,7 @@
 //! formatted in thousands (`200k`, `1M`). Hidden when the payload
 //! doesn't carry context-window data.
 
-use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
+use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::DataContext;
 use crate::input::ContextWindow;
 use crate::theme::Role;
@@ -15,7 +15,7 @@ pub struct ContextWindowSegment;
 const PRIORITY: u8 = 32;
 
 impl Segment for ContextWindowSegment {
-    fn render(&self, ctx: &DataContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let Some(cw) = ctx.status.context_window.as_ref() else {
             crate::lsm_debug!("context_window: status.context_window absent; hiding");
             return Ok(None);
@@ -64,6 +64,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    fn rc() -> RenderContext {
+        RenderContext::new(80)
+    }
+
     fn ctx(window: Option<ContextWindow>) -> DataContext {
         DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
@@ -95,7 +99,7 @@ mod tests {
     fn renders_percent_and_sonnet_200k() {
         assert_eq!(
             ContextWindowSegment
-                .render(&ctx(Some(window(42.3, 200_000))))
+                .render(&ctx(Some(window(42.3, 200_000))), &rc())
                 .unwrap(),
             Some(RenderedSegment::new("42% · 200k").with_role(Role::Info))
         );
@@ -105,7 +109,7 @@ mod tests {
     fn renders_one_million_size_as_m_suffix() {
         assert_eq!(
             ContextWindowSegment
-                .render(&ctx(Some(window(5.0, 1_000_000))))
+                .render(&ctx(Some(window(5.0, 1_000_000))), &rc())
                 .unwrap(),
             Some(RenderedSegment::new("5% · 1M").with_role(Role::Info))
         );
@@ -115,7 +119,7 @@ mod tests {
     fn renders_non_round_size_literally() {
         assert_eq!(
             ContextWindowSegment
-                .render(&ctx(Some(window(10.0, 131_072))))
+                .render(&ctx(Some(window(10.0, 131_072))), &rc())
                 .unwrap(),
             Some(RenderedSegment::new("10% · 131072").with_role(Role::Info))
         );
@@ -125,7 +129,7 @@ mod tests {
     fn rounds_percent_to_nearest_integer() {
         assert_eq!(
             ContextWindowSegment
-                .render(&ctx(Some(window(99.9, 200_000))))
+                .render(&ctx(Some(window(99.9, 200_000))), &rc())
                 .unwrap(),
             Some(RenderedSegment::new("100% · 200k").with_role(Role::Info))
         );
@@ -133,7 +137,10 @@ mod tests {
 
     #[test]
     fn hidden_when_context_window_absent() {
-        assert_eq!(ContextWindowSegment.render(&ctx(None)).unwrap(), None);
+        assert_eq!(
+            ContextWindowSegment.render(&ctx(None), &rc()).unwrap(),
+            None
+        );
     }
 
     #[test]

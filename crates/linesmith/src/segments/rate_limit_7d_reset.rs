@@ -8,7 +8,7 @@ use super::rate_limit_format::{
     apply_common_extras, format_duration, parse_bool, parse_duration_format, render_error,
     CommonRateLimitConfig, DurationFormat, ResetWindow,
 };
-use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
+use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::{DataContext, DataDep, UsageData};
 use crate::theme::Role;
 
@@ -56,7 +56,7 @@ impl RateLimit7dResetSegment {
 }
 
 impl Segment for RateLimit7dResetSegment {
-    fn render(&self, ctx: &DataContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let usage = ctx.usage();
         let text = match &*usage {
             Ok(UsageData::Endpoint(e)) => {
@@ -119,6 +119,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    fn rc() -> RenderContext {
+        RenderContext::new(80)
+    }
+
     fn ctx_with_usage(usage: Result<UsageData, UsageError>) -> DataContext {
         let dc = DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
@@ -166,7 +170,7 @@ mod tests {
             Duration::days(4) + Duration::hours(8),
         )));
         let rendered = RateLimit7dResetSegment::default()
-            .render(&dc)
+            .render(&dc, &rc())
             .unwrap()
             .expect("visible");
         assert_eq!(rendered.text(), "7d reset: 4d 8hr");
@@ -181,7 +185,7 @@ mod tests {
         let dc = ctx_with_usage(Ok(data_with_reset_in(
             Duration::days(1) + Duration::hours(3),
         )));
-        let rendered = seg.render(&dc).unwrap().expect("visible");
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
         assert_eq!(rendered.text(), "7d reset: 27hr");
     }
 
@@ -189,7 +193,9 @@ mod tests {
     fn hidden_when_resets_at_in_past() {
         let dc = ctx_with_usage(Ok(data_with_reset_in(Duration::minutes(-10))));
         assert_eq!(
-            RateLimit7dResetSegment::default().render(&dc).unwrap(),
+            RateLimit7dResetSegment::default()
+                .render(&dc, &rc())
+                .unwrap(),
             None,
         );
     }
@@ -207,7 +213,7 @@ mod tests {
         });
         assert_eq!(
             RateLimit7dResetSegment::default()
-                .render(&ctx_with_usage(Ok(data)))
+                .render(&ctx_with_usage(Ok(data)), &rc())
                 .unwrap(),
             None,
         );
@@ -217,7 +223,7 @@ mod tests {
     fn renders_error_when_usage_fails() {
         let dc = ctx_with_usage(Err(UsageError::RateLimited { retry_after: None }));
         let rendered = RateLimit7dResetSegment::default()
-            .render(&dc)
+            .render(&dc, &rc())
             .unwrap()
             .expect("visible");
         assert_eq!(rendered.text(), "7d reset: [Rate limited]");
@@ -235,7 +241,9 @@ mod tests {
         ));
         let dc = ctx_with_usage(Ok(data));
         assert_eq!(
-            RateLimit7dResetSegment::default().render(&dc).unwrap(),
+            RateLimit7dResetSegment::default()
+                .render(&dc, &rc())
+                .unwrap(),
             None,
         );
     }
@@ -251,7 +259,7 @@ mod tests {
             format: DurationFormat::Progress,
             ..Default::default()
         };
-        let rendered = seg.render(&dc).unwrap().expect("visible");
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
         let pct_str = rendered
             .text()
             .rsplit(' ')
@@ -282,7 +290,7 @@ mod tests {
         });
         assert_eq!(
             RateLimit7dResetSegment::default()
-                .render(&ctx_with_usage(Ok(data)))
+                .render(&ctx_with_usage(Ok(data)), &rc())
                 .unwrap(),
             None,
         );

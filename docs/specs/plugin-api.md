@@ -134,6 +134,7 @@ Accepted dep names are a deliberately narrower subset of the `DataDep` enum from
 ctx.status          // always available; mirrors StatusContext (parsed stdin)
 ctx.config          // per-plugin config from [segments.<id>] TOML table
 ctx.env             // whitelisted env var snapshot (see §ctx.env below)
+ctx.render          // per-render layout state (see §ctx.render below)
 ctx.settings        // present iff @data_deps includes "settings"
 ctx.claude_json     // present iff @data_deps includes "claude_json"
 ctx.usage           // present iff @data_deps includes "usage"
@@ -142,6 +143,16 @@ ctx.git             // present iff @data_deps includes "git"
 // ctx.credentials and ctx.jsonl are reserved and not plugin-accessible in v0.2;
 // see §@data_deps header syntax for the rationale
 ```
+
+**`ctx.render`** mirrors the host's `RenderContext` ([segment-system.md](segment-system.md) §Segment trait). It carries per-render layout state that the engine builds once per call:
+
+```rhai
+ctx.render = #{
+    terminal_width: 80,  // total cells available to this line
+}
+```
+
+Width-aware plugins read `ctx.render.terminal_width` to ladder their own output before the engine's reflow pass runs (e.g. drop a progress bar before its percent reading at narrow widths). `RenderContext` is `#[non_exhaustive]` on the Rust side, so additional fields may appear in later versions; plugins should access fields defensively (`ctx.render.terminal_width ?? 80`) when forward-compat matters.
 
 Accessing a non-declared source's accessor (e.g. `ctx.usage` without `@data_deps = ["usage"]`) returns `()`. This is not an error — it's the plugin's responsibility to declare every source it reads.
 

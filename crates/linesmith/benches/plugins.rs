@@ -25,7 +25,7 @@ use tempfile::TempDir;
 
 use linesmith::data_context::DataContext;
 use linesmith::plugins::{build_engine, CompiledPlugin, PluginRegistry, RhaiSegment};
-use linesmith::segments::{Segment, BUILT_IN_SEGMENT_IDS};
+use linesmith::segments::{RenderContext, Segment, BUILT_IN_SEGMENT_IDS};
 
 const MINIMAL_PLUGIN: &str = include_str!("../tests/fixtures/plugins/minimal.rhai");
 const MINIMAL_PAYLOAD: &[u8] = include_bytes!("../tests/fixtures/claude_minimal.json");
@@ -55,6 +55,10 @@ fn build_segment(registry: PluginRegistry, engine: Arc<Engine>) -> RhaiSegment {
         .next()
         .expect("compiled plugin");
     RhaiSegment::from_compiled(plugin, engine, Dynamic::UNIT)
+}
+
+fn rc() -> RenderContext {
+    RenderContext::new(80)
 }
 
 fn data_context() -> DataContext {
@@ -131,7 +135,7 @@ fn bench_render_cold(c: &mut Criterion) {
             },
             |(seg, ctx, _tmp)| {
                 let rendered = seg
-                    .render(&ctx)
+                    .render(&ctx, &rc())
                     .expect("render ok")
                     .expect("visible rendered segment");
                 criterion::black_box(rendered.text());
@@ -151,7 +155,7 @@ fn bench_render_warm(c: &mut Criterion) {
     c.bench_function("plugin_render_warm", |b| {
         b.iter(|| {
             let rendered = seg
-                .render(&ctx)
+                .render(&ctx, &rc())
                 .expect("render ok")
                 .expect("visible rendered segment");
             criterion::black_box(rendered.text());

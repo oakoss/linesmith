@@ -9,7 +9,7 @@ use super::rate_limit_format::{
     apply_common_extras, format_extra_usage, parse_extra_usage_format, render_error,
     CommonRateLimitConfig, ExtraUsageFormat,
 };
-use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
+use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::{DataContext, DataDep, UsageData};
 use crate::theme::Role;
 
@@ -44,7 +44,7 @@ impl ExtraUsageSegment {
 }
 
 impl Segment for ExtraUsageSegment {
-    fn render(&self, ctx: &DataContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let usage = ctx.usage();
         match &*usage {
             Ok(UsageData::Endpoint(e)) => {
@@ -105,6 +105,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    fn rc() -> RenderContext {
+        RenderContext::new(80)
+    }
+
     fn ctx_with_usage(usage: Result<UsageData, UsageError>) -> DataContext {
         let dc = DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
@@ -149,7 +153,10 @@ mod tests {
     #[test]
     fn hidden_when_extra_usage_missing() {
         let dc = ctx_with_usage(Ok(data_with_extra(None)));
-        assert_eq!(ExtraUsageSegment::default().render(&dc).unwrap(), None);
+        assert_eq!(
+            ExtraUsageSegment::default().render(&dc, &rc()).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -162,7 +169,10 @@ mod tests {
             currency: Some("USD".into()),
         };
         let dc = ctx_with_usage(Ok(data_with_extra(Some(extra))));
-        assert_eq!(ExtraUsageSegment::default().render(&dc).unwrap(), None);
+        assert_eq!(
+            ExtraUsageSegment::default().render(&dc, &rc()).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -172,7 +182,7 @@ mod tests {
             Some(40.0),
         )))));
         let rendered = ExtraUsageSegment::default()
-            .render(&dc)
+            .render(&dc, &rc())
             .unwrap()
             .expect("visible");
         assert_eq!(rendered.text(), "extra: $60.00");
@@ -189,7 +199,7 @@ mod tests {
         };
         let dc = ctx_with_usage(Ok(data_with_extra(Some(extra))));
         let rendered = ExtraUsageSegment::default()
-            .render(&dc)
+            .render(&dc, &rc())
             .unwrap()
             .expect("visible");
         assert_eq!(rendered.text(), "extra: EUR 60.00");
@@ -199,7 +209,7 @@ mod tests {
     fn renders_error_instead_of_hiding_when_fetch_fails() {
         let dc = ctx_with_usage(Err(UsageError::Timeout));
         let rendered = ExtraUsageSegment::default()
-            .render(&dc)
+            .render(&dc, &rc())
             .unwrap()
             .expect("visible");
         assert_eq!(rendered.text(), "extra: [Timeout]");
@@ -221,7 +231,10 @@ mod tests {
             SevenDayWindow::new(TokenCounts::default()),
         ));
         let dc = ctx_with_usage(Ok(data));
-        assert_eq!(ExtraUsageSegment::default().render(&dc).unwrap(), None);
+        assert_eq!(
+            ExtraUsageSegment::default().render(&dc, &rc()).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -239,7 +252,7 @@ mod tests {
             format: ExtraUsageFormat::Percent,
             ..Default::default()
         };
-        let rendered = seg.render(&dc).unwrap().expect("visible");
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
         assert_eq!(rendered.text(), "extra: 42.5%");
     }
 
@@ -279,7 +292,7 @@ mod tests {
         };
         let dc = ctx_with_usage(Ok(data_with_extra(Some(extra))));
         let rendered = ExtraUsageSegment::default()
-            .render(&dc)
+            .render(&dc, &rc())
             .unwrap()
             .expect("visible");
         assert_eq!(rendered.text(), "extra: 42.5%");

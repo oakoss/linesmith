@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use super::rate_limit_format::parse_bool;
-use super::{RenderResult, RenderedSegment, Segment, SegmentDefaults};
+use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::{DataContext, DataDep, GitContext, Head, RepoKind};
 use crate::theme::Role;
 
@@ -230,7 +230,7 @@ impl Segment for GitBranchSegment {
         SegmentDefaults::with_priority(PRIORITY)
     }
 
-    fn render(&self, ctx: &DataContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let arc = ctx.git();
         match &*arc {
             Err(_) | Ok(None) => Ok(None),
@@ -443,6 +443,10 @@ mod tests {
         }
     }
 
+    fn rc() -> RenderContext {
+        RenderContext::new(80)
+    }
+
     fn ctx_with_git(
         result: Result<Option<GitContext>, crate::data_context::GitError>,
     ) -> DataContext {
@@ -454,7 +458,7 @@ mod tests {
     #[test]
     fn hides_when_not_in_repo() {
         assert!(GitBranchSegment::default()
-            .render(&ctx_with_git(Ok(None)))
+            .render(&ctx_with_git(Ok(None)), &rc())
             .unwrap()
             .is_none());
     }
@@ -466,7 +470,7 @@ mod tests {
             message: "synthetic".into(),
         };
         assert!(GitBranchSegment::default()
-            .render(&ctx_with_git(Err(err)))
+            .render(&ctx_with_git(Err(err)), &rc())
             .unwrap()
             .is_none());
     }
@@ -481,7 +485,7 @@ mod tests {
             },
         );
         assert!(GitBranchSegment::default()
-            .render(&ctx_with_git(Ok(Some(gc))))
+            .render(&ctx_with_git(Ok(Some(gc))), &rc())
             .unwrap()
             .is_none());
     }
@@ -494,7 +498,7 @@ mod tests {
             Head::Branch("main".into()),
         );
         let rendered = GitBranchSegment::default()
-            .render(&ctx_with_git(Ok(Some(gc))))
+            .render(&ctx_with_git(Ok(Some(gc))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(rendered.text(), "main");
@@ -509,7 +513,7 @@ mod tests {
             Head::Detached(gix::ObjectId::empty_tree(gix::hash::Kind::Sha1)),
         );
         let rendered = GitBranchSegment::default()
-            .render(&ctx_with_git(Ok(Some(gc))))
+            .render(&ctx_with_git(Ok(Some(gc))), &rc())
             .unwrap()
             .expect("rendered");
         // gix's canonical empty-tree SHA starts with "4b825dc6" — we
@@ -531,7 +535,7 @@ mod tests {
             },
         );
         let rendered = GitBranchSegment::default()
-            .render(&ctx_with_git(Ok(Some(gc))))
+            .render(&ctx_with_git(Ok(Some(gc))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(rendered.text(), "refs/remotes/origin/feature");
@@ -550,14 +554,17 @@ mod tests {
     #[test]
     fn renders_ahead_when_local_leads() {
         let rendered = GitBranchSegment::default()
-            .render(&ctx_with_upstream(
-                Head::Branch("main".into()),
-                Some(UpstreamState {
-                    ahead: 2,
-                    behind: 0,
-                    upstream_branch: "origin/main".into(),
-                }),
-            ))
+            .render(
+                &ctx_with_upstream(
+                    Head::Branch("main".into()),
+                    Some(UpstreamState {
+                        ahead: 2,
+                        behind: 0,
+                        upstream_branch: "origin/main".into(),
+                    }),
+                ),
+                &rc(),
+            )
             .unwrap()
             .expect("rendered");
         assert_eq!(rendered.text(), "main ↑2");
@@ -566,14 +573,17 @@ mod tests {
     #[test]
     fn renders_behind_when_remote_leads() {
         let rendered = GitBranchSegment::default()
-            .render(&ctx_with_upstream(
-                Head::Branch("main".into()),
-                Some(UpstreamState {
-                    ahead: 0,
-                    behind: 3,
-                    upstream_branch: "origin/main".into(),
-                }),
-            ))
+            .render(
+                &ctx_with_upstream(
+                    Head::Branch("main".into()),
+                    Some(UpstreamState {
+                        ahead: 0,
+                        behind: 3,
+                        upstream_branch: "origin/main".into(),
+                    }),
+                ),
+                &rc(),
+            )
             .unwrap()
             .expect("rendered");
         assert_eq!(rendered.text(), "main ↓3");
@@ -582,14 +592,17 @@ mod tests {
     #[test]
     fn renders_both_when_diverged() {
         let rendered = GitBranchSegment::default()
-            .render(&ctx_with_upstream(
-                Head::Branch("main".into()),
-                Some(UpstreamState {
-                    ahead: 2,
-                    behind: 3,
-                    upstream_branch: "origin/main".into(),
-                }),
-            ))
+            .render(
+                &ctx_with_upstream(
+                    Head::Branch("main".into()),
+                    Some(UpstreamState {
+                        ahead: 2,
+                        behind: 3,
+                        upstream_branch: "origin/main".into(),
+                    }),
+                ),
+                &rc(),
+            )
             .unwrap()
             .expect("rendered");
         assert_eq!(rendered.text(), "main ↑2 ↓3");
@@ -598,14 +611,17 @@ mod tests {
     #[test]
     fn hides_ahead_behind_when_zero_by_default() {
         let rendered = GitBranchSegment::default()
-            .render(&ctx_with_upstream(
-                Head::Branch("main".into()),
-                Some(UpstreamState {
-                    ahead: 0,
-                    behind: 0,
-                    upstream_branch: "origin/main".into(),
-                }),
-            ))
+            .render(
+                &ctx_with_upstream(
+                    Head::Branch("main".into()),
+                    Some(UpstreamState {
+                        ahead: 0,
+                        behind: 0,
+                        upstream_branch: "origin/main".into(),
+                    }),
+                ),
+                &rc(),
+            )
             .unwrap()
             .expect("rendered");
         assert_eq!(rendered.text(), "main");
@@ -616,14 +632,17 @@ mod tests {
         let mut seg = GitBranchSegment::default();
         seg.cfg.ahead_behind.hide_when_zero = false;
         let rendered = seg
-            .render(&ctx_with_upstream(
-                Head::Branch("main".into()),
-                Some(UpstreamState {
-                    ahead: 0,
-                    behind: 0,
-                    upstream_branch: "origin/main".into(),
-                }),
-            ))
+            .render(
+                &ctx_with_upstream(
+                    Head::Branch("main".into()),
+                    Some(UpstreamState {
+                        ahead: 0,
+                        behind: 0,
+                        upstream_branch: "origin/main".into(),
+                    }),
+                ),
+                &rc(),
+            )
             .unwrap()
             .expect("rendered");
         assert_eq!(rendered.text(), "main ↑0 ↓0");
@@ -632,7 +651,7 @@ mod tests {
     #[test]
     fn hides_ahead_behind_when_no_upstream_by_default() {
         let rendered = GitBranchSegment::default()
-            .render(&ctx_with_upstream(Head::Branch("main".into()), None))
+            .render(&ctx_with_upstream(Head::Branch("main".into()), None), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(rendered.text(), "main");
@@ -643,7 +662,7 @@ mod tests {
         let mut seg = GitBranchSegment::default();
         seg.cfg.ahead_behind.hide_when_no_upstream = false;
         let rendered = seg
-            .render(&ctx_with_upstream(Head::Branch("main".into()), None))
+            .render(&ctx_with_upstream(Head::Branch("main".into()), None), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(rendered.text(), "main ?");
@@ -659,7 +678,7 @@ mod tests {
         let dc = DataContext::with_cwd(minimal_status(), None);
         dc.preseed_git(Ok(Some(gc))).expect("seed");
         let rendered = GitBranchSegment::default()
-            .render(&dc)
+            .render(&dc, &rc())
             .unwrap()
             .expect("rendered");
         assert!(
@@ -730,12 +749,15 @@ mod tests {
     #[test]
     fn skips_ahead_behind_on_unborn_head() {
         let rendered = GitBranchSegment::default()
-            .render(&ctx_with_upstream(
-                Head::Unborn {
-                    symbolic_ref: "main".into(),
-                },
-                None,
-            ))
+            .render(
+                &ctx_with_upstream(
+                    Head::Unborn {
+                        symbolic_ref: "main".into(),
+                    },
+                    None,
+                ),
+                &rc(),
+            )
             .unwrap()
             .expect("rendered");
         assert!(
@@ -750,12 +772,15 @@ mod tests {
     #[test]
     fn skips_ahead_behind_on_other_ref_head() {
         let rendered = GitBranchSegment::default()
-            .render(&ctx_with_upstream(
-                Head::OtherRef {
-                    full_name: "refs/remotes/origin/feature".into(),
-                },
-                None,
-            ))
+            .render(
+                &ctx_with_upstream(
+                    Head::OtherRef {
+                        full_name: "refs/remotes/origin/feature".into(),
+                    },
+                    None,
+                ),
+                &rc(),
+            )
             .unwrap()
             .expect("rendered");
         assert!(
@@ -775,12 +800,15 @@ mod tests {
         let mut seg = GitBranchSegment::default();
         seg.cfg.ahead_behind.hide_when_no_upstream = false;
         let rendered = seg
-            .render(&ctx_with_upstream(
-                Head::Unborn {
-                    symbolic_ref: "main".into(),
-                },
-                None,
-            ))
+            .render(
+                &ctx_with_upstream(
+                    Head::Unborn {
+                        symbolic_ref: "main".into(),
+                    },
+                    None,
+                ),
+                &rc(),
+            )
             .unwrap()
             .expect("rendered");
         assert!(
@@ -795,14 +823,17 @@ mod tests {
         let mut seg = GitBranchSegment::default();
         seg.cfg.ahead_behind.ahead_format = FormatTemplate::parse(">>{n}").expect("valid");
         let rendered = seg
-            .render(&ctx_with_upstream(
-                Head::Branch("main".into()),
-                Some(UpstreamState {
-                    ahead: 5,
-                    behind: 0,
-                    upstream_branch: "origin/main".into(),
-                }),
-            ))
+            .render(
+                &ctx_with_upstream(
+                    Head::Branch("main".into()),
+                    Some(UpstreamState {
+                        ahead: 5,
+                        behind: 0,
+                        upstream_branch: "origin/main".into(),
+                    }),
+                ),
+                &rc(),
+            )
             .unwrap()
             .expect("rendered");
         assert_eq!(rendered.text(), "main >>5");
@@ -836,7 +867,7 @@ mod tests {
             Head::Branch("main".into()),
         );
         let rendered = GitBranchSegment::default()
-            .render(&ctx_with_git(Ok(Some(gc))))
+            .render(&ctx_with_git(Ok(Some(gc))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(rendered.text(), "main");
@@ -874,7 +905,7 @@ mod tests {
             },
         );
         let rendered = GitBranchSegment::default()
-            .render(&ctx_with_git(Ok(Some(gc))))
+            .render(&ctx_with_git(Ok(Some(gc))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(rendered.text(), "master");
@@ -891,7 +922,7 @@ mod tests {
             Head::Branch("main".into()),
         );
         let rendered = seg
-            .render(&ctx_with_git(Ok(Some(gc))))
+            .render(&ctx_with_git(Ok(Some(gc))), &rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(rendered.text(), ">> branch: main");

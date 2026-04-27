@@ -1,7 +1,7 @@
 # Segment System
 
 - Status: draft
-- Version: 0.4
+- Version: 0.5
 - Last updated: 2026-04-27
 - Driving ADRs: [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0004](../adrs/0004-rhai-for-plugins.md), [ADR-0005](../adrs/0005-role-based-themes.md), [ADR-0008](../adrs/0008-canonical-type-refinements.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md)
 
@@ -70,8 +70,10 @@ pub trait Segment: Send {
     /// (plugin script errors, unexpected state); the layout engine logs
     /// the error to stderr and hides the segment. `ctx` owns the parsed
     /// stdin payload (`ctx.status`) plus lazy accessors for other sources
-    /// declared in `data_deps()`.
-    fn render(&self, ctx: &DataContext) -> RenderResult;
+    /// declared in `data_deps()`. `rc` is the per-render layout state
+    /// — terminal width today, more fields later — for segments that
+    /// pick their own shape based on available room.
+    fn render(&self, ctx: &DataContext, rc: &RenderContext) -> RenderResult;
 
     /// Default layout intent. Can be overridden by user config.
     fn defaults(&self) -> SegmentDefaults {
@@ -95,6 +97,20 @@ pub trait Segment: Send {
 `Segment: Send` (not `Send + Sync`) per [ADR-0008](../adrs/0008-canonical-type-refinements.md); `rhai::AST` is `Send` but its `Sync` story depends on feature flags. Adding `Sync` later is a non-breaking extension.
 
 The render signature receives `&DataContext` as of v0.3. `DataContext` owns `StatusContext` as a field (`ctx.status`), so segments that only need stdin data write `ctx.status.model.id` with no functional loss compared to the v0.2 signature. Segments that need other sources call `ctx.usage()`, `ctx.credentials()`, `ctx.claude_json()`, etc. — each is an `Arc<Result<T, E>>` that lazy-initializes on first call and returns cached results thereafter.
+
+As of v0.5 the signature also takes `&RenderContext` — the per-render layout state the engine builds before walking segments. `DataContext` is the data layer (one instance per process invocation, shared across segments); `RenderContext` is the layout layer (built once per `render` call from terminal width and any future per-line state). The split keeps the data cache stable while the layout state can rebuild cheaply.
+
+```rust
+#[non_exhaustive]
+pub struct RenderContext {
+    /// Total cells available to this line. The layout engine sources this
+    /// from the terminal (or 200 when stdout is detached, per the input-
+    /// schema fallback).
+    pub terminal_width: u16,
+}
+```
+
+Segments that don't care about width ignore the argument (`_rc: &RenderContext`); width-aware segments read `rc.terminal_width` to ladder their own output. Planned consumers (each tracked under its own bead) include `context_bar` dropping the bar before the percent at narrow widths, `model` stripping the parenthetical before the name, and `git_branch` dropping dirty/ahead-behind markers before truncating the branch. The layout engine's reflow pass (§Layout algorithm) still handles prose-like segments where end-ellipsis truncation reads correctly; `RenderContext` is for segments whose internal structure means generic truncation would mislead.
 
 ```rust
 pub type RenderResult = Result<Option<RenderedSegment>, SegmentError>;
@@ -296,11 +312,14 @@ stdin payload → StatusContext + config
   load segment list
          │
          ▼
+  build RenderContext { terminal_width, ... } once per render
+         │
+         ▼
   check cache for each
          │         │
     hit  │    miss │
          │         ▼
-         │     segment.render(&DataContext) → Option<RenderedSegment>
+         │     segment.render(&DataContext, &RenderContext) → Option<RenderedSegment>
          │         │
          └─────────┴───── collected list (with None → dropped)
          │
@@ -476,3 +495,5 @@ Fixtures: lists of `(SegmentId, width, priority)` tuples.
 - 2026-04-17: initial draft (v0.1)
 - 2026-04-17: v0.2 incorporating [ADR-0008](../adrs/0008-canonical-type-refinements.md) (Separator::Literal Cow, Segment: Send only, CachePolicy::Invalidated with any_of semantics, WidthBounds newtype) + rate_limit combined segment + Nerd Font glyph source + effort segment clarification + link to plugin-api.md
 - 2026-04-19: v0.3 incorporating [ADR-0010](../adrs/0010-data-fetching-architecture.md). Render signature moves from `&StatusContext` to `&DataContext`; `StatusContext` remains accessible via `ctx.status`. Adds `data_deps()` method with a default of `&[DataDep::Status]`. Existing stdin-only segments pick up the default `data_deps()` for free but still migrate their render signature to `&DataContext` and reach stdin fields via `ctx.status`. Rendering pipeline diagram updated to show the dep-union pre-fetch step. See [data-fetching.md](data-fetching.md) for the `DataContext` shape and `DataDep` enum.
+- 2026-04-27: v0.4. Adds `SegmentDefaults.truncatable` opt-in (default `false`); under width pressure the layout engine shrinks `truncatable` segments to `(cur_width - overflow)` cells before dropping, with a floor of `max(width.min, 2)`. `workspace` opts in. Numeric segments stay opt-out so end-ellipsis truncation never produces a wrong number.
+- 2026-04-27: v0.5. Render signature gains `&RenderContext` as a second argument: `fn render(&self, ctx: &DataContext, rc: &RenderContext) -> RenderResult`. The new struct carries `terminal_width` today and is `#[non_exhaustive]` for additive growth (line index, capability, neighbor info). Segments that don't care about layout state ignore the argument; width-aware segments read `rc.terminal_width` to ladder their own output before the engine's reflow pass runs. Rendering pipeline diagram updated to show the per-render `RenderContext` build step.

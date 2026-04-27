@@ -327,7 +327,11 @@ mod tests {
     struct StubWithWidth;
 
     impl Segment for StubWithWidth {
-        fn render(&self, _: &crate::data_context::DataContext) -> segments::RenderResult {
+        fn render(
+            &self,
+            _: &crate::data_context::DataContext,
+            _: &segments::RenderContext,
+        ) -> segments::RenderResult {
             Ok(Some(segments::RenderedSegment::new("x")))
         }
         fn defaults(&self) -> segments::SegmentDefaults {
@@ -378,6 +382,10 @@ mod tests {
         assert_eq!(got.max(), 50);
     }
 
+    fn rc() -> crate::segments::RenderContext {
+        crate::segments::RenderContext::new(80)
+    }
+
     fn model_ctx(display_name: &str) -> crate::data_context::DataContext {
         use crate::input::{ModelInfo, Tool, WorkspaceInfo};
         use std::path::PathBuf;
@@ -412,7 +420,7 @@ mod tests {
         .expect("parse");
         let built = build_segments(Some(&cfg), None, |_| {});
         let rendered = built[0]
-            .render(&model_ctx("Claude Sonnet 4.6"))
+            .render(&model_ctx("Claude Sonnet 4.6"), &rc())
             .expect("render ok")
             .expect("visible");
         assert_eq!(rendered.style.role, Some(Role::Accent));
@@ -437,7 +445,7 @@ mod tests {
         .expect("parse");
         let built = build_segments(Some(&cfg), None, |_| {});
         let rendered = built[0]
-            .render(&model_ctx("Claude Sonnet 4.6"))
+            .render(&model_ctx("Claude Sonnet 4.6"), &rc())
             .expect("render ok")
             .expect("visible");
         assert_eq!(
@@ -462,7 +470,7 @@ mod tests {
         let mut warnings = Vec::new();
         let built = build_segments(Some(&cfg), None, |m| warnings.push(m.to_string()));
         let rendered = built[0]
-            .render(&model_ctx("Claude Sonnet 4.6"))
+            .render(&model_ctx("Claude Sonnet 4.6"), &rc())
             .expect("render ok")
             .expect("visible");
         assert_eq!(rendered.style.role, Some(Role::Primary));
@@ -486,7 +494,7 @@ mod tests {
         .expect("parse");
         let built = build_segments(Some(&cfg), None, |_| {});
         let rendered = built[0]
-            .render(&model_ctx("Claude Sonnet 4.6"))
+            .render(&model_ctx("Claude Sonnet 4.6"), &rc())
             .expect("render ok")
             .expect("visible");
         assert_eq!(rendered.style.role, Some(Role::Primary));
@@ -506,7 +514,7 @@ mod tests {
         .expect("parse");
         let built = build_segments(Some(&cfg), None, |_| {});
         let rendered = built[0]
-            .render(&model_ctx("Claude Sonnet 4.6"))
+            .render(&model_ctx("Claude Sonnet 4.6"), &rc())
             .expect("render ok")
             .expect("visible");
         assert_eq!(rendered.style.role, Some(Role::Primary));
@@ -562,7 +570,7 @@ mod tests {
         // wiring regression that swaps slots fails loudly.
         let dc = model_ctx("Sonnet");
         let plugin_render = built[1]
-            .render(&dc)
+            .render(&dc, &rc())
             .expect("plugin render ok")
             .expect("visible");
         assert_eq!(plugin_render.text(), "from-plugin");
@@ -640,7 +648,10 @@ mod tests {
         let built = build_segments(Some(&cfg), Some((registry, engine)), |_| {});
         assert_eq!(built.len(), 1);
         let dc = model_ctx("Sonnet");
-        let rendered = built[0].render(&dc).expect("render ok").expect("visible");
+        let rendered = built[0]
+            .render(&dc, &rc())
+            .expect("render ok")
+            .expect("visible");
         assert_eq!(rendered.text(), "from-toml");
     }
 
