@@ -9,6 +9,7 @@ use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
 
 pub(crate) mod builder;
+pub mod context_bar;
 pub mod context_window;
 pub mod cost;
 pub mod effort;
@@ -394,6 +395,7 @@ pub const DEFAULT_SEGMENT_IDS: &[&str] = &[
 pub const BUILT_IN_SEGMENT_IDS: &[&str] = &[
     "model",
     "context_window",
+    "context_bar",
     "workspace",
     "cost",
     "effort",
@@ -426,6 +428,9 @@ pub fn built_in_by_id(
     match id {
         "model" => Some(Box::new(model::ModelSegment)),
         "context_window" => Some(Box::new(context_window::ContextWindowSegment)),
+        "context_bar" => Some(Box::new(context_bar::ContextBarSegment::from_extras(
+            e, warn,
+        ))),
         "workspace" => Some(Box::new(workspace::WorkspaceSegment)),
         "cost" => Some(Box::new(cost::CostSegment)),
         "effort" => Some(Box::new(effort::EffortSegment)),
@@ -699,6 +704,7 @@ mod layout_type_tests {
     #[test]
     fn built_in_by_id_resolves_additional_documented_ids() {
         for id in [
+            "context_bar",
             "rate_limit_5h",
             "rate_limit_7d",
             "rate_limit_5h_reset",

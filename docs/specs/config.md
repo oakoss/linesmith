@@ -138,12 +138,20 @@ api_base_url = "https://api.anthropic.com"
 timeout = 2
 
 # Per-segment overrides. All sections optional. Keys match a segment's `id`.
-# Any field set here overrides the segment's declared defaults.
+# Any field set here overrides the segment's declared defaults. The
+# top-level `width = { min, max }` table is reserved for layout bounds;
+# segments that need an integer "cells" knob (context_bar) expose it
+# under their own key (e.g. `cells = 10`).
 [segments.context_window]
 style = "role:primary bold"
-width = 10                # for context_bar-style segments: bar width in cells
 format = "{pct}% · {size}" # segment-specific format string
 priority = 32             # lower = more likely to be dropped
+
+[segments.context_bar]
+cells = 10                # bar width in terminal cells (default 10)
+[segments.context_bar.thresholds]
+green = 50                # pct < green renders Role::Success
+yellow = 80               # green <= pct < yellow renders Role::Warning
 
 [segments.workspace]
 # Shorthand: hide the segment if this evaluates to false.
