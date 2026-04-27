@@ -53,7 +53,7 @@ impl Segment for WorkspaceSegment {
     }
 
     fn defaults(&self) -> SegmentDefaults {
-        SegmentDefaults::with_priority(PRIORITY)
+        SegmentDefaults::with_priority(PRIORITY).with_truncatable(true)
     }
 }
 

@@ -1,8 +1,8 @@
 # Segment System
 
 - Status: draft
-- Version: 0.3
-- Last updated: 2026-04-19
+- Version: 0.4
+- Last updated: 2026-04-27
 - Driving ADRs: [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0004](../adrs/0004-rhai-for-plugins.md), [ADR-0005](../adrs/0005-role-based-themes.md), [ADR-0008](../adrs/0008-canonical-type-refinements.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md)
 
 ## Overview
@@ -162,6 +162,15 @@ pub struct SegmentDefaults {
     /// Default separator to the right of this segment. Theme or user
     /// config can override.
     pub default_separator: Separator,
+
+    /// May this segment be truncated under width pressure before being
+    /// dropped? Defaults to `false` — opt in for prose-like content
+    /// (workspace name, branch name) where a partial value is more
+    /// useful than disappearing. Numeric or structured segments
+    /// (model, cost, percent, countdown) leave this `false`: a
+    /// half-cut percentage reads as the wrong number, which is worse
+    /// than no number.
+    pub truncatable: bool,
 }
 
 /// Width bounds with `min <= max` enforced at construction.
@@ -185,6 +194,7 @@ impl Default for SegmentDefaults {
             priority: 128,
             width: None,
             default_separator: Separator::Space,
+            truncatable: false,
         }
     }
 }
@@ -313,16 +323,30 @@ Input: list of `Option<RenderedSegment>`, each with `SegmentDefaults`, terminal 
        (theme-provided, default "…").
 3. Compute total width = sum(segment widths) + sum(separator widths).
 4. If total <= W: render as-is.
-5. Else: priority-based drop loop:
+5. Else: priority-based reflow loop:
      a. Find the highest-priority (numerically largest) remaining segment.
-     b. Drop it.
-     c. Recompute total width.
-     d. Repeat until total <= W or only priority-0 segments remain.
+        If only priority-0 segments remain, stop.
+     b. Compute `overflow = total - W`.
+     c. If the chosen segment declares `truncatable = true`, attempt to
+        shrink it to `cur_width - overflow` cells (which exactly closes
+        the gap). The shrunk width must be at least `floor`, which is
+        the segment's `width.min` if declared, else `2` (one content
+        cell plus the ellipsis); a declared `width.min` below `2` is
+        clamped up.
+        If feasible, replace the segment with its truncated form and
+        recompute total. The loop exits the next iteration because
+        total now equals W.
+     d. Otherwise (not truncatable, or truncation would fall below
+        `floor`) drop the segment outright.
+     e. Recompute total width.
+     f. Repeat until total <= W or only priority-0 segments remain.
 6. Emit: for each remaining segment, write its runs, then its right-separator
    (either segment-declared override or theme default), to stdout.
 ```
 
-Priority-0 segments are never dropped. If total width still exceeds `W` after all droppable segments are removed, render anyway (terminal wraps or truncates visually; worse UX than hiding, but priority-0 means "user said don't drop this").
+Priority-0 segments are never dropped or truncated by the reflow loop. If total width still exceeds `W` after all droppable segments are removed, render anyway (terminal wraps or truncates visually; worse UX than hiding, but priority-0 means "user said don't drop this").
+
+The `truncatable` flag is opt-in (default `false`). The built-in `workspace` segment opts in so a long `repo/feature-branch-name` shrinks under width pressure instead of disappearing. Numeric segments (model, cost, percent meters, countdowns) leave it `false`: a half-cut percentage reads as the wrong number, which is worse than no number.
 
 ### Multi-line layouts
 
@@ -386,20 +410,20 @@ Segments that render Nerd Font glyphs (powerline separators, git icons, model ba
 
 ## Edge cases
 
-| Case                                                               | Handling                                                                                  |
-| ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- |
-| Segment returns `None`                                             | Dropped from layout. Separator also dropped (not left as a floating artifact)             |
-| Segment panics during render                                       | Panic caught; segment dropped; error logged once per segment per run; rendering continues |
-| Cache file corrupt / unparseable                                   | Treated as miss; re-rendered; new write replaces bad file                                 |
-| Segment width exceeds terminal width                               | Truncated with ellipsis per `width.max`; if still too wide, dropped unless priority 0     |
-| Terminal width unknown (detached tty)                              | Fall back to 200 cells                                                                    |
-| All segments drop due to width pressure                            | Emit blank line (status line is empty but still emitted)                                  |
-| Segment tries to construct `WidthBounds { min: 20, max: 10 }`      | `WidthBounds::new` returns `None`; segment must fix or drop bounds                        |
-| Two segments have the same `id`                                    | Second one rejected at config-load time; first wins                                       |
-| Rhai script errors at render                                       | Plugin segment dropped; error logged; rendering continues                                 |
-| Segment writes to stdout directly (should never)                   | Undefined behavior; segments must return `RenderedSegment`, not print                     |
-| Context has no `git_worktree`, but `workspace` segment expects one | Segment returns `None` (conditional visibility)                                           |
-| `effort` segment requested but `ctx.effort == None`                | Segment returns `None`; user-visible reason documented in segment's doc comment           |
+| Case                                                               | Handling                                                                                                                                                         |
+| ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Segment returns `None`                                             | Dropped from layout. Separator also dropped (not left as a floating artifact)                                                                                    |
+| Segment panics during render                                       | Panic caught; segment dropped; error logged once per segment per run; rendering continues                                                                        |
+| Cache file corrupt / unparseable                                   | Treated as miss; re-rendered; new write replaces bad file                                                                                                        |
+| Segment width exceeds terminal width                               | Truncated with ellipsis per `width.max` (if declared); reflow loop further truncates `truncatable` segments before dropping; otherwise dropped unless priority 0 |
+| Terminal width unknown (detached tty)                              | Fall back to 200 cells                                                                                                                                           |
+| All segments drop due to width pressure                            | Emit blank line (status line is empty but still emitted)                                                                                                         |
+| Segment tries to construct `WidthBounds { min: 20, max: 10 }`      | `WidthBounds::new` returns `None`; segment must fix or drop bounds                                                                                               |
+| Two segments have the same `id`                                    | Second one rejected at config-load time; first wins                                                                                                              |
+| Rhai script errors at render                                       | Plugin segment dropped; error logged; rendering continues                                                                                                        |
+| Segment writes to stdout directly (should never)                   | Undefined behavior; segments must return `RenderedSegment`, not print                                                                                            |
+| Context has no `git_worktree`, but `workspace` segment expects one | Segment returns `None` (conditional visibility)                                                                                                                  |
+| `effort` segment requested but `ctx.effort == None`                | Segment returns `None`; user-visible reason documented in segment's doc comment                                                                                  |
 
 ## Testing strategy
 

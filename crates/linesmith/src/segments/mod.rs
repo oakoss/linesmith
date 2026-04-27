@@ -235,6 +235,13 @@ pub struct SegmentDefaults {
     pub priority: u8,
     pub width: Option<WidthBounds>,
     pub default_separator: Separator,
+    /// May the layout engine shrink this segment under width pressure
+    /// before dropping it? Default `false` — only prose-like segments
+    /// (workspace name, branch name) opt in. Numeric or structured
+    /// segments leave this `false`: a half-cut percentage reads as
+    /// the wrong number, which is worse than no number.
+    /// See `docs/specs/segment-system.md` §Layout algorithm.
+    pub truncatable: bool,
 }
 
 impl SegmentDefaults {
@@ -262,6 +269,13 @@ impl SegmentDefaults {
         self.default_separator = separator;
         self
     }
+
+    /// Chainable setter for the truncate-before-drop opt-in.
+    #[must_use]
+    pub fn with_truncatable(mut self, truncatable: bool) -> Self {
+        self.truncatable = truncatable;
+        self
+    }
 }
 
 impl Default for SegmentDefaults {
@@ -270,6 +284,7 @@ impl Default for SegmentDefaults {
             priority: 128,
             width: None,
             default_separator: Separator::Space,
+            truncatable: false,
         }
     }
 }

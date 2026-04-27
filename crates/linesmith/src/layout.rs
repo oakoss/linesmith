@@ -1,7 +1,9 @@
 //! Layout engine. Takes a list of `Segment`s plus a `StatusContext` and
 //! fits their renders into a terminal-width budget, dropping the
-//! highest-priority (numerically largest) segments first. Priority-0
-//! segments are never dropped, even when that overflows the budget.
+//! highest-priority (numerically largest) segments first — or, when a
+//! segment opts in via `truncatable`, shrinking it to fit before drop.
+//! Priority-0 segments are never dropped or truncated, even when that
+//! overflows the budget.
 //!
 //! See `docs/specs/segment-system.md` §Layout algorithm.
 
@@ -89,7 +91,12 @@ fn render_items(
     theme: &Theme,
     capability: Capability,
 ) -> String {
-    while total_width(&items) > u32::from(terminal_width) {
+    let budget = u32::from(terminal_width);
+    loop {
+        let total = total_width(&items);
+        if total <= budget {
+            break;
+        }
         let Some(drop_idx) = items
             .iter()
             .enumerate()
@@ -99,6 +106,13 @@ fn render_items(
         else {
             break;
         };
+        let overflow = total - budget;
+        if items[drop_idx].defaults.truncatable {
+            if let Some(reflowed) = try_reflow(&items[drop_idx], overflow) {
+                items[drop_idx] = reflowed;
+                continue;
+            }
+        }
         items.remove(drop_idx);
     }
 
@@ -160,6 +174,33 @@ fn apply_width_bounds(
         return Some(truncate_to(rendered, bounds.max()));
     }
     Some(rendered)
+}
+
+/// Shrink `item` by `overflow` cells so the layout fits, or return
+/// `None` when the result would fall below `max(width.min, 2)` cells
+/// (one content grapheme plus the ellipsis), so the caller can drop the
+/// segment whole.
+///
+/// Subtracting exactly `overflow` lands total width on the budget so
+/// the reflow loop exits on its next check; a wide grapheme straddling
+/// the boundary may yield a slightly narrower result, which still
+/// meets the `overflow` requirement.
+fn try_reflow(item: &Item, overflow: u32) -> Option<Item> {
+    let floor = item.defaults.width.map_or(2, |b| b.min().max(2));
+    let cur = item.rendered.width;
+    let target = u32::from(cur).checked_sub(overflow)?;
+    let target_u16 = u16::try_from(target).ok()?;
+    if target_u16 < floor {
+        return None;
+    }
+    let truncated = truncate_to(item.rendered.clone(), target_u16);
+    if truncated.width < floor {
+        return None;
+    }
+    Some(Item {
+        rendered: truncated,
+        defaults: item.defaults.clone(),
+    })
 }
 
 /// Truncate `rendered` to at most `max_cells` terminal cells, appending
@@ -342,6 +383,7 @@ mod tests {
                     priority: 10,
                     width: None,
                     default_separator: Separator::Literal(Cow::Borrowed(" | ")),
+                    truncatable: false,
                 },
             },
             Item {
@@ -579,5 +621,111 @@ mod tests {
         });
         assert_eq!(items.len(), 1);
         assert!(warnings.is_empty());
+    }
+
+    // --- truncate-before-drop (reflow) ---
+
+    fn truncatable_item(text: &str, priority: u8) -> Item {
+        Item {
+            rendered: RenderedSegment::new(text),
+            defaults: SegmentDefaults::with_priority(priority).with_truncatable(true),
+        }
+    }
+
+    #[test]
+    fn reflow_truncates_highest_priority_before_dropping() {
+        // Workspace-style scenario: long location plus a small fixed
+        // segment. Without reflow the location would drop entirely;
+        // with reflow it shrinks to fit so the user keeps orientation.
+        let items = vec![
+            truncatable_item("linesmith/very-long-feature-branch-name", 200),
+            item("Sonnet", 0),
+        ];
+        // Total: 39 + 1 + 6 = 46. Budget 30 → overflow 16.
+        // Workspace truncates from 39 → 23 cells; result fits exactly.
+        let out = render_plain(items, 30);
+        assert!(out.starts_with("linesmith/very-long-fe"), "got {out:?}");
+        assert!(out.ends_with("… Sonnet"), "got {out:?}");
+        assert_eq!(text_width(&out), 30);
+    }
+
+    #[test]
+    fn reflow_drops_when_truncation_would_fall_below_floor() {
+        // Budget so tight that truncating the workspace segment would
+        // leave only the ellipsis (or less). Engine falls back to drop.
+        let items = vec![truncatable_item("workspace-name", 200), item("KEEP", 0)];
+        // Total: 14 + 1 + 4 = 19. Budget 4 → overflow 15.
+        // workspace target = 14 - 15 < 0 → reflow returns None → drop.
+        let out = render_plain(items, 4);
+        assert_eq!(out, "KEEP");
+    }
+
+    #[test]
+    fn reflow_respects_explicit_width_min_floor() {
+        // Segment declares min=8; reflow must not shrink below that
+        // even if a smaller truncation would fit the budget.
+        let bounds = WidthBounds::new(8, u16::MAX).expect("valid");
+        let mut wide = truncatable_item("abcdefghijklmnop", 200); // width 16
+        wide.defaults.width = Some(bounds);
+        let items = vec![wide, item("X", 0)];
+        // Total 16 + 1 + 1 = 18. Budget 10 → overflow 8 → target 8 ✓
+        // (target equals floor; reflow proceeds).
+        let out = render_plain(items, 10);
+        assert!(out.contains('…'), "got {out:?}");
+        assert!(out.ends_with(" X"), "got {out:?}");
+
+        // Now budget 9 → overflow 9 → target 7 < floor 8 → drop.
+        let bounds = WidthBounds::new(8, u16::MAX).expect("valid");
+        let mut wide = truncatable_item("abcdefghijklmnop", 200);
+        wide.defaults.width = Some(bounds);
+        let items = vec![wide, item("X", 0)];
+        let out = render_plain(items, 9);
+        assert_eq!(out, "X");
+    }
+
+    #[test]
+    fn non_truncatable_drops_unchanged_under_pressure() {
+        // Default `truncatable=false` keeps the legacy whole-segment
+        // drop path so numeric segments don't suddenly start emitting
+        // half-cut percentages or dollar figures.
+        let items = vec![item("45% · 200k", 200), item("Sonnet", 0)];
+        // Total 10 + 1 + 6 = 17. Budget 10 → drop the wider one.
+        let out = render_plain(items, 10);
+        assert_eq!(out, "Sonnet");
+    }
+
+    #[test]
+    fn reflow_iterates_when_first_truncation_insufficient() {
+        // Two truncatable segments, both same priority. After tying
+        // priority we drop the right-most first; if that's still over
+        // budget the loop comes back for the left one.
+        let items = vec![
+            truncatable_item("aaaaaaaaaa", 100),
+            truncatable_item("bbbbbbbbbb", 100),
+            item("KEEP", 0),
+        ];
+        // Total: 10 + 1 + 10 + 1 + 4 = 26. Budget 12 → overflow 14.
+        // Right-most ("b...") is chosen first; truncating it to
+        // 10-14 < 0 fails, so it drops. New total 10+1+4 = 15.
+        // Loop continues; next iteration overflow=3, "a..." truncates
+        // to 10-3 = 7 ("aaaaaa…").
+        let out = render_plain(items, 12);
+        assert_eq!(out, "aaaaaa… KEEP");
+        assert_eq!(text_width(&out), 12);
+    }
+
+    #[test]
+    fn reflow_does_not_touch_priority_zero_even_when_truncatable() {
+        // Priority 0 is "user said don't drop"; the reflow loop never
+        // selects it (the existing droppable filter guards this).
+        let items = vec![
+            Item {
+                rendered: RenderedSegment::new("untouchable-long-name"),
+                defaults: SegmentDefaults::with_priority(0).with_truncatable(true),
+            },
+            item("Sonnet", 0),
+        ];
+        let out = render_plain(items, 5);
+        assert_eq!(out, "untouchable-long-name Sonnet");
     }
 }
