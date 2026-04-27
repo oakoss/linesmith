@@ -117,6 +117,7 @@ mod tests {
                 "workspace",
                 "context_window",
                 "cost",
+                "session_duration",
                 "rate_limit_5h",
                 "rate_limit_7d",
             ]

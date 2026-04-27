@@ -1,6 +1,6 @@
 # linesmith preset: developer
-# Full developer statusline: model, workspace, context, cost, rate limits.
-# The `workspace` segment surfaces the worktree name.
+# Full developer statusline: model, workspace, context, cost, rate limits,
+# and session duration. The `workspace` segment surfaces the worktree name.
 
 [line]
 segments = [
@@ -8,6 +8,7 @@ segments = [
   "workspace",
   "context_window",
   "cost",
+  "session_duration",
   "rate_limit_5h",
   "rate_limit_7d",
 ]

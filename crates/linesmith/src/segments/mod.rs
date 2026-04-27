@@ -21,6 +21,7 @@ pub mod rate_limit_5h_reset;
 pub mod rate_limit_7d;
 pub mod rate_limit_7d_reset;
 pub mod rate_limit_format;
+pub mod session_duration;
 pub mod tokens;
 pub mod workspace;
 
@@ -405,6 +406,7 @@ pub const BUILT_IN_SEGMENT_IDS: &[&str] = &[
     "rate_limit_5h_reset",
     "rate_limit_7d_reset",
     "extra_usage",
+    "session_duration",
     "tokens_input",
     "tokens_output",
     "tokens_cached",
@@ -450,6 +452,7 @@ pub fn built_in_by_id(
         "extra_usage" => Some(Box::new(extra_usage::ExtraUsageSegment::from_extras(
             e, warn,
         ))),
+        "session_duration" => Some(Box::new(session_duration::SessionDurationSegment)),
         "tokens_input" => Some(Box::new(tokens::TokensInputSegment)),
         "tokens_output" => Some(Box::new(tokens::TokensOutputSegment)),
         "tokens_cached" => Some(Box::new(tokens::TokensCachedSegment)),
@@ -705,6 +708,7 @@ mod layout_type_tests {
     fn built_in_by_id_resolves_additional_documented_ids() {
         for id in [
             "context_bar",
+            "session_duration",
             "rate_limit_5h",
             "rate_limit_7d",
             "rate_limit_5h_reset",
