@@ -434,6 +434,75 @@ fn config_style_override_invalid_warns_and_render_still_succeeds() {
 }
 
 #[test]
+fn model_format_compact_strips_context_word_end_to_end() {
+    // Default `format = "compact"` strips the trailing word "context"
+    // from `(X context)` parentheticals. Pins the from_extras wiring
+    // (segments/mod.rs::built_in_by_id → ModelSegment::from_extras)
+    // through the full Config → build_segments → render path.
+    let cfg = linesmith::config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model"]
+        "#,
+    )
+    .expect("parse");
+    let segments = linesmith::build_segments(Some(&cfg), None, |_| {});
+    let payload = br#"{
+        "model": { "id": "claude-opus-4-7", "display_name": "Opus 4.7 (1M context)" },
+        "session_id": "test-session",
+        "cwd": "/home/dev/linesmith",
+        "workspace": {
+            "current_dir": ".",
+            "project_dir": "/home/dev/linesmith",
+            "added_dirs": [],
+            "git_worktree": null
+        }
+    }"#;
+    let mut out = Vec::new();
+    linesmith::run_with_segments_and_width(Cursor::new(&payload[..]), &mut out, &segments, 200)
+        .expect("run ok");
+    let rendered = String::from_utf8(out).expect("utf8");
+    assert!(rendered.contains("Opus 4.7 (1M)"), "got {rendered:?}");
+    assert!(
+        !rendered.contains("(1M context)"),
+        "compact must drop the word: {rendered:?}"
+    );
+}
+
+#[test]
+fn model_format_full_preserves_anthropics_verbatim_string_end_to_end() {
+    let cfg = linesmith::config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model"]
+            [segments.model]
+            format = "full"
+        "#,
+    )
+    .expect("parse");
+    let segments = linesmith::build_segments(Some(&cfg), None, |_| {});
+    let payload = br#"{
+        "model": { "id": "claude-opus-4-7", "display_name": "Opus 4.7 (1M context)" },
+        "session_id": "test-session",
+        "cwd": "/home/dev/linesmith",
+        "workspace": {
+            "current_dir": ".",
+            "project_dir": "/home/dev/linesmith",
+            "added_dirs": [],
+            "git_worktree": null
+        }
+    }"#;
+    let mut out = Vec::new();
+    linesmith::run_with_segments_and_width(Cursor::new(&payload[..]), &mut out, &segments, 200)
+        .expect("run ok");
+    let rendered = String::from_utf8(out).expect("utf8");
+    assert!(
+        rendered.contains("Opus 4.7 (1M context)"),
+        "got {rendered:?}"
+    );
+}
+
+#[test]
 fn config_priority_override_flips_drop_order_under_pressure() {
     // With default priorities, a narrow terminal drops cost (192)
     // before model (64). Override model's priority to 250 and it drops

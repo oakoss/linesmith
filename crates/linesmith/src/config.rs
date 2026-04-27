@@ -288,8 +288,10 @@ fn segment_override_schema(id: &str) -> Option<&'static [&'static str]> {
         "dirty",
         "ahead_behind",
     ];
+    const MODEL_SEGMENT: &[&str] = &["priority", "width", "style", "visible_if", "format"];
     match id {
-        "model" | "workspace" | "cost" | "effort" | "context_window" => Some(BUILT_IN_COMMON),
+        "model" => Some(MODEL_SEGMENT),
+        "workspace" | "cost" | "effort" | "context_window" => Some(BUILT_IN_COMMON),
         "rate_limit_5h" | "rate_limit_7d" => Some(PERCENT_SEGMENT),
         "rate_limit_5h_reset" | "rate_limit_7d_reset" => Some(RESET_SEGMENT),
         "extra_usage" => Some(RATE_LIMIT_COMMON),
@@ -665,6 +667,44 @@ mod tests {
             "#,
         );
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn model_segment_allows_format_key_without_warning() {
+        let warnings = collect_warnings(
+            r#"
+                [segments.model]
+                format = "compact"
+            "#,
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+
+        let warnings_full = collect_warnings(
+            r#"
+                [segments.model]
+                format = "full"
+            "#,
+        );
+        assert!(
+            warnings_full.is_empty(),
+            "unexpected warnings: {warnings_full:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_segment_warns_when_format_key_set() {
+        // `format` is a model-only key; the validator's per-id schema
+        // split should reject it on `workspace` (and the rest of
+        // `BUILT_IN_COMMON`) so silent typos don't slip through.
+        let warnings = collect_warnings(
+            r#"
+                [segments.workspace]
+                format = "compact"
+            "#,
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("format"));
+        assert!(warnings[0].contains("[segments.workspace]"));
     }
 
     #[test]

@@ -470,7 +470,7 @@ pub fn built_in_by_id(
     let empty: std::collections::BTreeMap<String, toml::Value> = std::collections::BTreeMap::new();
     let e = extras.unwrap_or(&empty);
     match id {
-        "model" => Some(Box::new(model::ModelSegment)),
+        "model" => Some(Box::new(model::ModelSegment::from_extras(e, warn))),
         "context_window" => Some(Box::new(context_window::ContextWindowSegment)),
         "context_bar" => Some(Box::new(context_bar::ContextBarSegment::from_extras(
             e, warn,

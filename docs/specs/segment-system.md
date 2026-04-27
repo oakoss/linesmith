@@ -110,7 +110,7 @@ pub struct RenderContext {
 }
 ```
 
-Segments that don't care about width ignore the argument (`_rc: &RenderContext`); width-aware segments read `rc.terminal_width` to ladder their own output. Planned consumers (each tracked under its own bead) include `context_bar` dropping the bar before the percent at narrow widths, `model` stripping the parenthetical before the name, and `git_branch` dropping dirty/ahead-behind markers before truncating the branch. The layout engine's reflow pass (§Layout algorithm) still handles prose-like segments where end-ellipsis truncation reads correctly; `RenderContext` is for segments whose internal structure means generic truncation would mislead.
+Segments that don't care about width ignore the argument (`_rc: &RenderContext`); width-aware segments read `rc.terminal_width` to ladder their own output. Planned consumers (tracked under their own beads) include `git_branch` dropping dirty/ahead-behind markers before truncating the branch — its rendered string carries structured tail content that generic end-ellipsis truncation would misrepresent. The layout engine's reflow pass (§Layout algorithm) handles prose-like segments where end-ellipsis truncation reads correctly. Some segments addressed the same UX concern at the data layer instead: `model`'s `format = "compact"` config strips the trailing `(X context)` filler unconditionally, and `context_bar` relies on its higher priority to drop before the textual `context_window`. `RenderContext` is the right tool only when the laddering decision genuinely depends on terminal width.
 
 ```rust
 pub type RenderResult = Result<Option<RenderedSegment>, SegmentError>;
@@ -409,7 +409,7 @@ Example: a `git_group` segment combines branch + dirty + ahead/behind into one v
 
 Per [`docs/ideas/0001-feature-parity-matrix.md`](../ideas/0001-feature-parity-matrix.md):
 
-1. `model`: model display_name
+1. `model`: model display_name. Default `format = "compact"` strips the trailing word "context" from `(X context)` parentheticals (`Opus 4.7 (1M context)` → `Opus 4.7 (1M)`); `format = "full"` renders Anthropic's wire value verbatim. The strip is gated on `Tool::ClaudeCode` since the suffix shape is Claude-specific; other tools (Qwen, Codex CLI, Copilot CLI) render verbatim regardless of `format`.
 2. `context_window`: percentage + size (e.g. `45% · 200k`)
 3. `context_bar`: visual bar, width configurable (4/6/8/10/12 cells)
 4. `cost`: session cost in USD
