@@ -59,6 +59,7 @@ staged_icon = "+"              # when format = "counts": "+3 ~2 ?1"
 unstaged_icon = "~"
 untracked_icon = "?"
 count_hide_zero = true         # in "counts" mode, hide a category when its count is zero
+hide_below_cells = 0           # suppress dirty marker when terminal_width < N cells; 0 = never auto-hide
 
 [segments.git_branch.ahead_behind]
 enabled = true                 # include ahead/behind counters
@@ -66,7 +67,12 @@ ahead_format = "↑{n}"
 behind_format = "↓{n}"
 hide_when_zero = true          # hide ahead/behind entirely when both are 0
 hide_when_no_upstream = true   # hide when branch has no tracked upstream (true = hide; false = render "?")
+hide_below_cells = 0           # suppress ahead/behind marker when terminal_width < N cells; 0 = never auto-hide
 ```
+
+Per-marker `hide_below_cells` thresholds let users keep the branch name visible at narrow terminals while shedding the structured tail. The `dirty` and `ahead_behind` markers each pick their own threshold: a user who cares more about tracking state than dirty state sets a higher `dirty.hide_below_cells` so the dirty marker drops first. The threshold composes multiplicatively with the existing `enabled` knob — `enabled = false` always hides; `enabled = true + hide_below_cells = 0` always shows; `enabled = true + hide_below_cells = N` shows when `terminal_width >= N`.
+
+**Scope of `hide_below_cells`.** The gate keys on `terminal_width` alone, so it fires only when the terminal itself is narrow. It does **not** fire when a wide terminal hosts a dense layout where this segment is pressured by other segments. Under that kind of layout pressure, the segment drops whole via priority because `truncatable` stays `false` (generic end-ellipsis would mangle `↑2 ↓1`). Layout-pressure compaction is a separate problem — segment-aware shedding under any pressure — tracked as a `shrink_to_fit` trait extension; once it lands, `hide_below_cells` becomes a user preference for narrow terminals while `shrink_to_fit` handles real overflow.
 
 Branch-rendering keys (`max_length`, `truncation_marker`,
 `short_sha_length`) live at the top level of `[segments.git_branch]`

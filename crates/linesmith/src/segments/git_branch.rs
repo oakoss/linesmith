@@ -44,6 +44,9 @@ pub(crate) struct Config {
     pub(crate) dirty_enabled: bool,
     pub(crate) dirty_indicator: String,
     pub(crate) clean_indicator: String,
+    /// Hide the dirty marker when `rc.terminal_width` is below this
+    /// threshold. `0` = never auto-hide.
+    pub(crate) dirty_hide_below_cells: u16,
     pub(crate) ahead_behind: AheadBehindConfig,
 }
 
@@ -55,6 +58,9 @@ pub(crate) struct AheadBehindConfig {
     pub(crate) behind_format: FormatTemplate,
     pub(crate) hide_when_zero: bool,
     pub(crate) hide_when_no_upstream: bool,
+    /// Hide the ahead/behind marker when `rc.terminal_width` is below
+    /// this threshold. `0` = never auto-hide.
+    pub(crate) hide_below_cells: u16,
 }
 
 impl Default for AheadBehindConfig {
@@ -67,6 +73,7 @@ impl Default for AheadBehindConfig {
                 .expect("DEFAULT_BEHIND_FORMAT must contain FormatTemplate::PLACEHOLDER"),
             hide_when_zero: true,
             hide_when_no_upstream: true,
+            hide_below_cells: 0,
         }
     }
 }
@@ -108,6 +115,7 @@ impl Default for Config {
             dirty_enabled: true,
             dirty_indicator: DEFAULT_DIRTY_INDICATOR.into(),
             clean_indicator: String::new(),
+            dirty_hide_below_cells: 0,
             ahead_behind: AheadBehindConfig::default(),
         }
     }
@@ -178,6 +186,9 @@ impl GitBranchSegment {
             if let Some(v) = dirty_map.get("clean_indicator").and_then(|v| v.as_str()) {
                 cfg.clean_indicator = v.to_string();
             }
+            if let Some(v) = parse_hide_below_cells(&dirty_map, "git_branch.dirty", warn) {
+                cfg.dirty_hide_below_cells = v;
+            }
         }
 
         if let Some(ab) = extras.get("ahead_behind").and_then(|v| v.as_table()) {
@@ -215,9 +226,40 @@ impl GitBranchSegment {
             ) {
                 cfg.ahead_behind.hide_when_no_upstream = v;
             }
+            if let Some(v) = parse_hide_below_cells(&ab_map, "git_branch.ahead_behind", warn) {
+                cfg.ahead_behind.hide_below_cells = v;
+            }
         }
 
         Self { cfg }
+    }
+}
+
+/// `true` when the configured threshold is set and the current
+/// terminal width is below it. Threshold `0` is the sentinel for
+/// "never auto-hide" — the marker shows at every terminal width.
+fn is_below_threshold(rc: &RenderContext, threshold: u16) -> bool {
+    threshold > 0 && rc.terminal_width < threshold
+}
+
+/// Parse a `hide_below_cells` field as a `u16` cell threshold. Returns
+/// `Some(n)` for a valid `u16`, `None` on missing key (silent), and
+/// `None` plus a warning on a malformed value — leaving the caller's
+/// existing threshold untouched rather than clearing it on a typo.
+fn parse_hide_below_cells(
+    table: &BTreeMap<String, toml::Value>,
+    scope: &str,
+    warn: &mut impl FnMut(&str),
+) -> Option<u16> {
+    let v = table.get("hide_below_cells")?;
+    match v.as_integer().and_then(|n| u16::try_from(n).ok()) {
+        Some(n) => Some(n),
+        None => {
+            warn(&format!(
+                "segments.{scope}.hide_below_cells: expected 0..=65535; ignoring"
+            ));
+            None
+        }
     }
 }
 
@@ -230,7 +272,7 @@ impl Segment for GitBranchSegment {
         SegmentDefaults::with_priority(PRIORITY)
     }
 
-    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
+    fn render(&self, ctx: &DataContext, rc: &RenderContext) -> RenderResult {
         let arc = ctx.git();
         match &*arc {
             Err(_) | Ok(None) => Ok(None),
@@ -242,7 +284,7 @@ impl Segment for GitBranchSegment {
                 Ok(None)
             }
             Ok(Some(gc)) => {
-                let text = self.assemble(gc);
+                let text = self.assemble(gc, rc);
                 if text.is_empty() {
                     return Ok(None);
                 }
@@ -253,7 +295,7 @@ impl Segment for GitBranchSegment {
 }
 
 impl GitBranchSegment {
-    fn assemble(&self, gc: &GitContext) -> String {
+    fn assemble(&self, gc: &GitContext, rc: &RenderContext) -> String {
         let mut parts: Vec<String> = Vec::new();
         if !self.cfg.icon.is_empty() {
             parts.push(self.cfg.icon.clone());
@@ -267,13 +309,15 @@ impl GitBranchSegment {
             parts.push(head);
         }
 
-        if self.cfg.dirty_enabled {
+        if self.cfg.dirty_enabled && !is_below_threshold(rc, self.cfg.dirty_hide_below_cells) {
             if let Some(marker) = self.render_dirty(gc) {
                 parts.push(marker);
             }
         }
 
-        if self.cfg.ahead_behind.enabled {
+        if self.cfg.ahead_behind.enabled
+            && !is_below_threshold(rc, self.cfg.ahead_behind.hide_below_cells)
+        {
             if let Some(marker) = self.render_ahead_behind(gc) {
                 parts.push(marker);
             }
@@ -421,7 +465,7 @@ fn truncate_middle(s: &str, max: u16, marker: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_context::{GitContext, Head, RepoKind, UpstreamState};
+    use crate::data_context::{DirtyState, GitContext, Head, RepoKind, UpstreamState};
     use crate::input::{ModelInfo, StatusContext, Tool, WorkspaceInfo};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -1035,5 +1079,143 @@ mod tests {
         // marker "[truncated]" is wider than max=3 cells. Falls back
         // to keeping the first `max` graphemes.
         assert_eq!(truncate_middle("hello-world", 3, "[truncated]"), "hel");
+    }
+
+    // --- Width-aware threshold ---
+
+    /// Build a `DataContext` with a dirty working tree and an
+    /// ahead/behind upstream so both markers fire at full width.
+    fn ctx_with_dirty_and_upstream(ahead: u32, behind: u32) -> DataContext {
+        let gc = GitContext::new(
+            RepoKind::Main,
+            PathBuf::from("/repo/.git"),
+            Head::Branch("main".into()),
+        );
+        gc.preseed_dirty_state(DirtyState::Dirty(None))
+            .expect("fresh dirty cell");
+        gc.preseed_upstream(Some(UpstreamState {
+            ahead,
+            behind,
+            upstream_branch: "origin/main".into(),
+        }))
+        .expect("fresh upstream cell");
+        let dc = DataContext::with_cwd(minimal_status(), None);
+        dc.preseed_git(Ok(Some(gc))).expect("seed");
+        dc
+    }
+
+    fn render_at(seg: &GitBranchSegment, terminal_width: u16, dc: &DataContext) -> String {
+        let rendered = seg
+            .render(dc, &RenderContext::new(terminal_width))
+            .unwrap()
+            .expect("rendered");
+        rendered.text().to_string()
+    }
+
+    #[test]
+    fn dirty_hide_below_cells_default_zero_keeps_existing_behavior() {
+        // Default config: threshold 0 means "never auto-hide". The
+        // dirty marker shows even at terminal_width=1.
+        let seg = GitBranchSegment::default();
+        let dc = ctx_with_dirty_and_upstream(0, 0);
+        assert_eq!(render_at(&seg, 1, &dc), "main *");
+        assert_eq!(render_at(&seg, 200, &dc), "main *");
+    }
+
+    #[test]
+    fn dirty_marker_hidden_when_terminal_width_below_threshold() {
+        let mut seg = GitBranchSegment::default();
+        seg.cfg.dirty_hide_below_cells = 50;
+        let dc = ctx_with_dirty_and_upstream(0, 0);
+        // Width 49: below threshold → marker hidden.
+        assert_eq!(render_at(&seg, 49, &dc), "main");
+        // Width 50 and above: not-below → marker shown.
+        assert_eq!(render_at(&seg, 50, &dc), "main *");
+        assert_eq!(render_at(&seg, 100, &dc), "main *");
+    }
+
+    #[test]
+    fn ahead_behind_hidden_when_terminal_width_below_threshold() {
+        let mut seg = GitBranchSegment::default();
+        seg.cfg.ahead_behind.hide_below_cells = 80;
+        let dc = ctx_with_dirty_and_upstream(2, 1);
+        // Width 79: below ahead/behind threshold → ahead/behind
+        // hidden. Dirty still shows (its threshold defaults to 0).
+        assert_eq!(render_at(&seg, 79, &dc), "main *");
+        // Width 80 and above: not-below → ahead/behind shown.
+        assert_eq!(render_at(&seg, 80, &dc), "main * ↑2 ↓1");
+    }
+
+    #[test]
+    fn per_marker_thresholds_compose_independently() {
+        // dirty.hide_below_cells = 50, ahead_behind.hide_below_cells = 80.
+        // Three regimes: full / no-tracking / branch-only.
+        let mut seg = GitBranchSegment::default();
+        seg.cfg.dirty_hide_below_cells = 50;
+        seg.cfg.ahead_behind.hide_below_cells = 80;
+        let dc = ctx_with_dirty_and_upstream(2, 1);
+        assert_eq!(render_at(&seg, 100, &dc), "main * ↑2 ↓1"); // full
+        assert_eq!(render_at(&seg, 60, &dc), "main *"); // no tracking
+        assert_eq!(render_at(&seg, 40, &dc), "main"); // branch only
+    }
+
+    #[test]
+    fn enabled_false_overrides_hide_below_cells() {
+        // `dirty.enabled = false` always hides, regardless of threshold.
+        let mut seg = GitBranchSegment::default();
+        seg.cfg.dirty_enabled = false;
+        seg.cfg.dirty_hide_below_cells = 50;
+        let dc = ctx_with_dirty_and_upstream(0, 0);
+        // Wide terminal, threshold satisfied — but still hidden.
+        assert_eq!(render_at(&seg, 200, &dc), "main");
+    }
+
+    #[test]
+    fn from_extras_reads_dirty_hide_below_cells() {
+        let mut dirty = toml::value::Table::new();
+        dirty.insert("hide_below_cells".to_string(), toml::Value::Integer(60));
+        let extras = BTreeMap::from([("dirty".to_string(), toml::Value::Table(dirty))]);
+        let seg = GitBranchSegment::from_extras(&extras, &mut |_| {});
+        assert_eq!(seg.cfg.dirty_hide_below_cells, 60);
+    }
+
+    #[test]
+    fn from_extras_reads_ahead_behind_hide_below_cells() {
+        let mut ab = toml::value::Table::new();
+        ab.insert("hide_below_cells".to_string(), toml::Value::Integer(90));
+        let extras = BTreeMap::from([("ahead_behind".to_string(), toml::Value::Table(ab))]);
+        let seg = GitBranchSegment::from_extras(&extras, &mut |_| {});
+        assert_eq!(seg.cfg.ahead_behind.hide_below_cells, 90);
+    }
+
+    #[test]
+    fn ahead_behind_hide_when_zero_and_hide_below_cells_compose_multiplicatively() {
+        // The two gates live in different layers: `hide_below_cells`
+        // short-circuits in `assemble`, while `hide_when_zero` checks
+        // counts inside `render_ahead_behind`. Either gate firing
+        // hides the marker. Pin both branches so a refactor that
+        // collapses them can't silently drop one path.
+        let mut seg = GitBranchSegment::default();
+        seg.cfg.ahead_behind.hide_below_cells = 80;
+        // Width gate fires first (counts non-zero, but width < 80).
+        let dc_diverged = ctx_with_dirty_and_upstream(2, 1);
+        assert_eq!(render_at(&seg, 79, &dc_diverged), "main *");
+        // Counts gate fires (width >= 80, but ahead == 0 && behind == 0
+        // and hide_when_zero defaults to true).
+        let dc_zero = ctx_with_dirty_and_upstream(0, 0);
+        assert_eq!(render_at(&seg, 100, &dc_zero), "main *");
+    }
+
+    #[test]
+    fn from_extras_warns_on_negative_hide_below_cells_and_keeps_default() {
+        let mut dirty = toml::value::Table::new();
+        dirty.insert("hide_below_cells".to_string(), toml::Value::Integer(-5));
+        let extras = BTreeMap::from([("dirty".to_string(), toml::Value::Table(dirty))]);
+        let mut warnings = vec![];
+        let seg = GitBranchSegment::from_extras(&extras, &mut |m| warnings.push(m.to_string()));
+        assert_eq!(seg.cfg.dirty_hide_below_cells, 0);
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("segments.git_branch.dirty.hide_below_cells")));
     }
 }

@@ -193,6 +193,13 @@ impl GitContext {
         self.upstream.set(Arc::new(value))
     }
 
+    /// Pre-populate the `dirty` OnceCell with an explicit value,
+    /// bypassing the real scan. Same `OnceCell::set` semantics as
+    /// [`Self::preseed_upstream`].
+    pub fn preseed_dirty_state(&self, value: DirtyState) -> Result<(), Arc<DirtyState>> {
+        self.dirty.set(Arc::new(value))
+    }
+
     /// Upstream-tracking state, scanned lazily on first access.
     ///
     /// Returns `Arc<None>` in five distinct cases:

@@ -708,6 +708,24 @@ mod tests {
     }
 
     #[test]
+    fn git_branch_allows_per_marker_hide_below_cells_without_warning() {
+        // `[segments.git_branch.dirty]` and `.ahead_behind` are
+        // pass-through sub-tables, so per-marker `hide_below_cells`
+        // reaches `from_extras` instead of tripping the unknown-key
+        // validator.
+        let warnings = collect_warnings(
+            r#"
+                [segments.git_branch.dirty]
+                hide_below_cells = 50
+
+                [segments.git_branch.ahead_behind]
+                hide_below_cells = 80
+            "#,
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
     fn rate_limit_percent_segments_allow_format_and_invert_without_warning() {
         let warnings = collect_warnings(
             r#"

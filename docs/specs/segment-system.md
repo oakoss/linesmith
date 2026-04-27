@@ -415,7 +415,7 @@ Per [`docs/ideas/0001-feature-parity-matrix.md`](../ideas/0001-feature-parity-ma
 4. `cost`: session cost in USD
 5. `duration`: session duration
 6. `workspace`: directory / worktree hybrid
-7. `git_branch`: branch + dirty + ahead/behind (sub-composed)
+7. `git_branch`: branch + dirty + ahead/behind (sub-composed). Per-marker `[segments.git_branch.dirty].hide_below_cells` and `[segments.git_branch.ahead_behind].hide_below_cells` knobs shed markers on narrow terminals (default `0` = never auto-hide; pair with `enabled = false` for unconditional hide). The threshold keys on `rc.terminal_width` only, so it fires when the terminal itself is small — **not** when a wide terminal hosts a dense layout where neighboring segments pressure this one. Layout-pressure compaction (shedding markers under any pressure, regardless of terminal size) is tracked separately as a `shrink_to_fit` trait extension; it composes with the existing knob (the threshold becomes a user preference for narrow terminals while `shrink_to_fit` handles real overflow). Generic end-ellipsis truncation isn't safe (the structured tail would be mangled), so `truncatable` stays `false` and further pressure drops the segment whole via priority until that follow-up lands.
 8. `rate_limit_5h`: 5-hour percentage + resets-at countdown
 9. `rate_limit_7d`: 7-day percentage + resets-at countdown
 10. `rate_limit`: combined 5h/7d view; sub-composed from `rate_limit_5h` and `rate_limit_7d` with a tighter layout (users pick either the combined form or the individual segments, not both)
