@@ -145,7 +145,7 @@ timeout = 2
 [segments.context_window]
 style = "role:primary bold"
 format = "{pct}% · {size}" # segment-specific format string
-priority = 32             # lower = more likely to be dropped
+priority = 32             # higher = more likely to be dropped (255 first; 0 never drops)
 
 [segments.context_bar]
 cells = 10                # bar width in terminal cells (default 10)
