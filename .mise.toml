@@ -6,6 +6,7 @@ node = "25.9.0"
 lefthook = "2.1.5"
 "cargo:cocogitto" = "7"
 shellcheck = "0.11.0"
+hyperfine = "1.20.0"
 
 [tasks.fmt]
 description = "Format all non-Rust files"
@@ -65,6 +66,35 @@ run = ["mise run cargo:test", "mise run cargo:test:doc"]
 [tasks.bench]
 description = "Run all benchmarks"
 depends = ["cargo:bench"]
+
+# End-to-end cold-start measurement: defends the README's `<20ms` claim
+# at the level a Claude Code user actually feels — process spawn + ELF
+# load + static init + render → stdout. Different signal from the
+# in-process Criterion benches (`cargo:bench`), which post-spawn only.
+#
+# `cwd` is set to a fresh `git init` tempdir (not the caller's checkout)
+# so the number doesn't drift with whatever's dirty in the developer's
+# tree. Binary path resolves the `.exe` suffix on Windows so contributors
+# on bash/Git-Bash see the same task work cross-platform.
+[tasks."bench:cold-start"]
+description = "Measure end-to-end cold-start wall-clock via hyperfine"
+run = '''
+set -euo pipefail
+cargo build --release --locked -p linesmith
+bin="$(pwd)/target/release/linesmith"
+[ "${OS:-}" = "Windows_NT" ] && bin="${bin}.exe"
+fixture="$(pwd)/crates/linesmith/tests/fixtures/claude_worktree.json"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+(cd "$tmp" && git init -q)
+cd "$tmp"
+hyperfine \
+  --warmup 3 \
+  --runs 30 \
+  --shell=none \
+  --input "$fixture" \
+  "$bin"
+'''
 
 [tasks.check]
 description = "Run all checks (format + lint + Rust)"

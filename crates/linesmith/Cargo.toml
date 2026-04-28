@@ -44,3 +44,7 @@ path = "src/main.rs"
 [[bench]]
 name = "plugins"
 harness = false
+
+[[bench]]
+name = "render"
+harness = false

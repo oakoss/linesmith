@@ -68,12 +68,12 @@ pub fn run_with_segments_and_width(
 ) -> io::Result<()> {
     // `cwd: None` — callers that want gix discovery go through
     // `run_with_context` with a populated RunContext.
-    let ctx = RunContext {
-        theme: theme::default_theme(),
-        capability: theme::Capability::None,
+    let ctx = RunContext::new(
+        theme::default_theme(),
+        theme::Capability::None,
         terminal_width,
-        cwd: None,
-    };
+        None,
+    );
     run_with_context(reader, writer, &mut io::stderr().lock(), segments, &ctx)
 }
 
@@ -95,6 +95,32 @@ pub struct RunContext<'a> {
     pub capability: theme::Capability,
     pub terminal_width: u16,
     pub cwd: Option<std::path::PathBuf>,
+}
+
+impl<'a> RunContext<'a> {
+    /// Build a `RunContext`. The struct is `#[non_exhaustive]` so
+    /// struct-literal construction is blocked downstream; benches,
+    /// out-of-tree embedders, and in-crate call sites all go through
+    /// this constructor so future field additions touch one site.
+    ///
+    /// `terminal_width` is forwarded as-is. The layout engine treats
+    /// `0` as "no budget" and drops every droppable segment; callers
+    /// that want a default should use `detect_terminal_width` or
+    /// `DEFAULT_TERMINAL_WIDTH` instead of relying on the sentinel.
+    #[must_use]
+    pub fn new(
+        theme: &'a theme::Theme,
+        capability: theme::Capability,
+        terminal_width: u16,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Self {
+        Self {
+            theme,
+            capability,
+            terminal_width,
+            cwd,
+        }
+    }
 }
 
 /// Full-control entry with injected stderr and explicit run context.

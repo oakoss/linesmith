@@ -97,6 +97,13 @@ Built-in segments available in v0.1.0: `model`, `workspace`, `context_window`, `
 
 Custom segments via [rhai](https://rhai.rs/) scripts dropped in `~/.config/linesmith/segments/` are on the roadmap (see `lsm-ewa`); v0.1 ships the runtime scaffolding without the loader wired up.
 
+## How fast
+
+linesmith targets `<20ms` per invocation, end-to-end from process spawn to rendered stdout. Two complementary measurements cover that:
+
+- **End-to-end wall-clock**: `mise run bench:cold-start` runs [hyperfine](https://github.com/sharkdp/hyperfine) against the release binary with a real fixture payload on stdin. Captures the user-perceived signal — process spawn + ELF load + crate-level static init + render. Run on demand against any local build.
+- **Render-path regression detector**: `mise run bench` (Criterion, `crates/linesmith/benches/render.rs`) measures the post-spawn render hot path in three configurations (minimal / default preset / all built-ins minus segments with `DataDep::Usage`). Local-only — runner variance on GitHub-hosted CI overwhelms the regression delta worth catching, so this isn't gated automatically. See [`docs/research/perf-benchmarking-survey.md`](docs/research/perf-benchmarking-survey.md) for the rationale and the v0.2+ candidate (CodSpeed) for managed bare-metal CI gating.
+
 ## Documentation
 
 | Folder                             | Contents                                                                                                                  |

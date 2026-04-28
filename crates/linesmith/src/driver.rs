@@ -427,12 +427,7 @@ fn run_cli(
     let width = raw_width.saturating_sub(padding);
     let theme_ref = resolve_theme(cfg.as_ref(), &registry, stderr);
     let capability = resolve_color_capability(args.color_override, env, cfg.as_ref());
-    let ctx = RunContext {
-        theme: theme_ref,
-        capability,
-        terminal_width: width,
-        cwd: env.cwd.clone(),
-    };
+    let ctx = RunContext::new(theme_ref, capability, width, env.cwd.clone());
     if let Err(err) = run_with_context(stdin, stdout, stderr, &segments, &ctx) {
         let _ = writeln!(stderr, "linesmith: {err}");
         return 1;
