@@ -165,6 +165,55 @@ impl Style {
     }
 }
 
+/// Text + style emitted by the layout engine. The flat run sequence is
+/// what [`crate::layout::render_to_runs`] returns: one run per segment
+/// plus one run per non-empty inter-segment separator. Consumers map
+/// runs to their target surface — ANSI SGR for terminal stdout,
+/// ratatui `Span` for the TUI preview pane — without re-parsing
+/// escape sequences.
+///
+/// Fields are `pub(crate)` so external callers go through
+/// [`StyledRun::new`] and the accessors; this mirrors
+/// [`crate::segments::RenderedSegment`] and keeps room to enforce
+/// text-content invariants later without a SemVer break.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StyledRun {
+    pub(crate) text: String,
+    pub(crate) style: Style,
+}
+
+impl StyledRun {
+    /// Build a run from `text` and `style`. Out-of-tree consumers of
+    /// [`crate::layout::runs_to_ansi`] go through this so future
+    /// invariants (escape-sequence rejection, width caching) can
+    /// land without breaking them.
+    ///
+    /// Today the constructor performs no validation; sanitizing
+    /// untrusted text is the segment's responsibility (see
+    /// [`crate::segments::RenderedSegment::new`]).
+    #[must_use]
+    pub fn new(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            style,
+        }
+    }
+
+    /// The run's text. Map directly to a target surface (ratatui
+    /// `Span`, ANSI SGR pair, etc.).
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The run's style. Returned by value since `Style` is `Copy`.
+    #[must_use]
+    pub fn style(&self) -> Style {
+        self.style
+    }
+}
+
 /// Terminal color capability detected from the environment. Truecolor
 /// is preferred when available; `None` strips all color and keeps only
 /// decorations.

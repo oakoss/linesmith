@@ -11,7 +11,7 @@ use crate::data_context::DataContext;
 use crate::segments::{
     text_width, RenderContext, RenderedSegment, Segment, SegmentDefaults, Separator, WidthBounds,
 };
-use crate::theme::{self, Capability, Theme};
+use crate::theme::{self, Capability, Style, StyledRun, Theme};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Render `segments` for `ctx` within `terminal_width` cells. Returns the
@@ -39,6 +39,10 @@ pub fn render(segments: &[Box<dyn Segment>], ctx: &DataContext, terminal_width: 
 /// and `capability`. Used by [`crate::run_with_context`] so `cli_main`
 /// tests can capture segment errors alongside exit codes while the
 /// render path picks up theme colors.
+///
+/// Thin wrapper over [`render_to_runs`] + [`runs_to_ansi`]; same
+/// layout, same bytes. Callers that need the styled-run form (e.g.
+/// the TUI preview pane) call [`render_to_runs`] directly.
 #[must_use]
 pub fn render_with_warn(
     segments: &[Box<dyn Segment>],
@@ -48,9 +52,56 @@ pub fn render_with_warn(
     theme: &Theme,
     capability: Capability,
 ) -> String {
+    let runs = render_to_runs(segments, ctx, terminal_width, warn);
+    runs_to_ansi(&runs, theme, capability)
+}
+
+/// Render `segments` into a flat [`StyledRun`] sequence. One run per
+/// surviving segment, plus one run per non-empty inter-segment
+/// separator (in render order). Layout decisions — priority-drop,
+/// `shrink_to_fit`, truncatable reflow, width-bound truncation —
+/// match [`render`] / [`render_with_warn`] exactly; only the emit
+/// form differs.
+///
+/// `Separator::None` between segments contributes no run; it would
+/// be an empty-text run with no consumer use. Separator runs carry
+/// [`Style::default`]; separators inherit no styling from their
+/// flanking segments.
+///
+/// Segment render errors and `Ok(None)` go through `warn` exactly as
+/// in the ANSI path; the run sequence reflects only segments that
+/// survived to the layout pass.
+#[must_use]
+pub fn render_to_runs(
+    segments: &[Box<dyn Segment>],
+    ctx: &DataContext,
+    terminal_width: u16,
+    warn: &mut dyn FnMut(&str),
+) -> Vec<StyledRun> {
     let rc = RenderContext::new(terminal_width);
     let items = collect_items_with(segments, ctx, &rc, warn);
-    render_items(items, ctx, &rc, terminal_width, theme, capability)
+    let laid_out = apply_layout(items, ctx, &rc, terminal_width);
+    items_to_runs(&laid_out)
+}
+
+/// Emit a flat [`StyledRun`] sequence as an ANSI SGR-wrapped string
+/// suitable for terminal stdout. Each run with non-empty styling gets
+/// its own `sgr_open` / `sgr_reset` pair so decorations don't leak
+/// across boundaries; plain runs pass through unwrapped.
+#[must_use]
+pub fn runs_to_ansi(runs: &[StyledRun], theme: &Theme, capability: Capability) -> String {
+    let mut out = String::new();
+    for run in runs {
+        let open = theme::sgr_open(&run.style, theme, capability);
+        if open.is_empty() {
+            out.push_str(&run.text);
+        } else {
+            out.push_str(&open);
+            out.push_str(&run.text);
+            out.push_str(theme::sgr_reset());
+        }
+    }
+    out
 }
 
 /// Rendered output paired with the defaults needed to place it (priority,
@@ -90,14 +141,15 @@ fn collect_items_with<'a>(
         .collect()
 }
 
-fn render_items(
-    mut items: Vec<Item<'_>>,
+/// Pure layout pass — no styling, no emission. Runs the
+/// priority-drop / shrink / reflow loop and returns surviving items
+/// in render order.
+fn apply_layout<'a>(
+    mut items: Vec<Item<'a>>,
     ctx: &DataContext,
     rc: &RenderContext,
     terminal_width: u16,
-    theme: &Theme,
-    capability: Capability,
-) -> String {
+) -> Vec<Item<'a>> {
     let budget = u32::from(terminal_width);
     loop {
         let total = total_width(&items);
@@ -130,23 +182,48 @@ fn render_items(
         }
         items.remove(drop_idx);
     }
+    items
+}
 
-    let mut out = String::new();
+/// Test-only helper that mirrors `render_with_warn`'s compose order.
+/// Lets unit tests build `Item` literals directly without restating
+/// the layout-then-emit dance per case.
+#[cfg(test)]
+fn render_items(
+    items: Vec<Item<'_>>,
+    ctx: &DataContext,
+    rc: &RenderContext,
+    terminal_width: u16,
+    theme: &Theme,
+    capability: Capability,
+) -> String {
+    let laid_out = apply_layout(items, ctx, rc, terminal_width);
+    let runs = items_to_runs(&laid_out);
+    runs_to_ansi(&runs, theme, capability)
+}
+
+/// Flatten step for [`render_to_runs`]: see that function for the
+/// emit contract. Separator runs carry [`Style::default`];
+/// `Separator::None` is filtered here so consumers don't see
+/// empty-text runs.
+fn items_to_runs(items: &[Item<'_>]) -> Vec<StyledRun> {
+    let mut runs = Vec::with_capacity(items.len().saturating_mul(2));
     for (i, item) in items.iter().enumerate() {
-        let style = &item.rendered.style;
-        let open = theme::sgr_open(style, theme, capability);
-        if !open.is_empty() {
-            out.push_str(&open);
-            out.push_str(&item.rendered.text);
-            out.push_str(theme::sgr_reset());
-        } else {
-            out.push_str(&item.rendered.text);
-        }
+        runs.push(StyledRun {
+            text: item.rendered.text.clone(),
+            style: item.rendered.style,
+        });
         if i + 1 < items.len() {
-            out.push_str(effective_separator(item).text());
+            let sep_text = effective_separator(item).text();
+            if !sep_text.is_empty() {
+                runs.push(StyledRun {
+                    text: sep_text.to_string(),
+                    style: Style::default(),
+                });
+            }
         }
     }
-    out
+    runs
 }
 
 /// Sum of segment widths plus the separators that sit *between* segments
@@ -1098,5 +1175,219 @@ mod tests {
         // No "…" appears because shrink_to_fit ran first.
         assert!(line.contains("longprefix"), "got {line:?}");
         assert!(!line.contains('…'), "no end-ellipsis: {line:?}");
+    }
+
+    // --- render_to_runs ---------------------------------------------------
+
+    #[test]
+    fn render_to_runs_empty_input_yields_no_runs() {
+        let segments: Vec<Box<dyn Segment>> = vec![];
+        let runs = render_to_runs(&segments, &empty_ctx(), 100, &mut |_| {});
+        assert!(runs.is_empty());
+    }
+
+    #[test]
+    fn render_to_runs_emits_segment_then_separator_then_segment() {
+        // Neither segment requested a role, so all three emitted runs
+        // carry Style::default().
+        let segments: Vec<Box<dyn Segment>> = vec![
+            Box::new(StubSegment(Ok(Some(RenderedSegment::new("a"))))),
+            Box::new(StubSegment(Ok(Some(RenderedSegment::new("b"))))),
+        ];
+        let runs = render_to_runs(&segments, &empty_ctx(), 100, &mut |_| {});
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].text, "a");
+        assert_eq!(runs[0].style, Style::default());
+        assert_eq!(runs[1].text, " ");
+        assert_eq!(runs[1].style, Style::default());
+        assert_eq!(runs[2].text, "b");
+        assert_eq!(runs[2].style, Style::default());
+    }
+
+    #[test]
+    fn render_to_runs_preserves_segment_style() {
+        // The styled segment's role lands on its run unchanged; the
+        // TUI consumer maps role → ratatui Color, so anything dropped
+        // here would silently break themed preview.
+        use crate::theme::Role;
+        let segments: Vec<Box<dyn Segment>> = vec![
+            Box::new(StubSegment(Ok(Some(RenderedSegment::new("plain"))))),
+            Box::new(StubSegment(Ok(Some(
+                RenderedSegment::new("warn").with_role(Role::Warning),
+            )))),
+        ];
+        let runs = render_to_runs(&segments, &empty_ctx(), 100, &mut |_| {});
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[2].text, "warn");
+        assert_eq!(runs[2].style.role, Some(Role::Warning));
+    }
+
+    #[test]
+    fn render_to_runs_skips_separator_none_between_segments() {
+        // `Separator::None` is "no gap"; the runs view skips it
+        // entirely so consumers don't have to filter empty-text runs.
+        let segments: Vec<Box<dyn Segment>> = vec![
+            Box::new(StubSegment(Ok(Some(RenderedSegment::with_separator(
+                "a",
+                Separator::None,
+            ))))),
+            Box::new(StubSegment(Ok(Some(RenderedSegment::new("b"))))),
+        ];
+        let runs = render_to_runs(&segments, &empty_ctx(), 100, &mut |_| {});
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].text, "a");
+        assert_eq!(runs[1].text, "b");
+    }
+
+    #[test]
+    fn render_to_runs_drops_segments_under_width_pressure() {
+        // The runs view reflects post-layout state: dropped segments
+        // produce no run, and the separator that would have followed
+        // a dropped segment also vanishes.
+        let segments: Vec<Box<dyn Segment>> = vec![
+            Box::new(StubSegment(Ok(Some(
+                RenderedSegment::new("keep").with_role(crate::theme::Role::Primary),
+            )))),
+            Box::new(DroppableStub("droppable")),
+            Box::new(StubSegment(Ok(Some(RenderedSegment::new("anchor"))))),
+        ];
+        // Total: 4 + 1 + 9 + 1 + 6 = 21. Budget 12 forces the
+        // priority-200 middle segment to drop.
+        let runs = render_to_runs(&segments, &empty_ctx(), 12, &mut |_| {});
+        let texts: Vec<&str> = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(texts, vec!["keep", " ", "anchor"]);
+    }
+
+    /// Build a styled multi-segment layout for round-trip tests:
+    /// roled segments + a plain literal in the middle so both styled
+    /// and unstyled run paths are exercised.
+    fn round_trip_segments() -> Vec<Box<dyn Segment>> {
+        use crate::theme::Role;
+        vec![
+            Box::new(StubSegment(Ok(Some(
+                RenderedSegment::new("ctx").with_role(Role::Info),
+            )))),
+            Box::new(StubSegment(Ok(Some(RenderedSegment::new("|"))))),
+            Box::new(StubSegment(Ok(Some(
+                RenderedSegment::new("err").with_role(Role::Error),
+            )))),
+        ]
+    }
+
+    fn round_trip_assert(terminal_width: u16, capability: theme::Capability) {
+        let segments = round_trip_segments();
+        let direct = render_with_warn(
+            &segments,
+            &empty_ctx(),
+            terminal_width,
+            &mut |_| {},
+            theme::default_theme(),
+            capability,
+        );
+        let runs = render_to_runs(&segments, &empty_ctx(), terminal_width, &mut |_| {});
+        let recomposed = runs_to_ansi(&runs, theme::default_theme(), capability);
+        assert_eq!(
+            direct, recomposed,
+            "cap={capability:?} width={terminal_width}"
+        );
+    }
+
+    #[test]
+    fn render_to_runs_then_runs_to_ansi_matches_render_with_warn() {
+        // Round-trip pin: `render_to_runs` → `runs_to_ansi` must match
+        // `render_with_warn` byte-for-byte. The contract that lets
+        // `render_with_warn` stay a thin wrapper.
+        round_trip_assert(100, theme::Capability::Palette16);
+    }
+
+    #[test]
+    fn render_to_runs_round_trip_holds_under_capability_none() {
+        // No-color path: every run goes through the `open.is_empty()`
+        // branch in `runs_to_ansi`. A future change to `sgr_open`
+        // returning a non-empty string for `Capability::None` would
+        // silently leak escapes; this pins it.
+        round_trip_assert(100, theme::Capability::None);
+    }
+
+    #[test]
+    fn render_to_runs_round_trip_holds_under_width_pressure() {
+        // Width pressure forces `apply_layout` to drop a segment;
+        // both emit paths must produce the same post-drop output.
+        // `round_trip_segments` totals 9 cells; budget 5 drops the
+        // rightmost priority-128 tie ("err"), leaving "ctx |".
+        round_trip_assert(5, theme::Capability::Palette16);
+    }
+
+    #[test]
+    fn render_to_runs_with_one_survivor_emits_no_trailing_separator() {
+        // Drop pressure leaves a single segment. The `i + 1 < items.len()`
+        // guard in `items_to_runs` must suppress the trailing separator;
+        // otherwise the runs view ends with a stray " " run.
+        let segments: Vec<Box<dyn Segment>> = vec![
+            Box::new(StubSegment(Ok(Some(RenderedSegment::new("a"))))),
+            Box::new(DroppableStub("droppable")),
+        ];
+        // Total: 1 + 1 + 9 = 11. Budget 1 drops the priority-200
+        // segment; "a" survives alone with no trailing separator.
+        let runs = render_to_runs(&segments, &empty_ctx(), 1, &mut |_| {});
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].text, "a");
+    }
+
+    #[test]
+    fn render_to_runs_emits_literal_separator_with_default_style() {
+        // `Separator::Literal(" | ")` from the segment's defaults
+        // becomes a separator run with that exact text and
+        // Style::default() — separators don't inherit segment styling.
+        struct PipeSepSegment;
+        impl Segment for PipeSepSegment {
+            fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+                Ok(Some(
+                    RenderedSegment::new("a").with_role(crate::theme::Role::Warning),
+                ))
+            }
+            fn defaults(&self) -> SegmentDefaults {
+                SegmentDefaults::with_priority(10)
+                    .with_default_separator(Separator::Literal(Cow::Borrowed(" | ")))
+            }
+        }
+        let segments: Vec<Box<dyn Segment>> = vec![
+            Box::new(PipeSepSegment),
+            Box::new(StubSegment(Ok(Some(RenderedSegment::new("b"))))),
+        ];
+        let runs = render_to_runs(&segments, &empty_ctx(), 100, &mut |_| {});
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[1].text, " | ");
+        assert_eq!(runs[1].style, Style::default());
+    }
+
+    #[test]
+    fn runs_to_ansi_capability_none_emits_unwrapped_text() {
+        // Pin the no-color emit path independent of layout: a run
+        // with a styled role + Capability::None must produce zero
+        // ANSI escapes. Catches a regression where `sgr_open` would
+        // start emitting decoration codes for the no-color tier.
+        use crate::theme::Role;
+        let runs = vec![
+            StyledRun::new("plain", Style::default()),
+            StyledRun::new(" ", Style::default()),
+            StyledRun::new("warn", Style::role(Role::Warning)),
+        ];
+        let out = runs_to_ansi(&runs, theme::default_theme(), theme::Capability::None);
+        assert_eq!(out, "plain warn");
+        assert!(!out.contains('\x1b'), "unexpected ANSI escape: {out:?}");
+    }
+
+    /// Stub for the drop-under-pressure run test: priority-200 so it
+    /// becomes the layout's first drop target. `StubSegment`'s default
+    /// priority (128) wouldn't be eligible against the anchors.
+    struct DroppableStub(&'static str);
+    impl Segment for DroppableStub {
+        fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+            Ok(Some(RenderedSegment::new(self.0)))
+        }
+        fn defaults(&self) -> SegmentDefaults {
+            SegmentDefaults::with_priority(200)
+        }
     }
 }
