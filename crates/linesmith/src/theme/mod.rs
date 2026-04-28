@@ -3,15 +3,23 @@
 //! based on the terminal's detected capability. Full contract in
 //! `docs/specs/theming.md`.
 //!
-//! What's here today: Role / Color / Style / Theme types, capability
-//! detection, truecolor→256→16 downgrade, and two built-ins (`default`,
-//! `minimal`). TOML theme files, style-string syntax, and the
-//! Catppuccin flavors are documented in the spec and ship separately.
+//! Built-ins compiled in: `default` (Palette16, terminal-default
+//! anchor), `minimal` (decoration-only), the four Catppuccin flavors,
+//! plus Dracula, Nord, Gruvbox, Tokyo Night, and Rose Pine. User
+//! themes load from `~/.config/linesmith/themes/*.toml` via
+//! [`user::ThemeRegistry`].
 
 use std::fmt::Write;
 
 mod catppuccin;
+mod default;
+mod dracula;
+mod gruvbox;
+mod minimal;
+mod nord;
+mod rose_pine;
 pub mod style_syntax;
+mod tokyo_night;
 pub mod user;
 
 pub use style_syntax::{parse_style, StyleParseError};
@@ -369,34 +377,21 @@ impl Theme {
 /// Built-in themes. `default` fully populates base roles so
 /// `Theme::color`'s fallback loop never returns `NoColor` for it;
 /// `minimal` leaves every role unset so everything falls through to
-/// `NoColor`, forcing decoration-only output.
+/// `NoColor`, forcing decoration-only output. The rest are popular
+/// curated palettes shipped per the v0.1 vision (#3 — preset
+/// onboarding).
 const BUILTIN_THEMES: &[Theme] = &[
-    Theme {
-        name: "default",
-        // Palette16 values render on every terminal without needing
-        // runtime downgrade; user themes use TrueColor and pay for it.
-        colors: {
-            let mut c = [None; Role::COUNT];
-            c[Role::Foreground as usize] = Some(Color::Palette16(AnsiColor::BrightWhite));
-            c[Role::Background as usize] = Some(Color::NoColor);
-            c[Role::Muted as usize] = Some(Color::Palette16(AnsiColor::BrightBlack));
-            c[Role::Primary as usize] = Some(Color::Palette16(AnsiColor::BrightMagenta));
-            c[Role::Accent as usize] = Some(Color::Palette16(AnsiColor::BrightBlue));
-            c[Role::Success as usize] = Some(Color::Palette16(AnsiColor::BrightGreen));
-            c[Role::Warning as usize] = Some(Color::Palette16(AnsiColor::BrightYellow));
-            c[Role::Error as usize] = Some(Color::Palette16(AnsiColor::BrightRed));
-            c[Role::Info as usize] = Some(Color::Palette16(AnsiColor::BrightCyan));
-            c
-        },
-    },
-    Theme {
-        name: "minimal",
-        colors: [None; Role::COUNT],
-    },
+    default::DEFAULT,
+    minimal::MINIMAL,
     catppuccin::LATTE,
     catppuccin::FRAPPE,
     catppuccin::MACCHIATO,
     catppuccin::MOCHA,
+    dracula::DRACULA,
+    nord::NORD,
+    gruvbox::GRUVBOX,
+    tokyo_night::TOKYO_NIGHT,
+    rose_pine::ROSE_PINE,
 ];
 
 /// Look up a built-in theme by name. Unknown names return `None` so
@@ -763,6 +758,53 @@ mod tests {
         let names: Vec<&str> = builtin_names().collect();
         assert!(names.contains(&"default"));
         assert!(names.contains(&"minimal"));
+    }
+
+    #[test]
+    fn builtin_names_lists_all_curated_presets() {
+        // Pin the v0.1 preset pack: a regression that drops one of
+        // these from BUILTIN_THEMES would hide a user-visible theme
+        // from `linesmith themes list` and the future TUI picker.
+        // The count check ratchets — adding a new theme must update
+        // both the membership list and the count, forcing deliberate
+        // review.
+        let names: Vec<&str> = builtin_names().collect();
+        for theme in ["dracula", "nord", "gruvbox", "tokyo-night", "rose-pine"] {
+            assert!(names.contains(&theme), "missing {theme} in builtin_names");
+        }
+        assert_eq!(
+            builtin_names().count(),
+            11,
+            "BUILTIN_THEMES count drift: default + minimal + 4 catppuccin + 5 curated = 11"
+        );
+    }
+
+    #[test]
+    fn every_curated_preset_maps_every_base_role() {
+        // Contract: no curated preset leaves a base role unmapped. A
+        // typo dropping `c[Role::Warning as usize] = ...` from any
+        // theme module would silently leave `NoColor` in production
+        // for that role; this test catches it. Mirrors
+        // `catppuccin::tests::every_flavor_maps_every_base_role`.
+        for name in ["dracula", "nord", "gruvbox", "tokyo-night", "rose-pine"] {
+            let t = built_in(name).expect(name);
+            for role in [
+                Role::Foreground,
+                Role::Background,
+                Role::Muted,
+                Role::Primary,
+                Role::Accent,
+                Role::Success,
+                Role::Warning,
+                Role::Error,
+                Role::Info,
+            ] {
+                assert!(
+                    !matches!(t.color(role), Color::NoColor),
+                    "{name} left {role:?} as NoColor"
+                );
+            }
+        }
     }
 
     // --- Downgrade ---

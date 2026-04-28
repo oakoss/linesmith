@@ -218,12 +218,33 @@ Per `docs/ideas/0001-feature-parity-matrix.md`:
 
 - `default`: neutral, terminal-default colors (uses 16-color palette only) — **shipped**
 - `minimal`: no colors, just bold / dim / italic — **shipped**
-- `catppuccin-latte` — deferred; lands alongside the rest of the Catppuccin set
-- `catppuccin-frappe` — deferred
-- `catppuccin-macchiato` — deferred
-- `catppuccin-mocha` — deferred
+- Catppuccin: `catppuccin-latte`, `catppuccin-frappe`, `catppuccin-macchiato`, `catppuccin-mocha` — **shipped** (palette via `catppuccin` crate)
+- `dracula` — **shipped** (palette per [draculatheme.com](https://draculatheme.com/contribute))
+- `nord` — **shipped** (palette per [nordtheme.com](https://www.nordtheme.com/docs/colors-and-palettes))
+- `gruvbox` — **shipped** (palette per [morhetz/gruvbox](https://github.com/morhetz/gruvbox); dark medium variant)
+- `tokyo-night` — **shipped** (palette per [folke/tokyonight.nvim](https://github.com/folke/tokyonight.nvim); Storm variant)
+- `rose-pine` — **shipped** (palette per [rosepinetheme.com](https://rosepinetheme.com/palette/); main flavor)
 
-All compile into the binary. User themes override built-ins of the same name. Config files that reference a not-yet-shipped name emit a stderr warning and fall back to `default`.
+All compile into the binary. User themes override built-ins of the same name. Config files that reference an unknown name emit a stderr warning and fall back to `default`.
+
+#### Curated-preset role mappings
+
+Each curated theme maps the full `Role` enum. Common conventions:
+
+| Role      | Convention                                                   |
+| --------- | ------------------------------------------------------------ |
+| `primary` | The theme's brand accent (Dracula → Pink, Nord → nord8)      |
+| `accent`  | Secondary accent (typically blue/cyan-leaning)               |
+| `success` | Green, where the palette has one                             |
+| `warning` | Yellow / gold                                                |
+| `error`   | Red                                                          |
+| `info`    | Cyan / teal                                                  |
+| `muted`   | Comment-tier color (de-emphasized text)                      |
+| `surface` | Elevated background (current-line / surface tier)            |
+| `border`  | Subtle divider                                               |
+| `*_dim`   | Left unset; `Theme::color`'s fallback chain resolves to base |
+
+Rose Pine's palette has no green; Foam (cyan-teal) covers both Success and Info, matching what Rose-Pine-themed UIs do upstream rather than minting an off-palette green. Pinned by a per-theme test.
 
 ### Catppuccin integration
 
@@ -233,6 +254,19 @@ linesmith targets inclusion on the [Catppuccin integration list](https://github.
 - Colors match the official Catppuccin palette exactly (sourced from `catppuccin` Rust crate)
 - README documents how to switch flavors
 - We maintain theme files under the Catppuccin license/attribution
+
+### Theme attributions
+
+Color hex values are facts and not copyrightable, but we credit each upstream source per project convention. Module-level docs in `crates/linesmith/src/theme/<name>.rs` carry the same attribution inline.
+
+| Theme       | Upstream                                                                    | License    |
+| ----------- | --------------------------------------------------------------------------- | ---------- |
+| Catppuccin  | [`catppuccin`](https://github.com/catppuccin/catppuccin) (via Rust crate)   | MIT        |
+| Dracula     | [`dracula/dracula-theme`](https://github.com/dracula/dracula-theme)         | MIT        |
+| Nord        | [`nordtheme/nord`](https://github.com/nordtheme/nord)                       | MIT        |
+| Gruvbox     | [`morhetz/gruvbox`](https://github.com/morhetz/gruvbox)                     | MIT/X11    |
+| Tokyo Night | [`folke/tokyonight.nvim`](https://github.com/folke/tokyonight.nvim)         | Apache 2.0 |
+| Rose Pine   | [`rose-pine/rose-pine-theme`](https://github.com/rose-pine/rose-pine-theme) | MIT        |
 
 ## Behavior
 
