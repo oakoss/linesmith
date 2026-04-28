@@ -257,6 +257,18 @@ if ctx.status.context_window != () {
     }
 }
 
+// Effort, vim, output style, and active agent — informational, opt-in.
+// All four are `()` when the payload doesn't carry them. Vim
+// additionally degrades to `()` on an unrecognized mode (per ADR-0014);
+// effort still raises a parse error in that case until lsm-9zvh extends
+// the same discipline.
+ctx.status.effort                       // string ("low"|"medium"|"high"|"max"|"xhigh") or ()
+ctx.status.vim                          // string ("normal"|"insert"|"visual"|"command"|"replace") or ()
+if ctx.status.output_style != () {
+    ctx.status.output_style.name        // non-empty string (parser-side invariant)
+}
+ctx.status.agent_name                   // non-empty string or () (collapsed from agent.name per ADR-0008)
+
 // Rate-limit data is not on ctx.status — read ctx.usage instead
 // (declared via @data_deps = ["usage"]). The OAuth endpoint +
 // JSONL fallback cascade is strictly richer than the old stdin

@@ -263,6 +263,9 @@ mod tests {
             context_window: window,
             cost: None,
             effort: None,
+            vim: None,
+            output_style: None,
+            agent_name: None,
             raw: Arc::new(serde_json::Value::Null),
         })
     }

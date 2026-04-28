@@ -8,6 +8,7 @@ use crate::theme::{Role, Style};
 use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
 
+pub mod agent;
 pub(crate) mod builder;
 pub mod context_bar;
 pub mod context_window;
@@ -16,6 +17,7 @@ pub mod effort;
 pub mod extra_usage;
 pub mod git_branch;
 pub mod model;
+pub mod output_style;
 pub mod rate_limit_5h;
 pub mod rate_limit_5h_reset;
 pub mod rate_limit_7d;
@@ -23,6 +25,7 @@ pub mod rate_limit_7d_reset;
 pub mod rate_limit_format;
 pub mod session_duration;
 pub mod tokens;
+pub mod vim;
 pub mod workspace;
 
 /// Output of a successful segment render.
@@ -472,6 +475,9 @@ pub const BUILT_IN_SEGMENT_IDS: &[&str] = &[
     "workspace",
     "cost",
     "effort",
+    "output_style",
+    "vim",
+    "agent",
     "git_branch",
     "rate_limit_5h",
     "rate_limit_7d",
@@ -508,6 +514,9 @@ pub fn built_in_by_id(
         "workspace" => Some(Box::new(workspace::WorkspaceSegment)),
         "cost" => Some(Box::new(cost::CostSegment)),
         "effort" => Some(Box::new(effort::EffortSegment)),
+        "output_style" => Some(Box::new(output_style::OutputStyleSegment)),
+        "vim" => Some(Box::new(vim::VimSegment)),
+        "agent" => Some(Box::new(agent::AgentSegment)),
         "git_branch" => Some(Box::new(git_branch::GitBranchSegment::from_extras(e, warn))),
         "rate_limit_5h" => Some(Box::new(rate_limit_5h::RateLimit5hSegment::from_extras(
             e, warn,
@@ -803,10 +812,26 @@ mod layout_type_tests {
             "tokens_output",
             "tokens_cached",
             "tokens_total",
+            "output_style",
+            "vim",
+            "agent",
         ] {
             assert!(
                 built_in_by_id(id, None, &mut |_| {}).is_some(),
                 "expected {id} to resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn built_in_by_id_resolves_every_id_in_built_in_segment_ids() {
+        // Anchors the contract documented at `BUILT_IN_SEGMENT_IDS`:
+        // every id in the const must round-trip through the registry.
+        // Catches drift between the const and the match arms.
+        for id in BUILT_IN_SEGMENT_IDS {
+            assert!(
+                built_in_by_id(id, None, &mut |_| {}).is_some(),
+                "BUILT_IN_SEGMENT_IDS lists {id} but built_in_by_id can't construct it"
             );
         }
     }
@@ -1004,6 +1029,9 @@ mod layout_type_tests {
             context_window: None,
             cost: None,
             effort: None,
+            vim: None,
+            output_style: None,
+            agent_name: None,
             raw: Arc::new(serde_json::Value::Null),
         })
     }

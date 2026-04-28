@@ -167,6 +167,9 @@ mod tests {
             context_window: None,
             cost: None,
             effort: None,
+            vim: None,
+            output_style: None,
+            agent_name: None,
             raw: Arc::new(serde_json::json!({})),
         }
     }

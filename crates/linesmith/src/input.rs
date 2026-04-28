@@ -1,6 +1,7 @@
-//! `StatusContext` models the parsed Claude Code statusline JSON.
-//! Rate-limit windows, cost, vim state, effort, output-style, and agent
-//! fields are added as segments start consuming them; see
+//! `StatusContext` is the canonical, tool-agnostic model parsed from a
+//! statusline JSON payload (Claude Code today; per-tool normalizers are
+//! added as other tools wire in). Rate-limit windows live on
+//! `DataContext::usage()` and are not parsed from stdin; see
 //! `docs/specs/input-schema.md` for the full contract.
 
 use std::borrow::Cow;
@@ -22,6 +23,13 @@ pub struct StatusContext {
     pub context_window: Option<ContextWindow>,
     pub cost: Option<CostMetrics>,
     pub effort: Option<EffortLevel>,
+    pub vim: Option<VimMode>,
+    pub output_style: Option<OutputStyle>,
+    /// Active sub-agent name (collapsed from `agent.name` per ADR-0008).
+    /// **Invariant:** `Some(s)` always carries a non-empty `s`; the
+    /// parser folds null/missing/empty to `None`. See `lsm-srvz` for the
+    /// follow-up to lift this into the type via a `NonEmptyString`.
+    pub agent_name: Option<String>,
     pub raw: Arc<serde_json::Value>,
 }
 
@@ -133,6 +141,63 @@ impl std::str::FromStr for EffortLevel {
             _ => Err(()),
         }
     }
+}
+
+/// Vim editing mode reflected from Claude Code's `vim.mode` field.
+/// `Command` is Vim's `:`-prefix command-line buffer, not "a command was
+/// run".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VimMode {
+    Normal,
+    Insert,
+    Visual,
+    Command,
+    Replace,
+}
+
+impl VimMode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Insert => "insert",
+            Self::Visual => "visual",
+            Self::Command => "command",
+            Self::Replace => "replace",
+        }
+    }
+}
+
+impl std::str::FromStr for VimMode {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "normal" => Ok(Self::Normal),
+            "insert" => Ok(Self::Insert),
+            "visual" => Ok(Self::Visual),
+            "command" => Ok(Self::Command),
+            "replace" => Ok(Self::Replace),
+            _ => Err(()),
+        }
+    }
+}
+
+/// Active output style. Kept as a struct (rather than collapsing to
+/// `Option<String>`) so `name` can later evolve to an enum with a
+/// `Custom(String)` variant without breaking downstream type signatures.
+/// See ADR-0008.
+///
+/// **Invariant:** `name` is never empty. The Claude normalizer collapses
+/// empty/null/missing names to `Option::None` at the parser boundary, so
+/// every `Some(OutputStyle)` reaching a segment carries a non-empty name.
+/// In-crate constructors should preserve this contract; lsm-srvz tracks
+/// lifting it into the type system via a constructor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OutputStyle {
+    pub name: String,
 }
 
 /// Percentage in `0.0..=100.0`. Construction outside that range returns
@@ -354,8 +419,8 @@ impl std::error::Error for ParseError {}
 
 mod claude {
     use super::{
-        ContextWindow, CostMetrics, EffortLevel, GitWorktree, JsonType, ModelInfo, ParseError,
-        Percent, StatusContext, Tool, TurnUsage, WorkspaceInfo,
+        ContextWindow, CostMetrics, EffortLevel, GitWorktree, JsonType, ModelInfo, OutputStyle,
+        ParseError, Percent, StatusContext, Tool, TurnUsage, VimMode, WorkspaceInfo,
     };
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -370,6 +435,9 @@ mod claude {
         let context_window = parse_context_window(root)?;
         let cost = parse_cost(root)?;
         let effort = parse_effort(root)?;
+        let vim = parse_vim(root)?;
+        let output_style = parse_output_style(root)?;
+        let agent_name = parse_agent_name(root)?;
 
         Ok(StatusContext {
             tool: TOOL,
@@ -378,6 +446,9 @@ mod claude {
             context_window,
             cost,
             effort,
+            vim,
+            output_style,
+            agent_name,
             raw,
         })
     }
@@ -587,6 +658,143 @@ mod claude {
         raw.parse::<EffortLevel>()
             .map(Some)
             .map_err(|()| invalid_value(path, "expected one of: low, medium, high, max, xhigh"))
+    }
+
+    fn parse_vim(
+        root: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<VimMode>, ParseError> {
+        let Some(value) = root.get("vim") else {
+            return Ok(None);
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        // Canonical CC shape is `vim: { mode: "<name>" }` per
+        // research/claude-code-statusline-api.md. A bare string is
+        // tolerated for forward/backward compat (mirrors the effort
+        // normalizer's two-shape acceptance).
+        let (raw, path): (&str, &'static str) = match value {
+            serde_json::Value::Object(obj) => {
+                let mode = obj.get("mode").ok_or_else(|| missing("vim.mode"))?;
+                if mode.is_null() {
+                    return Ok(None);
+                }
+                let s = mode.as_str().ok_or_else(|| {
+                    type_mismatch("vim.mode", JsonType::String, JsonType::of(mode))
+                })?;
+                (s, "vim.mode")
+            }
+            serde_json::Value::String(s) => {
+                // Bare-string is a tolerated forward/backward-compat
+                // shape; canonical CC emits `vim: { mode: "..." }`.
+                // Log when the fallback fires so it leaves a trail
+                // whether CC drifts to bare-string or a non-canonical
+                // producer slips in.
+                crate::lsm_debug!(
+                    "vim: accepted bare-string compat shape {:?}; canonical is {{ mode }}",
+                    s
+                );
+                (s.as_str(), "vim")
+            }
+            other => {
+                return Err(type_mismatch("vim", JsonType::Object, JsonType::of(other)));
+            }
+        };
+        // Unknown vim modes degrade the segment, not the whole render:
+        // `vim` is opt-in and informational, so a future CC mode (e.g.
+        // `select`, `terminal`) shouldn't blank the statusline. Warn so
+        // schema drift surfaces at the default log level. The strict
+        // `MissingField` / `TypeMismatch` paths above stay as-is because
+        // those signal a malformed wrapper, not an unrecognized variant.
+        // ADR-0014 / lsm-9zvh extends this discipline to other enum
+        // parsers (`parse_effort`).
+        match raw.parse::<VimMode>() {
+            Ok(mode) => Ok(Some(mode)),
+            Err(()) => {
+                crate::lsm_warn!(
+                    "vim: unknown mode {raw:?} at {path}; treating as None (possible CC schema drift — known: normal, insert, visual, command, replace)"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    fn parse_output_style(
+        root: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<OutputStyle>, ParseError> {
+        let Some(value) = root.get("output_style") else {
+            return Ok(None);
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        let obj = expect_object(value, "output_style")?;
+        // Tolerate a missing `name` as None so the schema can grow,
+        // but warn: the wrapper is present, so a future CC rename of
+        // `name` would otherwise dark-ship this segment without a
+        // diagnostic trail.
+        //
+        // This deliberately diverges from `parse_effort` / `parse_vim`,
+        // which raise `MissingField` on absent inner keys. Effort and
+        // vim mirror closed enums whose inner key is part of the
+        // canonical CC contract; output_style and agent are open-ended
+        // wrapper structs whose shape may grow (per ADR-0008), so the
+        // parser soft-tolerates and surfaces drift through logging
+        // instead of through the parse error path.
+        let Some(name_value) = obj.get("name") else {
+            crate::lsm_warn!(
+                "output_style: wrapper present but `name` field missing; treating as None (possible CC schema drift)"
+            );
+            return Ok(None);
+        };
+        if name_value.is_null() {
+            return Ok(None);
+        }
+        let name = name_value
+            .as_str()
+            .ok_or_else(|| {
+                type_mismatch(
+                    "output_style.name",
+                    JsonType::String,
+                    JsonType::of(name_value),
+                )
+            })?
+            .to_owned();
+        if name.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(OutputStyle { name }))
+    }
+
+    fn parse_agent_name(
+        root: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<String>, ParseError> {
+        let Some(value) = root.get("agent") else {
+            return Ok(None);
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        let obj = expect_object(value, "agent")?;
+        // Same drift-detection rationale as `parse_output_style`: warn
+        // when the wrapper is present but `name` is absent.
+        let Some(name_value) = obj.get("name") else {
+            crate::lsm_warn!(
+                "agent: wrapper present but `name` field missing; treating as None (possible CC schema drift)"
+            );
+            return Ok(None);
+        };
+        if name_value.is_null() {
+            return Ok(None);
+        }
+        let name = name_value
+            .as_str()
+            .ok_or_else(|| type_mismatch("agent.name", JsonType::String, JsonType::of(name_value)))?
+            .to_owned();
+        if name.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(name))
     }
 
     // --- helpers ------------------------------------------------------
@@ -1404,6 +1612,169 @@ mod tests {
                 );
             }
             other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    // --- vim / output_style / agent ---
+
+    #[test]
+    fn parses_vim_object_form() {
+        let bytes = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/r" },
+            "vim": { "mode": "insert" }
+        }"#;
+        let ctx = parse(bytes).expect("ok");
+        assert_eq!(ctx.vim, Some(VimMode::Insert));
+    }
+
+    #[test]
+    fn parses_vim_string_form_for_compat() {
+        let bytes = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/r" },
+            "vim": "visual"
+        }"#;
+        let ctx = parse(bytes).expect("ok");
+        assert_eq!(ctx.vim, Some(VimMode::Visual));
+    }
+
+    #[test]
+    fn vim_absent_or_null_yields_none() {
+        let absent = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"}}"#;
+        assert_eq!(parse(absent).unwrap().vim, None);
+        let null = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"vim":null}"#;
+        assert_eq!(parse(null).unwrap().vim, None);
+        let null_mode = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"vim":{"mode":null}}"#;
+        assert_eq!(parse(null_mode).unwrap().vim, None);
+    }
+
+    #[test]
+    fn vim_unknown_mode_degrades_segment_not_whole_parse() {
+        // An unknown vim mode (e.g. a future CC `select` or `terminal`)
+        // must NOT abort the whole parse — the rest of the statusline
+        // would render blank for an opt-in informational segment. Warn
+        // and degrade to None instead. Lock the contract so a refactor
+        // that re-introduces `InvalidValue` here regresses loudly.
+        let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"vim":{"mode":"surrogate"}}"#;
+        let ctx = parse(bytes).expect("unknown vim mode must not fail parse");
+        assert_eq!(ctx.vim, None);
+    }
+
+    #[test]
+    fn parses_output_style() {
+        let bytes = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/r" },
+            "output_style": { "name": "concise" }
+        }"#;
+        let ctx = parse(bytes).expect("ok");
+        let style = ctx.output_style.expect("present");
+        assert_eq!(style.name, "concise");
+    }
+
+    #[test]
+    fn output_style_absent_or_null_yields_none() {
+        let absent = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"}}"#;
+        assert!(parse(absent).unwrap().output_style.is_none());
+        let null = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"output_style":null}"#;
+        assert!(parse(null).unwrap().output_style.is_none());
+        let null_name = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"output_style":{"name":null}}"#;
+        assert!(parse(null_name).unwrap().output_style.is_none());
+        // Object without `name` is tolerated as None so the schema can grow.
+        let no_name =
+            br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"output_style":{}}"#;
+        assert!(parse(no_name).unwrap().output_style.is_none());
+        let empty = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"output_style":{"name":""}}"#;
+        assert!(parse(empty).unwrap().output_style.is_none());
+    }
+
+    #[test]
+    fn output_style_name_typed_wrong_rejected() {
+        let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"output_style":{"name":42}}"#;
+        match parse(bytes).expect_err("rejected") {
+            ParseError::TypeMismatch { path, .. } => assert_eq!(path, "output_style.name"),
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_agent_name() {
+        let bytes = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/r" },
+            "agent": { "name": "research" }
+        }"#;
+        let ctx = parse(bytes).expect("ok");
+        assert_eq!(ctx.agent_name.as_deref(), Some("research"));
+    }
+
+    #[test]
+    fn agent_absent_null_or_empty_yields_none() {
+        let absent = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"}}"#;
+        assert!(parse(absent).unwrap().agent_name.is_none());
+        let null =
+            br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"agent":null}"#;
+        assert!(parse(null).unwrap().agent_name.is_none());
+        let empty = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"agent":{"name":""}}"#;
+        assert!(parse(empty).unwrap().agent_name.is_none());
+        let no_name =
+            br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"agent":{}}"#;
+        assert!(parse(no_name).unwrap().agent_name.is_none());
+    }
+
+    #[test]
+    fn vim_object_missing_mode_surfaces_missing_field() {
+        let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"vim":{}}"#;
+        match parse(bytes).expect_err("rejected") {
+            ParseError::MissingField { path, .. } => assert_eq!(path, "vim.mode"),
+            other => panic!("expected MissingField, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vim_object_non_string_mode_surfaces_type_mismatch() {
+        let bytes =
+            br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"vim":{"mode":42}}"#;
+        match parse(bytes).expect_err("rejected") {
+            ParseError::TypeMismatch { path, .. } => assert_eq!(path, "vim.mode"),
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vim_non_object_non_string_rejected_as_type_mismatch() {
+        let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"vim":42}"#;
+        match parse(bytes).expect_err("rejected") {
+            ParseError::TypeMismatch { path, .. } => assert_eq!(path, "vim"),
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn output_style_non_object_rejected_as_type_mismatch() {
+        let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"output_style":"concise"}"#;
+        match parse(bytes).expect_err("rejected") {
+            ParseError::TypeMismatch { path, .. } => assert_eq!(path, "output_style"),
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_non_object_rejected_as_type_mismatch() {
+        let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"agent":"research"}"#;
+        match parse(bytes).expect_err("rejected") {
+            ParseError::TypeMismatch { path, .. } => assert_eq!(path, "agent"),
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_name_typed_wrong_rejected_as_type_mismatch() {
+        let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"agent":{"name":42}}"#;
+        match parse(bytes).expect_err("rejected") {
+            ParseError::TypeMismatch { path, .. } => assert_eq!(path, "agent.name"),
+            other => panic!("expected TypeMismatch, got {other:?}"),
         }
     }
 }

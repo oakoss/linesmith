@@ -14,8 +14,7 @@ use crate::theme::Role;
 
 pub struct EffortSegment;
 
-/// Between rate-limit (96) and cost (192): informational; drops before
-/// cost but after the time-sensitive health metrics.
+/// Informational; drops before cost (192), kept past rate-limit (96).
 const PRIORITY: u8 = 160;
 
 impl Segment for EffortSegment {
@@ -58,6 +57,9 @@ mod tests {
             context_window: None,
             cost: None,
             effort,
+            vim: None,
+            output_style: None,
+            agent_name: None,
             raw: Arc::new(serde_json::Value::Null),
         })
     }

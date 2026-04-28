@@ -24,8 +24,8 @@ use crate::data_context::{
     UsageBucket, UsageData,
 };
 use crate::input::{
-    ContextWindow, CostMetrics, GitWorktree, ModelInfo, StatusContext, Tool, TurnUsage,
-    WorkspaceInfo,
+    ContextWindow, CostMetrics, GitWorktree, ModelInfo, OutputStyle, StatusContext, Tool,
+    TurnUsage, WorkspaceInfo,
 };
 use crate::segments::RenderContext;
 
@@ -229,6 +229,23 @@ fn build_status(s: &StatusContext) -> Dynamic {
         s.effort
             .map_or(Dynamic::UNIT, |e| Dynamic::from(e.as_str().to_string())),
     );
+    m.insert(
+        "vim".into(),
+        s.vim
+            .map_or(Dynamic::UNIT, |v| Dynamic::from(v.as_str().to_string())),
+    );
+    m.insert(
+        "output_style".into(),
+        s.output_style
+            .as_ref()
+            .map_or(Dynamic::UNIT, build_output_style),
+    );
+    m.insert(
+        "agent_name".into(),
+        s.agent_name
+            .as_ref()
+            .map_or(Dynamic::UNIT, |n| Dynamic::from(n.clone())),
+    );
     m.insert("raw".into(), json_to_dynamic(&s.raw));
     Dynamic::from_map(m)
 }
@@ -252,6 +269,12 @@ fn build_tool(t: &Tool) -> Dynamic {
 fn build_model(m: &ModelInfo) -> Dynamic {
     let mut out = Map::new();
     out.insert("display_name".into(), Dynamic::from(m.display_name.clone()));
+    Dynamic::from_map(out)
+}
+
+fn build_output_style(o: &OutputStyle) -> Dynamic {
+    let mut out = Map::new();
+    out.insert("name".into(), Dynamic::from(o.name.clone()));
     Dynamic::from_map(out)
 }
 
@@ -847,6 +870,9 @@ mod tests {
             context_window: None,
             cost: None,
             effort: None,
+            vim: None,
+            output_style: None,
+            agent_name: None,
             raw: Arc::new(serde_json::json!({"custom": "field"})),
         }
     }
@@ -1302,6 +1328,9 @@ mod tests {
         assert!(status.get("context_window").unwrap().is_unit());
         assert!(status.get("cost").unwrap().is_unit());
         assert!(status.get("effort").unwrap().is_unit());
+        assert!(status.get("vim").unwrap().is_unit());
+        assert!(status.get("output_style").unwrap().is_unit());
+        assert!(status.get("agent_name").unwrap().is_unit());
         assert!(
             !status.contains_key("rate_limits"),
             "rate_limits is no longer mirrored; plugins read ctx.usage",
@@ -1321,6 +1350,50 @@ mod tests {
             .try_cast::<String>()
             .unwrap();
         assert_eq!(effort, "xhigh");
+    }
+
+    #[test]
+    fn vim_output_style_agent_name_surface_as_strings_when_present() {
+        use crate::input::{OutputStyle, VimMode};
+        let mut s = minimal_status();
+        s.vim = Some(VimMode::Insert);
+        s.output_style = Some(OutputStyle {
+            name: "concise".into(),
+        });
+        s.agent_name = Some("research".into());
+        let dc = DataContext::new(s);
+        let ctx = build_and_unwrap_map(&dc, &[]);
+        let status = status_map(&ctx);
+        assert_eq!(
+            status
+                .get("vim")
+                .unwrap()
+                .clone()
+                .try_cast::<String>()
+                .unwrap(),
+            "insert"
+        );
+        let output_style: Map = status
+            .get("output_style")
+            .unwrap()
+            .clone()
+            .try_cast()
+            .unwrap();
+        assert_eq!(
+            output_style
+                .get("name")
+                .and_then(|d| d.clone().try_cast::<String>()),
+            Some("concise".to_string())
+        );
+        assert_eq!(
+            status
+                .get("agent_name")
+                .unwrap()
+                .clone()
+                .try_cast::<String>()
+                .unwrap(),
+            "research"
+        );
     }
 
     #[test]
