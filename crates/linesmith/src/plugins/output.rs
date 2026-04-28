@@ -11,11 +11,14 @@
 //! as [`PluginError::MalformedReturn`] with a message pointing at the
 //! limitation.
 //!
-//! `bg`, `hyperlink`, and `width` are silently accepted but not acted
-//! on. `bg` and `hyperlink` require host `Style` fields that don't
-//! exist; `width` is recomputed from rendered text. Silence is
-//! deliberate: a plugin author who writes these fields for forward
-//! compatibility doesn't trigger a load error.
+//! `hyperlink` threads through to `Style.hyperlink` so capable
+//! terminals render the run as an OSC 8 link.
+//!
+//! `bg` and `width` are silently accepted but not acted on: `bg`
+//! requires a host `Style` field that doesn't exist yet; `width` is
+//! recomputed from rendered text. Silence is deliberate — a plugin
+//! author who writes these fields for forward compatibility doesn't
+//! trigger a load error.
 
 use rhai::{Array, Dynamic, Map};
 
@@ -116,6 +119,16 @@ fn parse_style(run: &Map, id: &str) -> Result<Style, PluginError> {
                 .clone()
                 .try_cast::<bool>()
                 .ok_or_else(|| malformed(id, &format!("`{key}` must be a bool")))?;
+        }
+    }
+
+    if let Some(link_dyn) = run.get("hyperlink") {
+        let url = link_dyn
+            .clone()
+            .try_cast::<String>()
+            .ok_or_else(|| malformed(id, "`hyperlink` must be a string"))?;
+        if !url.is_empty() {
+            style.hyperlink = Some(url);
         }
     }
 
@@ -547,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_hyperlink_field_silently_ignored() {
+    fn hyperlink_field_threads_to_style() {
         let rendered = eval_and_validate(
             r#"#{ runs: [#{ text: "x", hyperlink: "https://example.com" }] }"#,
             "t",
@@ -555,5 +568,30 @@ mod tests {
         .unwrap()
         .expect("rendered");
         assert_eq!(rendered.text(), "x");
+        assert_eq!(
+            rendered.style().hyperlink.as_deref(),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn empty_hyperlink_string_does_not_set_link() {
+        // `hyperlink: ""` folds to None so the emitter doesn't wrap
+        // text in a link-to-nothing OSC 8 pair. Empty URL `\x1b]8;;\x1b\\`
+        // is the canonical OSC 8 close sequence per ECMA-48 — using it
+        // as a link target would semantically tell the terminal "no
+        // link," which is just absence with extra bytes.
+        let rendered = eval_and_validate(r#"#{ runs: [#{ text: "x", hyperlink: "" }] }"#, "t")
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(rendered.style().hyperlink, None);
+    }
+
+    #[test]
+    fn non_string_hyperlink_rejected() {
+        let err =
+            eval_and_validate(r#"#{ runs: [#{ text: "x", hyperlink: 42 }] }"#, "t").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("hyperlink"), "got: {msg}");
     }
 }

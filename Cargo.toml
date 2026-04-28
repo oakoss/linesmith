@@ -40,6 +40,10 @@ rhai = { version = "1.24", default-features = false, features = ["std", "sync"] 
 # §Interface.
 secrecy = "0.10"
 supports-color = "3"
+# OSC 8 hyperlink capability detection per ADR-0007's terminal-feature
+# probing approach. Returns a single bool; we don't need the
+# `supports_hyperlinks::on_cached` variant.
+supports-hyperlinks = "3"
 tempfile = "3"
 terminal_size = "0.4"
 # ureq 3.x is the current major line — post-rewrite, sync HTTP client

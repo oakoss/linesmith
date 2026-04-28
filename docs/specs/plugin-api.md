@@ -342,7 +342,7 @@ The return value of `render(ctx)` must be either `()` (hide) or a map with these
             fg: "#ff00ff",            // optional absolute color (hex)
             bg: "#000000",            // optional
             bold: false, italic: false, underline: false, dim: false,   // all optional
-            hyperlink: "https://...",  // optional OSC 8 URL
+            hyperlink: "https://...",  // optional OSC 8 URL; "" folds to absent
         },
         // more runs...
     ],

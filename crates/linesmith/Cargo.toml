@@ -27,6 +27,7 @@ lexopt.workspace = true
 rhai.workspace = true
 secrecy.workspace = true
 supports-color.workspace = true
+supports-hyperlinks.workspace = true
 tempfile.workspace = true
 terminal_size.workspace = true
 ureq.workspace = true

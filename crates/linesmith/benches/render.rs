@@ -147,6 +147,7 @@ fn run_context(cwd: std::path::PathBuf) -> RunContext<'static> {
         Capability::None,
         TERMINAL_WIDTH,
         Some(cwd),
+        false,
     )
 }
 

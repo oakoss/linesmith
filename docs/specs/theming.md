@@ -194,6 +194,8 @@ When a segment wants to render styled text, resolution runs this order:
 4. **Terminal capability downgrade** (truecolor → 256 → 16 → no-color)
 5. **`NO_COLOR` / `FORCE_COLOR` env vars** (final override)
 
+The user override wholesale-replaces visual fields (`role`, `fg`, `bold`, `italic`, `underline`, `dim`) — that's the documented "restyle the segment" semantic. `hyperlink` is the exception: it carries segment behavior (the link target) rather than appearance, and the user-style TOML syntax has no slot for it. The override therefore inherits the inner segment's `hyperlink`, so `[segments.X] color = "red"` repaints without silently stripping links.
+
 ```text
 user config style?   ──► yes ──► use it
          │ no
@@ -260,6 +262,8 @@ Detected once at startup via `supports-color` crate:
 - 256-color → truecolor downsampled to nearest 256-palette entry (fast table lookup, not arithmetic)
 - 16-color → further downsampled; shipped themes explicitly specify 16-color fallbacks via extended metadata if they care
 - No color (per `NO_COLOR` or capability) → strip all color; styles fall back to text decoration only (bold/dim/italic)
+
+OSC 8 hyperlink support is a separate, orthogonal capability detected via the `supports-hyperlinks` crate. When supported, `Style.hyperlink` URLs render as clickable links wrapped _outside_ the SGR pair so the link survives `sgr_reset`; when unsupported, the URL is dropped and the run emits as plain styled text. Capable terminals get the link, others get the text. Hyperlink emission strips control characters from the URL (ESC, BEL, NUL, DEL, C1 ST) so a plugin- or repo-derived URL can't terminate the OSC 8 envelope early and inject raw control sequences. URLs live on `Style`, never embedded in segment text, so width-based truncation can't split an OSC 8 escape.
 
 ### Cache interaction
 

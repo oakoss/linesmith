@@ -31,6 +31,7 @@ pub fn render(segments: &[Box<dyn Segment>], ctx: &DataContext, terminal_width: 
         &mut warn,
         theme::default_theme(),
         Capability::None,
+        false,
     )
 }
 
@@ -39,6 +40,12 @@ pub fn render(segments: &[Box<dyn Segment>], ctx: &DataContext, terminal_width: 
 /// and `capability`. Used by [`crate::run_with_context`] so `cli_main`
 /// tests can capture segment errors alongside exit codes while the
 /// render path picks up theme colors.
+///
+/// `hyperlinks` gates OSC 8 emission for runs whose `Style.hyperlink`
+/// is set. Pass `true` when the terminal advertises OSC 8 support
+/// (e.g. via the `supports-hyperlinks` crate or an explicit user
+/// override), `false` otherwise — capable terminals render the run
+/// as a clickable link, others see plain text.
 ///
 /// Thin wrapper over [`render_to_runs`] + [`runs_to_ansi`]; same
 /// layout, same bytes. Callers that need the styled-run form (e.g.
@@ -51,9 +58,10 @@ pub fn render_with_warn(
     warn: &mut dyn FnMut(&str),
     theme: &Theme,
     capability: Capability,
+    hyperlinks: bool,
 ) -> String {
     let runs = render_to_runs(segments, ctx, terminal_width, warn);
-    runs_to_ansi(&runs, theme, capability)
+    runs_to_ansi(&runs, theme, capability, hyperlinks)
 }
 
 /// Render `segments` into a flat [`StyledRun`] sequence. One run per
@@ -87,11 +95,26 @@ pub fn render_to_runs(
 /// Emit a flat [`StyledRun`] sequence as an ANSI SGR-wrapped string
 /// suitable for terminal stdout. Each run with non-empty styling gets
 /// its own `sgr_open` / `sgr_reset` pair so decorations don't leak
-/// across boundaries; plain runs pass through unwrapped.
+/// across boundaries; plain runs pass through unwrapped. When
+/// `hyperlinks` is `true`, runs carrying `Style.hyperlink` are
+/// additionally wrapped in OSC 8 open/close so capable terminals
+/// render them as clickable links; the OSC 8 wrap sits *outside* the
+/// SGR pair so the link survives the SGR reset. `hyperlinks = false`
+/// drops the URL silently — the run still emits, just without the
+/// link.
 #[must_use]
-pub fn runs_to_ansi(runs: &[StyledRun], theme: &Theme, capability: Capability) -> String {
+pub fn runs_to_ansi(
+    runs: &[StyledRun],
+    theme: &Theme,
+    capability: Capability,
+    hyperlinks: bool,
+) -> String {
     let mut out = String::new();
     for run in runs {
+        let link = run.style.hyperlink.as_deref().filter(|_| hyperlinks);
+        if let Some(url) = link {
+            push_osc8_open(&mut out, url);
+        }
         let open = theme::sgr_open(&run.style, theme, capability);
         if open.is_empty() {
             out.push_str(&run.text);
@@ -100,8 +123,36 @@ pub fn runs_to_ansi(runs: &[StyledRun], theme: &Theme, capability: Capability) -
             out.push_str(&run.text);
             out.push_str(theme::sgr_reset());
         }
+        if link.is_some() {
+            push_osc8_close(&mut out);
+        }
     }
     out
+}
+
+/// OSC 8 hyperlink open: `ESC ] 8 ; ; <url> ST`. Uses ESC `\` (the
+/// canonical String Terminator) rather than the BEL alternative;
+/// modern terminals accept both but ESC `\` is the spec form and
+/// safer when output is piped through tools that interpret BEL.
+///
+/// Strips control characters from `url` before emission. Without
+/// this, an embedded `ESC \` in a plugin- or repo-derived URL would
+/// terminate the OSC 8 envelope early and turn the remainder into
+/// raw terminal control sequences — the same escape-injection class
+/// `RenderedSegment::new` strips from segment text.
+fn push_osc8_open(out: &mut String, url: &str) {
+    out.push_str("\x1b]8;;");
+    for c in url.chars() {
+        if !c.is_control() {
+            out.push(c);
+        }
+    }
+    out.push_str("\x1b\\");
+}
+
+/// OSC 8 hyperlink close: same envelope, empty URL.
+fn push_osc8_close(out: &mut String) {
+    out.push_str("\x1b]8;;\x1b\\");
 }
 
 /// Rendered output paired with the defaults needed to place it (priority,
@@ -199,7 +250,7 @@ fn render_items(
 ) -> String {
     let laid_out = apply_layout(items, ctx, rc, terminal_width);
     let runs = items_to_runs(&laid_out);
-    runs_to_ansi(&runs, theme, capability)
+    runs_to_ansi(&runs, theme, capability, false)
 }
 
 /// Flatten step for [`render_to_runs`]: see that function for the
@@ -211,7 +262,7 @@ fn items_to_runs(items: &[Item<'_>]) -> Vec<StyledRun> {
     for (i, item) in items.iter().enumerate() {
         runs.push(StyledRun {
             text: item.rendered.text.clone(),
-            style: item.rendered.style,
+            style: item.rendered.style.clone(),
         });
         if i + 1 < items.len() {
             let sep_text = effective_separator(item).text();
@@ -845,6 +896,7 @@ mod tests {
             &mut |msg| warnings.push(msg.to_string()),
             theme::default_theme(),
             theme::Capability::None,
+            false,
         );
         assert!(line.contains("137"), "got {line:?}");
     }
@@ -1020,6 +1072,7 @@ mod tests {
             &mut |m| warnings.push(m.to_string()),
             theme::default_theme(),
             theme::Capability::None,
+            false,
         );
         // Full 18 + sep 1 + KEEP 4 = 23. Budget 17 → overflow 6.
         // shrink target = 18 - 6 = 12. Compact "longbranch" (10)
@@ -1046,6 +1099,7 @@ mod tests {
             &mut |m| warnings.push(m.to_string()),
             theme::default_theme(),
             theme::Capability::None,
+            false,
         );
         // Compact form 17 cells > target → reject → drop. Only the
         // anchor remains.
@@ -1087,6 +1141,7 @@ mod tests {
             &mut |_| {},
             theme::default_theme(),
             theme::Capability::None,
+            false,
         );
         // shrunk would deliver 5 cells, but width.min=8 → rejected,
         // segment drops. Only anchor remains.
@@ -1130,6 +1185,7 @@ mod tests {
             &mut |_| {},
             theme::default_theme(),
             theme::Capability::None,
+            false,
         );
         assert_eq!(line, "X");
     }
@@ -1169,6 +1225,7 @@ mod tests {
             &mut |m| warnings.push(m.to_string()),
             theme::default_theme(),
             theme::Capability::None,
+            false,
         );
         // Full = 20, X = 1, separator = 1 → total 22. Budget 13 →
         // overflow 9. shrink target = 20 - 9 = 11. Compact
@@ -1275,7 +1332,7 @@ mod tests {
         ]
     }
 
-    fn round_trip_assert(terminal_width: u16, capability: theme::Capability) {
+    fn round_trip_assert(terminal_width: u16, capability: theme::Capability, hyperlinks: bool) {
         let segments = round_trip_segments();
         let direct = render_with_warn(
             &segments,
@@ -1284,12 +1341,13 @@ mod tests {
             &mut |_| {},
             theme::default_theme(),
             capability,
+            hyperlinks,
         );
         let runs = render_to_runs(&segments, &empty_ctx(), terminal_width, &mut |_| {});
-        let recomposed = runs_to_ansi(&runs, theme::default_theme(), capability);
+        let recomposed = runs_to_ansi(&runs, theme::default_theme(), capability, hyperlinks);
         assert_eq!(
             direct, recomposed,
-            "cap={capability:?} width={terminal_width}"
+            "cap={capability:?} width={terminal_width} hyperlinks={hyperlinks}"
         );
     }
 
@@ -1298,7 +1356,7 @@ mod tests {
         // Round-trip pin: `render_to_runs` → `runs_to_ansi` must match
         // `render_with_warn` byte-for-byte. The contract that lets
         // `render_with_warn` stay a thin wrapper.
-        round_trip_assert(100, theme::Capability::Palette16);
+        round_trip_assert(100, theme::Capability::Palette16, false);
     }
 
     #[test]
@@ -1307,7 +1365,7 @@ mod tests {
         // branch in `runs_to_ansi`. A future change to `sgr_open`
         // returning a non-empty string for `Capability::None` would
         // silently leak escapes; this pins it.
-        round_trip_assert(100, theme::Capability::None);
+        round_trip_assert(100, theme::Capability::None, false);
     }
 
     #[test]
@@ -1316,7 +1374,18 @@ mod tests {
         // both emit paths must produce the same post-drop output.
         // `round_trip_segments` totals 9 cells; budget 5 drops the
         // rightmost priority-128 tie ("err"), leaving "ctx |".
-        round_trip_assert(5, theme::Capability::Palette16);
+        round_trip_assert(5, theme::Capability::Palette16, false);
+    }
+
+    #[test]
+    fn render_to_runs_round_trip_holds_with_hyperlinks_enabled() {
+        // The `hyperlinks` bool must thread identically through both
+        // emit paths. `round_trip_segments` carries no hyperlinks
+        // today, so the equivalence is structural — a regression
+        // where one path silently dropped the bool would still match
+        // here. Adding a hyperlinked segment to the round-trip set
+        // is a follow-up; this test names the bool-thread contract.
+        round_trip_assert(100, theme::Capability::Palette16, true);
     }
 
     #[test]
@@ -1363,6 +1432,191 @@ mod tests {
     }
 
     #[test]
+    fn runs_to_ansi_emits_osc8_around_styled_run_when_hyperlinks_supported() {
+        // Pin the OSC 8 envelope and its order: the link wraps
+        // *outside* the SGR pair so the link survives `sgr_reset`.
+        // Bytes asserted explicitly so a future change to the OSC 8
+        // emitter (BEL terminator, different escape) is caught.
+        use crate::theme::Role;
+        let runs = vec![StyledRun::new(
+            "branch",
+            Style::role(Role::Primary).with_hyperlink("https://example.com/b"),
+        )];
+        let out = runs_to_ansi(
+            &runs,
+            theme::default_theme(),
+            theme::Capability::Palette16,
+            true,
+        );
+        assert_eq!(
+            out, "\x1b]8;;https://example.com/b\x1b\\\x1b[95mbranch\x1b[0m\x1b]8;;\x1b\\",
+            "got {out:?}"
+        );
+    }
+
+    #[test]
+    fn runs_to_ansi_drops_hyperlink_when_not_supported() {
+        // `hyperlinks = false` must produce zero OSC 8 bytes; the
+        // run still emits with its SGR styling. The URL is dropped
+        // silently — capable terminals get the link, others get the
+        // text.
+        use crate::theme::Role;
+        let runs = vec![StyledRun::new(
+            "branch",
+            Style::role(Role::Primary).with_hyperlink("https://example.com/b"),
+        )];
+        let out = runs_to_ansi(
+            &runs,
+            theme::default_theme(),
+            theme::Capability::Palette16,
+            false,
+        );
+        assert_eq!(out, "\x1b[95mbranch\x1b[0m");
+        assert!(!out.contains("\x1b]8"), "no OSC 8: {out:?}");
+    }
+
+    #[test]
+    fn runs_to_ansi_emits_no_osc8_when_style_has_no_hyperlink() {
+        // `hyperlinks = true` is permission, not obligation: a run
+        // with `Style.hyperlink = None` emits no OSC 8 even when the
+        // terminal supports it.
+        let runs = vec![StyledRun::new("plain", Style::default())];
+        let out = runs_to_ansi(&runs, theme::default_theme(), theme::Capability::None, true);
+        assert_eq!(out, "plain");
+        assert!(!out.contains("\x1b]8"), "no OSC 8: {out:?}");
+    }
+
+    #[test]
+    fn runs_to_ansi_emits_osc8_around_unstyled_run() {
+        // An unstyled run with a hyperlink still gets OSC 8: the link
+        // is independent of color/decoration. The text passes through
+        // without an SGR pair.
+        let runs = vec![StyledRun::new(
+            "click",
+            Style::default().with_hyperlink("https://example.com"),
+        )];
+        let out = runs_to_ansi(&runs, theme::default_theme(), theme::Capability::None, true);
+        assert_eq!(out, "\x1b]8;;https://example.com\x1b\\click\x1b]8;;\x1b\\");
+    }
+
+    #[test]
+    fn osc8_pair_balanced_when_hyperlinked_run_is_truncated() {
+        // Truncation rewrites the run's text; the OSC 8 wrapper sits
+        // outside text in `runs_to_ansi`, so truncated text still
+        // emits a balanced OSC 8 open/close. Pins the design
+        // contract: hyperlinks live on `Style`, never in `text`, so
+        // there's no escape-sequence inside the string for
+        // truncation to split.
+        let mut rendered = RenderedSegment::new("very-long-branch-name")
+            .with_style(Style::default().with_hyperlink("https://example.com/branch"));
+        rendered = truncate_to(rendered, 8);
+        // Truncation produces "very-lo…" (7 graphemes + ellipsis = 8 cells).
+        let runs = vec![StyledRun::new(
+            rendered.text().to_string(),
+            rendered.style.clone(),
+        )];
+        let out = runs_to_ansi(&runs, theme::default_theme(), theme::Capability::None, true);
+        assert!(
+            out.starts_with("\x1b]8;;https://example.com/branch\x1b\\"),
+            "OSC 8 open present: {out:?}"
+        );
+        assert!(
+            out.ends_with("\x1b]8;;\x1b\\"),
+            "OSC 8 close present: {out:?}"
+        );
+        assert!(out.contains('…'), "truncation marker preserved: {out:?}");
+        assert_eq!(
+            out.matches("\x1b]8;;").count(),
+            2,
+            "exactly one open and one close: {out:?}"
+        );
+    }
+
+    #[test]
+    fn osc8_pair_balanced_when_hyperlinked_run_truncated_to_zero() {
+        // truncate_to(_, 0) yields empty text + preserved style. The
+        // OSC 8 pair must still be balanced — emitting a half-open
+        // envelope would break every later byte on the line.
+        let rendered = RenderedSegment::new("anything")
+            .with_style(Style::default().with_hyperlink("https://example.com"));
+        let truncated = truncate_to(rendered, 0);
+        let runs = vec![StyledRun::new(
+            truncated.text().to_string(),
+            truncated.style.clone(),
+        )];
+        let out = runs_to_ansi(&runs, theme::default_theme(), theme::Capability::None, true);
+        assert_eq!(
+            out, "\x1b]8;;https://example.com\x1b\\\x1b]8;;\x1b\\",
+            "empty-text run still emits balanced OSC 8 pair: {out:?}"
+        );
+    }
+
+    #[test]
+    fn runs_to_ansi_emits_independent_osc8_pairs_for_adjacent_hyperlinked_runs() {
+        // Adjacent runs with different links must each get their own
+        // open/close pair — no nesting, no leak across the boundary.
+        // Pins the per-run scoping of OSC 8 emission.
+        let runs = vec![
+            StyledRun::new("a", Style::default().with_hyperlink("https://a.example")),
+            StyledRun::new("b", Style::default().with_hyperlink("https://b.example")),
+        ];
+        let out = runs_to_ansi(&runs, theme::default_theme(), theme::Capability::None, true);
+        assert_eq!(
+            out,
+            "\x1b]8;;https://a.example\x1b\\a\x1b]8;;\x1b\\\x1b]8;;https://b.example\x1b\\b\x1b]8;;\x1b\\"
+        );
+        assert_eq!(out.matches("\x1b]8;;").count(), 4, "two opens + two closes");
+    }
+
+    #[test]
+    fn push_osc8_open_strips_control_chars_from_url() {
+        // Security regression: a URL with embedded ESC `\` would
+        // close the OSC 8 envelope early, turning the rest of the
+        // line into raw control sequences. `push_osc8_open` strips
+        // control bytes before emit. The bare `\` survives but
+        // cannot reconstitute a String Terminator without the
+        // stripped ESC.
+        let runs = vec![StyledRun::new(
+            "x",
+            Style::default().with_hyperlink("https://example.com\x1b\\evil\x07more"),
+        )];
+        let out = runs_to_ansi(&runs, theme::default_theme(), theme::Capability::None, true);
+        // Exactly one OSC 8 open and one close — the embedded ESC `\`
+        // can't smuggle a second close into the output.
+        assert_eq!(
+            out.matches("\x1b]8;;").count(),
+            2,
+            "exactly one pair: {out:?}"
+        );
+        assert!(!out.contains("\x1b\\evil"), "ESC \\ stripped: {out:?}");
+        assert!(!out.contains('\x07'), "BEL stripped: {out:?}");
+        assert!(
+            out.contains("https://example.com\\evilmore"),
+            "non-control chars survive: {out:?}"
+        );
+    }
+
+    #[test]
+    fn push_osc8_open_strips_c1_string_terminator_and_nul() {
+        // `char::is_control()` covers C0 (0x00-0x1F, 0x7F) and C1
+        // (0x80-0x9F). The most plausible bypass via the C1 range is
+        // 0x9C (single-byte ST in 8-bit terminals); NUL and DEL are
+        // the other classics. Pin that all three are stripped so a
+        // future change to the sanitizer can't quietly narrow the
+        // filter.
+        let runs = vec![StyledRun::new(
+            "x",
+            Style::default().with_hyperlink("https://a.example\x00b\x7fc\u{009C}d"),
+        )];
+        let out = runs_to_ansi(&runs, theme::default_theme(), theme::Capability::None, true);
+        assert_eq!(out.matches("\x1b]8;;").count(), 2, "single pair: {out:?}");
+        assert!(!out.contains('\x00'), "NUL stripped: {out:?}");
+        assert!(!out.contains('\x7f'), "DEL stripped: {out:?}");
+        assert!(!out.contains('\u{009C}'), "C1 ST stripped: {out:?}");
+        assert!(out.contains("https://a.examplebcd"));
+    }
+
+    #[test]
     fn runs_to_ansi_capability_none_emits_unwrapped_text() {
         // Pin the no-color emit path independent of layout: a run
         // with a styled role + Capability::None must produce zero
@@ -1374,7 +1628,12 @@ mod tests {
             StyledRun::new(" ", Style::default()),
             StyledRun::new("warn", Style::role(Role::Warning)),
         ];
-        let out = runs_to_ansi(&runs, theme::default_theme(), theme::Capability::None);
+        let out = runs_to_ansi(
+            &runs,
+            theme::default_theme(),
+            theme::Capability::None,
+            false,
+        );
         assert_eq!(out, "plain warn");
         assert!(!out.contains('\x1b'), "unexpected ANSI escape: {out:?}");
     }

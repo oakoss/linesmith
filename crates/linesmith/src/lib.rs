@@ -73,6 +73,7 @@ pub fn run_with_segments_and_width(
         theme::Capability::None,
         terminal_width,
         None,
+        false,
     );
     run_with_context(reader, writer, &mut io::stderr().lock(), segments, &ctx)
 }
@@ -95,6 +96,11 @@ pub struct RunContext<'a> {
     pub capability: theme::Capability,
     pub terminal_width: u16,
     pub cwd: Option<std::path::PathBuf>,
+    /// Whether the terminal advertises OSC 8 hyperlink support. Drives
+    /// emission of `Style.hyperlink` URLs in [`layout::runs_to_ansi`];
+    /// orthogonal to color `capability` since hyperlinks and color
+    /// support are independent terminal features.
+    pub hyperlinks: bool,
 }
 
 impl<'a> RunContext<'a> {
@@ -113,12 +119,14 @@ impl<'a> RunContext<'a> {
         capability: theme::Capability,
         terminal_width: u16,
         cwd: Option<std::path::PathBuf>,
+        hyperlinks: bool,
     ) -> Self {
         Self {
             theme,
             capability,
             terminal_width,
             cwd,
+            hyperlinks,
         }
     }
 }
@@ -160,6 +168,7 @@ pub fn run_with_context(
         },
         ctx.theme,
         ctx.capability,
+        ctx.hyperlinks,
     );
     writeln!(writer, "{line}")
 }

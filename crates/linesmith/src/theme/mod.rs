@@ -135,11 +135,15 @@ impl Color {
     }
 }
 
-/// Text decorations a segment may layer over its theme color. `role` is
-/// the role the segment wants; `fg` is an explicit color override that
-/// wins over `role`. `bg` and `hyperlink` live in the spec but aren't
-/// wired through yet.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Text decorations a segment may layer over its theme color. `role`
+/// is the role the segment wants; `fg` is an explicit color override
+/// that wins over `role`. `hyperlink` carries an OSC 8 URL that
+/// [`crate::layout::runs_to_ansi`] wraps around the run's text when
+/// the terminal advertises hyperlink support. `bg` lives in the spec
+/// but isn't wired through.
+///
+/// Not `Copy` — `hyperlink` carries an owned `String`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Style {
     pub role: Option<Role>,
@@ -148,6 +152,7 @@ pub struct Style {
     pub italic: bool,
     pub underline: bool,
     pub dim: bool,
+    pub hyperlink: Option<String>,
 }
 
 impl Style {
@@ -161,7 +166,21 @@ impl Style {
             italic: false,
             underline: false,
             dim: false,
+            hyperlink: None,
         }
+    }
+
+    /// Chainable: attach an OSC 8 URL to this style. The link emits
+    /// only when the terminal advertises hyperlink support; capable
+    /// terminals render the run as a clickable link to `url`. An
+    /// empty `url` folds to `None`, matching the plugin-output path
+    /// — emitting `\x1b]8;;\x1b\\` would wrap text in a link to
+    /// nothing.
+    #[must_use]
+    pub fn with_hyperlink(mut self, url: impl Into<String>) -> Self {
+        let url = url.into();
+        self.hyperlink = if url.is_empty() { None } else { Some(url) };
+        self
     }
 }
 
@@ -207,10 +226,11 @@ impl StyledRun {
         &self.text
     }
 
-    /// The run's style. Returned by value since `Style` is `Copy`.
+    /// The run's style. Returned by reference; `Style` carries an
+    /// owned `hyperlink` URL so it is no longer `Copy`.
     #[must_use]
-    pub fn style(&self) -> Style {
-        self.style
+    pub fn style(&self) -> &Style {
+        &self.style
     }
 }
 

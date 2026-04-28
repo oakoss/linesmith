@@ -598,8 +598,11 @@ impl OverriddenSegment {
 impl Segment for OverriddenSegment {
     fn render(&self, ctx: &DataContext, rc: &RenderContext) -> RenderResult {
         let result = self.inner.render(ctx, rc)?;
-        Ok(result.map(|r| match self.user_style {
-            Some(style) => r.with_style(style),
+        Ok(result.map(|r| match &self.user_style {
+            Some(override_style) => {
+                let merged = merge_user_override(r.style(), override_style);
+                r.with_style(merged)
+            }
             None => r,
         }))
     }
@@ -611,8 +614,11 @@ impl Segment for OverriddenSegment {
         target: u16,
     ) -> Option<RenderedSegment> {
         let inner = self.inner.shrink_to_fit(ctx, rc, target)?;
-        Some(match self.user_style {
-            Some(style) => inner.with_style(style),
+        Some(match &self.user_style {
+            Some(override_style) => {
+                let merged = merge_user_override(inner.style(), override_style);
+                inner.with_style(merged)
+            }
             None => inner,
         })
     }
@@ -634,6 +640,23 @@ impl Segment for OverriddenSegment {
         }
         d
     }
+}
+
+/// Merge a user-config style override onto the inner segment's style.
+/// Visual fields (role, fg, bold, italic, underline, dim) take the
+/// override's value — that's the documented "user wholesale-replaces
+/// segment styling" behavior. `hyperlink` is the exception: it carries
+/// segment behavior (the link target) rather than appearance, and the
+/// user-style TOML syntax doesn't expose a way to set it, so the
+/// override always arrives with `hyperlink: None`. Inheriting the
+/// inner segment's hyperlink keeps `[segments.X] color = "red"` from
+/// silently stripping links the segment emits.
+fn merge_user_override(inner: &Style, override_style: &Style) -> Style {
+    let mut merged = override_style.clone();
+    if merged.hyperlink.is_none() {
+        merged.hyperlink = inner.hyperlink.clone();
+    }
+    merged
 }
 
 #[cfg(test)]
@@ -948,12 +971,46 @@ mod layout_type_tests {
             italic: true,
             ..Style::default()
         };
-        let wrapped = OverriddenSegment::new(Box::new(Styled)).with_user_style(override_style);
+        let wrapped =
+            OverriddenSegment::new(Box::new(Styled)).with_user_style(override_style.clone());
         let rendered = wrapped
             .render(&stub_ctx(), &stub_rc())
             .unwrap()
             .expect("rendered");
         assert_eq!(rendered.style, override_style);
+    }
+
+    #[test]
+    fn user_style_override_preserves_inner_hyperlink() {
+        // Pin the merge contract: visual override fields wholesale-
+        // replace, but the inner segment's hyperlink survives so a
+        // user `[segments.X] color = "red"` doesn't silently strip
+        // links the segment emits. The user-style TOML syntax has no
+        // hyperlink slot today, so the override's hyperlink is
+        // always None — inheriting from the inner is lossless.
+        struct Linked;
+        impl Segment for Linked {
+            fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+                Ok(Some(RenderedSegment::new("x").with_style(
+                    Style::default().with_hyperlink("https://example.com"),
+                )))
+            }
+            fn defaults(&self) -> SegmentDefaults {
+                SegmentDefaults::with_priority(0)
+            }
+        }
+        let override_style = Style::role(Role::Error);
+        let wrapped =
+            OverriddenSegment::new(Box::new(Linked)).with_user_style(override_style.clone());
+        let rendered = wrapped
+            .render(&stub_ctx(), &stub_rc())
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(rendered.style.role, Some(Role::Error));
+        assert_eq!(
+            rendered.style.hyperlink.as_deref(),
+            Some("https://example.com"),
+        );
     }
 
     #[test]
@@ -1000,7 +1057,8 @@ mod layout_type_tests {
             italic: true,
             ..Style::default()
         };
-        let wrapped = OverriddenSegment::new(Box::new(Shrinkable)).with_user_style(override_style);
+        let wrapped =
+            OverriddenSegment::new(Box::new(Shrinkable)).with_user_style(override_style.clone());
         let shrunk = wrapped
             .shrink_to_fit(&stub_ctx(), &stub_rc(), 5)
             .expect("inner returned compact form");

@@ -427,7 +427,8 @@ fn run_cli(
     let width = raw_width.saturating_sub(padding);
     let theme_ref = resolve_theme(cfg.as_ref(), &registry, stderr);
     let capability = resolve_color_capability(args.color_override, env, cfg.as_ref());
-    let ctx = RunContext::new(theme_ref, capability, width, env.cwd.clone());
+    let hyperlinks = supports_hyperlinks::on(supports_hyperlinks::Stream::Stdout);
+    let ctx = RunContext::new(theme_ref, capability, width, env.cwd.clone(), hyperlinks);
     if let Err(err) = run_with_context(stdin, stdout, stderr, &segments, &ctx) {
         let _ = writeln!(stderr, "linesmith: {err}");
         return 1;

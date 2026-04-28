@@ -399,6 +399,7 @@ fn config_style_override_emits_sgr_bytes_end_to_end() {
         &mut |_| {},
         linesmith::theme::default_theme(),
         linesmith::theme::Capability::TrueColor,
+        false,
     );
     assert!(
         line.contains("\x1b[1;38;2;255;0;0m"),
