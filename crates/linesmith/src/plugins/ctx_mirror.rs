@@ -246,6 +246,12 @@ fn build_status(s: &StatusContext) -> Dynamic {
             .as_ref()
             .map_or(Dynamic::UNIT, |n| Dynamic::from(n.clone())),
     );
+    m.insert(
+        "version".into(),
+        s.version
+            .as_ref()
+            .map_or(Dynamic::UNIT, |v| Dynamic::from(v.clone())),
+    );
     m.insert("raw".into(), json_to_dynamic(&s.raw));
     Dynamic::from_map(m)
 }
@@ -873,6 +879,7 @@ mod tests {
             vim: None,
             output_style: None,
             agent_name: None,
+            version: None,
             raw: Arc::new(serde_json::json!({"custom": "field"})),
         }
     }
@@ -1331,9 +1338,33 @@ mod tests {
         assert!(status.get("vim").unwrap().is_unit());
         assert!(status.get("output_style").unwrap().is_unit());
         assert!(status.get("agent_name").unwrap().is_unit());
+        assert!(status.get("version").unwrap().is_unit());
         assert!(
             !status.contains_key("rate_limits"),
             "rate_limits is no longer mirrored; plugins read ctx.usage",
+        );
+    }
+
+    #[test]
+    fn version_surfaces_as_string_when_present() {
+        // Plugins gate behavior on Claude Code version (e.g. workaround
+        // segments that activate only on a specific CC release). The
+        // built-in path reads `s.version`; this test pins that the
+        // plugin mirror exposes the same field so the two views stay
+        // in sync.
+        let mut s = minimal_status();
+        s.version = Some("2.1.90".into());
+        let dc = DataContext::new(s);
+        let ctx = build_and_unwrap_map(&dc, &[]);
+        let status = status_map(&ctx);
+        assert_eq!(
+            status
+                .get("version")
+                .unwrap()
+                .clone()
+                .try_cast::<String>()
+                .unwrap(),
+            "2.1.90"
         );
     }
 

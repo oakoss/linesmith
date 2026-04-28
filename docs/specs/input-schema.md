@@ -71,6 +71,10 @@ pub struct StatusContext {
     pub vim: Option<VimMode>,
     pub output_style: Option<OutputStyle>,
     pub agent_name: Option<String>,
+    /// Tool CLI version string from the top-level `version` field
+    /// (e.g. Claude Code emits `"2.1.90"`). Folds null/missing/empty
+    /// to `None`.
+    pub version: Option<String>,
 
     /// Full original JSON. Plugins consult this for tool-specific fields
     /// that aren't in the canonical model.
@@ -324,8 +328,8 @@ StatusContext (or ParseError)
 
 Priority order, first true wins:
 
-1. **QwenCode**: `version` field present at top level (Qwen emits a version; Claude does not)
-2. **ClaudeCode**: `cost` object present with `total_api_duration_ms` field (Claude-specific)
+1. **ClaudeCode**: `cost` object present with `total_api_duration_ms` field (Claude-specific). The top-level `version` string is no longer a distinguishing field — Claude Code 2.x emits it too, alongside Qwen.
+2. **QwenCode**: _stub; the prior `version`-presence rule is invalid since CC 2.x. A new discriminator needs a current Qwen payload to compare against current CC. Until then, Qwen routes through the Fallback at rule 5._
 3. **CodexCli**: _stub; detection to be defined when Codex ships the statusLine API_
 4. **CopilotCli**: _stub; detection TBD_
 5. **Fallback**: `ClaudeCode` (most common, most conservative; Qwen fields are a near-superset so this degrades gracefully)

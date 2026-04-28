@@ -25,6 +25,7 @@ pub mod rate_limit_7d_reset;
 pub mod rate_limit_format;
 pub mod session_duration;
 pub mod tokens;
+pub mod version;
 pub mod vim;
 pub mod workspace;
 
@@ -489,6 +490,7 @@ pub const BUILT_IN_SEGMENT_IDS: &[&str] = &[
     "tokens_output",
     "tokens_cached",
     "tokens_total",
+    "version",
 ];
 
 /// Construct a built-in segment by its config id. Unknown ids return
@@ -538,6 +540,7 @@ pub fn built_in_by_id(
         "tokens_output" => Some(Box::new(tokens::TokensOutputSegment)),
         "tokens_cached" => Some(Box::new(tokens::TokensCachedSegment)),
         "tokens_total" => Some(Box::new(tokens::TokensTotalSegment)),
+        "version" => Some(Box::new(version::VersionSegment::from_extras(e, warn))),
         _ => None,
     }
 }
@@ -842,6 +845,45 @@ mod layout_type_tests {
         assert!(built_in_by_id("", None, &mut |_| {}).is_none());
     }
 
+    #[test]
+    fn built_in_by_id_threads_extras_to_version_segment() {
+        // Pin the registry → from_extras wiring for `version`. A
+        // future refactor that drops `from_extras` and constructs
+        // `VersionSegment::default()` would silently break user
+        // configs that set `[segments.version].prefix = "CC "`.
+        use crate::input::{ModelInfo, StatusContext, Tool, WorkspaceInfo};
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let mut extras = BTreeMap::new();
+        extras.insert("prefix".to_string(), toml::Value::String("CC ".to_string()));
+        let seg = built_in_by_id("version", Some(&extras), &mut |_| {})
+            .expect("version segment resolves");
+
+        let ctx = DataContext::new(StatusContext {
+            tool: Tool::ClaudeCode,
+            model: ModelInfo {
+                display_name: "X".into(),
+            },
+            workspace: WorkspaceInfo {
+                project_dir: PathBuf::from("/r"),
+                git_worktree: None,
+            },
+            context_window: None,
+            cost: None,
+            effort: None,
+            vim: None,
+            output_style: None,
+            agent_name: None,
+            version: Some("2.1.90".into()),
+            raw: Arc::new(serde_json::Value::Null),
+        });
+        let rc = RenderContext::new(80);
+        let rendered = seg.render(&ctx, &rc).unwrap().expect("renders");
+        assert_eq!(rendered.text(), "CC 2.1.90");
+    }
+
     // --- OverriddenSegment ---
 
     #[test]
@@ -1032,6 +1074,7 @@ mod layout_type_tests {
             vim: None,
             output_style: None,
             agent_name: None,
+            version: None,
             raw: Arc::new(serde_json::Value::Null),
         })
     }

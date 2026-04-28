@@ -268,6 +268,7 @@ if ctx.status.output_style != () {
     ctx.status.output_style.name        // non-empty string (parser-side invariant)
 }
 ctx.status.agent_name                   // non-empty string or () (collapsed from agent.name per ADR-0008)
+ctx.status.version                      // tool CLI version string (e.g. "2.1.90") or ()
 
 // Rate-limit data is not on ctx.status — read ctx.usage instead
 // (declared via @data_deps = ["usage"]). The OAuth endpoint +

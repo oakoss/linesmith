@@ -30,6 +30,12 @@ pub struct StatusContext {
     /// parser folds null/missing/empty to `None`. See `lsm-srvz` for the
     /// follow-up to lift this into the type via a `NonEmptyString`.
     pub agent_name: Option<String>,
+    /// Tool CLI version string from the top-level `version` field
+    /// (e.g. Claude Code emits `"2.1.90"`). Trimmed; folds
+    /// null/missing/empty/whitespace-only to `None`. Per
+    /// `docs/specs/input-schema.md`, both Claude Code 2.x and Qwen
+    /// Code emit this; it is no longer a tool-detection discriminator.
+    pub version: Option<String>,
     pub raw: Arc<serde_json::Value>,
 }
 
@@ -438,6 +444,7 @@ mod claude {
         let vim = parse_vim(root)?;
         let output_style = parse_output_style(root)?;
         let agent_name = parse_agent_name(root)?;
+        let version = parse_version(root)?;
 
         Ok(StatusContext {
             tool: TOOL,
@@ -449,6 +456,7 @@ mod claude {
             vim,
             output_style,
             agent_name,
+            version,
             raw,
         })
     }
@@ -764,6 +772,28 @@ mod claude {
             return Ok(None);
         }
         Ok(Some(OutputStyle { name }))
+    }
+
+    fn parse_version(
+        root: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<String>, ParseError> {
+        let Some(value) = root.get("version") else {
+            return Ok(None);
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        let raw = value
+            .as_str()
+            .ok_or_else(|| type_mismatch("version", JsonType::String, JsonType::of(value)))?;
+        // Trim and fold whitespace-only / empty to None — the
+        // empty-payload contract should treat `"  "` the same as `""`
+        // and `null` rather than rendering a blank-looking version.
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(trimmed.to_owned()))
     }
 
     fn parse_agent_name(
@@ -1774,6 +1804,58 @@ mod tests {
         let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"agent":{"name":42}}"#;
         match parse(bytes).expect_err("rejected") {
             ParseError::TypeMismatch { path, .. } => assert_eq!(path, "agent.name"),
+            other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_top_level_version_string() {
+        // Pinned against the official CC docs at code.claude.com/docs/en/statusline
+        // (verified 2026-04-28): `version` is a top-level string field
+        // on the statusline payload.
+        let bytes = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/r" },
+            "version": "2.1.90"
+        }"#;
+        assert_eq!(parse(bytes).unwrap().version.as_deref(), Some("2.1.90"));
+    }
+
+    #[test]
+    fn version_absent_or_null_or_empty_yields_none() {
+        let absent = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"}}"#;
+        assert!(parse(absent).unwrap().version.is_none());
+        let null =
+            br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"version":null}"#;
+        assert!(parse(null).unwrap().version.is_none());
+        let empty =
+            br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"version":""}"#;
+        assert!(parse(empty).unwrap().version.is_none());
+        // Whitespace-only is treated like empty: rendering "v   " is
+        // worse than hiding the segment.
+        let ws =
+            br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"version":"   "}"#;
+        assert!(parse(ws).unwrap().version.is_none());
+    }
+
+    #[test]
+    fn version_surrounding_whitespace_is_trimmed() {
+        // Defensive: if CC ever ships padded version strings, the
+        // segment shouldn't render `v  2.1.90  `.
+        let bytes = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/r" },
+            "version": "  2.1.90  "
+        }"#;
+        assert_eq!(parse(bytes).unwrap().version.as_deref(), Some("2.1.90"));
+    }
+
+    #[test]
+    fn version_typed_wrong_rejected_as_type_mismatch() {
+        let bytes =
+            br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"version":42}"#;
+        match parse(bytes).expect_err("rejected") {
+            ParseError::TypeMismatch { path, .. } => assert_eq!(path, "version"),
             other => panic!("expected TypeMismatch, got {other:?}"),
         }
     }

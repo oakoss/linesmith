@@ -54,6 +54,7 @@ mod tests {
             vim: None,
             output_style,
             agent_name: None,
+            version: None,
             raw: Arc::new(serde_json::Value::Null),
         })
     }
