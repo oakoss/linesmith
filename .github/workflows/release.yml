@@ -95,11 +95,14 @@ jobs:
           path: ~/.cargo/bin/dist
       # On push (real release) the tag is the pushed ref. On dispatch /
       # pull_request (dry-run) `github.ref_name` is a branch name, so
-      # synthesize an ephemeral tag from the commit SHA — `dist build` accepts
-      # any tag-shaped string for artifact naming; nothing is pushed back to
-      # git. PR events use the head SHA (not ${GITHUB_SHA}, which is the merge
-      # commit on PRs). Unknown event_name exits non-zero rather than silently
-      # emitting an empty tag-flag.
+      # synthesize an ephemeral tag — but it must match the workspace's
+      # current package version, because `dist build --tag=` rejects tags
+      # whose version part doesn't correspond to a real package version
+      # (otherwise: "This workspace doesn't have anything for dist to
+      # Release"). Append a SemVer prerelease suffix from the head SHA so
+      # the tag is unique per commit. PR events use the head SHA, not
+      # ${GITHUB_SHA} (which is the merge commit on PRs). Unknown
+      # event_name exits non-zero rather than silently emitting a bad tag.
       - id: compute-tag
         shell: bash
         run: |
@@ -107,12 +110,18 @@ jobs:
             push)
               tag="${{ github.ref_name }}"
               ;;
-            workflow_dispatch)
-              tag="v0.0.0-dry-run-${GITHUB_SHA:0:7}"
-              ;;
-            pull_request)
-              head_sha="${{ github.event.pull_request.head.sha }}"
-              tag="v0.0.0-dry-run-${head_sha:0:7}"
+            workflow_dispatch | pull_request)
+              if [ "${{ github.event_name }}" = "pull_request" ]; then
+                sha="${{ github.event.pull_request.head.sha }}"
+              else
+                sha="${GITHUB_SHA}"
+              fi
+              version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
+              if [ -z "${version}" ]; then
+                echo "::error::compute-tag: failed to read version from Cargo.toml" >&2
+                exit 1
+              fi
+              tag="v${version}-dry-run-${sha:0:7}"
               ;;
             *)
               echo "::error::compute-tag: unsupported event_name '${{ github.event_name }}'. Update release.yml to handle this trigger." >&2
