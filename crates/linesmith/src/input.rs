@@ -285,11 +285,13 @@ impl Percent {
 ///
 /// # Errors
 ///
-/// Returns `ParseError::InvalidJson` on malformed JSON, `MissingField`
-/// when a required key is absent, `TypeMismatch` when a value has the
-/// wrong JSON kind, `InvalidValue` when a value violates a canonical-model
-/// invariant (e.g. out-of-range percentage), and `NormalizerError` for
-/// tool-specific mapping failures.
+/// Per ADR-0014, sub-field failures degrade to `Option::None` with
+/// `lsm_warn!` rather than propagating through `Result`. `parse` only
+/// returns `Err` for catastrophic failures: `ParseError::InvalidJson`
+/// on malformed JSON, `TypeMismatch` when the root is not a JSON
+/// object, and `InvalidValue` for a `used_percentage` < 0 (carve-out
+/// for undocumented CC corruption signals; NaN is rejected upstream
+/// by `serde_json` as `InvalidJson`).
 pub fn parse(input: &[u8]) -> Result<StatusContext, ParseError> {
     let raw_value: serde_json::Value =
         serde_json::from_slice(input).map_err(|err| ParseError::InvalidJson {
@@ -313,6 +315,12 @@ pub enum ParseError {
         message: String,
         location: Option<SourcePos>,
     },
+    /// **Reserved variant — not currently constructed by any parser
+    /// path.** Per ADR-0014, missing leaves degrade to `Option::None`
+    /// with `lsm_warn!`, never `Err`. The variant stays declared so
+    /// re-introducing a strict required-field policy in a future ADR
+    /// is non-breaking; today it cannot fire and pattern-matching for
+    /// it as a distinct case is dead code.
     MissingField {
         tool: Tool,
         path: String,
@@ -1743,6 +1751,56 @@ mod tests {
         assert!(cw.current_usage.is_none());
         assert_eq!(cw.size, Some(200_000));
         assert!(cw.used.is_some());
+    }
+
+    #[test]
+    fn current_usage_inner_missing_collapses_whole_turn_usage() {
+        // Symmetric to the null-leaf test, but pinned at the call
+        // site (parse_current_usage's let-else cascade), not at the
+        // helper. `try_u64_optional` collapses missing and null into
+        // the same silent `None` branch today; if a future refactor
+        // splits them (e.g. logging a warn on missing), this test
+        // catches the call-site behavior change without forcing the
+        // helper's internal control flow into the test surface.
+        let json = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/repo" },
+            "context_window": {
+                "used_percentage": 50.0,
+                "context_window_size": 200000,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "current_usage": {
+                    "output_tokens": 50,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
+                }
+            }
+        }"#;
+        let ctx = parse(json).expect("missing leaf inside current_usage must not fail parse");
+        let cw = ctx.context_window.expect("context_window present");
+        assert!(cw.current_usage.is_none());
+        assert_eq!(cw.size, Some(200_000));
+    }
+
+    #[test]
+    fn cost_total_cost_usd_accepts_zero_and_tiny_positive() {
+        // Defends try_f64_required's success path against a future
+        // over-tightening like `n != 0.0` or `n > 0.0`. Zero is valid
+        // (no API calls yet); a tiny non-zero positive must also
+        // round-trip. serde_json rejects literals at f64::MAX as
+        // "number out of range" — see `out_of_range_number_rejected_
+        // at_json_layer` for the upper bound.
+        for &val in &[0.0_f64, 1e-300_f64] {
+            let bytes = format!(
+                r#"{{"model":{{"display_name":"X"}},"workspace":{{"project_dir":"/r"}},
+                     "cost":{{"total_cost_usd":{val},"total_duration_ms":0,"total_api_duration_ms":0,
+                              "total_lines_added":0,"total_lines_removed":0}}}}"#
+            );
+            let ctx = parse(bytes.as_bytes()).expect("finite f64 must round-trip");
+            let cost = ctx.cost.expect("cost present");
+            assert_eq!(cost.total_cost_usd, Some(val));
+        }
     }
 
     #[test]

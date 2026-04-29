@@ -118,23 +118,19 @@ impl Percent {
 }
 ```
 
-`Percent` prevents `used + remaining != 100` and negative percentages. Normalizers construct via `Percent::new` and propagate the `Option` or map to `ParseError::TypeMismatch`. `Percent::new` rejects `NaN` (NaN fails the range check because `(0.0..=100.0).contains(&NaN)` returns `false`); normalizers therefore never produce a `Some(Percent(NaN))`. `Percent` does not derive `Eq`/`Hash` because `f32` lacks total ordering in general; if a segment's cache invalidator needs to compare percentages, compare the underlying `f32` directly.
+`Percent` prevents `used + remaining != 100` and negative percentages. Normalizers construct via `Percent::from_f64`; per ADR-0014, missing/null/wrong-typed `used_percentage` warn-and-degrade to `Option::None`, while a negative value raises `ParseError::InvalidValue` (carve-out — undocumented CC state surfaces loud). `Percent::from_f64` also rejects `NaN` defensively (NaN fails the range check because `(0.0..=100.0).contains(&NaN)` returns `false`); the NaN branch is unreachable through `parse()` because `serde_json` rejects NaN literals as `InvalidJson` upstream. `Percent` does not derive `Eq`/`Hash` because `f32` lacks total ordering in general; if a segment's cache invalidator needs to compare percentages, compare the underlying `f32` directly.
 
 ### Sub-types
 
 ```rust
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
-    pub id: String,             // e.g. "claude-sonnet-4-6"
     pub display_name: String,   // e.g. "Claude Sonnet 4.6"
 }
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceInfo {
-    pub cwd: PathBuf,           // absolute path from invocation
-    pub current_dir: PathBuf,   // relative to project_dir in Claude
     pub project_dir: PathBuf,   // project root
-    pub added_dirs: Vec<PathBuf>,
     pub git_worktree: Option<GitWorktree>,
 }
 
@@ -153,8 +149,10 @@ pub struct ContextWindow {
     pub size: Option<u32>,            // e.g. 200_000 for Sonnet, 1_000_000 for 1M contexts
     pub total_input_tokens: Option<u64>,
     pub total_output_tokens: Option<u64>,
-    /// None before the first API call in a session.
-    pub current_usage: Option<TokenUsage>,
+    /// None before the first API call in a session. TurnUsage's
+    /// inner leaves are non-Option — when `current_usage` is `Some`,
+    /// every field is populated.
+    pub current_usage: Option<TurnUsage>,
 }
 
 impl ContextWindow {
@@ -162,18 +160,18 @@ impl ContextWindow {
     pub fn remaining(&self) -> Option<Percent> { self.used.map(Percent::complement) }
 }
 
-#[derive(Debug, Clone)]
-pub struct TokenUsage {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct CostMetrics {
     /// Per ADR-0014, leaves degrade independently. `None` arises on
-    /// missing/null leaves or non-finite numbers.
+    /// missing/null/wrong-typed leaves.
     pub total_cost_usd: Option<f64>,
     pub total_duration_ms: Option<u64>,
     pub total_api_duration_ms: Option<u64>,
@@ -339,11 +337,11 @@ If heuristic matching is ambiguous, emit a warning-level log line once (to stder
 ### Normalizer behavior
 
 - Each normalizer parses only fields in the canonical model; everything else stays in `raw`
-- Unknown enum values (e.g. a new `EffortLevel` string) fall back to the closest known value and log a warning once per variant per run
-- Paths (`cwd`, `current_dir`, etc.) use `PathBuf::from`, preserving platform-native separators
+- Unknown enum values (e.g. a new `EffortLevel` string) warn-and-degrade to `None` per ADR-0014, with the unknown raw value logged at the JSON path
+- Paths (`project_dir`, `git_worktree.path`, etc.) use `PathBuf::from`, preserving platform-native separators
 - Timestamps parse with `chrono::DateTime::parse_from_rfc3339` and convert to UTC
 - Nullable fields stay `None` when absent or JSON-null
-- `Percent::new` failure (out-of-range value in input JSON) becomes `ParseError::TypeMismatch` with `path` pointing at the offending field
+- `Percent::new` failure on a negative or NaN `used_percentage` becomes `ParseError::InvalidValue` (ADR-0014 carve-out: undocumented CC state surfaces loud rather than degrading silently). An above-100 value clamps to 100 with a warn (claude-code#37163).
 
 ## Edge cases
 
