@@ -17,8 +17,15 @@ impl Segment for CostSegment {
             crate::lsm_debug!("cost: status.cost absent; hiding");
             return Ok(None);
         };
+        // Per ADR-0014, `total_cost_usd` is a per-leaf Option; hide
+        // when null. The other CostMetrics leaves are independent —
+        // a malformed `total_lines_added` doesn't blank the cost.
+        let Some(usd) = cost.total_cost_usd else {
+            crate::lsm_debug!("cost: total_cost_usd null; hiding");
+            return Ok(None);
+        };
         Ok(Some(
-            RenderedSegment::new(format!("${:.2}", cost.total_cost_usd)).with_role(Role::Muted),
+            RenderedSegment::new(format!("${usd:.2}")).with_role(Role::Muted),
         ))
     }
 
@@ -61,11 +68,11 @@ mod tests {
 
     fn cost_of(usd: f64) -> CostMetrics {
         CostMetrics {
-            total_cost_usd: usd,
-            total_duration_ms: 0,
-            total_api_duration_ms: 0,
-            total_lines_added: 0,
-            total_lines_removed: 0,
+            total_cost_usd: Some(usd),
+            total_duration_ms: Some(0),
+            total_api_duration_ms: Some(0),
+            total_lines_added: Some(0),
+            total_lines_removed: Some(0),
         }
     }
 

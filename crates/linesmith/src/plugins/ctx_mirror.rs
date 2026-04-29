@@ -374,22 +374,25 @@ fn build_turn_usage(u: &TurnUsage) -> Dynamic {
 
 fn build_cost(c: &CostMetrics) -> Dynamic {
     let mut m = Map::new();
-    m.insert("total_cost_usd".into(), Dynamic::from(c.total_cost_usd));
+    m.insert(
+        "total_cost_usd".into(),
+        c.total_cost_usd.map_or(Dynamic::UNIT, Dynamic::from),
+    );
     m.insert(
         "total_duration_ms".into(),
-        int_from_u64(c.total_duration_ms),
+        c.total_duration_ms.map_or(Dynamic::UNIT, int_from_u64),
     );
     m.insert(
         "total_api_duration_ms".into(),
-        int_from_u64(c.total_api_duration_ms),
+        c.total_api_duration_ms.map_or(Dynamic::UNIT, int_from_u64),
     );
     m.insert(
         "total_lines_added".into(),
-        int_from_u64(c.total_lines_added),
+        c.total_lines_added.map_or(Dynamic::UNIT, int_from_u64),
     );
     m.insert(
         "total_lines_removed".into(),
-        int_from_u64(c.total_lines_removed),
+        c.total_lines_removed.map_or(Dynamic::UNIT, int_from_u64),
     );
     Dynamic::from_map(m)
 }
@@ -1598,11 +1601,11 @@ mod tests {
     fn cost_lines_fields_round_trip_as_i64() {
         let mut s = minimal_status();
         s.cost = Some(CostMetrics {
-            total_cost_usd: 1.23,
-            total_duration_ms: 60_000,
-            total_api_duration_ms: 30_000,
-            total_lines_added: 500,
-            total_lines_removed: 10,
+            total_cost_usd: Some(1.23),
+            total_duration_ms: Some(60_000),
+            total_api_duration_ms: Some(30_000),
+            total_lines_added: Some(500),
+            total_lines_removed: Some(10),
         });
         let dc = DataContext::new(s);
         let ctx = build_and_unwrap_map(&dc, &[]);

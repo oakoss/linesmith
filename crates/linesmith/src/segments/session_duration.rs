@@ -20,8 +20,12 @@ impl Segment for SessionDurationSegment {
             crate::lsm_debug!("session_duration: status.cost absent; hiding");
             return Ok(None);
         };
+        let Some(ms) = cost.total_duration_ms else {
+            crate::lsm_debug!("session_duration: total_duration_ms null; hiding");
+            return Ok(None);
+        };
         Ok(Some(
-            RenderedSegment::new(format_duration(cost.total_duration_ms)).with_role(Role::Muted),
+            RenderedSegment::new(format_duration(ms)).with_role(Role::Muted),
         ))
     }
 
@@ -86,11 +90,11 @@ mod tests {
 
     fn cost_of(duration_ms: u64) -> CostMetrics {
         CostMetrics {
-            total_cost_usd: 0.0,
-            total_duration_ms: duration_ms,
-            total_api_duration_ms: 0,
-            total_lines_added: 0,
-            total_lines_removed: 0,
+            total_cost_usd: Some(0.0),
+            total_duration_ms: Some(duration_ms),
+            total_api_duration_ms: Some(0),
+            total_lines_added: Some(0),
+            total_lines_removed: Some(0),
         }
     }
 

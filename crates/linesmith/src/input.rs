@@ -114,13 +114,17 @@ pub struct TurnUsage {
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct CostMetrics {
-    pub total_cost_usd: f64,
-    pub total_duration_ms: u64,
-    pub total_api_duration_ms: u64,
+    /// Per ADR-0014, leaves degrade independently. `total_cost_usd:
+    /// None` means the leaf was missing, null, or wrong-typed;
+    /// segments hide the affected metric and unrelated cost leaves
+    /// still render.
+    pub total_cost_usd: Option<f64>,
+    pub total_duration_ms: Option<u64>,
+    pub total_api_duration_ms: Option<u64>,
     /// Session lines added; `u64` to match the JSON wire width and avoid
     /// silent truncation on sessions with very large aggregated counts.
-    pub total_lines_added: u64,
-    pub total_lines_removed: u64,
+    pub total_lines_added: Option<u64>,
+    pub total_lines_removed: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -485,14 +489,14 @@ mod claude {
             Some(o) => o,
             None => {
                 crate::lsm_warn!(
-                    "model: expected object, got {:?}; hiding (possible CC schema drift)",
+                    "model: expected object, got {:?}; degrading to None (possible CC schema drift)",
                     JsonType::of(value)
                 );
                 return None;
             }
         };
         let Some(name_value) = model.get("display_name") else {
-            crate::lsm_warn!("model.display_name: missing; hiding");
+            crate::lsm_warn!("model.display_name: missing; degrading to None");
             return None;
         };
         if name_value.is_null() {
@@ -500,7 +504,7 @@ mod claude {
         }
         let Some(display_name) = name_value.as_str() else {
             crate::lsm_warn!(
-                "model.display_name: expected string, got {:?}; hiding",
+                "model.display_name: expected string, got {:?}; degrading to None",
                 JsonType::of(name_value)
             );
             return None;
@@ -522,14 +526,14 @@ mod claude {
             Some(o) => o,
             None => {
                 crate::lsm_warn!(
-                    "workspace: expected object, got {:?}; hiding (possible CC schema drift)",
+                    "workspace: expected object, got {:?}; degrading to None (possible CC schema drift)",
                     JsonType::of(value)
                 );
                 return None;
             }
         };
         let Some(dir_value) = workspace.get("project_dir") else {
-            crate::lsm_warn!("workspace.project_dir: missing; hiding");
+            crate::lsm_warn!("workspace.project_dir: missing; degrading to None");
             return None;
         };
         if dir_value.is_null() {
@@ -537,7 +541,7 @@ mod claude {
         }
         let Some(project_dir_str) = dir_value.as_str() else {
             crate::lsm_warn!(
-                "workspace.project_dir: expected string, got {:?}; hiding",
+                "workspace.project_dir: expected string, got {:?}; degrading to None",
                 JsonType::of(dir_value)
             );
             return None;
@@ -548,7 +552,7 @@ mod claude {
             Some(serde_json::Value::Object(obj)) => parse_git_worktree(obj),
             Some(other) => {
                 crate::lsm_warn!(
-                    "workspace.git_worktree: expected object, got {:?}; hiding worktree",
+                    "workspace.git_worktree: expected object, got {:?}; degrading to None (worktree only)",
                     JsonType::of(other)
                 );
                 None
@@ -608,7 +612,13 @@ mod claude {
         if value.is_null() {
             return Ok(None);
         }
-        let cw = expect_object(value, "context_window")?;
+        let Some(cw) = value.as_object() else {
+            crate::lsm_warn!(
+                "context_window: expected object, got {:?}; degrading to None",
+                JsonType::of(value)
+            );
+            return Ok(None);
+        };
 
         // ADR-0014: each leaf degrades independently. A null
         // `used_percentage` (the documented pre-first-API-call shape)
@@ -619,13 +629,28 @@ mod claude {
         let total_output_tokens = try_u64_required(cw, "context_window.total_output_tokens");
         let current_usage = parse_current_usage(cw)?;
 
-        Ok(Some(ContextWindow {
+        let window = ContextWindow {
             used,
             size,
             total_input_tokens,
             total_output_tokens,
             current_usage,
-        }))
+        };
+        // Collapse to `None` when every leaf failed so the plugin
+        // contract `ctx.status.context_window != ()` round-trips: a
+        // non-`()` map must always have at least one readable leaf.
+        if context_window_is_empty(&window) {
+            return Ok(None);
+        }
+        Ok(Some(window))
+    }
+
+    fn context_window_is_empty(cw: &ContextWindow) -> bool {
+        cw.used.is_none()
+            && cw.size.is_none()
+            && cw.total_input_tokens.is_none()
+            && cw.total_output_tokens.is_none()
+            && cw.current_usage.is_none()
     }
 
     /// Parse `context_window.used_percentage` into `Option<Percent>`.
@@ -738,6 +763,33 @@ mod claude {
         }
     }
 
+    /// Tolerant `f64` reader for *contracted* leaves. Mirrors
+    /// `try_u64_required`. JSON syntax can't represent NaN or ±Inf
+    /// (`serde_json` rejects them as `InvalidJson` at parse time),
+    /// so a non-finite check here would be unreachable through
+    /// `parse()` — omitted intentionally.
+    fn try_f64_required(
+        obj: &serde_json::Map<String, serde_json::Value>,
+        path: &'static str,
+    ) -> Option<f64> {
+        let Some(value) = obj.get(path_tail(path)) else {
+            crate::lsm_warn!("{path}: missing; degrading leaf to None (possible CC schema drift)");
+            return None;
+        };
+        if value.is_null() {
+            crate::lsm_warn!("{path}: null; degrading leaf to None (possible CC schema drift)");
+            return None;
+        }
+        let Some(n) = value.as_f64() else {
+            crate::lsm_warn!(
+                "{path}: expected number, got {:?}; degrading leaf to None",
+                JsonType::of(value)
+            );
+            return None;
+        };
+        Some(n)
+    }
+
     fn parse_current_usage(
         cw: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<Option<TurnUsage>, ParseError> {
@@ -801,21 +853,40 @@ mod claude {
         if value.is_null() {
             return Ok(None);
         }
-        let cost = expect_object(value, "cost")?;
+        let Some(cost) = value.as_object() else {
+            crate::lsm_warn!(
+                "cost: expected object, got {:?}; degrading to None",
+                JsonType::of(value)
+            );
+            return Ok(None);
+        };
 
-        let total_cost_usd = require_f64(cost, "cost.total_cost_usd")?;
-        let total_duration_ms = require_u64(cost, "cost.total_duration_ms")?;
-        let total_api_duration_ms = require_u64(cost, "cost.total_api_duration_ms")?;
-        let total_lines_added = require_u64(cost, "cost.total_lines_added")?;
-        let total_lines_removed = require_u64(cost, "cost.total_lines_removed")?;
+        // Per ADR-0014, leaves degrade independently. CC contract
+        // guarantees these keys when `cost` is present, so missing/null
+        // is schema drift and warns at the leaf.
+        let metrics = CostMetrics {
+            total_cost_usd: try_f64_required(cost, "cost.total_cost_usd"),
+            total_duration_ms: try_u64_required(cost, "cost.total_duration_ms"),
+            total_api_duration_ms: try_u64_required(cost, "cost.total_api_duration_ms"),
+            total_lines_added: try_u64_required(cost, "cost.total_lines_added"),
+            total_lines_removed: try_u64_required(cost, "cost.total_lines_removed"),
+        };
+        // If every leaf failed, collapse to `None` so the plugin
+        // contract `ctx.status.cost != ()` (per plugin-api.md) round-
+        // trips correctly: a non-`()` cost map must always have at
+        // least one readable leaf.
+        if cost_is_empty(&metrics) {
+            return Ok(None);
+        }
+        Ok(Some(metrics))
+    }
 
-        Ok(Some(CostMetrics {
-            total_cost_usd,
-            total_duration_ms,
-            total_api_duration_ms,
-            total_lines_added,
-            total_lines_removed,
-        }))
+    fn cost_is_empty(c: &CostMetrics) -> bool {
+        c.total_cost_usd.is_none()
+            && c.total_duration_ms.is_none()
+            && c.total_api_duration_ms.is_none()
+            && c.total_lines_added.is_none()
+            && c.total_lines_removed.is_none()
     }
 
     fn parse_effort(
@@ -827,32 +898,47 @@ mod claude {
         if value.is_null() {
             return Ok(None);
         }
-        // Claude Code 2.1.x emits `effort: { level: "xhigh" }`; the object
-        // form is canonical. A bare string is tolerated for forward/backward
-        // compat with other tools or earlier contracts.
+        // Canonical CC 2.1.x emits `effort: { level: "xhigh" }`. A bare
+        // string is tolerated for forward/backward compat. Per ADR-0014,
+        // every failure path warn-and-degrades — symmetric with parse_vim.
         let (raw, path): (&str, &'static str) = match value {
             serde_json::Value::Object(obj) => {
-                let level = obj.get("level").ok_or_else(|| missing("effort.level"))?;
+                let Some(level) = obj.get("level") else {
+                    crate::lsm_warn!(
+                        "effort: wrapper present but `level` missing; degrading to None (possible CC schema drift)"
+                    );
+                    return Ok(None);
+                };
                 if level.is_null() {
                     return Ok(None);
                 }
-                let s = level.as_str().ok_or_else(|| {
-                    type_mismatch("effort.level", JsonType::String, JsonType::of(level))
-                })?;
+                let Some(s) = level.as_str() else {
+                    crate::lsm_warn!(
+                        "effort.level: expected string, got {:?}; degrading to None",
+                        JsonType::of(level)
+                    );
+                    return Ok(None);
+                };
                 (s, "effort.level")
             }
             serde_json::Value::String(s) => (s.as_str(), "effort"),
             other => {
-                return Err(type_mismatch(
-                    "effort",
-                    JsonType::Object,
-                    JsonType::of(other),
-                ));
+                crate::lsm_warn!(
+                    "effort: expected object or string, got {:?}; degrading to None",
+                    JsonType::of(other)
+                );
+                return Ok(None);
             }
         };
-        raw.parse::<EffortLevel>()
-            .map(Some)
-            .map_err(|()| invalid_value(path, "expected one of: low, medium, high, max, xhigh"))
+        match raw.parse::<EffortLevel>() {
+            Ok(level) => Ok(Some(level)),
+            Err(()) => {
+                crate::lsm_warn!(
+                    "effort: unknown level {raw:?} at {path}; degrading to None (possible CC schema drift — known: low, medium, high, max, xhigh)"
+                );
+                Ok(None)
+            }
+        }
     }
 
     fn parse_vim(
@@ -866,17 +952,26 @@ mod claude {
         }
         // Canonical CC shape is `vim: { mode: "<name>" }` per
         // research/claude-code-statusline-api.md. A bare string is
-        // tolerated for forward/backward compat (mirrors the effort
-        // normalizer's two-shape acceptance).
+        // tolerated for forward/backward compat. Per ADR-0014, every
+        // failure path warn-and-degrades.
         let (raw, path): (&str, &'static str) = match value {
             serde_json::Value::Object(obj) => {
-                let mode = obj.get("mode").ok_or_else(|| missing("vim.mode"))?;
+                let Some(mode) = obj.get("mode") else {
+                    crate::lsm_warn!(
+                        "vim: wrapper present but `mode` missing; degrading to None (possible CC schema drift)"
+                    );
+                    return Ok(None);
+                };
                 if mode.is_null() {
                     return Ok(None);
                 }
-                let s = mode.as_str().ok_or_else(|| {
-                    type_mismatch("vim.mode", JsonType::String, JsonType::of(mode))
-                })?;
+                let Some(s) = mode.as_str() else {
+                    crate::lsm_warn!(
+                        "vim.mode: expected string, got {:?}; degrading to None",
+                        JsonType::of(mode)
+                    );
+                    return Ok(None);
+                };
                 (s, "vim.mode")
             }
             serde_json::Value::String(s) => {
@@ -892,22 +987,21 @@ mod claude {
                 (s.as_str(), "vim")
             }
             other => {
-                return Err(type_mismatch("vim", JsonType::Object, JsonType::of(other)));
+                crate::lsm_warn!(
+                    "vim: expected object or string, got {:?}; degrading to None",
+                    JsonType::of(other)
+                );
+                return Ok(None);
             }
         };
         // Unknown vim modes degrade the segment, not the whole render:
         // `vim` is opt-in and informational, so a future CC mode (e.g.
-        // `select`, `terminal`) shouldn't blank the statusline. Warn so
-        // schema drift surfaces at the default log level. The strict
-        // `MissingField` / `TypeMismatch` paths above stay as-is because
-        // those signal a malformed wrapper, not an unrecognized variant.
-        // ADR-0014 / lsm-9zvh extends this discipline to other enum
-        // parsers (`parse_effort`).
+        // `select`, `terminal`) shouldn't blank the statusline.
         match raw.parse::<VimMode>() {
             Ok(mode) => Ok(Some(mode)),
             Err(()) => {
                 crate::lsm_warn!(
-                    "vim: unknown mode {raw:?} at {path}; treating as None (possible CC schema drift — known: normal, insert, visual, command, replace)"
+                    "vim: unknown mode {raw:?} at {path}; degrading to None (possible CC schema drift — known: normal, insert, visual, command, replace)"
                 );
                 Ok(None)
             }
@@ -923,42 +1017,39 @@ mod claude {
         if value.is_null() {
             return Ok(None);
         }
-        let obj = expect_object(value, "output_style")?;
+        let Some(obj) = value.as_object() else {
+            crate::lsm_warn!(
+                "output_style: expected object, got {:?}; degrading to None",
+                JsonType::of(value)
+            );
+            return Ok(None);
+        };
         // Tolerate a missing `name` as None so the schema can grow,
         // but warn: the wrapper is present, so a future CC rename of
         // `name` would otherwise dark-ship this segment without a
         // diagnostic trail.
-        //
-        // This deliberately diverges from `parse_effort` / `parse_vim`,
-        // which raise `MissingField` on absent inner keys. Effort and
-        // vim mirror closed enums whose inner key is part of the
-        // canonical CC contract; output_style and agent are open-ended
-        // wrapper structs whose shape may grow (per ADR-0008), so the
-        // parser soft-tolerates and surfaces drift through logging
-        // instead of through the parse error path.
         let Some(name_value) = obj.get("name") else {
             crate::lsm_warn!(
-                "output_style: wrapper present but `name` field missing; treating as None (possible CC schema drift)"
+                "output_style: wrapper present but `name` field missing; degrading to None (possible CC schema drift)"
             );
             return Ok(None);
         };
         if name_value.is_null() {
             return Ok(None);
         }
-        let name = name_value
-            .as_str()
-            .ok_or_else(|| {
-                type_mismatch(
-                    "output_style.name",
-                    JsonType::String,
-                    JsonType::of(name_value),
-                )
-            })?
-            .to_owned();
+        let Some(name) = name_value.as_str() else {
+            crate::lsm_warn!(
+                "output_style.name: expected string, got {:?}; degrading to None",
+                JsonType::of(name_value)
+            );
+            return Ok(None);
+        };
         if name.is_empty() {
             return Ok(None);
         }
-        Ok(Some(OutputStyle { name }))
+        Ok(Some(OutputStyle {
+            name: name.to_owned(),
+        }))
     }
 
     fn parse_version(
@@ -970,9 +1061,13 @@ mod claude {
         if value.is_null() {
             return Ok(None);
         }
-        let raw = value
-            .as_str()
-            .ok_or_else(|| type_mismatch("version", JsonType::String, JsonType::of(value)))?;
+        let Some(raw) = value.as_str() else {
+            crate::lsm_warn!(
+                "version: expected string, got {:?}; degrading to None",
+                JsonType::of(value)
+            );
+            return Ok(None);
+        };
         // Trim and fold whitespace-only / empty to None — the
         // empty-payload contract should treat `"  "` the same as `""`
         // and `null` rather than rendering a blank-looking version.
@@ -992,26 +1087,35 @@ mod claude {
         if value.is_null() {
             return Ok(None);
         }
-        let obj = expect_object(value, "agent")?;
+        let Some(obj) = value.as_object() else {
+            crate::lsm_warn!(
+                "agent: expected object, got {:?}; degrading to None",
+                JsonType::of(value)
+            );
+            return Ok(None);
+        };
         // Same drift-detection rationale as `parse_output_style`: warn
         // when the wrapper is present but `name` is absent.
         let Some(name_value) = obj.get("name") else {
             crate::lsm_warn!(
-                "agent: wrapper present but `name` field missing; treating as None (possible CC schema drift)"
+                "agent: wrapper present but `name` field missing; degrading to None (possible CC schema drift)"
             );
             return Ok(None);
         };
         if name_value.is_null() {
             return Ok(None);
         }
-        let name = name_value
-            .as_str()
-            .ok_or_else(|| type_mismatch("agent.name", JsonType::String, JsonType::of(name_value)))?
-            .to_owned();
+        let Some(name) = name_value.as_str() else {
+            crate::lsm_warn!(
+                "agent.name: expected string, got {:?}; degrading to None",
+                JsonType::of(name_value)
+            );
+            return Ok(None);
+        };
         if name.is_empty() {
             return Ok(None);
         }
-        Ok(Some(name))
+        Ok(Some(name.to_owned()))
     }
 
     // --- helpers ------------------------------------------------------
@@ -1025,35 +1129,8 @@ mod claude {
             .ok_or_else(|| type_mismatch(path, JsonType::Object, JsonType::of(value)))
     }
 
-    fn require_f64(
-        obj: &serde_json::Map<String, serde_json::Value>,
-        path: &'static str,
-    ) -> Result<f64, ParseError> {
-        let value = obj.get(path_tail(path)).ok_or_else(|| missing(path))?;
-        value
-            .as_f64()
-            .ok_or_else(|| type_mismatch(path, JsonType::Number, JsonType::of(value)))
-    }
-
-    fn require_u64(
-        obj: &serde_json::Map<String, serde_json::Value>,
-        path: &'static str,
-    ) -> Result<u64, ParseError> {
-        let value = obj.get(path_tail(path)).ok_or_else(|| missing(path))?;
-        value
-            .as_u64()
-            .ok_or_else(|| type_mismatch(path, JsonType::Number, JsonType::of(value)))
-    }
-
     fn path_tail(path: &str) -> &str {
         path.rsplit('.').next().unwrap_or(path)
-    }
-
-    fn missing(path: impl Into<String>) -> ParseError {
-        ParseError::MissingField {
-            tool: TOOL,
-            path: path.into(),
-        }
     }
 
     fn type_mismatch(path: impl Into<String>, expected: JsonType, got: JsonType) -> ParseError {
@@ -1706,6 +1783,28 @@ mod tests {
     }
 
     #[test]
+    fn empty_object_payload_returns_all_none_top_level() {
+        // ADR-0014 confirmation: parse(b"{}") must succeed with every
+        // top-level Option field None, only `tool` and `raw` populated.
+        // This is the post-isolation contract — no field is required
+        // for parse to succeed on a syntactically valid object root.
+        let ctx = parse(b"{}").expect("empty object must parse");
+        assert_eq!(ctx.tool, Tool::ClaudeCode);
+        assert!(ctx.model.is_none());
+        assert!(ctx.workspace.is_none());
+        assert!(ctx.context_window.is_none());
+        assert!(ctx.cost.is_none());
+        assert_eq!(ctx.effort, None);
+        assert_eq!(ctx.vim, None);
+        assert!(ctx.output_style.is_none());
+        assert!(ctx.agent_name.is_none());
+        assert!(ctx.version.is_none());
+        // raw round-trips the empty object so plugins can still query
+        // ctx.status.raw paths without a None guard.
+        assert!(ctx.raw.is_object());
+    }
+
+    #[test]
     fn malformed_json_carries_exact_source_position() {
         // The `}` at line 2, column 10 is where serde_json bails.
         let ParseError::InvalidJson { location, .. } = parse(b"{\n  \"bad\": }").unwrap_err()
@@ -1755,22 +1854,75 @@ mod tests {
     }
 
     #[test]
-    fn cost_wrong_type_rejected_as_type_mismatch() {
+    fn cost_wrong_type_degrades_to_none() {
+        // ADR-0014: a non-object cost wrapper no longer aborts the
+        // whole parse; the field goes None and peers survive.
         let bytes =
             br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"cost":"nope"}"#;
-        match parse(bytes).expect_err("rejected") {
-            ParseError::TypeMismatch { path, .. } => assert_eq!(path, "cost"),
-            other => panic!("expected TypeMismatch, got {other:?}"),
-        }
+        let ctx = parse(bytes).expect("non-object cost must not fail the whole parse");
+        assert!(ctx.cost.is_none());
+        assert!(ctx.model.is_some());
     }
 
     #[test]
-    fn cost_missing_sub_field_rejected_as_missing_field() {
+    fn cost_missing_sub_field_degrades_leaf_only() {
+        // ADR-0014: missing cost leaf no longer aborts the parse;
+        // the leaf goes None, peers populate from the payload.
         let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},
             "cost":{"total_cost_usd":1.0,"total_duration_ms":0,"total_api_duration_ms":0,"total_lines_added":0}}"#;
-        match parse(bytes).expect_err("rejected") {
-            ParseError::MissingField { path, .. } => assert_eq!(path, "cost.total_lines_removed"),
-            other => panic!("expected MissingField, got {other:?}"),
+        let ctx = parse(bytes).expect("missing leaf must not fail the whole parse");
+        let cost = ctx.cost.expect("cost present");
+        assert!(cost.total_lines_removed.is_none());
+        assert_eq!(cost.total_cost_usd, Some(1.0));
+        assert_eq!(cost.total_lines_added, Some(0));
+    }
+
+    #[test]
+    fn cost_total_cost_usd_non_numeric_degrades_leaf_only() {
+        let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},
+            "cost":{"total_cost_usd":"oops","total_duration_ms":0,"total_api_duration_ms":0,
+                     "total_lines_added":0,"total_lines_removed":0}}"#;
+        let ctx = parse(bytes).expect("type-drift leaf must not fail the whole parse");
+        let cost = ctx.cost.expect("cost present");
+        assert!(cost.total_cost_usd.is_none());
+        assert_eq!(cost.total_duration_ms, Some(0));
+    }
+
+    #[test]
+    fn cost_wrapper_with_all_leaves_drift_collapses_to_none() {
+        // Plugin contract regression guard: ctx.status.cost != () must
+        // always imply at least one readable leaf. A wrapper whose
+        // every leaf is malformed collapses to None rather than
+        // surfacing an all-`()` cost map to rhai consumers.
+        let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},
+            "cost":{"total_cost_usd":"a","total_duration_ms":"b","total_api_duration_ms":"c",
+                     "total_lines_added":"d","total_lines_removed":"e"}}"#;
+        let ctx = parse(bytes).expect("all-leaves-drift cost must not fail the whole parse");
+        assert!(ctx.cost.is_none());
+    }
+
+    #[test]
+    fn context_window_wrapper_with_all_leaves_drift_collapses_to_none() {
+        // Same plugin contract for context_window.
+        let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},
+            "context_window":{"used_percentage":"a","context_window_size":"b",
+                               "total_input_tokens":"c","total_output_tokens":"d"}}"#;
+        let ctx = parse(bytes).expect("all-leaves-drift context_window must not fail the parse");
+        assert!(ctx.context_window.is_none());
+    }
+
+    #[test]
+    fn out_of_range_number_rejected_at_json_layer() {
+        // Pins the JSON-syntax barrier: `1e500` overflows f64 and
+        // serde_json rejects it as InvalidJson before our normalizer
+        // sees it. Documents why try_f64_required has no `is_finite()`
+        // guard — that branch would be unreachable through parse().
+        let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},
+            "cost":{"total_cost_usd":1e500,"total_duration_ms":0,"total_api_duration_ms":0,
+                     "total_lines_added":0,"total_lines_removed":0}}"#;
+        match parse(bytes).expect_err("serde_json rejects out-of-range numbers") {
+            ParseError::InvalidJson { .. } => {}
+            other => panic!("expected InvalidJson, got {other:?}"),
         }
     }
 
@@ -1785,7 +1937,10 @@ mod tests {
             n = 5_000_000_000u64
         );
         let ctx = parse(bytes.as_bytes()).expect("parse ok");
-        assert_eq!(ctx.cost.expect("cost").total_lines_added, 5_000_000_000u64);
+        assert_eq!(
+            ctx.cost.expect("cost").total_lines_added,
+            Some(5_000_000_000u64)
+        );
     }
 
     // --- effort error paths ---
@@ -1808,31 +1963,19 @@ mod tests {
     }
 
     #[test]
-    fn effort_object_missing_level_surfaces_missing_field_with_full_path() {
+    fn effort_object_missing_level_degrades_to_none() {
         let bytes =
             br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"effort":{}}"#;
-        match parse(bytes).expect_err("rejected") {
-            ParseError::MissingField { path, .. } => assert_eq!(path, "effort.level"),
-            other => panic!("expected MissingField, got {other:?}"),
-        }
+        let ctx = parse(bytes).expect("missing effort.level must not fail the whole parse");
+        assert_eq!(ctx.effort, None);
+        assert!(ctx.model.is_some());
     }
 
     #[test]
-    fn effort_object_non_string_level_surfaces_type_mismatch_with_full_path() {
+    fn effort_object_non_string_level_degrades_to_none() {
         let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"effort":{"level":42}}"#;
-        match parse(bytes).expect_err("rejected") {
-            ParseError::TypeMismatch {
-                path,
-                expected,
-                got,
-                ..
-            } => {
-                assert_eq!(path, "effort.level");
-                assert_eq!(expected, JsonType::String);
-                assert_eq!(got, JsonType::Number);
-            }
-            other => panic!("expected TypeMismatch, got {other:?}"),
-        }
+        let ctx = parse(bytes).expect("type-drift effort.level must not fail the whole parse");
+        assert_eq!(ctx.effort, None);
     }
 
     #[test]
@@ -1854,53 +1997,28 @@ mod tests {
     }
 
     #[test]
-    fn effort_non_object_non_string_rejected_as_type_mismatch() {
+    fn effort_non_object_non_string_degrades_to_none() {
         let bytes =
             br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"effort":42}"#;
-        match parse(bytes).expect_err("rejected") {
-            ParseError::TypeMismatch {
-                path,
-                expected,
-                got,
-                ..
-            } => {
-                assert_eq!(path, "effort");
-                assert_eq!(expected, JsonType::Object);
-                assert_eq!(got, JsonType::Number);
-            }
-            other => panic!("expected TypeMismatch, got {other:?}"),
-        }
+        let ctx = parse(bytes).expect("non-object/non-string effort must not fail the whole parse");
+        assert_eq!(ctx.effort, None);
     }
 
     #[test]
-    fn effort_object_unknown_level_rejected_as_invalid_value_with_full_path() {
+    fn effort_object_unknown_level_degrades_to_none() {
+        // ADR-0014: unknown effort variant warns + degrades, symmetric
+        // with parse_vim. A future CC level shouldn't blank the line.
         let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"effort":{"level":"ultra"}}"#;
-        match parse(bytes).expect_err("rejected") {
-            ParseError::InvalidValue { path, reason, .. } => {
-                assert_eq!(path, "effort.level");
-                assert!(
-                    reason.contains("low"),
-                    "reason should list known values, got {reason:?}"
-                );
-            }
-            other => panic!("expected InvalidValue, got {other:?}"),
-        }
+        let ctx = parse(bytes).expect("unknown effort variant must not fail the whole parse");
+        assert_eq!(ctx.effort, None);
     }
 
     #[test]
-    fn effort_unknown_string_rejected_as_invalid_value() {
+    fn effort_unknown_string_degrades_to_none() {
         let bytes =
             br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"effort":"ultra"}"#;
-        match parse(bytes).expect_err("rejected") {
-            ParseError::InvalidValue { path, reason, .. } => {
-                assert_eq!(path, "effort");
-                assert!(
-                    reason.contains("low"),
-                    "reason should list known values, got {reason:?}"
-                );
-            }
-            other => panic!("expected InvalidValue, got {other:?}"),
-        }
+        let ctx = parse(bytes).expect("unknown string effort must not fail the whole parse");
+        assert_eq!(ctx.effort, None);
     }
 
     // --- vim / output_style / agent ---
@@ -1978,12 +2096,10 @@ mod tests {
     }
 
     #[test]
-    fn output_style_name_typed_wrong_rejected() {
+    fn output_style_name_typed_wrong_degrades_to_none() {
         let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"output_style":{"name":42}}"#;
-        match parse(bytes).expect_err("rejected") {
-            ParseError::TypeMismatch { path, .. } => assert_eq!(path, "output_style.name"),
-            other => panic!("expected TypeMismatch, got {other:?}"),
-        }
+        let ctx = parse(bytes).expect("type-drift output_style.name must not fail the whole parse");
+        assert_eq!(ctx.output_style, None);
     }
 
     #[test]
@@ -2012,58 +2128,46 @@ mod tests {
     }
 
     #[test]
-    fn vim_object_missing_mode_surfaces_missing_field() {
+    fn vim_object_missing_mode_degrades_to_none() {
         let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"vim":{}}"#;
-        match parse(bytes).expect_err("rejected") {
-            ParseError::MissingField { path, .. } => assert_eq!(path, "vim.mode"),
-            other => panic!("expected MissingField, got {other:?}"),
-        }
+        let ctx = parse(bytes).expect("missing vim.mode must not fail the whole parse");
+        assert_eq!(ctx.vim, None);
     }
 
     #[test]
-    fn vim_object_non_string_mode_surfaces_type_mismatch() {
+    fn vim_object_non_string_mode_degrades_to_none() {
         let bytes =
             br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"vim":{"mode":42}}"#;
-        match parse(bytes).expect_err("rejected") {
-            ParseError::TypeMismatch { path, .. } => assert_eq!(path, "vim.mode"),
-            other => panic!("expected TypeMismatch, got {other:?}"),
-        }
+        let ctx = parse(bytes).expect("type-drift vim.mode must not fail the whole parse");
+        assert_eq!(ctx.vim, None);
     }
 
     #[test]
-    fn vim_non_object_non_string_rejected_as_type_mismatch() {
+    fn vim_non_object_non_string_degrades_to_none() {
         let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"vim":42}"#;
-        match parse(bytes).expect_err("rejected") {
-            ParseError::TypeMismatch { path, .. } => assert_eq!(path, "vim"),
-            other => panic!("expected TypeMismatch, got {other:?}"),
-        }
+        let ctx = parse(bytes).expect("non-object/non-string vim must not fail the whole parse");
+        assert_eq!(ctx.vim, None);
     }
 
     #[test]
-    fn output_style_non_object_rejected_as_type_mismatch() {
+    fn output_style_non_object_degrades_to_none() {
         let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"output_style":"concise"}"#;
-        match parse(bytes).expect_err("rejected") {
-            ParseError::TypeMismatch { path, .. } => assert_eq!(path, "output_style"),
-            other => panic!("expected TypeMismatch, got {other:?}"),
-        }
+        let ctx = parse(bytes).expect("non-object output_style must not fail the whole parse");
+        assert_eq!(ctx.output_style, None);
     }
 
     #[test]
-    fn agent_non_object_rejected_as_type_mismatch() {
+    fn agent_non_object_degrades_to_none() {
         let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"agent":"research"}"#;
-        match parse(bytes).expect_err("rejected") {
-            ParseError::TypeMismatch { path, .. } => assert_eq!(path, "agent"),
-            other => panic!("expected TypeMismatch, got {other:?}"),
-        }
+        let ctx = parse(bytes).expect("non-object agent must not fail the whole parse");
+        assert!(ctx.agent_name.is_none());
     }
 
     #[test]
-    fn agent_name_typed_wrong_rejected_as_type_mismatch() {
+    fn agent_name_typed_wrong_degrades_to_none() {
         let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"agent":{"name":42}}"#;
-        match parse(bytes).expect_err("rejected") {
-            ParseError::TypeMismatch { path, .. } => assert_eq!(path, "agent.name"),
-            other => panic!("expected TypeMismatch, got {other:?}"),
-        }
+        let ctx = parse(bytes).expect("type-drift agent.name must not fail the whole parse");
+        assert!(ctx.agent_name.is_none());
     }
 
     #[test]
@@ -2109,12 +2213,10 @@ mod tests {
     }
 
     #[test]
-    fn version_typed_wrong_rejected_as_type_mismatch() {
+    fn version_typed_wrong_degrades_to_none() {
         let bytes =
             br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"version":42}"#;
-        match parse(bytes).expect_err("rejected") {
-            ParseError::TypeMismatch { path, .. } => assert_eq!(path, "version"),
-            other => panic!("expected TypeMismatch, got {other:?}"),
-        }
+        let ctx = parse(bytes).expect("type-drift version must not fail the whole parse");
+        assert!(ctx.version.is_none());
     }
 }

@@ -128,9 +128,9 @@ The combination — best-effort parse + per-segment elision — is what every wo
 
 ## Implications / actions
 
-- **lsm-6z9e** — quick fix for the immediate `parse_context_window` null-sub-field bug. Lands in v0.1.2; doesn't wait on the ADR. ccstatusline-style per-field null tolerance is the proximate change.
-- **ADR-0014** — formalizes the architectural shift to best-effort parse + per-segment Option-shaped contract. Cites this research note as the driving evidence; recommends Option 1 (permissive parse + per-segment Option) per the synthesis.
-- **Implementation epic bead** — depends on ADR-0014. Tracks the refactor across `input.rs`, all segments that consume `model`/`workspace`/`context_window`/`cost`/`effort`, plugin `ctx_mirror.rs`, and tests for partial-data paths.
+- **lsm-6z9e** — quick fix for the immediate `parse_context_window` null-sub-field bug. Shipped in v0.1.2 ahead of the ADR.
+- **ADR-0014** — formalized the architectural shift to best-effort parse + per-segment Option-shaped contract; chose Option 1 (permissive parse + per-segment Option) per the synthesis.
+- **Implementation: lsm-9zvh** — the implementation epic. Refactor landed across `input.rs` (all sub-parsers warn-and-degrade per-leaf), every segment that consumes `model`/`workspace`/`context_window`/`cost`/`effort`/`vim`/`output_style`/`agent_name`/`version`, plugin `ctx_mirror.rs`, and tests pinning the partial-data contract.
 
 ## Open questions
 

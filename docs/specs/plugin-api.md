@@ -73,6 +73,10 @@ const ID = "my_segment";
 // REQUIRED: the renderer. Returns a map shaped like RenderedSegment,
 // or () to hide the segment.
 fn render(ctx) {
+    // Per ADR-0014, `ctx.status.model` is `()` when the wrapper is
+    // missing or malformed. Hide gracefully when there's nothing to
+    // render.
+    if ctx.status.model == () { return (); }
     let model_name = ctx.status.model.display_name;
     #{ runs: [ #{ text: `model: ${model_name}`, role: "primary", bold: true } ],
        width: model_name.len() + 7 }
@@ -87,7 +91,10 @@ fn defaults() {
 // OPTIONAL: conditional visibility predicate. If present and returns false,
 // `render` is not called and the segment is hidden.
 fn visible_if(ctx) {
-    ctx.status.cost != ()
+    // ADR-0014: `cost` wrapper is `()` when absent or all leaves drift;
+    // individual leaves are `()` independently when malformed. Guard the
+    // specific leaf you read, not just the wrapper.
+    ctx.status.cost != () && ctx.status.cost.total_cost_usd != ()
 }
 ```
 
@@ -212,6 +219,8 @@ For source-specific data shapes (`ctx.usage.data`, `ctx.git.data`, etc.), plugin
 
 **Legacy `ctx.*` access pre-v0.2.** Scripts written against v0.1 accessed stdin fields directly (`ctx.model.display_name`, `ctx.cost`, etc.). v0.2 moves those under `ctx.status.*` to make room for the DataContext sources. Plugin authors updating existing scripts do a one-time rename from `ctx.X` → `ctx.status.X` for every stdin field. `ctx.raw` (escape hatch for tool-specific fields) stays at `ctx.status.raw` in v0.2.
 
+**Per-leaf `()` migration (ADR-0014).** Pre-ADR-0014, `ctx.status.cost != ()` and `ctx.status.context_window != ()` were sufficient guards before reading any leaf — once the wrapper was non-`()`, every leaf had a typed value. After ADR-0014, leaves degrade independently: a wrapper can be present while individual leaves are `()` due to upstream schema drift. Plugins must guard the specific leaf they read (e.g. `if ctx.status.cost.total_cost_usd != () { … }`), not just the wrapper. The wrapper itself is still useful as a fast-path early return (it's `()` when absent or every leaf drifts), but it's not sufficient alone. Same applies to `ctx.status.model` and `ctx.status.workspace`, which are now `()` when missing or malformed.
+
 **`StatusContext` field shape** (accessible as `ctx.status.*`). Same as v0.1's `ctx.*` convention:
 
 **Variant naming convention:** Rust `UpperCamelCase` variants are exposed to rhai as `snake_case` strings. `Tool::ClaudeCode` → `"claude_code"`; `RepoKind::LinkedWorktree` → `"linked_worktree"`. This convention is uniform across every enum exposed to plugins.
@@ -230,25 +239,38 @@ Example access patterns (all fields below live under `ctx.status.*` as of v0.2):
 ctx.status.tool.kind
 if ctx.status.tool.kind == "other" { ctx.status.tool.name }
 
-// Base fields
-ctx.status.model.id
-ctx.status.model.display_name
-ctx.status.session.id
-ctx.status.workspace.cwd            // string; preserves platform-native separators
-ctx.status.workspace.project_dir
-ctx.status.workspace.git_worktree   // map or ()
-ctx.status.workspace.git_worktree.name
+// Base fields. Per ADR-0014, `model` and `workspace` are wrappers
+// that go `()` when missing or malformed; check before reading leaves.
+if ctx.status.model != () {
+    ctx.status.model.display_name   // string; non-empty (parser-side invariant)
+}
+if ctx.status.workspace != () {
+    ctx.status.workspace.project_dir    // string; preserves platform-native separators
+    ctx.status.workspace.git_worktree   // map or ()
+    if ctx.status.workspace.git_worktree != () {
+        ctx.status.workspace.git_worktree.name
+        ctx.status.workspace.git_worktree.path
+    }
+}
 
-// Nullable fields — check for () before accessing sub-fields
+// Nullable fields — per ADR-0014, the wrapper is `()` when absent or
+// all leaves drift, AND each leaf is independently `()` when its own
+// value is missing/null/malformed. Plugins must guard both layers
+// before reading a typed leaf.
 if ctx.status.context_window != () {
-    ctx.status.context_window.used                  // f32 in 0.0..=100.0 (Percent unwrapped)
-    ctx.status.context_window.remaining             // f32 in 0.0..=100.0 (pre-computed host-side)
-    ctx.status.context_window.size                  // i64 (context_window_size)
-    ctx.status.context_window.total_input_tokens    // i64 cumulative session total
-    ctx.status.context_window.total_output_tokens   // i64 cumulative session total
+    if ctx.status.context_window.used != () {
+        ctx.status.context_window.used                  // f32 in 0.0..=100.0 (Percent unwrapped)
+        ctx.status.context_window.remaining             // f32 in 0.0..=100.0; () when used is ()
+    }
+    if ctx.status.context_window.size != () {
+        ctx.status.context_window.size                  // i64 (context_window_size, narrowed to u32 then widened back)
+    }
+    // total_input_tokens / total_output_tokens are i64 or () independently.
     // `current_usage` is the per-turn breakdown of the most recent
     // API call; `()` before the first call in a session. Distinct
-    // from the cumulative `total_*_tokens` above.
+    // from the cumulative `total_*_tokens` above. TurnUsage's leaves
+    // are all-or-nothing — if `current_usage` is non-`()`, every
+    // inner field is a populated i64.
     if ctx.status.context_window.current_usage != () {
         ctx.status.context_window.current_usage.input_tokens                 // i64
         ctx.status.context_window.current_usage.output_tokens                // i64
@@ -257,11 +279,24 @@ if ctx.status.context_window != () {
     }
 }
 
+// `cost`: same per-leaf shape as context_window. The wrapper is `()`
+// when absent or every leaf drifts; each leaf is `()` independently.
+if ctx.status.cost != () {
+    if ctx.status.cost.total_cost_usd != () {
+        ctx.status.cost.total_cost_usd          // f64; session-cumulative USD
+    }
+    if ctx.status.cost.total_duration_ms != () {
+        ctx.status.cost.total_duration_ms       // i64; ms since session start
+    }
+    // total_api_duration_ms / total_lines_added / total_lines_removed
+    // are i64 or () independently.
+}
+
 // Effort, vim, output style, and active agent — informational, opt-in.
-// All four are `()` when the payload doesn't carry them. Vim
-// additionally degrades to `()` on an unrecognized mode (per ADR-0014);
-// effort still raises a parse error in that case until lsm-9zvh extends
-// the same discipline.
+// All four are `()` when the payload doesn't carry them or the value
+// is malformed/unrecognized. Per ADR-0014, every parser path here
+// warn-and-degrades; an unknown effort or vim variant degrades to `()`
+// rather than blanking the whole statusline.
 ctx.status.effort                       // string ("low"|"medium"|"high"|"max"|"xhigh") or ()
 ctx.status.vim                          // string ("normal"|"insert"|"visual"|"command"|"replace") or ()
 if ctx.status.output_style != () {

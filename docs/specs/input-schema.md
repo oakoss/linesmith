@@ -53,13 +53,15 @@ use chrono::{DateTime, Utc};
 /// `raw` lives behind an `Arc`.
 #[derive(Debug, Clone)]
 pub struct StatusContext {
-    /// Which upstream tool produced the payload.
+    /// Which upstream tool produced the payload. Only field guaranteed
+    /// populated by `normalize`; everything else may be `None` per
+    /// ADR-0014's per-leaf warn-and-degrade contract.
     pub tool: Tool,
 
-    /// Always present across every tool.
-    pub model: ModelInfo,
-    pub session: SessionInfo,
-    pub workspace: WorkspaceInfo,
+    /// Per ADR-0014: `None` when the wrapper is missing or malformed.
+    /// Segments hide; unrelated segments still render.
+    pub model: Option<ModelInfo>,
+    pub workspace: Option<WorkspaceInfo>,
 
     /// Potentially absent. See Edge cases section.
     pub context_window: Option<ContextWindow>,
@@ -128,12 +130,6 @@ pub struct ModelInfo {
 }
 
 #[derive(Debug, Clone)]
-pub struct SessionInfo {
-    pub id: String,
-    pub name: Option<String>,   // not all tools emit one
-}
-
-#[derive(Debug, Clone)]
 pub struct WorkspaceInfo {
     pub cwd: PathBuf,           // absolute path from invocation
     pub current_dir: PathBuf,   // relative to project_dir in Claude
@@ -150,18 +146,20 @@ pub struct GitWorktree {
 
 #[derive(Debug, Clone)]
 pub struct ContextWindow {
-    /// Used percentage. `remaining()` returns `used.complement()`.
-    pub used: Percent,
-    pub size: u32,              // e.g. 200_000 for Sonnet, 1_000_000 for 1M contexts
-    pub total_input_tokens: u64,
-    pub total_output_tokens: u64,
+    /// Per ADR-0014, leaves degrade independently. `None` arises when
+    /// CC emits the leaf as null (the documented pre-first-API-call
+    /// shape for `used`) or the leaf is otherwise malformed.
+    pub used: Option<Percent>,
+    pub size: Option<u32>,            // e.g. 200_000 for Sonnet, 1_000_000 for 1M contexts
+    pub total_input_tokens: Option<u64>,
+    pub total_output_tokens: Option<u64>,
     /// None before the first API call in a session.
     pub current_usage: Option<TokenUsage>,
 }
 
 impl ContextWindow {
-    /// Remaining percentage; always consistent with `used`.
-    pub fn remaining(&self) -> Percent { self.used.complement() }
+    /// Remaining percentage; `None` iff `used` is `None`.
+    pub fn remaining(&self) -> Option<Percent> { self.used.map(Percent::complement) }
 }
 
 #[derive(Debug, Clone)]
@@ -174,11 +172,13 @@ pub struct TokenUsage {
 
 #[derive(Debug, Clone)]
 pub struct CostMetrics {
-    pub total_cost_usd: f64,
-    pub total_duration_ms: u64,
-    pub total_api_duration_ms: u64,
-    pub total_lines_added: u32,
-    pub total_lines_removed: u32,
+    /// Per ADR-0014, leaves degrade independently. `None` arises on
+    /// missing/null leaves or non-finite numbers.
+    pub total_cost_usd: Option<f64>,
+    pub total_duration_ms: Option<u64>,
+    pub total_api_duration_ms: Option<u64>,
+    pub total_lines_added: Option<u64>,
+    pub total_lines_removed: Option<u64>,
 }
 
 // Rate-limit data is not modeled on StatusContext — it lives on
@@ -347,33 +347,41 @@ If heuristic matching is ambiguous, emit a warning-level log line once (to stder
 
 ## Edge cases
 
+Per [ADR-0014](../adrs/0014-best-effort-parse-with-segment-isolation.md), sub-field failures degrade per-leaf to `Option::None` with `lsm_warn!` for diagnostics; only catastrophic root failures (invalid JSON, non-object root) surface as `ParseError`. Segments check `is_none()` and elide.
+
 ### Field-level
 
-| Case                                         | Handling                                                                                         |
-| -------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `current_usage` is `null`                    | `ContextWindow.current_usage = None` (pre-first-call)                                            |
-| `rate_limits` field present on stdin         | Ignored — see [rate-limit-segments.md](rate-limit-segments.md); `ctx.usage()` is the data source |
-| `workspace.git_worktree` is `null` or absent | `WorkspaceInfo.git_worktree = None` (not in a worktree)                                          |
-| `added_dirs` is absent                       | `WorkspaceInfo.added_dirs = Vec::new()`                                                          |
-| `vim` is absent                              | `StatusContext.vim = None`                                                                       |
-| `cost.total_cost_usd` present but `0.0`      | Emit as-is (zero is valid, not missing)                                                          |
-| `context_window.size` is `0`                 | Parse as-is; segments decide whether to render                                                   |
-| `used_percentage` out of `0.0..=100.0`       | `ParseError::TypeMismatch { path: "context_window.used_percentage", ... }`                       |
-| `effort` field absent or `null`              | `StatusContext.effort = None`                                                                    |
-| `effort` is object `{"level": "xhigh"}`      | Canonical shape as of Claude Code 2.1.x; parse `effort.level` (bare-string form also accepted)   |
-| `effort.level` absent in object form         | `ParseError::MissingField { path: "effort.level" }`                                              |
-| `effort.level` is explicit `null`            | `StatusContext.effort = None` (same as absent outer `effort`)                                    |
+| Case                                                                                             | Handling                                                                                                                      |
+| ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------- |
+| `model` absent or malformed                                                                      | `StatusContext.model = None`; segments hide. Wrapper-non-object/non-string `display_name` warns.                              |
+| `workspace` absent or malformed                                                                  | `StatusContext.workspace = None`; segments hide. Wrapper-non-object/non-string `project_dir` warns.                           |
+| `workspace.git_worktree` is `null` or absent                                                     | `WorkspaceInfo.git_worktree = None` (not in a worktree). Non-object wrapper warns; the `project_dir` peer survives.           |
+| `current_usage` is `null` or absent                                                              | `ContextWindow.current_usage = None` (pre-first-call). Non-object warns.                                                      |
+| `current_usage` inner field null/missing                                                         | `ContextWindow.current_usage = None` (TurnUsage is all-or-nothing; partial token counts mislead).                             |
+| `context_window` leaf `null` (any of `used_percentage`, `context_window_size`, `total_*_tokens`) | Per-leaf `None`; peers survive. Type drift on a leaf warns.                                                                   |
+| `context_window.context_window_size` exceeds `u32::MAX`                                          | `ContextWindow.size = None` + warn (no real CC payload comes anywhere close).                                                 |
+| `used_percentage` > 100                                                                          | Clamp to 100 + warn (claude-code#37163 known upstream bug).                                                                   |
+| `used_percentage` < 0 or NaN                                                                     | `ParseError::InvalidValue` (carve-out from warn-and-degrade — undocumented CC state, surfacing loud catches real corruption). |
+| `cost` absent or non-object wrapper                                                              | `StatusContext.cost = None`; segments hide.                                                                                   |
+| `cost` leaf null/missing/non-finite                                                              | Per-leaf `None`; peers survive. Type drift warns.                                                                             |
+| `cost.total_cost_usd` present but `0.0`                                                          | Emit as-is (zero is valid, not missing).                                                                                      |
+| `effort` absent, null, malformed, or unknown level                                               | `StatusContext.effort = None`; warn for unknown variants and type drift.                                                      |
+| `vim` absent, null, malformed, or unknown mode                                                   | `StatusContext.vim = None`; warn for unknown variants and type drift.                                                         |
+| `output_style` absent, null, or malformed                                                        | `StatusContext.output_style = None`; warn for type drift.                                                                     |
+| `agent` absent, null, or malformed                                                               | `StatusContext.agent_name = None`; warn for type drift.                                                                       |
+| `version` absent, null, empty, whitespace-only, or non-string                                    | `StatusContext.version = None`; warn for type drift.                                                                          |
+| `rate_limits` field present on stdin                                                             | Ignored — see [rate-limit-segments.md](rate-limit-segments.md); `ctx.usage()` is the data source.                             |
 
 ### Input-level
 
-| Case                                              | Handling                                                             |
-| ------------------------------------------------- | -------------------------------------------------------------------- |
-| Empty stdin                                       | `ParseError::InvalidJson { message: "empty input", location: None }` |
-| Non-UTF-8 bytes                                   | `ParseError::InvalidJson { location: None }`                         |
-| Malformed JSON (truncated, invalid escape)        | `ParseError::InvalidJson { location: Some(SourcePos { .. }) }`       |
-| Valid JSON but not an object at top level         | `ParseError::TypeMismatch { path: "", expected: Object, got: ? }`    |
-| Tool detected, normalizer fails on required field | `ParseError::MissingField { tool, path }`                            |
-| Unknown tool, heuristic fails                     | Fall through to `ClaudeCode` default; most fields will still parse   |
+| Case                                       | Handling                                                                                          |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------- |
+| Empty stdin                                | `ParseError::InvalidJson { message: "empty input", location: None }`                              |
+| Non-UTF-8 bytes                            | `ParseError::InvalidJson { location: None }`                                                      |
+| Malformed JSON (truncated, invalid escape) | `ParseError::InvalidJson { location: Some(SourcePos { .. }) }`                                    |
+| Valid JSON but not an object at top level  | `ParseError::TypeMismatch { path: "", expected: Object, got: ? }`                                 |
+| Empty object `{}`                          | `Ok(StatusContext)` with every top-level Option field `None`; `tool` and `raw` populate normally. |
+| Unknown tool, heuristic fails              | Fall through to `ClaudeCode` default; most fields will still parse.                               |
 
 ### Tool-level
 
