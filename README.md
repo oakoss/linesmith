@@ -22,9 +22,26 @@ linesmith is built to close those gaps.
 
 ## Design in one paragraph
 
-A single static Rust binary (~3-5MB, <20ms cold start) reads Claude Code's status line JSON on stdin and renders a composable line with a rich segment system: priority, width hints, conditional visibility, caching, async, and sub-composition. A [rhai](https://rhai.rs/)-based extension API for user-authored segments is on the roadmap (see `lsm-ewa`). Themes are role-based (Catppuccin-compatible). The input schema is tool-agnostic; it works with Claude Code and Qwen Code today, with Codex CLI and GitHub Copilot CLI ready to slot in when they ship compatible APIs.
+A single static Rust binary (~3-5MB, <20ms cold start) reads Claude Code's status line JSON on stdin and renders a composable line with a rich segment system: priority, width hints, conditional visibility, caching, async, and sub-composition. A [rhai](https://rhai.rs/)-based extension API for user-authored segments has runtime scaffolding shipped; the script loader lands in v0.2 (see `lsm-ewa`). Themes are role-based (Catppuccin-compatible). The input schema is tool-agnostic; it works with Claude Code and Qwen Code today, with Codex CLI and GitHub Copilot CLI ready to slot in when they ship compatible APIs.
 
 See [`docs/adrs/`](docs/adrs/) for the decision rationale behind each piece and [`docs/research/`](docs/research/) for the research that drove those decisions.
+
+## What you'll see
+
+The default segment line, plain and powerline:
+
+```text
+# space separator (default)
+Opus 4.7 (1M)  8% · 1M  $2.34  xhigh  main * ↑1  linesmith
+
+# powerline separator (Nerd Font U+E0B0 chevron; renders as ` ` to
+# Nerd-Font terminals, tofu otherwise. Configure via [layout_options].separator.)
+Opus 4.7 (1M)   8% · 1M   $2.34   xhigh   main * ↑1   linesmith
+```
+
+Segments use role-based theming (foreground, accent, muted, success, error, etc.) that adapts to the terminal's color support. Auto-detection respects `NO_COLOR`, `TERM`, and `COLORTERM`; set `[layout_options].color = "always"` to force ANSI through pipes (Claude Code captures stdout, so this is the common setting).
+
+[OSC 8 hyperlinks](https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda) are wired end-to-end: any segment that sets `Style.hyperlink` (today, plugins; built-in workspace/branch links are tracked for v0.2) renders as a clickable link in supporting terminals, with detection via [`supports-hyperlinks`](https://crates.io/crates/supports-hyperlinks). Non-supporting terminals see plain text.
 
 ## Install
 
@@ -89,13 +106,46 @@ segments = [
   "workspace",
   "context_window",
   "cost",
-  "rate_limit",
+  "rate_limit_5h",
 ]
+
+[layout_options]
+# "always" forces ANSI through pipe boundaries (Claude Code captures
+# stdout, so auto-detection picks "no color" without this).
+color = "always"
+
+# Inter-segment separator. Reserved keywords: "space" (default),
+# "powerline" (Nerd Font U+E0B0 chevron), "" (no separator).
+# Anything else renders as a literal: " | ", " · ", "->", etc.
+separator = "powerline"
+
+# Cell count for the powerline chevron (1 or 2). Most modern Nerd
+# Fonts render U+E0B0 as 1 cell; bump to 2 if the chevron looks
+# squashed in your terminal.
+powerline_width = 1
 ```
 
-Built-in segments available in v0.1.0: `model`, `workspace`, `context_window`, `cost`, `effort`, `rate_limit`, `rate_limit_5h`, `rate_limit_7d`. The git-segment family (`git_branch`, dirty, ahead/behind) and the visual `context_bar` widget are tracked for v0.2+.
+Default segments (rendered when no `[line].segments` is set): `model`, `context_window`, `cost`, `effort`, `git_branch` (with dirty `*` and ahead/behind `↑`/`↓`), `workspace`. Opt-ins include `rate_limit_5h` / `rate_limit_7d` (current usage), `rate_limit_5h_reset` / `rate_limit_7d_reset` (countdown to window reset), `version` (Claude Code CLI version), token counts, session duration, and `vim` / `agent` / `output_style` mode indicators. The visual `context_bar` widget is wired but rough — tracked for v0.2 polish. See [`docs/specs/segment-system.md`](docs/specs/segment-system.md) for the full inventory and per-segment knobs.
 
-Custom segments via [rhai](https://rhai.rs/) scripts dropped in `~/.config/linesmith/segments/` are on the roadmap (see `lsm-ewa`); v0.1 ships the runtime scaffolding without the loader wired up.
+Custom segments via [rhai](https://rhai.rs/) scripts dropped in `~/.config/linesmith/segments/` are on the roadmap (see `lsm-ewa`); v0.1 ships the runtime scaffolding (the registry, the engine, the trait wiring) without the script loader.
+
+### Themes
+
+Eleven built-in themes ship in v0.1; pick one with `theme = "<name>"` at the top of your config:
+
+| Theme                                                             | Notes                                     |
+| ----------------------------------------------------------------- | ----------------------------------------- |
+| `default`                                                         | ANSI-16 fallback, works on every terminal |
+| `minimal`                                                         | Dim/muted only, no accent colors          |
+| `catppuccin-latte`                                                | Light flavor                              |
+| `catppuccin-frappe` / `catppuccin-macchiato` / `catppuccin-mocha` | Dark flavors                              |
+| `dracula`                                                         | High-contrast purple/cyan                 |
+| `nord`                                                            | Cool blue/gray                            |
+| `gruvbox`                                                         | Warm retro palette                        |
+| `tokyo-night`                                                     | Storm variant                             |
+| `rose-pine`                                                       | Main flavor                               |
+
+User themes (custom palettes via TOML) drop into `~/.config/linesmith/themes/`. See [`docs/specs/theming.md`](docs/specs/theming.md) for the role schema and palette source attribution.
 
 ## How fast
 
