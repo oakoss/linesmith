@@ -42,15 +42,12 @@ on:
   push:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
-  # Hand-edit protected by dist-workspace.toml `allow-dirty = ["ci"]`: trigger
-  # surface only. Full dry-run plumbing (ephemeral tags, `cargo publish --dry-run`)
-  # per docs/specs/release-process.md §Dry-run workflow is deferred to lsm-9ns.
+  # Dry-run dispatch: build all targets + generate attestations as workflow
+  # artifacts without creating a GitHub Release, publishing to crates.io, or
+  # touching the homebrew tap. Use to validate release-infra changes before
+  # cutting a real tag. Hand-edits below are protected by dist-workspace.toml
+  # `allow-dirty = ["ci"]` so cargo-dist regen preserves them.
   workflow_dispatch:
-    inputs:
-      allow_dirty:
-        description: "Allow dry-run against an uncommitted working tree"
-        type: boolean
-        default: false
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -58,9 +55,9 @@ jobs:
     runs-on: "ubuntu-latest"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
-      tag: ${{ !github.event.pull_request && github.ref_name || '' }}
-      tag-flag: ${{ !github.event.pull_request && format('--tag={0}', github.ref_name) || '' }}
-      publishing: ${{ !github.event.pull_request }}
+      tag: ${{ steps.compute-tag.outputs.tag }}
+      tag-flag: ${{ steps.compute-tag.outputs.tag-flag }}
+      publishing: ${{ github.event_name == 'push' }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -78,6 +75,31 @@ jobs:
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/dist
+      # On push (real release) the tag is the pushed ref. On dispatch (dry-run)
+      # `github.ref_name` is a branch name, so synthesize an ephemeral tag from
+      # the commit SHA — `dist build` accepts any tag-shaped string for
+      # artifact naming; nothing is pushed back to git. Unknown event_name
+      # exits non-zero rather than silently emitting an empty tag-flag.
+      - id: compute-tag
+        shell: bash
+        run: |
+          case "${{ github.event_name }}" in
+            push)
+              tag="${{ github.ref_name }}"
+              ;;
+            workflow_dispatch)
+              tag="v0.0.0-dry-run-${GITHUB_SHA:0:7}"
+              ;;
+            *)
+              echo "::error::compute-tag: unsupported event_name '${{ github.event_name }}'. Update release.yml to handle this trigger." >&2
+              exit 1
+              ;;
+          esac
+          echo "compute-tag: event=${{ github.event_name }} tag=${tag}"
+          {
+            echo "tag=${tag}"
+            echo "tag-flag=--tag=${tag}"
+          } >> "$GITHUB_OUTPUT"
       # sure would be cool if github gave us proper conditionals...
       # so here's a doubly-nested ternary-via-truthiness to try to provide the best possible
       # functionality based on whether this is a pull_request, and whether it's from a fork.
@@ -85,7 +107,7 @@ jobs:
       # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
         run: |
-          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          dist ${{ (github.event_name == 'push' && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -94,6 +116,7 @@ jobs:
         with:
           name: artifacts-plan-dist-manifest
           path: plan-dist-manifest.json
+          retention-days: ${{ github.event_name == 'workflow_dispatch' && 7 || 90 }}
 
   # Build and packages all the platform-specific things
   build-local-artifacts:
@@ -101,7 +124,7 @@ jobs:
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
-    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
+    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload' || github.event_name == 'workflow_dispatch') }}
     strategy:
       fail-fast: false
       # Target platforms/runners are computed by dist in create-release.
@@ -182,6 +205,7 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
+          retention-days: ${{ github.event_name == 'workflow_dispatch' && 7 || 90 }}
 
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
@@ -229,6 +253,7 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
+          retention-days: ${{ github.event_name == 'workflow_dispatch' && 7 || 90 }}
   # Determines if we should publish/announce
   host:
     needs:
@@ -306,7 +331,10 @@ jobs:
       PLAN: ${{ needs.plan.outputs.val }}
       GITHUB_USER: "axo bot"
       GITHUB_EMAIL: "admin+bot@axo.dev"
-    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
+    # Explicit `publishing` gate (defense-in-depth on top of `needs: host`):
+    # a future change adding `if: always()` here would otherwise re-enable
+    # homebrew pushes on dispatch.
+    if: ${{ needs.plan.outputs.publishing == 'true' && (!fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases) }}
     steps:
       # Hand-edit protected by dist-workspace.toml `allow-dirty = ["ci"]`:
       # cargo-dist defaults to a PAT in `secrets.HOMEBREW_TAP_TOKEN`, but

@@ -287,8 +287,6 @@ on:
   push:
     tags: ['v*.*.*']
   workflow_dispatch:
-    inputs:
-      allow_dirty: { type: boolean, default: false }
 
 jobs:
   cargo-dist-plan:
@@ -323,15 +321,17 @@ curl -LsSf https://github.com/oakoss/linesmith/releases/download/v0.2.0-rc.1/lin
 
 ### Dry-run workflow
 
-`release.yml` supports `workflow_dispatch` with an `allow_dirty: true` input. Dispatched from a branch, it runs the full pipeline but:
+`release.yml` runs via `workflow_dispatch` from any branch. Dispatched, it runs the build pipeline but:
 
-- Targets an ephemeral tag (`v0.0.0-dry-run-<commit>`), deleted after the run
-- Replaces `cargo publish` with `cargo publish --dry-run` (validates package contents and metadata without pushing)
-- Skips the Homebrew formula push (no write to `oakoss/homebrew-tap`)
-- Uploads binary artifacts as GitHub Actions workflow artifacts (7-day retention) rather than creating a GitHub Release
-- Still generates build attestations so the attestation flow itself is exercised
+- Synthesizes an ephemeral tag string (`v0.0.0-dry-run-<short-sha>`) from the dispatching commit and threads it to `dist build` for artifact naming. Nothing is pushed to git, so no cleanup is needed after the run.
+- Skips the GitHub Release creation (the `host` job is gated on `publishing == 'true'`, set by the `plan` job to `github.event_name == 'push'`).
+- Skips the Homebrew formula push (no write to `oakoss/homebrew-tap`) — `publish-homebrew-formula` is gated on the same `publishing` flag for defense-in-depth.
+- Uploads binary artifacts as GitHub Actions workflow artifacts with 7-day retention; real releases keep the 90-day default so maintainers can re-download post-release without re-building.
+- Still generates SLSA build attestations on each target leg so the attestation flow itself is exercised.
 
-Used for validating pipeline changes before cutting a real release. Dry-run runs do not consume crates.io version slots.
+Used for validating `release.yml` changes before cutting a real tag. Dry-run runs touch only GitHub Actions artifact storage — no crates.io version slot consumed, no GitHub Release created, no Homebrew formula pushed.
+
+cargo-dist 0.31's `--allow-dirty` flag is boolean and covers only "CI scripts out of date" — already permanently allowed via `dist-workspace.toml`'s `allow-dirty = ["ci"]`, so no per-dispatch toggle is needed. Source-tree-dirty dispatch isn't a concept in 0.31; CI checkouts are always clean. `release-plz.yml`'s `cargo publish` step has no dry-run path either, so pipeline-validating crates.io changes still require a local `cargo publish --dry-run` or a real `v0.0.x` patch release.
 
 ## Edge cases
 
