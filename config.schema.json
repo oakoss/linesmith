@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Config",
+  "description": "Parsed `config.toml`. Serde ignores unknown keys so a file from a\nnewer linesmith still parses on an older binary; fields this\nversion doesn't know are dropped rather than rejected. The\nschema-side `additionalProperties: false` tightens editor\nvalidation so typos like `thme = \"default\"` get flagged at the\nauthoring layer; the runtime stays permissive (the unknown-key\nwarning channel lives in `from_str_validated`).",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "description": "Editor-tooling `$schema` directive. Some users put it as a\ntop-level TOML key instead of (or alongside) the `#:schema`\ncomment directive `linesmith init` writes. Must be quoted in\nTOML (`\"$schema\" = \"...\"`) — `$` is not legal in bare keys.\nParsed and ignored at runtime; surfaced here so the schema\nvalidates configs using the alternate form.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "layout": {
+      "description": "Top-level layout mode. Defaults to [`LayoutMode::SingleLine`]\nwhen the field is omitted, preserving pre-multi-line config\nbehavior. [`LayoutMode::MultiLine`] triggers per-`[line.N]`\nrendering.",
+      "$ref": "#/$defs/LayoutMode"
+    },
+    "layout_options": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LayoutOptions"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "line": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LineConfig"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "plugin_dirs": {
+      "description": "Extra directories to scan for user plugin scripts (`.rhai`\nfiles). Scanned in list order before the default XDG\ndirectory. See `docs/specs/config.md` §Plugin directories and\n`docs/specs/plugin-api.md` §Plugin file location.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "plugins": {
+      "description": "Forward-compat `[plugins.*]` table. Typed as a string-keyed\nmap so a non-table value (`plugins = \"oops\"`) fails parse at\nload-time instead of silently dropping; per-plugin sub-table\nshape is open until the plugin-config spec lands. Schema\nmirror remaps `toml::Value` to `serde_json::Value` for the\nsame reason as `extra` / `numbered`: `toml::Value` has no\n`JsonSchema` impl.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true,
+      "default": null
+    },
+    "preset": {
+      "description": "Spec-listed forward-compat key. Parsed and runtime-ignored;\nsurfacing it in the schema so editor tooling doesn't flag\nuser configs that include it. Allow-listed in `KNOWN_TOP_LEVEL`\nto suppress the unknown-key warning.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "segments": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/SegmentOverride"
+      }
+    },
+    "theme": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "ColorPolicy": {
+      "description": "Config-level color override. `auto` honors CLI flags and env vars;\n`always` forces color even in non-TTY output; `never` strips all\ncolor. Sits below CLI flags and env vars in the precedence chain.",
+      "type": "string",
+      "enum": [
+        "auto",
+        "always",
+        "never"
+      ]
+    },
+    "LayoutMode": {
+      "description": "Top-level `layout = \"...\"` selector. Defaults to `SingleLine`\n(preserves pre-multi-line config behavior). `MultiLine` instructs\nthe builder + render loop to consume `[line.N]` sub-tables.",
+      "type": "string",
+      "enum": [
+        "single-line",
+        "multi-line"
+      ]
+    },
+    "LayoutOptions": {
+      "description": "`[layout_options]` section: render-path tunables that aren't tied\nto a specific segment. See `docs/specs/config.md` §layout_options.",
+      "type": "object",
+      "properties": {
+        "claude_padding": {
+          "type": "integer",
+          "format": "uint16",
+          "default": 0,
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "color": {
+          "$ref": "#/$defs/ColorPolicy"
+        },
+        "powerline_width": {
+          "description": "Cell-count for the Nerd Font powerline chevron (U+E0B0). Only\n`1` (the default; matches modern Nerd Fonts at standard sizes)\nand `2` (some older builds / larger sizes) are meaningful.\nTakes effect only when a powerline separator is in use; setting\nit under `separator = \"space\"` is harmless but inert.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "default": null,
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "separator": {
+          "description": "Inter-segment separator. Stored as a raw string; the segment\nbuilder parses it into a [`crate::segments::Separator`] at\nbuild time so unknown values warn and fall back to `space`\nrather than failing the whole config load. See\n`docs/specs/config.md` for the reserved-keyword set\n(`space`, `powerline`, `capsule`, `flex`, `\"\"`) and the\narbitrary-literal fallback.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "LineConfig": {
+      "description": "`[line]` section: ordered list of segment ids to render in\nsingle-line mode, plus any numbered child tables (`[line.1]`,\n`[line.2]`, ...) for multi-line mode. The `flatten`-captured\n[`numbered`](Self::numbered) map carries every other key as a\nraw [`toml::Value`]. Key validation (positive integer pointing\nat a table with a `segments` array) and ordering happen in the\nsegment builder, which keeps the spec's \"unknown keys are\nwarnings, not errors\" forward-compat contract: a typo like\n`[line] segmnts = [...]` parses as a `toml::Value::Array`,\nreaches the builder, and emits a warning rather than failing the\nconfig load. Per spec `docs/specs/config.md` §Multi-line layouts.",
+      "type": "object",
+      "properties": {
+        "segments": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "SegmentOverride": {
+      "description": "`[segments.<id>]` override block. Each typed field, when `Some`,\nreplaces the segment's built-in default. Any unrecognized keys land\nin [`extra`](Self::extra), which the segment builder forwards to\nplugin scripts as `ctx.config.<key>`. `style` is stored as a raw\nstring; `segments::builder::apply_override` parses it at build time\nso parse errors emit warnings through the same callback that\nhandles unknown-ID and inverted-bounds diagnostics.\n\n`Eq` isn't derived because [`toml::Value`] holds `f64` and so is\n`PartialEq` only — `extra` propagates that constraint.",
+      "type": "object",
+      "properties": {
+        "priority": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint8",
+          "default": null,
+          "maximum": 255,
+          "minimum": 0
+        },
+        "style": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "width": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WidthBoundsConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "WidthBoundsConfig": {
+      "description": "Width-bounds override. Either side may be omitted; a missing side\ninherits from the segment's built-in default.",
+      "type": "object",
+      "properties": {
+        "max": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "min": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

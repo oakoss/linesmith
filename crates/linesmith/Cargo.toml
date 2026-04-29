@@ -26,6 +26,7 @@ gix.workspace = true
 httpdate.workspace = true
 lexopt.workspace = true
 rhai.workspace = true
+schemars.workspace = true
 secrecy.workspace = true
 supports-color.workspace = true
 supports-hyperlinks.workspace = true

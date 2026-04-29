@@ -50,6 +50,9 @@ jobs:
       - name: Type check
         run: mise run cargo:check
 
+      - name: Schema drift check
+        run: mise run schema:check
+
   tests:
     name: Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

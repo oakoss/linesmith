@@ -252,9 +252,11 @@ v0.1 presets (per the matrix):
 
 ### JSON Schema
 
-Published as `config.schema.json` on the linesmith docs site and embedded via `include_str!` for offline editor integrations (taplo picks it up via the `$schema` key in the user's config).
+Published as `config.schema.json` at the repo root, served via GitHub raw at `https://raw.githubusercontent.com/oakoss/linesmith/main/config.schema.json`. The schema is generated from `crate::config::Config` and its sub-types via `schemars`; `mise run schema:check` runs in CI and fails if the committed file drifts from the Rust types. Regenerate with `mise run schema:update`.
 
-The schema is generated from Rust types via `schemars` at build time (single source of truth). CI fails if the committed JSON schema is stale relative to the types.
+`linesmith init` and `linesmith presets apply` write a `#:schema <url>` directive at the top of the generated config file (taplo / VS Code / Zed convention). Editors pick up the schema automatically — no per-user setup required.
+
+The URL is pinned to `main` for v0.1; once release tagging stabilizes, it'll switch to a version-pinned tag URL so a user's schema matches the binary that wrote their config.
 
 ## Behavior
 

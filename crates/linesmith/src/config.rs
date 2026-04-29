@@ -1,6 +1,7 @@
 //! User config: parse `config.toml`, resolve its path, and apply
 //! per-segment overrides. Full contract in `docs/specs/config.md`.
 
+use schemars::JsonSchema;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -8,9 +9,14 @@ use std::str::FromStr;
 
 /// Parsed `config.toml`. Serde ignores unknown keys so a file from a
 /// newer linesmith still parses on an older binary; fields this
-/// version doesn't know are dropped rather than rejected.
-#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+/// version doesn't know are dropped rather than rejected. The
+/// schema-side `additionalProperties: false` tightens editor
+/// validation so typos like `thme = "default"` get flagged at the
+/// authoring layer; the runtime stays permissive (the unknown-key
+/// warning channel lives in `from_str_validated`).
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, JsonSchema)]
 #[serde(default)]
+#[schemars(extend("additionalProperties" = false))]
 pub struct Config {
     pub line: Option<LineConfig>,
     pub theme: Option<String>,
@@ -28,13 +34,37 @@ pub struct Config {
     /// `docs/specs/plugin-api.md` §Plugin file location.
     #[serde(default)]
     pub plugin_dirs: Vec<PathBuf>,
+    /// Spec-listed forward-compat key. Parsed and runtime-ignored;
+    /// surfacing it in the schema so editor tooling doesn't flag
+    /// user configs that include it. Allow-listed in `KNOWN_TOP_LEVEL`
+    /// to suppress the unknown-key warning.
+    pub preset: Option<String>,
+    /// Forward-compat `[plugins.*]` table. Typed as a string-keyed
+    /// map so a non-table value (`plugins = "oops"`) fails parse at
+    /// load-time instead of silently dropping; per-plugin sub-table
+    /// shape is open until the plugin-config spec lands. Schema
+    /// mirror remaps `toml::Value` to `serde_json::Value` for the
+    /// same reason as `extra` / `numbered`: `toml::Value` has no
+    /// `JsonSchema` impl.
+    #[serde(default)]
+    #[schemars(with = "Option<BTreeMap<String, serde_json::Value>>")]
+    pub plugins: Option<BTreeMap<String, toml::Value>>,
+    /// Editor-tooling `$schema` directive. Some users put it as a
+    /// top-level TOML key instead of (or alongside) the `#:schema`
+    /// comment directive `linesmith init` writes. Must be quoted in
+    /// TOML (`"$schema" = "..."`) — `$` is not legal in bare keys.
+    /// Parsed and ignored at runtime; surfaced here so the schema
+    /// validates configs using the alternate form.
+    #[serde(default, rename = "$schema")]
+    pub schema_url: Option<String>,
 }
 
 /// `[layout_options]` section: render-path tunables that aren't tied
 /// to a specific segment. See `docs/specs/config.md` §layout_options.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(default)]
 #[non_exhaustive]
+#[schemars(extend("additionalProperties" = false))]
 pub struct LayoutOptions {
     pub color: ColorPolicy,
     pub claude_padding: u16,
@@ -57,7 +87,7 @@ pub struct LayoutOptions {
 /// Config-level color override. `auto` honors CLI flags and env vars;
 /// `always` forces color even in non-TTY output; `never` strips all
 /// color. Sits below CLI flags and env vars in the precedence chain.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum ColorPolicy {
@@ -78,7 +108,7 @@ pub enum ColorPolicy {
 /// `[line] segmnts = [...]` parses as a `toml::Value::Array`,
 /// reaches the builder, and emits a warning rather than failing the
 /// config load. Per spec `docs/specs/config.md` §Multi-line layouts.
-#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct LineConfig {
     pub segments: Vec<String>,
@@ -87,14 +117,19 @@ pub struct LineConfig {
     /// future versions may add. The builder routes table values
     /// with positive-integer keys to multi-line rendering and warns
     /// on the rest.
+    ///
+    /// Schema bypass: `toml::Value` has no `JsonSchema` impl, so
+    /// remap to `serde_json::Value`'s open-ended schema (any JSON
+    /// type) for the `additionalProperties` fallthrough.
     #[serde(flatten)]
+    #[schemars(with = "serde_json::Value")]
     pub numbered: BTreeMap<String, toml::Value>,
 }
 
 /// Top-level `layout = "..."` selector. Defaults to `SingleLine`
 /// (preserves pre-multi-line config behavior). `MultiLine` instructs
 /// the builder + render loop to consume `[line.N]` sub-tables.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum LayoutMode {
@@ -113,7 +148,7 @@ pub enum LayoutMode {
 ///
 /// `Eq` isn't derived because [`toml::Value`] holds `f64` and so is
 /// `PartialEq` only — `extra` propagates that constraint.
-#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct SegmentOverride {
     pub priority: Option<u8>,
@@ -124,13 +159,40 @@ pub struct SegmentOverride {
     /// `ctx.config.<key>` per `docs/specs/plugin-api.md` §ctx shape.
     /// Built-in segments ignore this; the unknown-key validator still
     /// warns when a built-in's table contains keys outside its schema.
+    ///
+    /// Schema bypass: `toml::Value` has no `JsonSchema` impl, so
+    /// remap to `serde_json::Value`'s open-ended schema for the
+    /// `additionalProperties` fallthrough.
     #[serde(flatten)]
+    #[schemars(with = "serde_json::Value")]
     pub extra: BTreeMap<String, toml::Value>,
+}
+
+/// URL for the published JSON Schema, pinned to the binary's own
+/// release tag. A user's schema therefore matches the binary that
+/// wrote their config, so a config-only follow-up on `main` can't
+/// retroactively invalidate older configs in editors.
+///
+/// Caveat: the URL is only live for tags whose release commit
+/// includes `config.schema.json`. The release pipeline must commit
+/// the regenerated schema before the tag for this to resolve.
+pub(crate) const SCHEMA_URL: &str = concat!(
+    "https://raw.githubusercontent.com/oakoss/linesmith/v",
+    env!("CARGO_PKG_VERSION"),
+    "/config.schema.json"
+);
+
+/// Prepend `#:schema <url>` directive (taplo / VS Code / Zed
+/// convention) to a freshly-generated config body so editors pick up
+/// the published schema without per-user setup.
+pub(crate) fn with_schema_directive(body: &str) -> String {
+    format!("#:schema {SCHEMA_URL}\n\n{body}")
 }
 
 /// Width-bounds override. Either side may be omitted; a missing side
 /// inherits from the segment's built-in default.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[schemars(extend("additionalProperties" = false))]
 pub struct WidthBoundsConfig {
     pub min: Option<u16>,
     pub max: Option<u16>,
@@ -211,9 +273,9 @@ impl Config {
 
     /// Same as [`Config::load`] but emits one warning per unknown key
     /// encountered (top-level, `[layout_options]`, or `[segments.<id>]`).
-    /// The allow-list tolerates spec-documented keys we haven't
-    /// implemented yet (`preset`, `layout`, `plugins`, `$schema`), so
-    /// forward-compat configs stay silent while typos surface.
+    /// The allow-list tolerates every spec-documented key (see
+    /// `KNOWN_TOP_LEVEL` and `KNOWN_LAYOUT_OPTIONS`), so forward-compat
+    /// configs stay silent while typos surface.
     pub fn load_validated(
         path: &Path,
         warn: impl FnMut(&str),
@@ -257,9 +319,10 @@ impl Config {
     }
 }
 
-/// Top-level config keys we recognize. Implemented keys + spec-documented
-/// keys for features not yet shipped (`preset`, `layout`, `plugins`) +
-/// `$schema` for editor tooling.
+/// Top-level config keys we recognize. Spec-documented keys (some
+/// runtime-consumed, some forward-compat parsed-and-ignored) plus
+/// `$schema` for editor tooling. Anything not in this list raises a
+/// per-key warning through `from_str_validated_impl`.
 const KNOWN_TOP_LEVEL: &[&str] = &[
     "line",
     "theme",
@@ -715,24 +778,97 @@ mod tests {
 
     #[test]
     fn from_str_validated_allows_implemented_and_forward_compat_top_level_keys() {
-        // `theme` / `line` / `layout_options` / `segments` are
-        // implemented; `preset` / `layout` / `plugins` / `$schema`
-        // are tolerated per the allow-list until they land.
-        let warnings = collect_warnings(
-            r#"
-                $schema = "https://example.invalid/schema.json"
-                theme = "default"
-                preset = "developer"
-                layout = "single-line"
-                [line]
-                segments = ["model"]
-                [layout_options]
-                color = "auto"
-                [plugins.example]
-                foo = "bar"
-            "#,
-        );
+        // Spec-listed keys parse cleanly. Forward-compat keys
+        // (`preset`, `plugins`, `$schema`) populate their fields so
+        // a future `#[serde(skip_deserializing)]` regression or a
+        // dropped `rename = "$schema"` shows up here, not silently.
+        // `"$schema"` is quoted because TOML rejects `$` in bare keys.
+        let toml = r#"
+            "$schema" = "https://example.invalid/schema.json"
+            theme = "default"
+            preset = "developer"
+            layout = "single-line"
+            [line]
+            segments = ["model"]
+            [layout_options]
+            color = "auto"
+            [plugins.example]
+            foo = "bar"
+        "#;
+        let warnings = collect_warnings(toml);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        let cfg = Config::from_str(toml).expect("parses");
+        assert_eq!(cfg.preset.as_deref(), Some("developer"));
+        assert_eq!(
+            cfg.schema_url.as_deref(),
+            Some("https://example.invalid/schema.json")
+        );
+        let plugins = cfg.plugins.expect("plugins table populated");
+        assert!(plugins.contains_key("example"));
+    }
+
+    #[test]
+    fn schema_for_config_round_trips_as_valid_json() {
+        // The drift check catches *changes* in generator output but
+        // not whether the output is well-formed JSON Schema in the
+        // first place. A future schemars-API typo could produce
+        // unserializable output; CI would only catch it after the
+        // committed schema bit-rotted. This pins basic validity.
+        let schema = schemars::schema_for!(Config);
+        let json = serde_json::to_string(&schema).expect("schema serializes as JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("schema round-trips as JSON");
+        let obj = parsed.as_object().expect("schema root is an object");
+        assert_eq!(
+            obj.get("$schema").and_then(|v| v.as_str()),
+            Some("https://json-schema.org/draft/2020-12/schema"),
+            "schema must declare its meta-schema URI"
+        );
+        assert_eq!(
+            obj.get("title").and_then(|v| v.as_str()),
+            Some("Config"),
+            "schema must title the root type"
+        );
+        // Pin that the round-7→round-8 forward-compat fields
+        // actually materialized into the schema. A future
+        // `#[serde(skip)]` slipping onto one of them would still
+        // round-trip cleanly through the asserts above; this
+        // catches the materialization gap directly.
+        let properties = obj
+            .get("properties")
+            .and_then(|v| v.as_object())
+            .expect("schema declares properties");
+        for key in ["preset", "plugins", "$schema"] {
+            assert!(
+                properties.contains_key(key),
+                "schema must expose {key:?} as a top-level property"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_directive_wrapped_body_round_trips_as_toml() {
+        // `with_schema_directive` prepends `#:schema URL\n\n` ahead
+        // of the preset body. A future regression that drops the
+        // separator (yielding `#:schema URL[body-first-line]`) would
+        // pass the position-pin tests in driver.rs but corrupt TOML
+        // parsing on bodies that start with `#` comments. Pin both
+        // the structural separator and the round-trip here.
+        let body = "[line]\nsegments = [\"model\"]\n";
+        let wrapped = with_schema_directive(body);
+        assert!(
+            wrapped.starts_with("#:schema https://"),
+            "directive at byte 0"
+        );
+        assert!(
+            wrapped.contains("\n\n["),
+            "blank-line separator before first table"
+        );
+        let parsed: Config = wrapped.parse().expect("wrapped body parses as Config");
+        assert_eq!(
+            parsed.line.expect("line").segments,
+            vec!["model".to_string()]
+        );
     }
 
     #[test]

@@ -56,6 +56,47 @@ run = "cargo test --locked --workspace --doc"
 description = "Run Rust benchmarks"
 run = "cargo bench --workspace"
 
+# `config.schema.json` lives at the repo root and is consumed by editor
+# integrations (taplo / VS Code / Zed) via the `#:schema` directive
+# `linesmith init` writes into user configs. The schema is derived
+# from `crate::config::Config` via schemars; CI pins it against drift
+# so a schema-affecting type change can't ship without regenerating.
+[tasks."schema:update"]
+description = "Regenerate config.schema.json from Rust types"
+# Atomic write via tempfile + mv. Direct shell redirect would
+# truncate config.schema.json *before* cargo runs, leaving the repo
+# with an empty schema if the generator fails to build. `set -e`
+# is load-bearing: without it, a cargo crash mid-stream still lets
+# `mv` proceed with a partially-written tempfile, replacing the
+# committed schema with corrupt bytes.
+run = '''
+set -e
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+cargo run --quiet --locked --bin gen-config-schema -p linesmith > "$tmp"
+mv "$tmp" config.schema.json
+'''
+
+[tasks."schema:check"]
+description = "Fail if config.schema.json drifts from Rust types"
+# Generate to a temp file rather than process substitution: mise tasks
+# run under sh, which doesn't support `<(…)`. On drift, print a hint
+# pointing at `mise run schema:update`. `set -e` ensures a generator
+# crash short-circuits before the diff (and yields the cargo error,
+# not a misleading drift report).
+run = '''
+set -e
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+cargo run --quiet --locked --bin gen-config-schema -p linesmith > "$tmp"
+if ! diff -u config.schema.json "$tmp" > /dev/null; then
+  echo "::error::config.schema.json is stale relative to crate::config types" >&2
+  echo "Run 'mise run schema:update' to regenerate." >&2
+  diff -u config.schema.json "$tmp" >&2 || true
+  exit 1
+fi
+'''
+
 [tasks.test]
 description = "Run all tests"
 # Sequential, not parallel-via-depends, so the two cargo invocations

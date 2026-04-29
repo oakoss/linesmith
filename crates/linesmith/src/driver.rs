@@ -220,7 +220,9 @@ fn presets_apply(
         return 1;
     };
     let policy = OverwritePolicy::presets(force);
-    if let Err(code) = write_config_with_backup(body, &resolved.path, policy, stdin, stderr) {
+    let with_schema = config::with_schema_directive(body);
+    if let Err(code) = write_config_with_backup(&with_schema, &resolved.path, policy, stdin, stderr)
+    {
         return code;
     }
     let _ = writeln!(
@@ -523,7 +525,7 @@ fn init_with_choices(
         let _ = writeln!(stderr, "linesmith: unknown preset '{}'", choices.preset);
         return 1;
     };
-    let composed = compose_init_body(body, &choices.theme);
+    let composed = config::with_schema_directive(&compose_init_body(body, &choices.theme));
 
     let Some(resolved) = resolve_writable_config_path(config_override, env, stderr) else {
         return 1;
@@ -2827,7 +2829,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), "# current\n");
         assert_eq!(
             std::fs::read_to_string(&cfg).unwrap(),
-            presets::body("minimal").unwrap()
+            config::with_schema_directive(presets::body("minimal").unwrap())
         );
     }
 
@@ -2854,10 +2856,51 @@ mod tests {
     }
 
     #[test]
+    fn init_writes_schema_directive_at_top_of_config() {
+        // taplo / VS Code / Zed pick up the published JSON Schema via
+        // the `#:schema URL` directive at the top of the file. Pin
+        // the position (very first bytes) so a future refactor that
+        // shifts the directive below comments or theme lines breaks
+        // editor schema attachment.
+        let dir = tempdir();
+        let env = env_with_home(dir.path());
+        let (code, _stdout, stderr) = run_init(init_choices("minimal", "default"), None, b"", &env);
+        assert_eq!(code, 0, "stderr:\n{stderr}");
+        let written = std::fs::read_to_string(dir.path().join(".config/linesmith/config.toml"))
+            .expect("file exists");
+        assert!(
+            written.starts_with("#:schema https://"),
+            "expected schema directive at top, got:\n{written}"
+        );
+        assert!(
+            written.contains("config.schema.json"),
+            "schema URL must point at config.schema.json"
+        );
+    }
+
+    #[test]
+    fn presets_apply_writes_schema_directive_at_top_of_config() {
+        // Same contract as init: presets apply must also emit the
+        // `#:schema` directive at the top.
+        let dir = tempdir();
+        let env = env_with_home(dir.path());
+        let (code, _stdout, _stderr) = run_cli_main(&["presets", "apply", "minimal"], b"", &env);
+        assert_eq!(code, 0);
+        let written = std::fs::read_to_string(dir.path().join(".config/linesmith/config.toml"))
+            .expect("file exists");
+        assert!(
+            written.starts_with("#:schema https://"),
+            "expected schema directive at top, got:\n{written}"
+        );
+    }
+
+    #[test]
     fn init_default_theme_omits_theme_field_to_match_presets_apply() {
         // When the user picks `default`, the written file should be
         // byte-identical to `presets apply minimal` so diff tools and
         // future migrations don't see a redundant `theme = "default"`.
+        // Both paths prepend the same `#:schema` directive, so
+        // byte-equality holds against the schema-wrapped preset.
         let dir = tempdir();
         let env = env_with_home(dir.path());
         let (code, _stdout, stderr) = run_init(init_choices("minimal", "default"), None, b"", &env);
@@ -2866,7 +2909,7 @@ mod tests {
             .expect("file exists");
         assert_eq!(
             written,
-            presets::body("minimal").expect("preset registered")
+            config::with_schema_directive(presets::body("minimal").expect("preset registered"))
         );
     }
 

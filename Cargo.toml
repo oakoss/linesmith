@@ -39,6 +39,10 @@ lexopt = "0.3"
 # `std` is required; default features like `metadata` / `serde` / `debugging`
 # are not needed for our embedder and add 100s of KB to the stripped binary.
 rhai = { version = "1.24", default-features = false, features = ["std", "sync"] }
+# JSON Schema generation for `config.toml`. Published as
+# `config.schema.json` at the repo root and consumed by taplo / VS Code
+# / Zed via the `#:schema` directive `linesmith init` writes.
+schemars = "1"
 # `SecretString` redacts on Debug/Display; we expose the inner bytes only
 # through the explicit `.token()` accessor per `docs/specs/credentials.md`
 # §Interface.
