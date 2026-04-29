@@ -21,6 +21,7 @@ serde.workspace = true
 serde_json.workspace = true
 catppuccin.workspace = true
 chrono.workspace = true
+dialoguer.workspace = true
 gix.workspace = true
 httpdate.workspace = true
 lexopt.workspace = true

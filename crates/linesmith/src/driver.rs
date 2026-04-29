@@ -167,6 +167,7 @@ where
             force,
             config,
         } => presets_apply(&name, force, config, stdin, stdout, stderr, env),
+        cli::Action::Init { config } => init_action(config, stdin, stdout, stderr, env),
         cli::Action::Run(args) => run_cli(args, stdin, stdout, stderr, env),
     }
 }
@@ -213,69 +214,167 @@ fn presets_apply(
         return 1;
     };
 
-    let Some(resolved) = config::resolve_config_path(
+    let Some(resolved) = resolve_writable_config_path(config_override, env, stderr) else {
+        return 1;
+    };
+    let policy = OverwritePolicy::presets(force);
+    if let Err(code) = write_config_with_backup(body, &resolved.path, policy, stdin, stderr) {
+        return code;
+    }
+    let _ = writeln!(
+        stdout,
+        "wrote preset '{name}' to {}",
+        resolved.path.display()
+    );
+    0
+}
+
+/// Resolve the target config path or emit the "set XDG_CONFIG_HOME or
+/// HOME" diagnostic and return `None`. Shared by `presets_apply` and
+/// the `init` flow so both treat an undiscoverable home identically.
+fn resolve_writable_config_path(
+    config_override: Option<PathBuf>,
+    env: &CliEnv,
+    stderr: &mut dyn Write,
+) -> Option<config::ConfigPath> {
+    match config::resolve_config_path(
         config_override,
         env.linesmith_config.as_deref(),
         env.xdg_config_home.as_deref(),
         env.home.as_deref(),
-    ) else {
-        let _ = writeln!(
-            stderr,
-            "linesmith: cannot resolve a config path (set XDG_CONFIG_HOME or HOME)"
-        );
-        return 1;
-    };
-    let path = resolved.path;
-    let backup = path.with_extension("toml.bak");
-    let mut backup_written: Option<&Path> = None;
-
-    // TOCTOU between `exists()` and `rename`/`write` is the downstream
-    // call's problem: if the file vanishes mid-call, `fs::rename` /
-    // `fs::write` surface their own error and we return 1. Don't "fix"
-    // this by precomputing a handle — concurrent editors of the same
-    // config path aren't a supported workflow.
-    if path.exists() {
-        if !force && !confirm_overwrite(&path, stdin, stderr) {
-            let _ = writeln!(stderr, "linesmith: aborted; config.toml unchanged");
-            return 1;
+    ) {
+        Some(p) => Some(p),
+        None => {
+            let _ = writeln!(
+                stderr,
+                "linesmith: cannot resolve a config path (set XDG_CONFIG_HOME or HOME)"
+            );
+            None
         }
-        // Refuse to clobber an existing backup: the user probably wants
-        // two generations preserved. `--force` says "I really mean it."
+    }
+}
+
+/// Two-bit policy for [`write_config_with_backup`]. `presets apply`
+/// maps `--force` to both bits at once; `init` separates them so a
+/// user who confirmed `y` to the overwrite prompt isn't then blocked
+/// by a leftover `.bak` from a prior run. Use
+/// [`OverwritePolicy::presets`] or [`OverwritePolicy::init`] so the
+/// bit-mapping doesn't drift between call sites.
+#[derive(Debug, Clone, Copy)]
+struct OverwritePolicy {
+    /// Skip the y/N prompt entirely. `presets apply --force` sets
+    /// this; `init` always leaves it `false` so the user explicitly
+    /// confirms.
+    skip_prompt: bool,
+    /// When a `.bak` already exists alongside `path`, replace it
+    /// instead of refusing. `presets apply --force` sets this; `init`
+    /// always sets it because the y/N prompt already captured the
+    /// user's intent to lose the previous content.
+    clobber_backup: bool,
+}
+
+impl OverwritePolicy {
+    /// `presets apply [--force]` policy: prompt + refuse `.bak` by
+    /// default, both elided when `--force`.
+    fn presets(force: bool) -> Self {
+        Self {
+            skip_prompt: force,
+            clobber_backup: force,
+        }
+    }
+
+    /// `init` policy: always prompt, always clobber `.bak` after a
+    /// confirmed `y`. The prompt captured the user's intent to lose
+    /// the previous content, so a leftover `.bak` from a prior run
+    /// shouldn't block the overwrite.
+    fn init() -> Self {
+        Self {
+            skip_prompt: false,
+            clobber_backup: true,
+        }
+    }
+}
+
+/// Write `body` to `path`, backing up any prior file. If `path` exists,
+/// honor `policy` (prompt or skip; refuse or clobber an existing
+/// `.bak`), rename to `path.bak`, then write. If `path` doesn't
+/// exist, create parent directories and write. Returns `Ok(true)`
+/// when a backup was made, `Ok(false)` otherwise; `Err(1)` on
+/// aborted overwrite, refused `.bak`, or I/O failure.
+///
+/// Shared between `presets_apply` and `init` so both paths use the
+/// same prompt phrasing and `.bak` filename. TOCTOU between
+/// `exists()` and `rename`/`write` is the downstream call's problem:
+/// a vanished file surfaces its own `fs::*` error and we return 1.
+fn write_config_with_backup(
+    body: &str,
+    path: &Path,
+    policy: OverwritePolicy,
+    stdin: impl Read,
+    stderr: &mut dyn Write,
+) -> Result<bool, u8> {
+    let backup = path.with_extension("toml.bak");
+    let mut backup_written = false;
+
+    if path.exists() {
+        if !policy.skip_prompt && !confirm_overwrite(path, stdin, stderr) {
+            let _ = writeln!(stderr, "linesmith: aborted; config.toml unchanged");
+            return Err(1);
+        }
+        // Refuse to clobber an existing backup unless the policy
+        // allows it. `presets apply` defaults to refusing (two
+        // generations preserved); `presets apply --force` and `init`
+        // (after a confirmed y/N) both clobber.
+        let mut clobbered_prior_bak = false;
         if backup.exists() {
-            if !force {
+            if !policy.clobber_backup {
                 let _ = writeln!(
                     stderr,
                     "linesmith: {} already exists; rerun with --force to replace it",
                     backup.display()
                 );
-                return 1;
+                return Err(1);
             }
             // Windows' `fs::rename` fails when the destination exists;
-            // pre-remove so `--force` works the same on every platform.
+            // pre-remove so the clobber path works the same on every
+            // platform.
             if let Err(e) = std::fs::remove_file(&backup) {
                 let _ = writeln!(
                     stderr,
                     "linesmith: could not remove existing backup {}: {e}",
                     backup.display()
                 );
-                return 1;
+                return Err(1);
             }
+            clobbered_prior_bak = true;
         }
-        if let Err(e) = std::fs::rename(&path, &backup) {
+        if let Err(e) = std::fs::rename(path, &backup) {
             let _ = writeln!(
                 stderr,
                 "linesmith: could not back up {} to {}: {e}",
                 path.display(),
                 backup.display()
             );
-            return 1;
+            // Surface that the prior-generation `.bak` was already
+            // removed before the rename was attempted. Without this
+            // breadcrumb, a user seeing only "could not back up"
+            // would assume nothing changed and miss that a
+            // recoverable backup was just consumed.
+            if clobbered_prior_bak {
+                let _ = writeln!(
+                    stderr,
+                    "linesmith: note: the previous {} was removed just before this failed rename; it is gone",
+                    backup.display()
+                );
+            }
+            return Err(1);
         }
         let _ = writeln!(
             stderr,
             "linesmith: backed up previous config to {}",
             backup.display()
         );
-        backup_written = Some(&backup);
+        backup_written = true;
     } else if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             let _ = writeln!(
@@ -283,23 +382,22 @@ fn presets_apply(
                 "linesmith: could not create {}: {e}",
                 parent.display()
             );
-            return 1;
+            return Err(1);
         }
     }
 
-    if let Err(e) = std::fs::write(&path, body) {
+    if let Err(e) = std::fs::write(path, body) {
         let _ = writeln!(stderr, "linesmith: write {}: {e}", path.display());
-        if let Some(bak) = backup_written {
+        if backup_written {
             let _ = writeln!(
                 stderr,
                 "linesmith: your previous config is preserved at {}",
-                bak.display()
+                backup.display()
             );
         }
-        return 1;
+        return Err(1);
     }
-    let _ = writeln!(stdout, "wrote preset '{name}' to {}", path.display());
-    0
+    Ok(backup_written)
 }
 
 /// Prompt once on stderr; accept `y` / `yes` (case-insensitive) as yes,
@@ -320,6 +418,277 @@ fn confirm_overwrite(path: &Path, stdin: impl Read, stderr: &mut dyn Write) -> b
 /// as confirmation. Everything else, including empty input, is rejected.
 fn parse_confirmation(input: &str) -> bool {
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// User-supplied choices for `linesmith init`. The dialoguer wrapper
+/// builds these at the CLI; tests construct them directly so the
+/// file-writing core can run without a TTY.
+#[derive(Debug, Clone)]
+struct InitChoices {
+    preset: String,
+    theme: String,
+}
+
+/// Gather choices via dialoguer, then dispatch to [`init_with_choices`].
+/// The split keeps the file-writing + snippet logic testable without a
+/// fake TTY. Also translates dialoguer's I/O errors (TTY missing,
+/// stdin closed mid-prompt, broken pipe, etc.) into a printed
+/// diagnostic plus a hint pointing at `presets apply` for
+/// non-interactive use.
+fn init_action(
+    config_override: Option<PathBuf>,
+    stdin: impl Read,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    env: &CliEnv,
+) -> u8 {
+    let preset_names: Vec<&'static str> = presets::names().collect();
+    let registry = build_theme_registry(env, stderr);
+    let theme_names: Vec<String> = registry
+        .iter()
+        .map(|t| t.theme.name().to_string())
+        .collect();
+
+    let choices = match prompt_for_init_choices(&preset_names, &theme_names) {
+        Ok(c) => c,
+        Err(err) => {
+            // dialoguer collapses TTY-missing, EOF-mid-prompt, broken
+            // pipe, and EINTR into a single `Error::IO` variant, so
+            // we can't reliably distinguish them. Print the
+            // underlying error verbatim and offer the no-tty fallback
+            // as conditional advice rather than a diagnosis.
+            let _ = writeln!(stderr, "linesmith: init: {err}");
+            let _ = writeln!(
+                stderr,
+                "linesmith: if a terminal isn't attached, use 'linesmith presets apply <name>' instead",
+            );
+            return 1;
+        }
+    };
+
+    init_with_choices(&choices, config_override, stdin, stdout, stderr, env)
+}
+
+/// Drive the two interactive Select prompts. Defaults to index 0 in
+/// each list so pressing Enter through both prompts produces a usable
+/// config; the caller controls what index 0 means (today: preset =
+/// `minimal`, theme = `default`).
+///
+/// `docs/specs/config.md:285` and lsm-5yd both list a third "tool"
+/// prompt (claude-code / qwen-code / auto). Skipped here for v0.1:
+/// `Config` has no `tool` field, only Claude Code has a real install
+/// path, and prompting for an option that does nothing is worse UX
+/// than not prompting at all. Revisit when qwen-code support gives
+/// the choice a real consequence.
+fn prompt_for_init_choices(
+    presets: &[&str],
+    themes: &[String],
+) -> Result<InitChoices, dialoguer::Error> {
+    use dialoguer::{theme::ColorfulTheme, Select};
+    let theme = ColorfulTheme::default();
+    let preset_idx = Select::with_theme(&theme)
+        .with_prompt("preset")
+        .items(presets)
+        .default(0)
+        .interact()?;
+    let theme_idx = Select::with_theme(&theme)
+        .with_prompt("theme")
+        .items(themes)
+        .default(0)
+        .interact()?;
+    Ok(InitChoices {
+        preset: presets[preset_idx].to_string(),
+        theme: themes[theme_idx].clone(),
+    })
+}
+
+/// Testable core of `linesmith init`: write the chosen preset (with the
+/// chosen theme injected) to the resolved config path, then print the
+/// Claude Code `settings.json` snippet for copy-paste. Returns 0 on
+/// success, 1 on user-facing errors.
+fn init_with_choices(
+    choices: &InitChoices,
+    config_override: Option<PathBuf>,
+    stdin: impl Read,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    env: &CliEnv,
+) -> u8 {
+    let Some(body) = presets::body(&choices.preset) else {
+        // Defense-in-depth: prompts only offer registered presets, but a
+        // hand-built `InitChoices` from a test could pass an unknown
+        // name.
+        let _ = writeln!(stderr, "linesmith: unknown preset '{}'", choices.preset);
+        return 1;
+    };
+    let composed = compose_init_body(body, &choices.theme);
+
+    let Some(resolved) = resolve_writable_config_path(config_override, env, stderr) else {
+        return 1;
+    };
+    let policy = OverwritePolicy::init();
+    if let Err(code) = write_config_with_backup(&composed, &resolved.path, policy, stdin, stderr) {
+        return code;
+    }
+
+    // Snippet must point at the file we just wrote. If the user
+    // resolved the path explicitly (via `--config` OR `LINESMITH_CONFIG`),
+    // bare `linesmith` would re-resolve to the XDG default and miss
+    // it. The `explicit` bit lets us emit the right `--config <path>`
+    // for both branches.
+    let snippet_path = resolved.explicit.then(|| resolved.path.clone());
+    let _ = writeln!(stdout, "wrote config.toml to {}", resolved.path.display());
+    warn_if_path_needs_user_edit(snippet_path.as_deref(), stderr);
+    let _ = writeln!(stdout);
+    let _ = writeln!(stdout, "Add this to your Claude Code settings.json:");
+    let _ = writeln!(stdout, "(merge into the existing top-level object)");
+    let _ = writeln!(stdout);
+    let _ = writeln!(stdout, "  \"statusLine\": {{");
+    let _ = writeln!(stdout, "    \"type\": \"command\",");
+    let _ = writeln!(stdout, "    \"command\": {},", json_command(&snippet_path));
+    let _ = writeln!(stdout, "    \"padding\": 0");
+    let _ = writeln!(stdout, "  }}");
+    let _ = writeln!(stdout);
+    // Placeholder string contracted by the bead. Swap for an actual
+    // y/N "run doctor now?" offer once lsm-l35 (linesmith doctor)
+    // wires the subcommand into the CLI.
+    let _ = writeln!(stdout, "linesmith doctor coming soon.");
+    0
+}
+
+/// JSON-encode the `command` string for the Claude Code snippet emitted
+/// by `init_with_choices`. When the user resolved an explicit path (via
+/// `--config` or `LINESMITH_CONFIG`), Claude Code must call
+/// `linesmith --config <PATH>` to read the file we just wrote;
+/// otherwise plain `linesmith` finds the XDG default. Only JSON
+/// escaping happens here (backslashes + double quotes); shell quoting
+/// is the caller's problem because POSIX and Windows shells disagree
+/// on the rules and any wrapping we do would be wrong somewhere.
+/// [`warn_if_path_needs_user_edit`] flags the cases that need
+/// hand-quoting before this is invoked.
+fn json_command(explicit_path: &Option<PathBuf>) -> String {
+    let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    match explicit_path {
+        Some(p) => format!("\"linesmith --config {}\"", escape(&p.to_string_lossy())),
+        None => "\"linesmith\"".to_string(),
+    }
+}
+
+/// Warn on stderr when the `--config` path will produce a snippet that
+/// can't be pasted as-is. Two failure modes:
+///
+/// - Non-UTF-8 bytes: `to_string_lossy` substitutes `U+FFFD`, so the
+///   emitted path is garbled and Claude Code's exec fails at runtime
+///   with no link back to init.
+/// - Shell metacharacters or whitespace: Claude Code tokenizes
+///   `command` as a shell argv, so `linesmith --config /a b/c.toml`
+///   becomes four tokens. The snippet is valid JSON but exec won't
+///   find the config.
+///
+/// Init's exit code stays 0 either way (the file was written); the
+/// warning tells the user to hand-edit before pasting.
+fn warn_if_path_needs_user_edit(explicit_path: Option<&Path>, stderr: &mut dyn Write) {
+    let Some(p) = explicit_path else { return };
+    let s = p.to_str();
+    let non_utf8 = s.is_none();
+    let leading_dash = s.is_some_and(|s| s.starts_with('-'));
+    let needs_quoting = s.is_some_and(|s| s.chars().any(needs_shell_quoting));
+    if non_utf8 {
+        let _ = writeln!(
+            stderr,
+            "linesmith: warning: --config path contains non-UTF-8 bytes; the emitted snippet uses Unicode replacement characters and won't work as-is — hand-edit before pasting"
+        );
+    } else if leading_dash {
+        // Shell tokenizes the snippet's `command` as argv, so a path
+        // starting with `-` lands as a flag at re-invocation. lexopt
+        // rejects the unknown flag and the statusline silently fails
+        // every Claude Code tick.
+        let _ = writeln!(
+            stderr,
+            "linesmith: warning: --config path starts with `-` ({}); the emitted snippet would be parsed as a flag at re-invocation. Hand-edit the snippet's `command` field before pasting: prefix the path with `./`, use an absolute path, or insert `--` before it",
+            p.display()
+        );
+    } else if needs_quoting {
+        let _ = writeln!(
+            stderr,
+            "linesmith: warning: --config path contains characters that need shell quoting ({}); add quotes around the path in the snippet's `command` field before pasting",
+            p.display()
+        );
+    }
+}
+
+/// Characters that change shell tokenization away from "one
+/// whitespace-free token." Conservative: the goal is flagging paths
+/// the user would otherwise paste and find broken at exec time, not
+/// reproducing every shell's full quoting grammar. The arm below
+/// covers common POSIX metacharacters plus a useful subset of
+/// cmd.exe / PowerShell specials (including cmd.exe's `^` escape and
+/// `%` variable expansion). Position-sensitive cases like a leading
+/// `-` are checked separately in [`warn_if_path_needs_user_edit`].
+fn needs_shell_quoting(c: char) -> bool {
+    matches!(
+        c,
+        ' ' | '\t'
+            | '\''
+            | '"'
+            | '`'
+            | '$'
+            | '\\'
+            | '*'
+            | '?'
+            | '['
+            | ']'
+            | '&'
+            | ';'
+            | '|'
+            | '<'
+            | '>'
+            | '('
+            | ')'
+            | '{'
+            | '}'
+            | '#'
+            | '!'
+            | '~'
+            | '='
+            | '^'
+            | '%'
+    )
+}
+
+/// Inject `theme = "<name>"` into a preset body before the first table
+/// header. `default` is the implicit choice and skipped, so `init`
+/// with the default theme writes the same bytes as `presets apply
+/// <name>`. See
+/// `init_default_theme_omits_theme_field_to_match_presets_apply` for
+/// the regression guard: pinning byte equality on the common path
+/// makes the rare-path escape bug obvious.
+fn compose_init_body(preset_body: &str, theme: &str) -> String {
+    if theme == "default" {
+        return preset_body.to_string();
+    }
+    let escaped = theme.replace('\\', "\\\\").replace('"', "\\\"");
+    let theme_line = format!("theme = \"{escaped}\"\n\n");
+    // A preset starting with `[` at byte 0 has no preceding newline,
+    // so `find("\n[")` would miss it. Treat both shapes as "table
+    // header at the top" and prepend before it.
+    if preset_body.starts_with('[') {
+        return format!("{theme_line}{preset_body}");
+    }
+    if let Some(idx) = preset_body.find("\n[") {
+        // Keep the preset's leading comment block above the injected
+        // `theme = ...` line.
+        let split = idx + 1;
+        let mut out = String::with_capacity(preset_body.len() + theme_line.len());
+        out.push_str(&preset_body[..split]);
+        out.push_str(&theme_line);
+        out.push_str(&preset_body[split..]);
+        out
+    } else {
+        // Degenerate preset with no tables: prepend so `theme` still
+        // appears at top-level position.
+        format!("{theme_line}{preset_body}")
+    }
 }
 
 /// Discover and compile plugin scripts. Returns `None` when no
@@ -1932,6 +2301,605 @@ mod tests {
             assert!(!super::parse_confirmation(no), "expected no for {no:?}");
         }
     }
+
+    // --- init ---
+
+    /// Drive the testable core directly (bypassing dialoguer) with a
+    /// hand-built `InitChoices`. Mirrors `run_cli_main`'s tuple shape so
+    /// init tests read like the surrounding `presets_apply_*` tests.
+    fn run_init(
+        choices: InitChoices,
+        config_override: Option<PathBuf>,
+        stdin: &[u8],
+        env: &CliEnv,
+    ) -> (u8, String, String) {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = super::init_with_choices(
+            &choices,
+            config_override,
+            io::Cursor::new(stdin),
+            &mut stdout,
+            &mut stderr,
+            env,
+        );
+        (
+            code,
+            String::from_utf8(stdout).expect("stdout utf8"),
+            String::from_utf8(stderr).expect("stderr utf8"),
+        )
+    }
+
+    fn init_choices(preset: &str, theme: &str) -> InitChoices {
+        InitChoices {
+            preset: preset.to_string(),
+            theme: theme.to_string(),
+        }
+    }
+
+    #[test]
+    fn init_creates_valid_config_round_trips_parse() {
+        use std::str::FromStr;
+        let dir = tempdir();
+        let env = env_with_home(dir.path());
+        let (code, stdout, stderr) =
+            run_init(init_choices("minimal", "catppuccin-mocha"), None, b"", &env);
+        assert_eq!(code, 0, "stderr:\n{stderr}");
+        let path = dir.path().join(".config/linesmith/config.toml");
+        let written = std::fs::read_to_string(&path).expect("file exists");
+        let cfg = config::Config::from_str(&written).expect("round-trips");
+        assert_eq!(cfg.theme.as_deref(), Some("catppuccin-mocha"));
+        assert_eq!(
+            cfg.line.expect("has [line]").segments,
+            vec!["model".to_string(), "context_window".to_string()]
+        );
+        assert!(stdout.contains("wrote config.toml to"));
+    }
+
+    #[test]
+    fn init_writes_to_resolved_xdg_path() {
+        // Two tempdirs so XDG-vs-HOME precedence is decisive: if the
+        // resolver wrongly fell through to HOME, we'd see a file in
+        // `home_dir`, not `xdg_dir`.
+        let xdg_dir = tempdir();
+        let home_dir = tempdir();
+        let env = CliEnv {
+            xdg_config_home: Some(xdg_dir.path().to_string_lossy().into_owned()),
+            home: Some(home_dir.path().to_string_lossy().into_owned()),
+            ..CliEnv::for_tests()
+        };
+        let (code, _stdout, stderr) = run_init(init_choices("minimal", "default"), None, b"", &env);
+        assert_eq!(code, 0, "stderr:\n{stderr}");
+        assert!(
+            xdg_dir.path().join("linesmith/config.toml").exists(),
+            "expected config at XDG path"
+        );
+        assert!(
+            !home_dir
+                .path()
+                .join(".config/linesmith/config.toml")
+                .exists(),
+            "HOME path should not be touched when XDG resolves"
+        );
+    }
+
+    /// Pull the indented `"statusLine": { ... }` JSON-fragment block
+    /// out of the init stdout and wrap it as a complete object so
+    /// `serde_json` can parse it. Asserting on the parsed shape (not
+    /// substring matches) catches regressions like a stray trailing
+    /// comma or unbalanced brace that would silently ship as bad UX.
+    fn parse_snippet(stdout: &str) -> serde_json::Value {
+        let lines: Vec<&str> = stdout.lines().collect();
+        let start = lines
+            .iter()
+            .position(|l| l.contains("\"statusLine\""))
+            .expect("snippet header present");
+        let end = lines[start..]
+            .iter()
+            .position(|l| l.trim_end() == "  }")
+            .map(|i| start + i)
+            .expect("snippet closing brace present");
+        let body: String = lines[start..=end].join("\n");
+        let wrapped = format!("{{\n{body}\n}}");
+        serde_json::from_str(&wrapped)
+            .unwrap_or_else(|e| panic!("snippet not valid JSON ({e}):\n{wrapped}"))
+    }
+
+    #[test]
+    fn init_emits_claude_code_settings_snippet() {
+        let dir = tempdir();
+        let env = env_with_home(dir.path());
+        let (code, stdout, _stderr) = run_init(init_choices("minimal", "default"), None, b"", &env);
+        assert_eq!(code, 0);
+        let parsed = parse_snippet(&stdout);
+        let status_line = &parsed["statusLine"];
+        assert_eq!(status_line["type"], "command");
+        assert_eq!(status_line["command"], "linesmith");
+        assert_eq!(status_line["padding"], 0);
+        assert!(
+            stdout.contains("settings.json"),
+            "snippet should name the destination file"
+        );
+        assert!(
+            stdout.contains("merge into the existing top-level object"),
+            "merge hint missing — without it, users pasting into an empty file get invalid JSON",
+        );
+        assert!(
+            stdout.contains("linesmith doctor coming soon"),
+            "doctor placeholder line missing"
+        );
+    }
+
+    #[test]
+    fn init_snippet_preserves_explicit_config_flag() {
+        // When --config <PATH> was used, the snippet must tell Claude
+        // Code to call `linesmith --config <PATH>`. A bare
+        // `linesmith` would point at the XDG default and the file
+        // `init` just wrote would never be read.
+        let dir = tempdir();
+        let custom = dir.path().join("custom-init.toml");
+        let env = env_with_home(dir.path());
+        let (code, stdout, _stderr) = run_init(
+            init_choices("minimal", "default"),
+            Some(custom.clone()),
+            b"",
+            &env,
+        );
+        assert_eq!(code, 0);
+        let parsed = parse_snippet(&stdout);
+        let cmd = parsed["statusLine"]["command"]
+            .as_str()
+            .expect("command is a string");
+        assert!(
+            cmd.starts_with("linesmith --config "),
+            "expected `--config` in command, got: {cmd}"
+        );
+        assert!(
+            cmd.contains(custom.to_string_lossy().as_ref()),
+            "command should reference the actual --config path: {cmd}"
+        );
+    }
+
+    #[test]
+    fn init_snippet_preserves_env_resolved_config_path() {
+        // When the user's explicit path comes from `LINESMITH_CONFIG`,
+        // the snippet must include `--config <path>` just as it does
+        // for the CLI flag. A bare `linesmith` snippet would
+        // re-resolve to the XDG default and miss the file we just
+        // wrote.
+        let dir = tempdir();
+        let custom = dir.path().join("env-init.toml");
+        let env = CliEnv {
+            linesmith_config: Some(custom.to_string_lossy().into_owned()),
+            ..env_with_home(dir.path())
+        };
+        let (code, stdout, _stderr) = run_init(init_choices("minimal", "default"), None, b"", &env);
+        assert_eq!(code, 0);
+        let parsed = parse_snippet(&stdout);
+        let cmd = parsed["statusLine"]["command"]
+            .as_str()
+            .expect("command is a string");
+        assert!(
+            cmd.starts_with("linesmith --config "),
+            "env-resolved path should still produce --config snippet, got: {cmd}"
+        );
+        assert!(
+            cmd.contains(custom.to_string_lossy().as_ref()),
+            "command should reference the env-resolved path: {cmd}"
+        );
+    }
+
+    #[test]
+    fn init_snippet_uses_bare_command_for_implicit_xdg_path() {
+        // The other side of the contract: when neither --config nor
+        // LINESMITH_CONFIG is set, the resolved path is the XDG
+        // default. Plain `linesmith` finds it without --config, so
+        // the snippet stays bare (no spurious --config flag).
+        let dir = tempdir();
+        let env = env_with_home(dir.path());
+        let (code, stdout, _stderr) = run_init(init_choices("minimal", "default"), None, b"", &env);
+        assert_eq!(code, 0);
+        let parsed = parse_snippet(&stdout);
+        assert_eq!(parsed["statusLine"]["command"], "linesmith");
+    }
+
+    #[test]
+    fn init_warns_about_env_resolved_path_with_spaces() {
+        // The user-edit warning must also fire on env-resolved paths,
+        // not just --config. Same broken-snippet failure mode
+        // either way.
+        let dir = tempdir();
+        let custom = dir.path().join("env path with spaces.toml");
+        let env = CliEnv {
+            linesmith_config: Some(custom.to_string_lossy().into_owned()),
+            ..env_with_home(dir.path())
+        };
+        let (code, _stdout, stderr) = run_init(init_choices("minimal", "default"), None, b"", &env);
+        assert_eq!(code, 0);
+        assert!(
+            stderr.contains("characters that need shell quoting"),
+            "missing shell-quoting warning for env-resolved path:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn init_snippet_escapes_quotes_and_backslashes_in_config_path() {
+        // The path is interpolated into a JSON string, so backslashes
+        // (Windows paths) and double quotes must be escaped or the
+        // emitted snippet is invalid JSON.
+        let dir = tempdir();
+        let env = env_with_home(dir.path());
+        let weird = dir.path().join("weird\"path\\ok.toml");
+        let (code, stdout, _stderr) = run_init(
+            init_choices("minimal", "default"),
+            Some(weird.clone()),
+            b"",
+            &env,
+        );
+        assert_eq!(code, 0);
+        // The decisive assertion: parse_snippet panics on invalid JSON.
+        let parsed = parse_snippet(&stdout);
+        let cmd = parsed["statusLine"]["command"]
+            .as_str()
+            .expect("command is a string");
+        assert!(cmd.contains(weird.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn init_succeeds_when_both_config_and_backup_already_exist() {
+        // A user who init'd once (creating config.toml.bak), then
+        // init'd a second time and confirmed `y`, must not be
+        // stranded on a third `init` because the .bak from run #1
+        // still exists. The `y` confirmation already captured intent
+        // to lose prior content, so init clobbers .bak unconditionally.
+        let dir = tempdir();
+        let cfg = dir.path().join(".config/linesmith/config.toml");
+        let bak = dir.path().join(".config/linesmith/config.toml.bak");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "# current\n").unwrap();
+        std::fs::write(&bak, "# older generation\n").unwrap();
+        let env = env_with_home(dir.path());
+        let (code, _stdout, stderr) =
+            run_init(init_choices("minimal", "default"), None, b"y\n", &env);
+        assert_eq!(
+            code, 0,
+            "init must not deadlock when .bak already exists\nstderr:\n{stderr}"
+        );
+        // The previously-current config moved to .bak; the older .bak
+        // generation was clobbered.
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), "# current\n");
+        assert_eq!(
+            std::fs::read_to_string(&cfg).unwrap(),
+            presets::body("minimal").unwrap()
+        );
+    }
+
+    #[test]
+    fn init_user_says_no_to_overwrite_does_not_clobber_backup() {
+        // Init only clobbers .bak after a confirmed `y`. An `n` must
+        // leave both files untouched, or every aborted init would
+        // destroy the .bak.
+        let dir = tempdir();
+        let cfg = dir.path().join(".config/linesmith/config.toml");
+        let bak = dir.path().join(".config/linesmith/config.toml.bak");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "# current\n").unwrap();
+        std::fs::write(&bak, "# older generation\n").unwrap();
+        let env = env_with_home(dir.path());
+        let (code, _stdout, _stderr) =
+            run_init(init_choices("minimal", "default"), None, b"n\n", &env);
+        assert_eq!(code, 1);
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "# current\n");
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            "# older generation\n"
+        );
+    }
+
+    #[test]
+    fn init_default_theme_omits_theme_field_to_match_presets_apply() {
+        // When the user picks `default`, the written file should be
+        // byte-identical to `presets apply minimal` so diff tools and
+        // future migrations don't see a redundant `theme = "default"`.
+        let dir = tempdir();
+        let env = env_with_home(dir.path());
+        let (code, _stdout, stderr) = run_init(init_choices("minimal", "default"), None, b"", &env);
+        assert_eq!(code, 0, "stderr:\n{stderr}");
+        let written = std::fs::read_to_string(dir.path().join(".config/linesmith/config.toml"))
+            .expect("file exists");
+        assert_eq!(
+            written,
+            presets::body("minimal").expect("preset registered")
+        );
+    }
+
+    #[test]
+    fn init_overwrite_prompts_and_backs_up_existing_config() {
+        let dir = tempdir();
+        let cfg = dir.path().join(".config/linesmith/config.toml");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "# prior content\n").unwrap();
+        let env = env_with_home(dir.path());
+        let (code, _stdout, stderr) =
+            run_init(init_choices("minimal", "default"), None, b"y\n", &env);
+        assert_eq!(code, 0, "stderr:\n{stderr}");
+        let backup = dir.path().join(".config/linesmith/config.toml.bak");
+        assert!(backup.exists(), "expected .bak");
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            "# prior content\n"
+        );
+        // `confirm_overwrite`'s prompt wording is owned by that helper;
+        // assert only the post-prompt diagnostic that's specific to
+        // this code path. The backup's existence + contents above
+        // already prove the prompt was honored.
+        assert!(stderr.contains("backed up previous config to"));
+    }
+
+    #[test]
+    fn init_eof_on_overwrite_aborts_without_clobbering() {
+        let dir = tempdir();
+        let cfg = dir.path().join(".config/linesmith/config.toml");
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        std::fs::write(&cfg, "# prior\n").unwrap();
+        let env = env_with_home(dir.path());
+        let (code, _stdout, stderr) = run_init(init_choices("minimal", "default"), None, b"", &env);
+        assert_eq!(code, 1);
+        assert!(stderr.contains("aborted"));
+        // Original content untouched.
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "# prior\n");
+    }
+
+    #[test]
+    fn init_honors_explicit_config_flag_over_xdg_path() {
+        let dir = tempdir();
+        let custom = dir.path().join("custom-init.toml");
+        let env = env_with_home(dir.path());
+        let (code, _stdout, stderr) = run_init(
+            init_choices("minimal", "default"),
+            Some(custom.clone()),
+            b"",
+            &env,
+        );
+        assert_eq!(code, 0, "stderr:\n{stderr}");
+        assert!(custom.exists(), "expected init at --config path");
+        assert!(!dir.path().join(".config/linesmith/config.toml").exists());
+    }
+
+    #[test]
+    fn init_unknown_preset_in_choices_errors() {
+        // The dialoguer wrapper only ever emits registered names, but a
+        // hand-built `InitChoices` with an unknown preset should still
+        // get a clear error rather than silently writing nothing.
+        let dir = tempdir();
+        let env = env_with_home(dir.path());
+        let (code, _stdout, stderr) =
+            run_init(init_choices("not-a-preset", "default"), None, b"", &env);
+        assert_eq!(code, 1);
+        assert!(stderr.contains("unknown preset 'not-a-preset'"));
+    }
+
+    #[test]
+    fn init_without_resolvable_path_errors() {
+        let env = CliEnv {
+            home: None,
+            ..CliEnv::for_tests()
+        };
+        let (code, _stdout, stderr) = run_init(init_choices("minimal", "default"), None, b"", &env);
+        assert_eq!(code, 1);
+        assert!(stderr.contains("cannot resolve"));
+    }
+
+    #[test]
+    fn compose_init_body_default_theme_passes_body_through() {
+        let body = "# hdr\n\n[line]\nsegments = [\"model\"]\n";
+        assert_eq!(super::compose_init_body(body, "default"), body);
+    }
+
+    #[test]
+    fn compose_init_body_inserts_theme_before_first_table() {
+        let body = "# hdr\n# more\n\n[line]\nsegments = [\"model\"]\n";
+        let out = super::compose_init_body(body, "catppuccin-mocha");
+        assert_eq!(
+            out,
+            "# hdr\n# more\n\ntheme = \"catppuccin-mocha\"\n\n[line]\nsegments = [\"model\"]\n"
+        );
+    }
+
+    #[test]
+    fn compose_init_body_escapes_quotes_and_backslashes_in_theme_name() {
+        // Theme names from user files may contain unusual characters;
+        // the TOML string literal must remain valid.
+        let body = "[line]\nsegments = []\n";
+        let out = super::compose_init_body(body, "weird\"name\\foo");
+        assert!(
+            out.starts_with("theme = \"weird\\\"name\\\\foo\"\n\n"),
+            "unexpected escape: {out:?}"
+        );
+        // Confirm round-trip parse.
+        use std::str::FromStr;
+        let cfg = config::Config::from_str(&out).expect("escaped TOML parses");
+        assert_eq!(cfg.theme.as_deref(), Some("weird\"name\\foo"));
+    }
+
+    #[test]
+    fn compose_init_body_handles_table_header_at_byte_zero() {
+        // No leading comment, no leading newline: `find("\n[")`
+        // wouldn't see this header, so we route through
+        // `starts_with('[')` to inject `theme` at the top instead of
+        // burying it after the segments.
+        use std::str::FromStr;
+        let body = "[line]\nsegments = [\"model\"]\n";
+        let out = super::compose_init_body(body, "catppuccin-mocha");
+        assert_eq!(
+            out,
+            "theme = \"catppuccin-mocha\"\n\n[line]\nsegments = [\"model\"]\n"
+        );
+        let cfg = config::Config::from_str(&out).expect("parses");
+        assert_eq!(cfg.theme.as_deref(), Some("catppuccin-mocha"));
+    }
+
+    #[test]
+    fn compose_init_body_falls_back_when_preset_has_no_tables() {
+        // Truly-degenerate preset (comments only, no `[table]` ever):
+        // the function still produces parseable TOML rather than
+        // returning the body unchanged.
+        use std::str::FromStr;
+        let body = "# only a comment\n";
+        let out = super::compose_init_body(body, "catppuccin-mocha");
+        assert!(
+            out.starts_with("theme = \"catppuccin-mocha\"\n\n"),
+            "unexpected output: {out:?}"
+        );
+        assert!(out.ends_with("# only a comment\n"));
+        let cfg = config::Config::from_str(&out).expect("parses");
+        assert_eq!(cfg.theme.as_deref(), Some("catppuccin-mocha"));
+    }
+
+    #[test]
+    fn init_warns_when_config_path_contains_spaces() {
+        // Snippet stays valid JSON, but Claude Code tokenizes the
+        // `command` field as a shell argv — the user has to add quotes
+        // before pasting. Without the warning the snippet would look
+        // fine and break silently at exec time.
+        let dir = tempdir();
+        let custom = dir.path().join("path with spaces.toml");
+        let env = env_with_home(dir.path());
+        let (code, _stdout, stderr) = run_init(
+            init_choices("minimal", "default"),
+            Some(custom.clone()),
+            b"",
+            &env,
+        );
+        assert_eq!(code, 0);
+        assert!(
+            stderr.contains("characters that need shell quoting"),
+            "missing shell-quoting warning, stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("path with spaces.toml"),
+            "warning should name the path"
+        );
+    }
+
+    #[test]
+    fn init_does_not_warn_for_plain_ascii_config_path() {
+        // Plain paths shouldn't get a warning — false positives would
+        // train users to ignore the channel.
+        let dir = tempdir();
+        let custom = dir.path().join("plain.toml");
+        let env = env_with_home(dir.path());
+        let (_code, _stdout, stderr) =
+            run_init(init_choices("minimal", "default"), Some(custom), b"", &env);
+        assert!(
+            !stderr.contains("characters that need shell quoting"),
+            "false-positive warning, stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("non-UTF-8"),
+            "false-positive warning, stderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn init_warns_when_config_path_contains_shell_metacharacters() {
+        // Single-quote, dollar, ampersand, etc. all change shell
+        // tokenization. One of them is enough to trigger the warning.
+        let dir = tempdir();
+        let custom = dir.path().join("weird$path.toml");
+        let env = env_with_home(dir.path());
+        let (code, _stdout, stderr) =
+            run_init(init_choices("minimal", "default"), Some(custom), b"", &env);
+        assert_eq!(code, 0);
+        assert!(
+            stderr.contains("characters that need shell quoting"),
+            "missing warning for `$`, stderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn needs_shell_quoting_flags_metacharacters_and_whitespace() {
+        // Direct unit test of the predicate so a future addition of a
+        // new metachar to the match arm doesn't silently regress.
+        // `^` and `%` are cmd.exe specials; the rest are POSIX
+        // metacharacters most shells respect.
+        for c in [' ', '\t', '\'', '"', '$', '&', ';', '|', '*', '?', '^', '%'] {
+            assert!(
+                super::needs_shell_quoting(c),
+                "expected {c:?} to need quoting"
+            );
+        }
+        for c in ['a', 'Z', '0', '_', '-', '.', '/'] {
+            assert!(
+                !super::needs_shell_quoting(c),
+                "expected {c:?} to NOT need quoting"
+            );
+        }
+    }
+
+    #[test]
+    fn warn_if_path_needs_user_edit_flags_leading_dash() {
+        // Position-sensitive case: a path string starting with `-`
+        // (e.g. `LINESMITH_CONFIG=-relative.toml` or a relative
+        // `--config -foo`) becomes a flag at the snippet's
+        // re-invocation. lexopt rejects the unknown flag and the
+        // statusline silently fails on every Claude Code tick.
+        // Tested directly because `tempdir().join("-foo")` produces
+        // an absolute path that starts with `/`, not `-`.
+        let mut stderr = Vec::new();
+        super::warn_if_path_needs_user_edit(Some(Path::new("-relative.toml")), &mut stderr);
+        let stderr = String::from_utf8(stderr).unwrap();
+        assert!(
+            stderr.contains("starts with `-`"),
+            "missing leading-dash warning:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn warn_if_path_needs_user_edit_quiet_for_clean_paths() {
+        // The leading-dash, shell-quoting, and non-UTF-8 branches
+        // are mutually exclusive guards. A plain absolute path with
+        // no metacharacters trips none of them.
+        let mut stderr = Vec::new();
+        super::warn_if_path_needs_user_edit(
+            Some(Path::new("/etc/linesmith/config.toml")),
+            &mut stderr,
+        );
+        assert!(
+            stderr.is_empty(),
+            "false-positive warning:\n{}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+
+    #[test]
+    fn overwrite_policy_constructors_lock_the_bit_mapping() {
+        // The doc on `OverwritePolicy` promises that the named
+        // constructors keep the bit-mapping from drifting between
+        // call sites. Pin the contract directly so a future refactor
+        // that "simplifies" `presets(force)` to `{ skip_prompt: false,
+        // clobber_backup: force }` (or similar) breaks here, not at
+        // a call site that no longer exists.
+        let presets_off = super::OverwritePolicy::presets(false);
+        assert!(!presets_off.skip_prompt);
+        assert!(!presets_off.clobber_backup);
+
+        let presets_on = super::OverwritePolicy::presets(true);
+        assert!(presets_on.skip_prompt);
+        assert!(presets_on.clobber_backup);
+
+        let init = super::OverwritePolicy::init();
+        assert!(!init.skip_prompt, "init must always prompt");
+        assert!(init.clobber_backup, "init must always clobber .bak");
+    }
+
+    // The rename-after-clobber breadcrumb path (where
+    // `write_config_with_backup` removes an existing .bak and the
+    // subsequent rename then fails) isn't unit-tested. Triggering
+    // rename failure between a successful `remove_file` and `rename`
+    // requires interposition (race) or cross-mount setup. The branch
+    // is short and visually inspectable in `write_config_with_backup`;
+    // revisit if the helper grows.
 
     #[test]
     fn presets_apply_without_resolvable_path_errors() {

@@ -1,8 +1,8 @@
 # Config
 
 - Status: draft
-- Version: 0.1.1
-- Last updated: 2026-04-20
+- Version: 0.1.2
+- Last updated: 2026-04-28
 - Driving ADRs: [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0005](../adrs/0005-role-based-themes.md), [ADR-0006](../adrs/0006-tool-agnostic-json-schema.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md), [ADR-0011](../adrs/0011-rate-limit-data-source.md)
 
 ## Overview
@@ -282,12 +282,12 @@ Build immutable RuntimeConfig passed to render pipeline
 
 Steps:
 
-- Prompt (dialoguer) for preset, theme, tool
+- Prompt (dialoguer) for preset and theme. The "tool" prompt listed in earlier drafts is deferred until `Config` grows a `tool` field and qwen-code support has a real install path; today only Claude Code ships.
 - Write config to resolved path; create directories as needed (0755)
 - Emit the Claude Code `settings.json` snippet for copy-paste (see below)
-- Offer to run `linesmith doctor` for an environment health check
+- Offer to run `linesmith doctor` for an environment health check (currently prints `linesmith doctor coming soon.` placeholder; offer wires up when the doctor subcommand lands)
 
-Snippet emitted:
+Snippet emitted (default — XDG-resolved path, plain `linesmith` finds it):
 
 ```json
 "statusLine": {
@@ -296,6 +296,18 @@ Snippet emitted:
   "padding": 0
 }
 ```
+
+When the user resolved an explicit path via `--config <PATH>` or `LINESMITH_CONFIG=<PATH>`, the snippet's `command` field includes the flag so Claude Code reads the file `init` just wrote rather than re-resolving to the XDG default:
+
+```json
+"statusLine": {
+  "type": "command",
+  "command": "linesmith --config /path/to/config.toml",
+  "padding": 0
+}
+```
+
+Path-content warnings (stderr, non-fatal): paths containing shell metacharacters or whitespace, paths starting with `-`, and paths with non-UTF-8 bytes all produce a hand-edit warning before the snippet is printed. The snippet still goes to stdout so users redirecting output get a clean copy.
 
 ### `linesmith check-config`
 
@@ -358,3 +370,4 @@ Parse and validate; print errors/warnings to stderr; exit non-zero on errors. Us
 
 - 2026-04-17: initial draft (v0.1)
 - 2026-04-20: v0.1.1 additive update. Adds `[usage]` top-level section (`cache_duration`, `api_base_url`, `timeout`) for the OAuth rate-limit endpoint knobs referenced by [data-fetching.md](data-fetching.md) §OAuth usage cache stack and [rate-limit-segments.md](rate-limit-segments.md) §Staleness bounds. Updates the `[segments.rate_limit_5h]` `visible_if` example from the stdin-payload `ctx.rate_limits` shape (dropped in lsm-7po) to the `ctx.usage` tagged-map shape matching ADR-0011's `UsageData` contract. Driven by ADR-0010 + ADR-0011. No breaking changes.
+- 2026-04-28: v0.1.2 update for `linesmith init` (lsm-5yd) shipping. Clarifies the `linesmith init` section: drops the deferred "tool" prompt, documents the doctor-offer placeholder, adds the `--config`/`LINESMITH_CONFIG` snippet propagation, and notes the path-content warnings (shell metacharacters, leading dash, non-UTF-8). No config-shape changes.

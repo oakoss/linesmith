@@ -24,8 +24,8 @@ pub enum ColorOverride {
 }
 
 /// What the binary should do after parsing. `Run` is the common case;
-/// `Help`, `Version`, `ThemesList`, `PresetsList`, and `PresetsApply`
-/// are meta-commands that print / write and exit.
+/// every other variant is a meta-command that prints / writes and
+/// exits.
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Action {
@@ -39,6 +39,9 @@ pub enum Action {
         force: bool,
         config: Option<PathBuf>,
     },
+    Init {
+        config: Option<PathBuf>,
+    },
 }
 
 /// Help text. Kept short; full docs live at
@@ -48,6 +51,7 @@ linesmith — status line for Claude Code and other AI coding CLIs
 
 USAGE:
     linesmith [OPTIONS]
+    linesmith init
     linesmith themes list
     linesmith presets list
     linesmith presets apply <NAME> [--force]
@@ -62,6 +66,8 @@ OPTIONS:
     -V, --version          Print version
 
 SUBCOMMANDS:
+    init                   Interactive onboarding: pick a preset + theme,
+                           write config.toml, print Claude Code snippet
     themes list            List available themes (built-in + user)
     presets list           List available config presets
     presets apply <NAME>   Write a preset's config.toml to the resolved path
@@ -141,6 +147,15 @@ fn dispatch_subcommand(
     }
     let first = positional[0].to_string_lossy();
     match first.as_ref() {
+        "init" => {
+            if positional.len() > 1 {
+                return Err(lexopt::Error::UnexpectedValue {
+                    option: "init".to_string(),
+                    value: positional[1].to_string_lossy().to_string().into(),
+                });
+            }
+            Ok(Some(Action::Init { config }))
+        }
         "themes" => {
             let sub = positional.get(1).map(|s| s.to_string_lossy().into_owned());
             match sub.as_deref() {
@@ -482,6 +497,39 @@ mod tests {
                 config: None,
             }
         );
+    }
+
+    #[test]
+    fn init_subcommand_parses_with_no_config_override() {
+        assert_eq!(
+            parse_args(&["init"]).expect("ok"),
+            Action::Init { config: None }
+        );
+    }
+
+    #[test]
+    fn init_threads_config_flag_into_action() {
+        let got = parse_args(&["--config", "/tmp/init.toml", "init"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::Init {
+                config: Some(PathBuf::from("/tmp/init.toml"))
+            }
+        );
+    }
+
+    #[test]
+    fn init_with_extra_positional_errors() {
+        let err = parse_args(&["init", "minimal"]).unwrap_err();
+        assert!(matches!(err, lexopt::Error::UnexpectedValue { .. }));
+    }
+
+    #[test]
+    fn init_rejects_force_flag() {
+        // `--force` is `presets apply`-only; init's overwrite path goes
+        // through the same y/N prompt without a force escape hatch.
+        let err = parse_args(&["--force", "init"]).unwrap_err();
+        assert!(matches!(err, lexopt::Error::UnexpectedOption(ref s) if s == "--force"));
     }
 
     #[test]

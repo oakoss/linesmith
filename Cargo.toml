@@ -20,6 +20,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 catppuccin = "2"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+# Interactive prompts for `linesmith init` (Select for preset/theme pickers).
+# `default-features = false` drops the optional history/fuzzy-select code we
+# don't use, keeping the binary smaller.
+dialoguer = { version = "0.12", default-features = false }
 # gix per ADR-0001. Features: repo discovery, HEAD, worktree kind,
 # and status (dirty scan including untracked). No network/TLS/
 # http-transport — the statusline never talks to a remote.
