@@ -147,12 +147,59 @@ impl UreqTransport {
         // `http_status_as_error(false)` so 4xx/5xx surface as
         // `Ok(Response)` with a status code rather than `Err` — we
         // need to inspect 401 and 429 specifically.
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .build();
+        let mut builder = ureq::Agent::config_builder().http_status_as_error(false);
+        if let Some(proxy) = resolve_proxy_from_env() {
+            builder = builder.proxy(Some(proxy));
+        }
         Self {
-            agent: ureq::Agent::new_with_config(config),
+            agent: ureq::Agent::new_with_config(builder.build()),
             user_agent: default_user_agent(),
+        }
+    }
+}
+
+/// Resolve a proxy from `ALL_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY`
+/// / `NO_PROXY` (and lowercase variants), matching ureq's documented
+/// env-var order. ureq's `Proxy::try_from_env` does the parsing,
+/// including the `NO_PROXY` exclusion list. A malformed proxy URL
+/// warns to stderr (variable name only — the value can carry
+/// credentials like `http://user:pass@host`) and falls through to a
+/// direct connection. Without the warn the proxy silently drops and
+/// the user sees `[Network error]` with no clue the env var was the
+/// cause.
+fn resolve_proxy_from_env() -> Option<ureq::Proxy> {
+    match ureq::Proxy::try_from_env() {
+        Some(proxy) => Some(proxy),
+        None => {
+            // `try_from_env` returns `None` both when no env var is
+            // set AND when a set var fails to parse. Distinguish the
+            // two by re-reading the env vars in ureq's own iteration
+            // order; a set-but-unparsed value is the case worth
+            // warning about.
+            for var in [
+                "ALL_PROXY",
+                "all_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "HTTP_PROXY",
+                "http_proxy",
+            ] {
+                if let Ok(val) = std::env::var(var) {
+                    if !val.is_empty() {
+                        // Log the variable NAME only. Proxy URLs
+                        // routinely embed credentials (`user:pass@`);
+                        // echoing the value to stderr / CI logs
+                        // would leak them precisely in the
+                        // misconfiguration scenario this warn is
+                        // trying to help diagnose.
+                        crate::lsm_warn!(
+                            "{var}: failed to parse as proxy URL; falling back to direct connection"
+                        );
+                        return None;
+                    }
+                }
+            }
+            None
         }
     }
 }
@@ -480,6 +527,20 @@ mod tests {
         // orchestrator can't meaningfully compare to a cache TTL.
         let parsed = parse_retry_after(&u64::MAX.to_string()).unwrap();
         assert_eq!(parsed, MAX_RETRY_AFTER);
+    }
+
+    #[test]
+    fn ureq_transport_construction_pins_user_agent_and_proxy_path() {
+        // `UreqTransport::new` is infallible by contract: a future
+        // refactor that wires the proxy via a fallible API without
+        // handling the error would regress here. The user_agent
+        // assertion doubles as a constructor smoke for the
+        // unrelated field. ureq's `Proxy::try_from_env` is the
+        // canonical RFC implementation; the warn-on-unparseable-
+        // env-var case our wrapper adds needs a warn-sink hook to
+        // assert directly.
+        let transport = UreqTransport::new();
+        assert_eq!(transport.user_agent, default_user_agent());
     }
 
     #[test]
