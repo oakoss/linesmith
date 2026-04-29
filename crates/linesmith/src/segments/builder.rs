@@ -1000,13 +1000,13 @@ mod tests {
         use std::sync::Arc;
         crate::data_context::DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
-            model: ModelInfo {
+            model: Some(ModelInfo {
                 display_name: "X".into(),
-            },
-            workspace: WorkspaceInfo {
+            }),
+            workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from("/r"),
                 git_worktree: None,
-            },
+            }),
             context_window: None,
             cost: None,
             effort: None,
@@ -1414,13 +1414,13 @@ mod tests {
         use std::sync::Arc;
         crate::data_context::DataContext::new(input::StatusContext {
             tool: Tool::ClaudeCode,
-            model: ModelInfo {
+            model: Some(ModelInfo {
                 display_name: display_name.into(),
-            },
-            workspace: WorkspaceInfo {
+            }),
+            workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from("/repo"),
                 git_worktree: None,
-            },
+            }),
             context_window: None,
             cost: None,
             effort: None,

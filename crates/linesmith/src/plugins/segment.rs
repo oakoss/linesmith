@@ -157,13 +157,13 @@ mod tests {
     fn minimal_status() -> StatusContext {
         StatusContext {
             tool: Tool::ClaudeCode,
-            model: ModelInfo {
+            model: Some(ModelInfo {
                 display_name: "Sonnet".to_string(),
-            },
-            workspace: WorkspaceInfo {
+            }),
+            workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from("/repo"),
                 git_worktree: None,
-            },
+            }),
             context_window: None,
             cost: None,
             effort: None,

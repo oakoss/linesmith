@@ -24,13 +24,11 @@ impl Segment for WorkspaceSegment {
     }
 
     fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
-        let Some(repo_name) = ctx
-            .status
-            .workspace
-            .project_dir
-            .file_name()
-            .and_then(|s| s.to_str())
-        else {
+        let Some(workspace) = ctx.status.workspace.as_ref() else {
+            crate::lsm_debug!("workspace: status.workspace absent; hiding");
+            return Ok(None);
+        };
+        let Some(repo_name) = workspace.project_dir.file_name().and_then(|s| s.to_str()) else {
             crate::lsm_debug!("workspace: status.workspace.project_dir has no basename; hiding");
             return Ok(None);
         };
@@ -68,13 +66,13 @@ mod tests {
     fn status(project_dir: &str) -> StatusContext {
         StatusContext {
             tool: Tool::ClaudeCode,
-            model: ModelInfo {
+            model: Some(ModelInfo {
                 display_name: "Claude Test".into(),
-            },
-            workspace: WorkspaceInfo {
+            }),
+            workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from(project_dir),
                 git_worktree: None,
-            },
+            }),
             context_window: None,
             cost: None,
             effort: None,

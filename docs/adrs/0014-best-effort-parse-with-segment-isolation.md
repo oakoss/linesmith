@@ -1,6 +1,6 @@
 # Best-effort parse with segment-level isolation for stdin payloads
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-04-25
 - Deciders: Jace
 - Driving research: [parse-failure-isolation-survey](../research/parse-failure-isolation-survey.md) (commit `e39184a`), [context-window-correctness](../research/context-window-correctness.md) (commit `ab22dca`)

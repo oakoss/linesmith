@@ -978,13 +978,13 @@ mod layout_type_tests {
 
         let ctx = DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
-            model: ModelInfo {
+            model: Some(ModelInfo {
                 display_name: "X".into(),
-            },
-            workspace: WorkspaceInfo {
+            }),
+            workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from("/r"),
                 git_worktree: None,
-            },
+            }),
             context_window: None,
             cost: None,
             effort: None,
@@ -1296,13 +1296,13 @@ mod layout_type_tests {
         use std::sync::Arc;
         DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
-            model: ModelInfo {
+            model: Some(ModelInfo {
                 display_name: "Claude".into(),
-            },
-            workspace: WorkspaceInfo {
+            }),
+            workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from("/repo/linesmith"),
                 git_worktree: None,
-            },
+            }),
             context_window: None,
             cost: None,
             effort: None,

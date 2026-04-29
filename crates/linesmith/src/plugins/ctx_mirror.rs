@@ -210,8 +210,14 @@ fn build_render(rc: &RenderContext) -> Dynamic {
 fn build_status(s: &StatusContext) -> Dynamic {
     let mut m = Map::new();
     m.insert("tool".into(), build_tool(&s.tool));
-    m.insert("model".into(), build_model(&s.model));
-    m.insert("workspace".into(), build_workspace(&s.workspace));
+    m.insert(
+        "model".into(),
+        s.model.as_ref().map_or(Dynamic::UNIT, build_model),
+    );
+    m.insert(
+        "workspace".into(),
+        s.workspace.as_ref().map_or(Dynamic::UNIT, build_workspace),
+    );
     m.insert(
         "context_window".into(),
         s.context_window
@@ -311,19 +317,28 @@ fn build_worktree(wt: &GitWorktree) -> Dynamic {
 
 fn build_context_window(cw: &ContextWindow) -> Dynamic {
     let mut m = Map::new();
-    m.insert("used".into(), Dynamic::from(f64::from(cw.used.value())));
+    m.insert(
+        "used".into(),
+        cw.used
+            .map_or(Dynamic::UNIT, |p| Dynamic::from(f64::from(p.value()))),
+    );
     m.insert(
         "remaining".into(),
-        Dynamic::from(f64::from(cw.remaining().value())),
+        cw.remaining()
+            .map_or(Dynamic::UNIT, |p| Dynamic::from(f64::from(p.value()))),
     );
-    m.insert("size".into(), int_from_u64(cw.size));
+    m.insert(
+        "size".into(),
+        cw.size
+            .map_or(Dynamic::UNIT, |s| Dynamic::from_int(i64::from(s))),
+    );
     m.insert(
         "total_input_tokens".into(),
-        int_from_u64(cw.total_input_tokens),
+        cw.total_input_tokens.map_or(Dynamic::UNIT, int_from_u64),
     );
     m.insert(
         "total_output_tokens".into(),
-        int_from_u64(cw.total_output_tokens),
+        cw.total_output_tokens.map_or(Dynamic::UNIT, int_from_u64),
     );
     m.insert(
         "current_usage".into(),
@@ -866,13 +881,13 @@ mod tests {
     fn minimal_status() -> StatusContext {
         StatusContext {
             tool: Tool::ClaudeCode,
-            model: ModelInfo {
+            model: Some(ModelInfo {
                 display_name: "Sonnet".to_string(),
-            },
-            workspace: WorkspaceInfo {
+            }),
+            workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from("/repo"),
                 git_worktree: None,
-            },
+            }),
             context_window: None,
             cost: None,
             effort: None,
@@ -1478,10 +1493,10 @@ mod tests {
     fn context_window_exposes_used_and_remaining_as_floats() {
         let mut s = minimal_status();
         s.context_window = Some(ContextWindow {
-            used: Percent::new(42.5).unwrap(),
-            size: 200_000,
-            total_input_tokens: 1_000,
-            total_output_tokens: 2_000,
+            used: Some(Percent::new(42.5).unwrap()),
+            size: Some(200_000),
+            total_input_tokens: Some(1_000),
+            total_output_tokens: Some(2_000),
             current_usage: None,
         });
         let dc = DataContext::new(s);
@@ -1517,10 +1532,10 @@ mod tests {
     fn context_window_current_usage_mirrors_all_four_fields() {
         let mut s = minimal_status();
         s.context_window = Some(ContextWindow {
-            used: Percent::new(12.4).unwrap(),
-            size: 200_000,
-            total_input_tokens: 24_800,
-            total_output_tokens: 3_200,
+            used: Some(Percent::new(12.4).unwrap()),
+            size: Some(200_000),
+            total_input_tokens: Some(24_800),
+            total_output_tokens: Some(3_200),
             current_usage: Some(TurnUsage {
                 input_tokens: 2_000,
                 output_tokens: 500,
@@ -2325,7 +2340,7 @@ mod tests {
     #[test]
     fn workspace_worktree_preserves_name_and_path() {
         let mut s = minimal_status();
-        s.workspace.git_worktree = Some(GitWorktree {
+        s.workspace.as_mut().expect("workspace").git_worktree = Some(GitWorktree {
             name: "feature".to_string(),
             path: PathBuf::from("/wt/feature"),
         });

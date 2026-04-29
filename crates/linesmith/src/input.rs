@@ -18,8 +18,13 @@ use std::sync::Arc;
 #[non_exhaustive]
 pub struct StatusContext {
     pub tool: Tool,
-    pub model: ModelInfo,
-    pub workspace: WorkspaceInfo,
+    /// Per ADR-0014: `None` when the `model` wrapper is missing or
+    /// malformed. Segments that depend on it hide.
+    pub model: Option<ModelInfo>,
+    /// Per ADR-0014: `None` when the `workspace` wrapper is missing or
+    /// malformed (including a missing/null `project_dir`). Segments
+    /// that depend on it hide.
+    pub workspace: Option<WorkspaceInfo>,
     pub context_window: Option<ContextWindow>,
     pub cost: Option<CostMetrics>,
     pub effort: Option<EffortLevel>,
@@ -69,11 +74,16 @@ pub struct GitWorktree {
 
 #[derive(Debug, Clone)]
 pub struct ContextWindow {
-    /// Used percentage. `remaining()` derives from this.
-    pub used: Percent,
-    pub size: u64,
-    pub total_input_tokens: u64,
-    pub total_output_tokens: u64,
+    /// Used percentage. `remaining()` derives from this. Per ADR-0014,
+    /// `None` when CC emits `used_percentage: null` (the pre-first-API-
+    /// call window, see `docs/research/context-window-correctness.md`)
+    /// or the leaf is otherwise malformed.
+    pub used: Option<Percent>,
+    /// Context-window size in tokens. `u32` matches ADR-0014's Shape
+    /// section; values outside the u32 range degrade to `None`.
+    pub size: Option<u32>,
+    pub total_input_tokens: Option<u64>,
+    pub total_output_tokens: Option<u64>,
     /// Tokens consumed by the most recent API call; `None` before the
     /// first call in a session. Distinct from `total_*_tokens` above,
     /// which are cumulative across the whole session.
@@ -81,10 +91,11 @@ pub struct ContextWindow {
 }
 
 impl ContextWindow {
-    /// Percentage remaining; always consistent with `used`.
+    /// Percentage remaining; always consistent with `used`. Returns
+    /// `None` when `used` is `None` (per-leaf Option per ADR-0014).
     #[must_use]
-    pub fn remaining(&self) -> Percent {
-        self.used.complement()
+    pub fn remaining(&self) -> Option<Percent> {
+        self.used.map(Percent::complement)
     }
 }
 
@@ -436,8 +447,8 @@ mod claude {
     pub fn normalize(raw: Arc<serde_json::Value>) -> Result<StatusContext, ParseError> {
         let root = expect_object(&raw, "")?;
 
-        let model = parse_model(root)?;
-        let workspace = parse_workspace(root)?;
+        let model = parse_model(root);
+        let workspace = parse_workspace(root);
         let context_window = parse_context_window(root)?;
         let cost = parse_cost(root)?;
         let effort = parse_effort(root)?;
@@ -461,46 +472,131 @@ mod claude {
         })
     }
 
-    fn parse_model(
-        root: &serde_json::Map<String, serde_json::Value>,
-    ) -> Result<ModelInfo, ParseError> {
-        let model = root
-            .get("model")
-            .ok_or_else(|| missing("model"))
-            .and_then(|v| expect_object(v, "model"))?;
-        let display_name = require_string(model, "model.display_name")?.to_owned();
-        Ok(ModelInfo { display_name })
+    /// ADR-0014: any sub-field failure (missing wrapper, non-object,
+    /// missing/null/non-string `display_name`) downgrades the field
+    /// to `None` with an `lsm_warn!` carrying the JSON path. Segments
+    /// hide; unrelated segments still render.
+    fn parse_model(root: &serde_json::Map<String, serde_json::Value>) -> Option<ModelInfo> {
+        let value = root.get("model")?;
+        if value.is_null() {
+            return None;
+        }
+        let model = match value.as_object() {
+            Some(o) => o,
+            None => {
+                crate::lsm_warn!(
+                    "model: expected object, got {:?}; hiding (possible CC schema drift)",
+                    JsonType::of(value)
+                );
+                return None;
+            }
+        };
+        let Some(name_value) = model.get("display_name") else {
+            crate::lsm_warn!("model.display_name: missing; hiding");
+            return None;
+        };
+        if name_value.is_null() {
+            return None;
+        }
+        let Some(display_name) = name_value.as_str() else {
+            crate::lsm_warn!(
+                "model.display_name: expected string, got {:?}; hiding",
+                JsonType::of(name_value)
+            );
+            return None;
+        };
+        Some(ModelInfo {
+            display_name: display_name.to_owned(),
+        })
     }
 
-    fn parse_workspace(
-        root: &serde_json::Map<String, serde_json::Value>,
-    ) -> Result<WorkspaceInfo, ParseError> {
-        let workspace = root
-            .get("workspace")
-            .ok_or_else(|| missing("workspace"))
-            .and_then(|v| expect_object(v, "workspace"))?;
-        let project_dir = PathBuf::from(require_string(workspace, "workspace.project_dir")?);
+    /// ADR-0014: any sub-field failure downgrades to `None` + warn.
+    /// `git_worktree` still degrades independently — a malformed
+    /// worktree shouldn't hide the project_dir basename.
+    fn parse_workspace(root: &serde_json::Map<String, serde_json::Value>) -> Option<WorkspaceInfo> {
+        let value = root.get("workspace")?;
+        if value.is_null() {
+            return None;
+        }
+        let workspace = match value.as_object() {
+            Some(o) => o,
+            None => {
+                crate::lsm_warn!(
+                    "workspace: expected object, got {:?}; hiding (possible CC schema drift)",
+                    JsonType::of(value)
+                );
+                return None;
+            }
+        };
+        let Some(dir_value) = workspace.get("project_dir") else {
+            crate::lsm_warn!("workspace.project_dir: missing; hiding");
+            return None;
+        };
+        if dir_value.is_null() {
+            return None;
+        }
+        let Some(project_dir_str) = dir_value.as_str() else {
+            crate::lsm_warn!(
+                "workspace.project_dir: expected string, got {:?}; hiding",
+                JsonType::of(dir_value)
+            );
+            return None;
+        };
 
         let git_worktree = match workspace.get("git_worktree") {
             Some(serde_json::Value::Null) | None => None,
-            Some(serde_json::Value::Object(obj)) => {
-                let name = require_string(obj, "workspace.git_worktree.name")?.to_owned();
-                let path = PathBuf::from(require_string(obj, "workspace.git_worktree.path")?);
-                Some(GitWorktree { name, path })
-            }
+            Some(serde_json::Value::Object(obj)) => parse_git_worktree(obj),
             Some(other) => {
-                return Err(type_mismatch(
-                    "workspace.git_worktree",
-                    JsonType::Object,
-                    JsonType::of(other),
-                ));
+                crate::lsm_warn!(
+                    "workspace.git_worktree: expected object, got {:?}; hiding worktree",
+                    JsonType::of(other)
+                );
+                None
             }
         };
 
-        Ok(WorkspaceInfo {
-            project_dir,
+        Some(WorkspaceInfo {
+            project_dir: PathBuf::from(project_dir_str),
             git_worktree,
         })
+    }
+
+    fn parse_git_worktree(obj: &serde_json::Map<String, serde_json::Value>) -> Option<GitWorktree> {
+        let name = string_leaf(obj, "workspace.git_worktree.name")?;
+        let path = string_leaf(obj, "workspace.git_worktree.path")?;
+        // Empty strings are silent: CC sometimes emits `""` for
+        // unset fields. A non-string drift already warned in
+        // `string_leaf` before reaching here.
+        if name.is_empty() || path.is_empty() {
+            return None;
+        }
+        Some(GitWorktree {
+            name: name.to_owned(),
+            path: PathBuf::from(path),
+        })
+    }
+
+    /// Tolerant string reader. Missing or null → silent `None`
+    /// (documented "field unset" shape). Non-string → `lsm_warn!` +
+    /// `None` to surface schema drift.
+    fn string_leaf<'a>(
+        obj: &'a serde_json::Map<String, serde_json::Value>,
+        path: &'static str,
+    ) -> Option<&'a str> {
+        let value = obj.get(path_tail(path))?;
+        if value.is_null() {
+            return None;
+        }
+        match value.as_str() {
+            Some(s) => Some(s),
+            None => {
+                crate::lsm_warn!(
+                    "{path}: expected string, got {:?}; degrading to None",
+                    JsonType::of(value)
+                );
+                None
+            }
+        }
     }
 
     fn parse_context_window(
@@ -514,57 +610,13 @@ mod claude {
         }
         let cw = expect_object(value, "context_window")?;
 
-        // Pre-first-API-call payloads (CC 2.1.x) carry a context_window
-        // object with `used_percentage` null — there's no usage data
-        // yet. (`current_usage: null` is the same shape, handled by
-        // parse_current_usage's own guard below.) Treat any required-
-        // leaf null the same as `context_window: null` and hide the
-        // segment for the ~15s pre-first-call window. Defensive sweep
-        // on the other required leaves keeps the next CC schema wobble
-        // (a single `total_*_tokens: null`) from tanking the segment.
-        for key in [
-            "used_percentage",
-            "context_window_size",
-            "total_input_tokens",
-            "total_output_tokens",
-        ] {
-            if cw.get(key).is_some_and(serde_json::Value::is_null) {
-                let version = root
-                    .get("version")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown");
-                crate::lsm_debug!(
-                    "context_window.{key} is null (CC {version}); hiding context segment \
-                     — expected during pre-first-API-call window; persistence past the \
-                     first assistant response indicates real schema drift"
-                );
-                return Ok(None);
-            }
-        }
-
-        let used_raw = require_f64(cw, "context_window.used_percentage")?;
-        // Asymmetric handling. Claude Code has been observed emitting
-        // values slightly past 100 post-/compact (claude-code#37163)
-        // so an above-100 value is a known upstream bug: clamp to 100
-        // and warn, rather than degrade the whole statusline to `?`.
-        // A below-zero value is NOT a documented Claude Code state —
-        // it points at a corrupted payload or a misrouted upstream —
-        // so let it surface as InvalidValue so the failure is loud.
-        let used = if used_raw > 100.0 {
-            crate::lsm_warn!("context_window.used_percentage = {used_raw} > 100; clamping to 100",);
-            Percent::from_f64_clamped(used_raw).expect("non-NaN value > 100 clamps successfully")
-        } else {
-            Percent::from_f64(used_raw).ok_or_else(|| {
-                invalid_value(
-                    "context_window.used_percentage",
-                    "percentage must be a number in [0, 100]",
-                )
-            })?
-        };
-
-        let size = require_u64(cw, "context_window.context_window_size")?;
-        let total_input_tokens = require_u64(cw, "context_window.total_input_tokens")?;
-        let total_output_tokens = require_u64(cw, "context_window.total_output_tokens")?;
+        // ADR-0014: each leaf degrades independently. A null
+        // `used_percentage` (the documented pre-first-API-call shape)
+        // no longer hides peers like `current_usage` or `size`.
+        let used = parse_used_percentage(cw)?;
+        let size = parse_size(cw);
+        let total_input_tokens = try_u64_required(cw, "context_window.total_input_tokens");
+        let total_output_tokens = try_u64_required(cw, "context_window.total_output_tokens");
         let current_usage = parse_current_usage(cw)?;
 
         Ok(Some(ContextWindow {
@@ -574,6 +626,116 @@ mod claude {
             total_output_tokens,
             current_usage,
         }))
+    }
+
+    /// Parse `context_window.used_percentage` into `Option<Percent>`.
+    /// - missing / null → `Ok(None)`, silent (documented pre-first-
+    ///   API-call shape; warning would spam at every fresh session)
+    /// - non-number → `Ok(None)` + warn (schema drift)
+    /// - in-range value → `Ok(Some(_))`
+    /// - >100 → clamp to 100 + warn (claude-code#37163)
+    /// - <0 or NaN → `Err(InvalidValue)`. Carve-out from ADR-0014's
+    ///   warn-and-degrade default: a negative is undocumented and
+    ///   most likely a corrupted payload; surfacing loud catches
+    ///   real upstream breakage that "Some(0)" or warn+None would mask.
+    fn parse_used_percentage(
+        cw: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<Percent>, ParseError> {
+        let Some(value) = cw.get("used_percentage") else {
+            return Ok(None);
+        };
+        if value.is_null() {
+            return Ok(None);
+        }
+        let Some(used_raw) = value.as_f64() else {
+            crate::lsm_warn!(
+                "context_window.used_percentage: expected number, got {:?}; degrading leaf to None",
+                JsonType::of(value)
+            );
+            return Ok(None);
+        };
+        if used_raw > 100.0 {
+            crate::lsm_warn!("context_window.used_percentage = {used_raw} > 100; clamping to 100");
+            return Ok(Some(
+                Percent::from_f64_clamped(used_raw)
+                    .expect("non-NaN value > 100 clamps successfully"),
+            ));
+        }
+        match Percent::from_f64(used_raw) {
+            Some(p) => Ok(Some(p)),
+            None => Err(invalid_value(
+                "context_window.used_percentage",
+                "percentage must be a number in [0, 100]",
+            )),
+        }
+    }
+
+    /// Parse `context_window_size` into `Option<u32>`. Narrows `u64`
+    /// to ADR-0014's `u32`; warns and degrades on overflow rather
+    /// than wrapping. No real CC context window comes anywhere close.
+    fn parse_size(cw: &serde_json::Map<String, serde_json::Value>) -> Option<u32> {
+        let raw = try_u64_required(cw, "context_window.context_window_size")?;
+        match u32::try_from(raw) {
+            Ok(n) => Some(n),
+            Err(_) => {
+                crate::lsm_warn!(
+                    "context_window.context_window_size = {raw} exceeds u32::MAX; degrading leaf to None"
+                );
+                None
+            }
+        }
+    }
+
+    /// Tolerant `u64` reader for *contracted* leaves (CC contract
+    /// guarantees the key is present and non-null). Missing or null
+    /// here is schema drift; warn so the channel surfaces upstream
+    /// changes. Use `try_u64_optional` for documented "may be absent"
+    /// fields like `current_usage.*`.
+    fn try_u64_required(
+        obj: &serde_json::Map<String, serde_json::Value>,
+        path: &'static str,
+    ) -> Option<u64> {
+        let Some(value) = obj.get(path_tail(path)) else {
+            crate::lsm_warn!("{path}: missing; degrading leaf to None (possible CC schema drift)");
+            return None;
+        };
+        if value.is_null() {
+            crate::lsm_warn!("{path}: null; degrading leaf to None (possible CC schema drift)");
+            return None;
+        }
+        match value.as_u64() {
+            Some(n) => Some(n),
+            None => {
+                crate::lsm_warn!(
+                    "{path}: expected unsigned integer, got {:?}; degrading leaf to None",
+                    JsonType::of(value)
+                );
+                None
+            }
+        }
+    }
+
+    /// Tolerant `u64` reader for *optional* leaves where missing/null
+    /// is documented (e.g. `current_usage.*` before the first API
+    /// call). Silent on absence; warn on type drift.
+    fn try_u64_optional(
+        obj: &serde_json::Map<String, serde_json::Value>,
+        path: &'static str,
+    ) -> Option<u64> {
+        let value = obj.get(path_tail(path))?;
+        if value.is_null() {
+            return None;
+        }
+        match value.as_u64() {
+            Some(n) => Some(n),
+            None => {
+                crate::lsm_warn!(
+                    "{path}: expected unsigned integer, got {:?}; degrading leaf to None",
+                    JsonType::of(value)
+                );
+                None
+            }
+        }
     }
 
     fn parse_current_usage(
@@ -590,18 +752,43 @@ mod claude {
         if value.is_null() {
             return Ok(None);
         }
-        let obj = expect_object(value, "context_window.current_usage")?;
+        let Some(obj) = value.as_object() else {
+            crate::lsm_warn!(
+                "context_window.current_usage: expected object, got {:?}; degrading to None",
+                JsonType::of(value)
+            );
+            return Ok(None);
+        };
+        // ADR-0014: TurnUsage's leaves are non-Option, so any leaf
+        // failure collapses the whole TurnUsage to None. Type drift
+        // warns via `try_u64_optional`; missing/null leaves stay
+        // silent because `current_usage` itself is documented to be
+        // null pre-first-API-call.
+        let Some(input_tokens) = try_u64_optional(obj, "context_window.current_usage.input_tokens")
+        else {
+            return Ok(None);
+        };
+        let Some(output_tokens) =
+            try_u64_optional(obj, "context_window.current_usage.output_tokens")
+        else {
+            return Ok(None);
+        };
+        let Some(cache_creation_input_tokens) = try_u64_optional(
+            obj,
+            "context_window.current_usage.cache_creation_input_tokens",
+        ) else {
+            return Ok(None);
+        };
+        let Some(cache_read_input_tokens) =
+            try_u64_optional(obj, "context_window.current_usage.cache_read_input_tokens")
+        else {
+            return Ok(None);
+        };
         Ok(Some(TurnUsage {
-            input_tokens: require_u64(obj, "context_window.current_usage.input_tokens")?,
-            output_tokens: require_u64(obj, "context_window.current_usage.output_tokens")?,
-            cache_creation_input_tokens: require_u64(
-                obj,
-                "context_window.current_usage.cache_creation_input_tokens",
-            )?,
-            cache_read_input_tokens: require_u64(
-                obj,
-                "context_window.current_usage.cache_read_input_tokens",
-            )?,
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
         }))
     }
 
@@ -838,16 +1025,6 @@ mod claude {
             .ok_or_else(|| type_mismatch(path, JsonType::Object, JsonType::of(value)))
     }
 
-    fn require_string<'a>(
-        obj: &'a serde_json::Map<String, serde_json::Value>,
-        path: &'static str,
-    ) -> Result<&'a str, ParseError> {
-        let value = obj.get(path_tail(path)).ok_or_else(|| missing(path))?;
-        value
-            .as_str()
-            .ok_or_else(|| type_mismatch(path, JsonType::String, JsonType::of(value)))
-    }
-
     fn require_f64(
         obj: &serde_json::Map<String, serde_json::Value>,
         path: &'static str,
@@ -979,12 +1156,11 @@ mod tests {
         }"#;
         let ctx = parse(json).expect("parse ok");
         assert_eq!(ctx.tool, Tool::ClaudeCode);
-        assert_eq!(ctx.model.display_name, "Claude Test");
-        assert_eq!(
-            ctx.workspace.project_dir.to_str(),
-            Some("/home/dev/linesmith")
-        );
-        assert!(ctx.workspace.git_worktree.is_none());
+        let model = ctx.model.expect("model");
+        assert_eq!(model.display_name, "Claude Test");
+        let workspace = ctx.workspace.expect("workspace");
+        assert_eq!(workspace.project_dir.to_str(), Some("/home/dev/linesmith"));
+        assert!(workspace.git_worktree.is_none());
         assert!(ctx.context_window.is_none());
     }
 
@@ -998,7 +1174,11 @@ mod tests {
             }
         }"#;
         let ctx = parse(json).expect("parse ok");
-        let wt = ctx.workspace.git_worktree.expect("worktree");
+        let wt = ctx
+            .workspace
+            .expect("workspace")
+            .git_worktree
+            .expect("worktree");
         assert_eq!(wt.name, "main");
         assert_eq!(wt.path, PathBuf::from("/wt/main"));
     }
@@ -1010,7 +1190,7 @@ mod tests {
             "workspace": { "project_dir": "/repo" }
         }"#;
         let ctx = parse(json).expect("parse ok");
-        assert!(ctx.workspace.git_worktree.is_none());
+        assert!(ctx.workspace.expect("workspace").git_worktree.is_none());
     }
 
     #[test]
@@ -1028,11 +1208,11 @@ mod tests {
         }"#;
         let ctx = parse(json).expect("parse ok");
         let cw = ctx.context_window.expect("context_window");
-        assert_eq!(cw.used.value(), 42.5);
-        assert_eq!(cw.remaining().value(), 57.5);
-        assert_eq!(cw.size, 200_000);
-        assert_eq!(cw.total_input_tokens, 12_345);
-        assert_eq!(cw.total_output_tokens, 6_789);
+        assert_eq!(cw.used.expect("used").value(), 42.5);
+        assert_eq!(cw.remaining().expect("remaining").value(), 57.5);
+        assert_eq!(cw.size, Some(200_000));
+        assert_eq!(cw.total_input_tokens, Some(12_345));
+        assert_eq!(cw.total_output_tokens, Some(6_789));
     }
 
     #[test]
@@ -1049,7 +1229,7 @@ mod tests {
         }"#;
         let ctx = parse(json).expect("clamp succeeds");
         let cw = ctx.context_window.expect("context_window present");
-        assert_eq!(cw.used.value(), 100.0);
+        assert_eq!(cw.used.expect("used").value(), 100.0);
     }
 
     #[test]
@@ -1068,7 +1248,7 @@ mod tests {
         }"#;
         let ctx = parse(json).expect("clamp succeeds");
         let cw = ctx.context_window.expect("context_window present");
-        assert_eq!(cw.used.value(), 100.0);
+        assert_eq!(cw.used.expect("used").value(), 100.0);
     }
 
     #[test]
@@ -1111,11 +1291,13 @@ mod tests {
         }"#;
         let ctx = parse(json).expect("in-range succeeds");
         let cw = ctx.context_window.expect("context_window present");
-        assert_eq!(cw.used.value(), 42.5);
+        assert_eq!(cw.used.expect("used").value(), 42.5);
     }
 
     #[test]
-    fn rejects_missing_used_percentage_as_missing_field() {
+    fn missing_used_percentage_degrades_leaf_to_none() {
+        // ADR-0014: missing leaf no longer aborts the parse; only the
+        // affected leaf goes None and peers like `size` survive.
         let json = br#"{
             "model": { "display_name": "X" },
             "workspace": { "project_dir": "/repo" },
@@ -1125,16 +1307,15 @@ mod tests {
                 "total_output_tokens": 0
             }
         }"#;
-        match parse(json).expect_err("should reject") {
-            ParseError::MissingField { path, .. } => {
-                assert_eq!(path, "context_window.used_percentage");
-            }
-            other => panic!("expected MissingField, got {other:?}"),
-        }
+        let ctx = parse(json).expect("missing leaf must not fail the whole parse");
+        let cw = ctx.context_window.expect("context_window present");
+        assert!(cw.used.is_none());
+        assert_eq!(cw.size, Some(200_000));
     }
 
     #[test]
-    fn rejects_wrong_type_used_percentage_as_type_mismatch() {
+    fn wrong_type_used_percentage_degrades_leaf_to_none() {
+        // ADR-0014: type drift on a leaf no longer aborts the parse.
         let json = br#"{
             "model": { "display_name": "X" },
             "workspace": { "project_dir": "/repo" },
@@ -1145,19 +1326,10 @@ mod tests {
                 "total_output_tokens": 0
             }
         }"#;
-        match parse(json).expect_err("should reject") {
-            ParseError::TypeMismatch {
-                path,
-                expected,
-                got,
-                ..
-            } => {
-                assert_eq!(path, "context_window.used_percentage");
-                assert_eq!(expected, JsonType::Number);
-                assert_eq!(got, JsonType::String);
-            }
-            other => panic!("expected TypeMismatch, got {other:?}"),
-        }
+        let ctx = parse(json).expect("type-drift leaf must not fail the whole parse");
+        let cw = ctx.context_window.expect("context_window present");
+        assert!(cw.used.is_none());
+        assert_eq!(cw.size, Some(200_000));
     }
 
     #[test]
@@ -1169,21 +1341,38 @@ mod tests {
         // test for reasons unrelated to the contract under check.
         let bytes = include_bytes!("../tests/fixtures/claude_pre_first_api_call.json");
         let ctx = parse(bytes).expect("parse must succeed despite null context_window leaves");
-        assert!(!ctx.model.display_name.is_empty(), "model must parse");
         assert!(
-            !ctx.workspace.project_dir.as_os_str().is_empty(),
+            !ctx.model.expect("model").display_name.is_empty(),
+            "model must parse"
+        );
+        assert!(
+            !ctx.workspace
+                .expect("workspace")
+                .project_dir
+                .as_os_str()
+                .is_empty(),
             "workspace must parse"
         );
-        assert!(
-            ctx.context_window.is_none(),
-            "context_window with null leaves must hide, not surface bogus zeros"
-        );
+        // Per ADR-0014, leaves degrade individually: `used` is null
+        // pre-first-call but `size` and `total_*_tokens` survive.
+        // Segments with a hard dependency on `used` (the textual
+        // `context_window` segment) hide; segments that only need
+        // peer leaves keep rendering.
+        let cw = ctx
+            .context_window
+            .expect("context_window present with partial leaves");
+        assert!(cw.used.is_none(), "used_percentage was null in payload");
+        assert!(cw.size.is_some(), "size populated in payload");
         assert!(ctx.cost.is_some(), "cost segment must still render");
         assert_eq!(ctx.effort, Some(EffortLevel::XHigh));
     }
 
     #[test]
-    fn used_percentage_null_hides_context_window_segment() {
+    fn null_used_percentage_degrades_leaf_only() {
+        // ADR-0014: peers (`size`, `total_*_tokens`) survive a null
+        // `used_percentage`, including the documented pre-first-API-
+        // call shape. The textual segment hides; tokens / current_usage
+        // peers remain consumable.
         let json = br#"{
             "model": { "display_name": "X" },
             "workspace": { "project_dir": "/repo" },
@@ -1195,13 +1384,14 @@ mod tests {
             }
         }"#;
         let ctx = parse(json).expect("null used_percentage must not fail the whole parse");
-        assert!(ctx.context_window.is_none());
+        let cw = ctx.context_window.expect("context_window present");
+        assert!(cw.used.is_none());
+        assert_eq!(cw.size, Some(200_000));
+        assert_eq!(cw.total_input_tokens, Some(0));
     }
 
     #[test]
-    fn null_context_window_size_hides_segment() {
-        // Defensive-sweep guard: not observed in the wild, but locks in
-        // the contract so a future schema wobble doesn't tank the parse.
+    fn null_context_window_size_degrades_leaf_only() {
         let json = br#"{
             "model": { "display_name": "X" },
             "workspace": { "project_dir": "/repo" },
@@ -1213,11 +1403,13 @@ mod tests {
             }
         }"#;
         let ctx = parse(json).expect("null size must not fail the whole parse");
-        assert!(ctx.context_window.is_none());
+        let cw = ctx.context_window.expect("context_window present");
+        assert!(cw.size.is_none());
+        assert!(cw.used.is_some(), "used survives even when size is null");
     }
 
     #[test]
-    fn null_total_input_tokens_hides_segment() {
+    fn null_total_input_tokens_degrades_leaf_only() {
         let json = br#"{
             "model": { "display_name": "X" },
             "workspace": { "project_dir": "/repo" },
@@ -1229,13 +1421,17 @@ mod tests {
             }
         }"#;
         let ctx = parse(json).expect("null total_input_tokens must not fail the whole parse");
-        assert!(ctx.context_window.is_none());
+        let cw = ctx.context_window.expect("context_window present");
+        assert!(cw.total_input_tokens.is_none());
+        assert_eq!(
+            cw.total_output_tokens,
+            Some(0),
+            "peer leaves survive isolated null"
+        );
     }
 
     #[test]
-    fn null_total_output_tokens_hides_segment() {
-        // Symmetric guard against a copy-paste regression that drops
-        // `total_output_tokens` from the loop array in parse_context_window.
+    fn null_total_output_tokens_degrades_leaf_only() {
         let json = br#"{
             "model": { "display_name": "X" },
             "workspace": { "project_dir": "/repo" },
@@ -1247,7 +1443,57 @@ mod tests {
             }
         }"#;
         let ctx = parse(json).expect("null total_output_tokens must not fail the whole parse");
-        assert!(ctx.context_window.is_none());
+        let cw = ctx.context_window.expect("context_window present");
+        assert!(cw.total_output_tokens.is_none());
+        assert_eq!(cw.total_input_tokens, Some(0));
+    }
+
+    #[test]
+    fn current_usage_survives_when_peer_leaf_is_null() {
+        // ADR-0014: per-leaf isolation — current_usage must not be
+        // dropped just because a sibling totals counter is null.
+        let json = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/repo" },
+            "context_window": {
+                "used_percentage": 50.0,
+                "context_window_size": 200000,
+                "total_input_tokens": 0,
+                "total_output_tokens": null,
+                "current_usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 50,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
+                }
+            }
+        }"#;
+        let ctx = parse(json).expect("partial null must not drop current_usage");
+        let cw = ctx.context_window.expect("context_window present");
+        assert!(cw.total_output_tokens.is_none());
+        let usage = cw.current_usage.expect("current_usage preserved");
+        assert_eq!(usage.input_tokens, 100);
+    }
+
+    #[test]
+    fn context_window_size_above_u32_max_degrades_leaf_only() {
+        // ADR-0014 narrows `size` to `u32`. A future hypothetical
+        // CC payload exceeding u32::MAX must degrade the leaf to
+        // None (not wrap via `as u32`) and let peers survive.
+        let json = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/repo" },
+            "context_window": {
+                "used_percentage": 12.5,
+                "context_window_size": 4294967296,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0
+            }
+        }"#;
+        let ctx = parse(json).expect("u32 overflow must not fail the whole parse");
+        let cw = ctx.context_window.expect("context_window present");
+        assert!(cw.size.is_none(), "size leaf degraded on overflow");
+        assert!(cw.used.is_some(), "peer leaf survives");
     }
 
     #[test]
@@ -1329,7 +1575,9 @@ mod tests {
     }
 
     #[test]
-    fn current_usage_non_object_is_type_mismatch() {
+    fn current_usage_non_object_degrades_to_none() {
+        // ADR-0014: a non-object current_usage no longer aborts the
+        // whole parse; the leaf goes None and peers survive.
         let json = br#"{
             "model": { "display_name": "X" },
             "workspace": { "project_dir": "/repo" },
@@ -1341,16 +1589,14 @@ mod tests {
                 "current_usage": "not an object"
             }
         }"#;
-        match parse(json).expect_err("should reject") {
-            ParseError::TypeMismatch { path, .. } => {
-                assert_eq!(path, "context_window.current_usage");
-            }
-            other => panic!("expected TypeMismatch, got {other:?}"),
-        }
+        let ctx = parse(json).expect("non-object current_usage must not fail the whole parse");
+        let cw = ctx.context_window.expect("context_window present");
+        assert!(cw.current_usage.is_none());
+        assert_eq!(cw.size, Some(200_000));
     }
 
     #[test]
-    fn current_usage_missing_inner_field_is_missing_field() {
+    fn current_usage_missing_inner_field_degrades_to_none() {
         let json = br#"{
             "model": { "display_name": "X" },
             "workspace": { "project_dir": "/repo" },
@@ -1365,23 +1611,13 @@ mod tests {
                 }
             }
         }"#;
-        match parse(json).expect_err("should reject") {
-            ParseError::MissingField { path, .. } => {
-                assert_eq!(
-                    path,
-                    "context_window.current_usage.cache_creation_input_tokens"
-                );
-            }
-            other => panic!("expected MissingField, got {other:?}"),
-        }
+        let ctx = parse(json).expect("partial current_usage must not fail the whole parse");
+        let cw = ctx.context_window.expect("context_window present");
+        assert!(cw.current_usage.is_none());
     }
 
     #[test]
-    fn current_usage_inner_wrong_type_is_type_mismatch_at_nested_path() {
-        // Lock the error-path provenance for nested fields: a non-
-        // number inner value should surface as TypeMismatch with the
-        // full `context_window.current_usage.<field>` path, not the
-        // outer `context_window.current_usage`.
+    fn current_usage_inner_wrong_type_degrades_to_none() {
         let json = br#"{
             "model": { "display_name": "X" },
             "workspace": { "project_dir": "/repo" },
@@ -1398,16 +1634,44 @@ mod tests {
                 }
             }
         }"#;
-        match parse(json).expect_err("should reject") {
-            ParseError::TypeMismatch { path, .. } => {
-                assert_eq!(path, "context_window.current_usage.input_tokens");
-            }
-            other => panic!("expected TypeMismatch, got {other:?}"),
-        }
+        let ctx = parse(json).expect("type-drift inner field must not fail the whole parse");
+        let cw = ctx.context_window.expect("context_window present");
+        assert!(cw.current_usage.is_none());
     }
 
     #[test]
-    fn rejects_wrong_type_git_worktree_as_type_mismatch() {
+    fn current_usage_inner_null_collapses_whole_turn_usage() {
+        // Pin TurnUsage's all-or-nothing semantics: a single null
+        // leaf collapses the whole `current_usage` to None (per
+        // parse_current_usage's let-else cascade), but peers
+        // outside `current_usage` (size, used) survive.
+        let json = br#"{
+            "model": { "display_name": "X" },
+            "workspace": { "project_dir": "/repo" },
+            "context_window": {
+                "used_percentage": 50.0,
+                "context_window_size": 200000,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "current_usage": {
+                    "input_tokens": null,
+                    "output_tokens": 50,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
+                }
+            }
+        }"#;
+        let ctx = parse(json).expect("partial null inside current_usage must not fail parse");
+        let cw = ctx.context_window.expect("context_window present");
+        assert!(cw.current_usage.is_none());
+        assert_eq!(cw.size, Some(200_000));
+        assert!(cw.used.is_some());
+    }
+
+    #[test]
+    fn wrong_type_git_worktree_degrades_to_none() {
+        // ADR-0014: malformed git_worktree no longer aborts the whole
+        // parse; the worktree goes None and the project_dir survives.
         let json = br#"{
             "model": { "display_name": "X" },
             "workspace": {
@@ -1415,28 +1679,22 @@ mod tests {
                 "git_worktree": "main"
             }
         }"#;
-        match parse(json).expect_err("should reject") {
-            ParseError::TypeMismatch {
-                path,
-                expected,
-                got,
-                ..
-            } => {
-                assert_eq!(path, "workspace.git_worktree");
-                assert_eq!(expected, JsonType::Object);
-                assert_eq!(got, JsonType::String);
-            }
-            other => panic!("expected TypeMismatch, got {other:?}"),
-        }
+        let ctx = parse(json).expect("malformed worktree must not fail the whole parse");
+        let workspace = ctx.workspace.expect("workspace present");
+        assert!(workspace.git_worktree.is_none());
+        assert_eq!(workspace.project_dir.to_str(), Some("/repo"));
     }
 
     #[test]
-    fn rejects_missing_model() {
+    fn missing_model_degrades_to_none() {
+        // ADR-0014: a payload without `model` no longer aborts the
+        // whole parse; the field goes None and segments hide.
         let json = br#"{
             "workspace": { "project_dir": "/repo" }
         }"#;
-        let err = parse(json).expect_err("should reject");
-        assert!(matches!(err, ParseError::MissingField { .. }));
+        let ctx = parse(json).expect("missing model must not fail the whole parse");
+        assert!(ctx.model.is_none());
+        assert!(ctx.workspace.is_some());
     }
 
     #[test]

@@ -126,13 +126,13 @@ mod tests {
     fn ctx_with_usage(usage: Result<UsageData, UsageError>) -> DataContext {
         let dc = DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
-            model: ModelInfo {
+            model: Some(ModelInfo {
                 display_name: "X".into(),
-            },
-            workspace: WorkspaceInfo {
+            }),
+            workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from("/repo"),
                 git_worktree: None,
-            },
+            }),
             context_window: None,
             cost: None,
             effort: None,

@@ -187,13 +187,20 @@ impl Segment for ContextBarSegment {
             crate::lsm_debug!("context_bar: status.context_window absent; hiding");
             return Ok(None);
         };
+        // Per ADR-0014, `used` is per-leaf Option: the bar can't
+        // render without a percentage, so hide when null (mirrors the
+        // text `context_window` segment).
+        let Some(used) = cw.used else {
+            crate::lsm_debug!("context_bar: used null; hiding");
+            return Ok(None);
+        };
         // Round-ties-to-even to match the textual `context_window`
         // segment's `{pct:.0}` formatting, which uses Rust's
         // round-half-to-even (banker's). Plain `f32::round` rounds
         // half-away-from-zero, which would diverge at exact halves
         // (e.g. 50.5 → 51 vs format! → "50") and break the contract
         // that text and bar agree at every boundary.
-        let pct = cw.used.value().round_ties_even();
+        let pct = used.value().round_ties_even();
         let bar = render_bar(pct, &self.cfg);
         let role = role_for_pct(pct, self.cfg.thresholds);
         Ok(Some(RenderedSegment::new(bar).with_role(role)))
@@ -253,13 +260,13 @@ mod tests {
     fn ctx(window: Option<ContextWindow>) -> DataContext {
         DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
-            model: ModelInfo {
+            model: Some(ModelInfo {
                 display_name: "X".into(),
-            },
-            workspace: WorkspaceInfo {
+            }),
+            workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from("/repo"),
                 git_worktree: None,
-            },
+            }),
             context_window: window,
             cost: None,
             effort: None,
@@ -271,12 +278,12 @@ mod tests {
         })
     }
 
-    fn window(used: f32, size: u64) -> ContextWindow {
+    fn window(used: f32, size: u32) -> ContextWindow {
         ContextWindow {
-            used: Percent::new(used).expect("in range"),
-            size,
-            total_input_tokens: 0,
-            total_output_tokens: 0,
+            used: Some(Percent::new(used).expect("in range")),
+            size: Some(size),
+            total_input_tokens: Some(0),
+            total_output_tokens: Some(0),
             current_usage: None,
         }
     }

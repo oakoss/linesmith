@@ -118,18 +118,18 @@ mod tests {
     fn ctx(usage: Option<TurnUsage>) -> DataContext {
         DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
-            model: ModelInfo {
+            model: Some(ModelInfo {
                 display_name: "X".into(),
-            },
-            workspace: WorkspaceInfo {
+            }),
+            workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from("/repo"),
                 git_worktree: None,
-            },
+            }),
             context_window: Some(ContextWindow {
-                used: Percent::new(0.0).unwrap(),
-                size: 200_000,
-                total_input_tokens: 0,
-                total_output_tokens: 0,
+                used: Some(Percent::new(0.0).unwrap()),
+                size: Some(200_000),
+                total_input_tokens: Some(0),
+                total_output_tokens: Some(0),
                 current_usage: usage,
             }),
             cost: None,
@@ -154,13 +154,13 @@ mod tests {
     fn ctx_without_context_window() -> DataContext {
         DataContext::new(StatusContext {
             tool: Tool::ClaudeCode,
-            model: ModelInfo {
+            model: Some(ModelInfo {
                 display_name: "X".into(),
-            },
-            workspace: WorkspaceInfo {
+            }),
+            workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from("/repo"),
                 git_worktree: None,
-            },
+            }),
             context_window: None,
             cost: None,
             effort: None,

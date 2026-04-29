@@ -69,7 +69,11 @@ impl ModelSegment {
 
 impl Segment for ModelSegment {
     fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
-        let raw = ctx.status.model.display_name.trim();
+        let Some(model) = ctx.status.model.as_ref() else {
+            crate::lsm_debug!("model: status.model absent; hiding");
+            return Ok(None);
+        };
+        let raw = model.display_name.trim();
         if raw.is_empty() {
             return Ok(None);
         }
@@ -119,13 +123,13 @@ mod tests {
     fn ctx_for_tool(tool: Tool, display_name: &str) -> DataContext {
         DataContext::new(StatusContext {
             tool,
-            model: ModelInfo {
+            model: Some(ModelInfo {
                 display_name: display_name.into(),
-            },
-            workspace: WorkspaceInfo {
+            }),
+            workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from("/repo"),
                 git_worktree: None,
-            },
+            }),
             context_window: None,
             cost: None,
             effort: None,
