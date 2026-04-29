@@ -168,19 +168,17 @@ pub struct SegmentOverride {
     pub extra: BTreeMap<String, toml::Value>,
 }
 
-/// URL for the published JSON Schema, pinned to the binary's own
-/// release tag. A user's schema therefore matches the binary that
-/// wrote their config, so a config-only follow-up on `main` can't
-/// retroactively invalidate older configs in editors.
-///
-/// Caveat: the URL is only live for tags whose release commit
-/// includes `config.schema.json`. The release pipeline must commit
-/// the regenerated schema before the tag for this to resolve.
-pub(crate) const SCHEMA_URL: &str = concat!(
-    "https://raw.githubusercontent.com/oakoss/linesmith/v",
-    env!("CARGO_PKG_VERSION"),
-    "/config.schema.json"
-);
+/// URL for the published JSON Schema, pinned to `main`. Single
+/// canonical URL — same shape bacon, starship, and dprint ship.
+/// The schema evolves forward-compatibly (fields added, not
+/// removed); editors validate "config field is allowed by schema"
+/// rather than "binary supports field," so a schema slightly ahead
+/// of the installed binary loosens validation rather than tightens
+/// it. Versioned per-tag self-hosted URLs (biome's model) are the
+/// destination once `linesmith` has its own website plus
+/// schemastore.org coverage.
+pub(crate) const SCHEMA_URL: &str =
+    "https://raw.githubusercontent.com/oakoss/linesmith/main/config.schema.json";
 
 /// Prepend `#:schema <url>` directive (taplo / VS Code / Zed
 /// convention) to a freshly-generated config body so editors pick up
