@@ -628,10 +628,10 @@ fn warn_if_path_needs_user_edit(explicit_path: Option<&Path>, stderr: &mut dyn W
 /// `%` variable expansion). Position-sensitive cases like a leading
 /// `-` are checked separately in [`warn_if_path_needs_user_edit`].
 ///
-/// `\` is the POSIX shell escape, but on Windows it isn't a
-/// metacharacter in cmd.exe / PowerShell tokenization (it's the
-/// path separator); flagging it there would warn on every absolute
-/// path.
+/// `\` and `~` are POSIX-only: `\` is the shell escape and `~` is
+/// home-directory expansion. On Windows they're literal (`\` is the
+/// path separator, `~` shows up in 8.3 short names like `RUNNER~1`),
+/// so flagging them there would warn on every Windows tempdir path.
 fn needs_shell_quoting(c: char) -> bool {
     if matches!(
         c,
@@ -655,7 +655,6 @@ fn needs_shell_quoting(c: char) -> bool {
             | '}'
             | '#'
             | '!'
-            | '~'
             | '='
             | '^'
             | '%'
@@ -664,7 +663,7 @@ fn needs_shell_quoting(c: char) -> bool {
     }
     #[cfg(not(windows))]
     {
-        c == '\\'
+        matches!(c, '\\' | '~')
     }
     #[cfg(windows)]
     {
@@ -3093,19 +3092,22 @@ mod tests {
                 "expected {c:?} to NOT need quoting"
             );
         }
-        // `\` pins the platform split: POSIX shell escape vs. Windows
-        // path separator. Without these arms a future refactor that
-        // collapses the cfg split slips past CI on every host.
-        #[cfg(not(windows))]
-        assert!(
-            super::needs_shell_quoting('\\'),
-            "POSIX: `\\` must need quoting"
-        );
-        #[cfg(windows)]
-        assert!(
-            !super::needs_shell_quoting('\\'),
-            "Windows: `\\` is the path separator and must not need quoting"
-        );
+        // `\` and `~` pin the platform split: POSIX shell
+        // escape / home expansion vs. Windows path separator and 8.3
+        // short-name literal. Without these arms a future refactor
+        // that collapses the cfg split slips past CI on every host.
+        for c in ['\\', '~'] {
+            #[cfg(not(windows))]
+            assert!(
+                super::needs_shell_quoting(c),
+                "POSIX: {c:?} must need quoting"
+            );
+            #[cfg(windows)]
+            assert!(
+                !super::needs_shell_quoting(c),
+                "Windows: {c:?} must not need quoting (path separator / 8.3 short name)"
+            );
+        }
     }
 
     #[test]
