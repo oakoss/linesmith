@@ -14,6 +14,11 @@ use std::str::FromStr;
 pub struct Config {
     pub line: Option<LineConfig>,
     pub theme: Option<String>,
+    /// Top-level layout mode. Defaults to [`LayoutMode::SingleLine`]
+    /// when the field is omitted, preserving pre-multi-line config
+    /// behavior. [`LayoutMode::MultiLine`] triggers per-`[line.N]`
+    /// rendering.
+    pub layout: LayoutMode,
     pub layout_options: Option<LayoutOptions>,
     #[serde(default)]
     pub segments: BTreeMap<String, SegmentOverride>,
@@ -62,11 +67,40 @@ pub enum ColorPolicy {
     Never,
 }
 
-/// `[line]` section: ordered list of segment ids to render.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
+/// `[line]` section: ordered list of segment ids to render in
+/// single-line mode, plus any numbered child tables (`[line.1]`,
+/// `[line.2]`, ...) for multi-line mode. The `flatten`-captured
+/// [`numbered`](Self::numbered) map carries every other key as a
+/// raw [`toml::Value`]. Key validation (positive integer pointing
+/// at a table with a `segments` array) and ordering happen in the
+/// segment builder, which keeps the spec's "unknown keys are
+/// warnings, not errors" forward-compat contract: a typo like
+/// `[line] segmnts = [...]` parses as a `toml::Value::Array`,
+/// reaches the builder, and emits a warning rather than failing the
+/// config load. Per spec `docs/specs/config.md` §Multi-line layouts.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct LineConfig {
     pub segments: Vec<String>,
+    /// Anything under `[line]` other than `segments`. Holds
+    /// `[line.N]` table values plus any forward-compat scalar keys
+    /// future versions may add. The builder routes table values
+    /// with positive-integer keys to multi-line rendering and warns
+    /// on the rest.
+    #[serde(flatten)]
+    pub numbered: BTreeMap<String, toml::Value>,
+}
+
+/// Top-level `layout = "..."` selector. Defaults to `SingleLine`
+/// (preserves pre-multi-line config behavior). `MultiLine` instructs
+/// the builder + render loop to consume `[line.N]` sub-tables.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum LayoutMode {
+    #[default]
+    SingleLine,
+    MultiLine,
 }
 
 /// `[segments.<id>]` override block. Each typed field, when `Some`,
@@ -458,6 +492,138 @@ mod tests {
         .expect("parse ok");
         let line = c.line.expect("line present");
         assert_eq!(line.segments, vec!["model", "workspace", "cost"]);
+        assert!(line.numbered.is_empty(), "no numbered tables expected");
+    }
+
+    #[test]
+    fn layout_field_defaults_to_single_line_when_omitted() {
+        let c = Config::from_str("").expect("parse ok");
+        assert_eq!(c.layout, LayoutMode::SingleLine);
+    }
+
+    #[test]
+    fn layout_field_parses_kebab_case_variants() {
+        let c = Config::from_str(r#"layout = "single-line""#).expect("parse ok");
+        assert_eq!(c.layout, LayoutMode::SingleLine);
+        let c = Config::from_str(r#"layout = "multi-line""#).expect("parse ok");
+        assert_eq!(c.layout, LayoutMode::MultiLine);
+    }
+
+    /// Pull the `segments` array out of a `[line.N]` raw value. The
+    /// flatten map carries `toml::Value`, so test helpers do the
+    /// same shape-walk the builder's `extract_line_segments` does
+    /// without depending on the production helper directly.
+    fn numbered_segments(value: &toml::Value) -> Vec<String> {
+        let table = value.as_table().expect("expected table value");
+        let array = table["segments"]
+            .as_array()
+            .expect("expected segments array");
+        array
+            .iter()
+            .map(|v| v.as_str().expect("expected string").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn line_numbered_only_parses() {
+        // Multi-line shape without a sibling `segments`: every key
+        // under `[line]` is a numbered child table.
+        let c = Config::from_str(
+            r#"
+                [line.1]
+                segments = ["model"]
+                [line.2]
+                segments = ["workspace", "cost"]
+            "#,
+        )
+        .expect("parse ok");
+        let line = c.line.expect("line present");
+        assert!(
+            line.segments.is_empty(),
+            "no top-level segments key expected"
+        );
+        assert_eq!(line.numbered.len(), 2);
+        assert_eq!(numbered_segments(&line.numbered["1"]), vec!["model"]);
+        assert_eq!(
+            numbered_segments(&line.numbered["2"]),
+            vec!["workspace", "cost"]
+        );
+    }
+
+    #[test]
+    fn line_with_segments_and_numbered_children_coexist() {
+        // The serde flatten + sibling field combination must accept
+        // both shapes simultaneously: `[line].segments` parses to the
+        // typed field, `[line.N]` sub-tables flatten into the
+        // numbered map. Edge case #3 from spec §Edge cases.
+        let c = Config::from_str(
+            r#"
+                [line]
+                segments = ["fallback"]
+                [line.1]
+                segments = ["a", "b"]
+                [line.2]
+                segments = ["c"]
+            "#,
+        )
+        .expect("parse ok");
+        let line = c.line.expect("line present");
+        assert_eq!(line.segments, vec!["fallback"]);
+        assert_eq!(line.numbered.len(), 2);
+        assert_eq!(numbered_segments(&line.numbered["1"]), vec!["a", "b"]);
+        assert_eq!(numbered_segments(&line.numbered["2"]), vec!["c"]);
+    }
+
+    #[test]
+    fn line_numbered_keys_preserved_verbatim_for_builder_validation() {
+        // The parser doesn't validate that numbered keys are positive
+        // integers — that's the builder's job (with a warning). Pin
+        // that contract so a future "smart" parser doesn't silently
+        // start dropping `[line.foo]` and break the warn-and-skip
+        // edge-case path.
+        let c = Config::from_str(
+            r#"
+                [line.foo]
+                segments = ["bogus"]
+                [line.10]
+                segments = ["valid"]
+            "#,
+        )
+        .expect("parse ok");
+        let line = c.line.expect("line present");
+        assert_eq!(line.numbered.len(), 2);
+        assert!(line.numbered.contains_key("foo"));
+        assert!(line.numbered.contains_key("10"));
+    }
+
+    #[test]
+    fn line_unknown_scalar_key_does_not_fail_parse_forward_compat() {
+        // CX-2-A regression guard: a typo'd or future-version scalar
+        // key under `[line]` (e.g. `[line] segmnts = [...]` or
+        // `[line] separator = "..."`) must NOT fail config load.
+        // The flatten map captures it as a raw `toml::Value`; the
+        // builder's `extract_line_segments` will warn-and-drop at
+        // render time. Without this contract, the spec's "unknown
+        // keys are warnings" forward-compat rule would silently
+        // regress for everything under `[line]`.
+        let c = Config::from_str(
+            r#"
+                [line]
+                segments = ["model"]
+                segmnts = ["typo"]              # scalar / array
+                future_separator = " | "        # scalar string
+                [line.1]
+                segments = ["valid"]
+            "#,
+        )
+        .expect("parse ok despite unknown sibling keys");
+        let line = c.line.expect("line present");
+        assert_eq!(line.segments, vec!["model"]);
+        // Unknown siblings show up in the flatten map; the [line.1]
+        // table sits next to them.
+        assert!(line.numbered.contains_key("segmnts"));
+        assert!(line.numbered.contains_key("future_separator"));
+        assert!(line.numbered.contains_key("1"));
     }
 
     #[test]

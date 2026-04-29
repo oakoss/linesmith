@@ -59,7 +59,7 @@ pub fn body(name: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::build_segments;
+    use crate::build_lines;
     use crate::config::Config;
     use std::str::FromStr;
 
@@ -71,6 +71,35 @@ mod tests {
             .segments
             .into_iter()
             .collect()
+    }
+
+    /// Per-line segment ids for a multi-line preset, sorted by parsed
+    /// integer key (matches what the builder feeds the renderer).
+    /// `numbered` carries raw `toml::Value`s (so the parser can
+    /// preserve the spec's "unknown keys are warnings" forward-compat
+    /// contract); the test helper walks the table shape directly,
+    /// panicking on anything other than a well-formed preset.
+    fn lines_of(preset: &str) -> Vec<Vec<String>> {
+        let body = body(preset).expect("preset registered");
+        let cfg = Config::from_str(body).expect("parse");
+        let line = cfg.line.expect("preset has [line]");
+        let mut sorted: Vec<(u32, Vec<String>)> = line
+            .numbered
+            .into_iter()
+            .map(|(k, value)| {
+                let n: u32 = k.parse().expect("preset uses positive-integer line keys");
+                let table = value.as_table().expect("preset [line.N] is a table");
+                let segs: Vec<String> = table["segments"]
+                    .as_array()
+                    .expect("preset [line.N].segments is an array")
+                    .iter()
+                    .map(|v| v.as_str().expect("preset segment is a string").to_string())
+                    .collect();
+                (n, segs)
+            })
+            .collect();
+        sorted.sort_by_key(|(n, _)| *n);
+        sorted.into_iter().map(|(_, segs)| segs).collect()
     }
 
     #[test]
@@ -90,12 +119,15 @@ mod tests {
 
     #[test]
     fn every_preset_parses_without_warnings() {
+        // `build_lines` so the multi-line `power-user` preset
+        // doesn't trip `build_segments`'s "[line].segments is
+        // empty" warning.
         for name in names() {
             let body = body(name).expect("preset registered");
             let cfg = Config::from_str(body)
                 .unwrap_or_else(|e| panic!("preset '{name}' failed to parse: {e}"));
             let mut warnings: Vec<String> = Vec::new();
-            let _ = build_segments(Some(&cfg), None, |m: &str| warnings.push(m.to_string()));
+            let _ = build_lines(Some(&cfg), None, |m: &str| warnings.push(m.to_string()));
             assert!(
                 warnings.is_empty(),
                 "preset '{name}' emitted warnings: {warnings:?}"
@@ -125,18 +157,29 @@ mod tests {
     }
 
     #[test]
-    fn power_user_preset_segments_match_spec() {
+    fn power_user_preset_is_multi_line_with_two_lines() {
+        // The spec's §Presets section marks power-user as v0.1's
+        // multi-line showcase. Pin both the layout mode and the
+        // per-line segment ordering so a refactor that flattens the
+        // preset back to single-line breaks loudly here.
+        let body = body("power-user").expect("preset registered");
+        let cfg = Config::from_str(body).expect("parse");
         assert_eq!(
-            segments_of("power-user"),
+            cfg.layout,
+            crate::config::LayoutMode::MultiLine,
+            "power-user must declare layout = \"multi-line\""
+        );
+        assert_eq!(
+            lines_of("power-user"),
             vec![
-                "model",
-                "context_window",
-                "workspace",
-                "rate_limit_5h",
-                "rate_limit_7d",
-                "cost",
-                "effort",
-                "tokens_total",
+                vec!["model", "context_window", "workspace"],
+                vec![
+                    "rate_limit_5h",
+                    "rate_limit_7d",
+                    "cost",
+                    "effort",
+                    "tokens_total",
+                ],
             ]
         );
     }

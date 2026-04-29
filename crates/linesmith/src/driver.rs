@@ -5,9 +5,11 @@
 //! and a hand-built `CliEnv`.
 
 use crate::plugins::{build_engine, PluginRegistry};
-use crate::segments::builder::build_segments;
+use crate::segments::builder::build_lines;
 use crate::segments::BUILT_IN_SEGMENT_IDS;
-use crate::{cli, config, detect_terminal_width, presets, run_with_context, theme, RunContext};
+use crate::{
+    cli, config, detect_terminal_width, presets, run_lines_with_context, theme, RunContext,
+};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -787,9 +789,13 @@ fn run_cli(
     }
 
     let (plugins, _plugin_load_errors) = load_plugins(cfg.as_ref(), env, stderr);
-    let segments = build_segments(cfg.as_ref(), plugins, |msg| {
+    let lines = build_lines(cfg.as_ref(), plugins, |msg| {
         let _ = writeln!(stderr, "linesmith: {msg}");
     });
+    // `run_lines_with_context` takes `&[&[Box<dyn Segment>]]`; map
+    // each owned `Vec` to a borrowed slice once.
+    let line_refs: Vec<&[Box<dyn crate::segments::Segment>]> =
+        lines.iter().map(Vec::as_slice).collect();
 
     let raw_width = env.terminal_width.unwrap_or_else(detect_terminal_width);
     let padding = layout_options(cfg.as_ref()).map_or(0, |l| l.claude_padding);
@@ -798,7 +804,7 @@ fn run_cli(
     let capability = resolve_color_capability(args.color_override, env, cfg.as_ref());
     let hyperlinks = supports_hyperlinks::on(supports_hyperlinks::Stream::Stdout);
     let ctx = RunContext::new(theme_ref, capability, width, env.cwd.clone(), hyperlinks);
-    if let Err(err) = run_with_context(stdin, stdout, stderr, &segments, &ctx) {
+    if let Err(err) = run_lines_with_context(stdin, stdout, stderr, &line_refs, &ctx) {
         let _ = writeln!(stderr, "linesmith: {err}");
         return 1;
     }
@@ -991,7 +997,11 @@ fn check_config(
     }
     let (plugins, plugin_load_errors) = load_plugins(Some(cfg), env, stderr);
     warn_count += plugin_load_errors;
-    let _ = build_segments(Some(cfg), plugins, |msg| {
+    // `build_lines` (not `build_segments`) so multi-line edge-case
+    // warnings — `[line.foo]` non-numeric keys, single-line-with-
+    // numbered-tables mode-mismatch, etc. — surface through
+    // `--check-config` the same way single-line validation does.
+    let _ = build_lines(Some(cfg), plugins, |msg| {
         let _ = writeln!(stderr, "linesmith: {msg}");
         warn_count += 1;
     });
@@ -1454,6 +1464,234 @@ mod tests {
         // Minimal theme has NoColor for every role; segments don't have
         // bold/italic decorations, so output is plain.
         assert_eq!(stdout, "Claude linesmith\n");
+    }
+
+    #[test]
+    fn multi_line_config_renders_one_writeln_per_line() {
+        // End-to-end multi-line: config declares two [line.N]
+        // sub-tables; stdout must carry two newline-separated rows
+        // with each line's segments resolved independently. Pin the
+        // exact bytes (not just newline count) so a regression that
+        // crosses the per-line boundary surfaces.
+        let json = br#"{
+            "model": { "display_name": "Claude" },
+            "workspace": { "project_dir": "/home/dev/proj" }
+        }"#;
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+                layout = "multi-line"
+                [line.1]
+                segments = ["model"]
+                [line.2]
+                segments = ["workspace"]
+            "#,
+        )
+        .unwrap();
+        let env = CliEnv::for_tests();
+        let (code, stdout, stderr) =
+            run_cli_main(&["--config", path.to_str().unwrap()], json, &env);
+        assert_eq!(code, 0, "stderr:\n{stderr}");
+        assert_eq!(stdout, "Claude\nproj\n");
+    }
+
+    #[test]
+    fn multi_line_config_renders_lines_in_parsed_integer_order() {
+        // BTreeMap key order is lexicographic on strings; the builder
+        // sorts numerically. Pin the through-the-driver behavior so
+        // a regression in either layer surfaces here.
+        let json = br#"{
+            "model": { "display_name": "Claude" },
+            "workspace": { "project_dir": "/home/dev/proj" }
+        }"#;
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+                layout = "multi-line"
+                [line.10]
+                segments = ["workspace"]
+                [line.2]
+                segments = ["model"]
+            "#,
+        )
+        .unwrap();
+        let env = CliEnv::for_tests();
+        let (code, stdout, _stderr) =
+            run_cli_main(&["--config", path.to_str().unwrap()], json, &env);
+        assert_eq!(code, 0);
+        assert_eq!(stdout, "Claude\nproj\n");
+    }
+
+    #[test]
+    fn multi_line_with_no_numbered_tables_falls_back_to_single_line_render() {
+        // Spec edge case: the fallback warning surfaces on stderr
+        // and rendering uses [line].segments, producing one stdout
+        // line (not zero, not two).
+        let json = br#"{
+            "model": { "display_name": "Claude" },
+            "workspace": { "project_dir": "/x" }
+        }"#;
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+                layout = "multi-line"
+                [line]
+                segments = ["model"]
+            "#,
+        )
+        .unwrap();
+        let env = CliEnv::for_tests();
+        let (code, stdout, stderr) =
+            run_cli_main(&["--config", path.to_str().unwrap()], json, &env);
+        assert_eq!(code, 0);
+        assert_eq!(stdout, "Claude\n", "expected exactly one line");
+        assert!(
+            stderr.contains("no usable [line.N]"),
+            "fallback warning should reach stderr, got:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn check_config_surfaces_multi_line_validation_warnings() {
+        // `--check-config` consumes `build_lines` (not just
+        // `build_segments`) so multi-line edge-case warnings
+        // ([line.foo], single-line+numbered, etc.) flow through the
+        // editor-facing validator, not just the render path.
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+                layout = "multi-line"
+                [line.1]
+                segments = ["model"]
+                [line.foo]
+                segments = ["bogus"]
+            "#,
+        )
+        .unwrap();
+        let env = CliEnv::for_tests();
+        let (_code, _stdout, stderr) = run_cli_main(
+            &["--config", path.to_str().unwrap(), "--check-config"],
+            b"",
+            &env,
+        );
+        assert!(
+            stderr.contains("[line.foo]") && stderr.contains("not a positive integer"),
+            "non-numeric-key warning should reach --check-config, got:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn multi_line_parse_failure_emits_one_question_marker_not_per_line() {
+        // The render loop iterates per line, but parse failure
+        // returns before the loop runs and emits a single `?\n`.
+        // Without this pin, a refactor that moves the parse into the
+        // loop would silently spam `?\n?\n?\n` for an N-line config.
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+                layout = "multi-line"
+                [line.1]
+                segments = ["model"]
+                [line.2]
+                segments = ["workspace"]
+                [line.3]
+                segments = ["context_window"]
+            "#,
+        )
+        .unwrap();
+        let env = CliEnv::for_tests();
+        let (code, stdout, stderr) =
+            run_cli_main(&["--config", path.to_str().unwrap()], b"{not json", &env);
+        assert_eq!(code, 0, "parse failure renders the marker, exits 0");
+        assert_eq!(stdout, "?\n", "exactly one marker, not one per line");
+        assert!(
+            stderr.contains("parse:"),
+            "parse error should breadcrumb to stderr, got:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn multi_line_empty_segments_in_a_line_still_emits_trailing_newline() {
+        // The doc on `run_lines_with_context` says explicitly-defined
+        // line slots stay in the output even if no segments rendered.
+        // Pin the byte count so a refactor that "optimizes" away the
+        // empty-line writeln doesn't silently change vertical
+        // footprint.
+        let json = br#"{
+            "model": { "display_name": "Claude" },
+            "workspace": { "project_dir": "/x" }
+        }"#;
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+                layout = "multi-line"
+                [line.1]
+                segments = ["model"]
+                [line.2]
+                segments = []
+            "#,
+        )
+        .unwrap();
+        let env = CliEnv::for_tests();
+        let (code, stdout, _stderr) =
+            run_cli_main(&["--config", path.to_str().unwrap()], json, &env);
+        assert_eq!(code, 0);
+        assert_eq!(
+            stdout, "Claude\n\n",
+            "empty line slot must still emit `\\n`"
+        );
+    }
+
+    #[test]
+    fn power_user_preset_renders_two_lines_end_to_end() {
+        // The preset-shape test in presets/mod.rs pins layout +
+        // per-line ids; this one pins the full pipeline (preset →
+        // builder → renderer) actually produces two lines. Catches
+        // a regression where a refactor breaks any layer in the
+        // chain.
+        let json = br#"{
+            "model": { "display_name": "Claude" },
+            "workspace": { "project_dir": "/home/dev/proj" }
+        }"#;
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            presets::body("power-user").expect("preset registered"),
+        )
+        .unwrap();
+        let env = CliEnv::for_tests();
+        let (code, stdout, _stderr) =
+            run_cli_main(&["--config", path.to_str().unwrap()], json, &env);
+        assert_eq!(code, 0);
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "power-user must render exactly two lines, got: {stdout:?}"
+        );
+        assert!(
+            lines[0].contains("Claude"),
+            "line 1 should carry model name, got: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains("proj"),
+            "line 1 should carry workspace name, got: {:?}",
+            lines[0]
+        );
     }
 
     #[test]

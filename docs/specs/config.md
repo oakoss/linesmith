@@ -1,8 +1,8 @@
 # Config
 
 - Status: draft
-- Version: 0.1.2
-- Last updated: 2026-04-28
+- Version: 0.1.4
+- Last updated: 2026-04-29
 - Driving ADRs: [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0005](../adrs/0005-role-based-themes.md), [ADR-0006](../adrs/0006-tool-agnostic-json-schema.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md), [ADR-0011](../adrs/0011-rate-limit-data-source.md)
 
 ## Overview
@@ -319,20 +319,23 @@ Parse and validate; print errors/warnings to stderr; exit non-zero on errors. Us
 
 ## Edge cases
 
-| Case                                                   | Handling                                                                                |
-| ------------------------------------------------------ | --------------------------------------------------------------------------------------- |
-| Config file missing entirely                           | Use built-in defaults; log hint `run 'linesmith init' to customize`                     |
-| Config file unreadable (permissions)                   | Log error, fall back to defaults                                                        |
-| Config file has BOM                                    | Strip BOM before parse                                                                  |
-| Unknown top-level key (e.g. `foo = 1`)                 | Warn, ignore                                                                            |
-| Theme missing                                          | Fall back to `default`, warn                                                            |
-| Segment listed but not registered                      | Skip, warn once                                                                         |
-| `visible_if` expression invalid                        | Treat as always-visible, warn                                                           |
-| `layout = "multi-line"` but no `[line.N]` sections     | Treat as single-line, warn                                                              |
-| `layout = "single-line"` but `[line.N]` sections exist | Log info; use `[line]` section for rendering                                            |
-| Preset name unknown for `--preset`                     | Fail with list of valid preset names                                                    |
-| `linesmith presets apply <name>` on existing config    | Confirm overwrite; `--force` flag skips confirmation; backup saved as `config.toml.bak` |
-| XDG vars unset AND home dir not detectable             | Fail fast with clear error (can't locate a writable config path)                        |
+| Case                                                              | Handling                                                                                |
+| ----------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| Config file missing entirely                                      | Use built-in defaults; log hint `run 'linesmith init' to customize`                     |
+| Config file unreadable (permissions)                              | Log error, fall back to defaults                                                        |
+| Config file has BOM                                               | Strip BOM before parse                                                                  |
+| Unknown top-level key (e.g. `foo = 1`)                            | Warn, ignore                                                                            |
+| Theme missing                                                     | Fall back to `default`, warn                                                            |
+| Segment listed but not registered                                 | Skip, warn once                                                                         |
+| `visible_if` expression invalid                                   | Treat as always-visible, warn                                                           |
+| `layout = "multi-line"` but no `[line.N]` sections                | Treat as single-line, warn                                                              |
+| `layout = "single-line"` but `[line.N]` sections exist            | Warn; ignore numbered tables and render `[line].segments`                               |
+| `layout` omitted, `[line.N]` present, `[line].segments` empty     | Auto-promote to multi-line with hint to add `layout = "multi-line"`                     |
+| Unknown scalar key under `[line]` (e.g. `[line] segmnts = [...]`) | Warn, drop the key (forward-compat: same rule as top-level unknown keys)                |
+| `[line.foo]` (non-positive-integer key)                           | Warn, drop                                                                              |
+| Preset name unknown for `--preset`                                | Fail with list of valid preset names                                                    |
+| `linesmith presets apply <name>` on existing config               | Confirm overwrite; `--force` flag skips confirmation; backup saved as `config.toml.bak` |
+| XDG vars unset AND home dir not detectable                        | Fail fast with clear error (can't locate a writable config path)                        |
 
 ## Testing strategy
 
@@ -371,3 +374,5 @@ Parse and validate; print errors/warnings to stderr; exit non-zero on errors. Us
 - 2026-04-17: initial draft (v0.1)
 - 2026-04-20: v0.1.1 additive update. Adds `[usage]` top-level section (`cache_duration`, `api_base_url`, `timeout`) for the OAuth rate-limit endpoint knobs referenced by [data-fetching.md](data-fetching.md) §OAuth usage cache stack and [rate-limit-segments.md](rate-limit-segments.md) §Staleness bounds. Updates the `[segments.rate_limit_5h]` `visible_if` example from the stdin-payload `ctx.rate_limits` shape (dropped in lsm-7po) to the `ctx.usage` tagged-map shape matching ADR-0011's `UsageData` contract. Driven by ADR-0010 + ADR-0011. No breaking changes.
 - 2026-04-28: v0.1.2 update for `linesmith init` (lsm-5yd) shipping. Clarifies the `linesmith init` section: drops the deferred "tool" prompt, documents the doctor-offer placeholder, adds the `--config`/`LINESMITH_CONFIG` snippet propagation, and notes the path-content warnings (shell metacharacters, leading dash, non-UTF-8). No config-shape changes.
+- 2026-04-29: v0.1.3 update for multi-line layout (lsm-bvu) shipping. Top-level `layout = "single-line" | "multi-line"` selector and `[line.N]` numbered sub-tables are now implemented end-to-end. The `power-user` preset is now a two-line layout (line 1: model + context_window + workspace; line 2: rate limits + cost + effort + tokens_total). Edge-case warnings — missing `[line.N]` under multi-line, non-numeric numbered keys, single-line with `[line.N]` present — surface through both render and `--check-config`. Numbered tables sort by parsed integer key (so `[line.10]` follows `[line.2]`, not lexicographic). No breaking changes.
+- 2026-04-29: v0.1.4 follow-up to v0.1.3 multi-line, addressing two review-found regressions. Forward-compat: typo'd or future scalar keys under `[line]` (e.g. `[line] segmnts = [...]`) now warn and drop, matching the spec's existing "unknown keys are warnings" rule for top-level keys, instead of failing the config load. Auto-promote: when `[line.N]` sub-tables are present but `layout` is omitted AND `[line].segments` is empty, the builder treats the config as multi-line with a hint pointing at the missing `layout = "multi-line"` key, instead of silently rendering blank. Both behaviors are documented in §Edge cases. No schema changes.

@@ -18,7 +18,7 @@ pub mod segments;
 pub mod theme;
 
 pub use driver::{cli_main, CliEnv};
-pub use segments::builder::{build_default_segments, build_segments};
+pub use segments::builder::{build_default_segments, build_lines, build_segments};
 
 use crate::segments::Segment;
 use std::io::{self, Read, Write};
@@ -141,10 +141,42 @@ impl<'a> RunContext<'a> {
 /// `writer` fails. Stderr write failures are swallowed (a broken
 /// stderr pipe must not abort a valid stdout render).
 pub fn run_with_context(
+    reader: impl Read,
+    writer: impl Write,
+    stderr: &mut dyn Write,
+    segments: &[Box<dyn Segment>],
+    ctx: &RunContext<'_>,
+) -> io::Result<()> {
+    // The function predates multi-line and is part of the public API
+    // surface (`pub use` in lib.rs), so removing it would be a SemVer
+    // break. Delegate to the multi-line path with one line so single-
+    // line callers don't need to allocate a `Vec<Vec<...>>` shim.
+    run_lines_with_context(reader, writer, stderr, std::slice::from_ref(&segments), ctx)
+}
+
+/// Multi-line render entry. Each inner slice is one rendered line;
+/// the layout algorithm runs independently per line with the full
+/// terminal width budget. Stdin is parsed once into a shared
+/// [`DataContext`](data_context::DataContext) so every line sees the
+/// same data snapshot. Empty inner slices still emit a `writeln!()`
+/// — the user explicitly defined the line slot, so it stays in the
+/// output even if no segments rendered.
+///
+/// Parse failures emit a single `?` marker on the first line and
+/// stop, matching the single-line failure mode (the marker tells
+/// Claude Code "linesmith ran but couldn't parse stdin"; emitting a
+/// per-line marker would be visually noisy without conveying more
+/// information).
+///
+/// # Errors
+///
+/// Returns the first `io::Error` from a `writeln!` to `writer`.
+/// Stderr write failures are swallowed.
+pub fn run_lines_with_context(
     mut reader: impl Read,
     mut writer: impl Write,
     stderr: &mut dyn Write,
-    segments: &[Box<dyn Segment>],
+    lines: &[&[Box<dyn Segment>]],
     ctx: &RunContext<'_>,
 ) -> io::Result<()> {
     let mut buf = Vec::new();
@@ -159,18 +191,21 @@ pub fn run_with_context(
     };
     let data_ctx = data_context::DataContext::with_cwd(status_ctx, ctx.cwd.clone());
 
-    let line = layout::render_with_warn(
-        segments,
-        &data_ctx,
-        ctx.terminal_width,
-        &mut |msg| {
-            let _ = writeln!(stderr, "linesmith: {msg}");
-        },
-        ctx.theme,
-        ctx.capability,
-        ctx.hyperlinks,
-    );
-    writeln!(writer, "{line}")
+    for segments in lines {
+        let line = layout::render_with_warn(
+            segments,
+            &data_ctx,
+            ctx.terminal_width,
+            &mut |msg| {
+                let _ = writeln!(stderr, "linesmith: {msg}");
+            },
+            ctx.theme,
+            ctx.capability,
+            ctx.hyperlinks,
+        );
+        writeln!(writer, "{line}")?;
+    }
+    Ok(())
 }
 
 /// Width fallback when `terminal_size()` and `COLUMNS` both fail.

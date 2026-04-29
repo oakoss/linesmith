@@ -1,12 +1,18 @@
 # linesmith preset: power-user
-# Every built-in segment, in priority order. The layout engine drops
-# lowest-priority segments first when the terminal is narrow.
+# Every built-in segment v0.1 supports, split into two lines:
+# - Line 1: identity + state (model, context, workspace)
+# - Line 2: metrics (rate limits, cost, effort, tokens)
+# The layout engine drops lowest-priority segments first per line
+# when the terminal is narrow; multi-line lets cost/limits keep
+# rendering even when line 1 is wide.
 
-[line]
+layout = "multi-line"
+
+[line.1]
+segments = ["model", "context_window", "workspace"]
+
+[line.2]
 segments = [
-  "model",
-  "context_window",
-  "workspace",
   "rate_limit_5h",
   "rate_limit_7d",
   "cost",
