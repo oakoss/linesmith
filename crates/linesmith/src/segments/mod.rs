@@ -172,22 +172,69 @@ pub(crate) fn sanitize_control_chars(s: String) -> String {
 /// `Theme` is reserved for theme-provided padding and renders as a
 /// single space when no theme is configured. `Literal` carries a
 /// `Cow<'static, str>` so built-ins stay zero-alloc while user config
-/// allocates once.
+/// allocates once. `Powerline { width }` emits the Nerd Font
+/// right-arrow chevron (U+E0B0) flanked by single-space padding;
+/// `width` is the chevron's own cell count (1 or 2 — see
+/// `[layout_options].powerline_width`), and the reported [`width()`]
+/// includes the 2 padding cells. Chevron styling lives in
+/// [`crate::layout::separator_style`].
+///
+/// [`width()`]: Separator::width
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Separator {
     Space,
     Theme,
     Literal(Cow<'static, str>),
+    Powerline { width: PowerlineWidth },
     None,
 }
 
+/// Cell-count for the Nerd Font powerline chevron (U+E0B0). Most
+/// modern fonts at standard sizes render the chevron as a single cell;
+/// some larger sizes / older Nerd Font builds render it as two. The
+/// type makes any other value unrepresentable so layout-width math
+/// can't drift into invalid territory.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PowerlineWidth {
+    #[default]
+    One,
+    Two,
+}
+
+impl PowerlineWidth {
+    /// Cell count this width represents (1 or 2).
+    #[must_use]
+    pub const fn cells(self) -> u16 {
+        match self {
+            Self::One => 1,
+            Self::Two => 2,
+        }
+    }
+}
+
+/// Nerd Font right-arrow chevron (U+E0B0) with single-space padding
+/// on each side.
+const POWERLINE_CHEVRON_PADDED: &str = " \u{E0B0} ";
+
 impl Separator {
+    /// Default 1-cell powerline chevron. Use this for the common case
+    /// (most modern Nerd Fonts render U+E0B0 as 1 cell at standard
+    /// sizes); pass `Powerline { width: PowerlineWidth::Two }` for
+    /// fonts/sizes that render 2 cells.
+    #[must_use]
+    pub const fn powerline() -> Self {
+        Self::Powerline {
+            width: PowerlineWidth::One,
+        }
+    }
+
     #[must_use]
     pub fn text(&self) -> &str {
         match self {
             Self::Space | Self::Theme => " ",
             Self::Literal(s) => s,
+            Self::Powerline { .. } => POWERLINE_CHEVRON_PADDED,
             Self::None => "",
         }
     }
@@ -197,6 +244,7 @@ impl Separator {
         match self {
             Self::Space | Self::Theme => 1,
             Self::Literal(s) => text_width(s),
+            Self::Powerline { width } => width.cells() + 2,
             Self::None => 0,
         }
     }
@@ -598,12 +646,15 @@ impl OverriddenSegment {
 impl Segment for OverriddenSegment {
     fn render(&self, ctx: &DataContext, rc: &RenderContext) -> RenderResult {
         let result = self.inner.render(ctx, rc)?;
-        Ok(result.map(|r| match &self.user_style {
-            Some(override_style) => {
-                let merged = merge_user_override(r.style(), override_style);
-                r.with_style(merged)
+        Ok(result.map(|r| {
+            let r = apply_separator_override(r, self.default_separator.as_ref());
+            match &self.user_style {
+                Some(override_style) => {
+                    let merged = merge_user_override(r.style(), override_style);
+                    r.with_style(merged)
+                }
+                None => r,
             }
-            None => r,
         }))
     }
 
@@ -614,6 +665,7 @@ impl Segment for OverriddenSegment {
         target: u16,
     ) -> Option<RenderedSegment> {
         let inner = self.inner.shrink_to_fit(ctx, rc, target)?;
+        let inner = apply_separator_override(inner, self.default_separator.as_ref());
         Some(match &self.user_style {
             Some(override_style) => {
                 let merged = merge_user_override(inner.style(), override_style);
@@ -640,6 +692,34 @@ impl Segment for OverriddenSegment {
         }
         d
     }
+}
+
+/// Apply an `OverriddenSegment.default_separator` policy to a
+/// rendered segment's `right_separator`. The override replaces a
+/// per-render `Some(Space)` or `Some(Theme)` — those mean "I didn't
+/// pick anything intentional," so the layout-options separator wins.
+/// All other values pass through: `Some(Literal(..))`,
+/// `Some(Powerline { .. })`, and `Some(Separator::None)` are explicit
+/// segment choices, while a bare `None` (no per-render override)
+/// signals "use my overridden default," which `effective_separator`
+/// resolves downstream.
+fn apply_separator_override(
+    r: RenderedSegment,
+    sep_override: Option<&Separator>,
+) -> RenderedSegment {
+    let Some(override_sep) = sep_override else {
+        return r;
+    };
+    let should_replace = matches!(
+        r.right_separator.as_ref(),
+        Some(Separator::Space) | Some(Separator::Theme)
+    );
+    if !should_replace {
+        return r;
+    }
+    let mut r = r;
+    r.right_separator = Some(override_sep.clone());
+    r
 }
 
 /// Merge a user-config style override onto the inner segment's style.
@@ -752,6 +832,18 @@ mod layout_type_tests {
         assert_eq!(Separator::Theme.width(), 1);
         assert_eq!(Separator::None.width(), 0);
         assert_eq!(Separator::Literal(Cow::Borrowed(" | ")).width(), 3);
+        // Powerline is configurable: width 1 (Nerd Font default) or
+        // width 2 (some fonts/sizes render the chevron as 2 cells).
+        // The reported width adds 2 cells of padding (one space on
+        // each side of the chevron) since `text()` emits " ▶ ".
+        assert_eq!(Separator::powerline().width(), 3);
+        assert_eq!(
+            Separator::Powerline {
+                width: PowerlineWidth::Two,
+            }
+            .width(),
+            4
+        );
     }
 
     #[test]
@@ -1111,6 +1203,91 @@ mod layout_type_tests {
         assert!(wrapped
             .shrink_to_fit(&stub_ctx(), &stub_rc(), 100)
             .is_none());
+    }
+
+    #[test]
+    fn shrink_to_fit_applies_separator_override_to_runtime_space() {
+        // Mirrors `layout_separator_powerline_overrides_runtime_right_separator`
+        // (in builder.rs) for the compact-render path. If the inner
+        // segment returns `right_separator: Some(Space)` from
+        // shrink_to_fit, the overridden default must replace it the
+        // same way it does on render — otherwise a width-pressured
+        // line would silently revert from powerline chevrons to
+        // spaces, producing inconsistent output across renders.
+        struct ShrinkableWithRuntimeSpace;
+        impl Segment for ShrinkableWithRuntimeSpace {
+            fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+                Ok(Some(RenderedSegment::with_separator(
+                    "full",
+                    Separator::Space,
+                )))
+            }
+            fn shrink_to_fit(
+                &self,
+                _: &DataContext,
+                _: &RenderContext,
+                _target: u16,
+            ) -> Option<RenderedSegment> {
+                Some(RenderedSegment::with_separator("c", Separator::Space))
+            }
+        }
+        let wrapped = OverriddenSegment::new(Box::new(ShrinkableWithRuntimeSpace))
+            .with_default_separator(Separator::powerline());
+        let shrunk = wrapped
+            .shrink_to_fit(&stub_ctx(), &stub_rc(), 5)
+            .expect("inner returned compact form");
+        assert_eq!(shrunk.right_separator(), Some(&Separator::powerline()));
+    }
+
+    #[test]
+    fn apply_separator_override_replaces_runtime_theme() {
+        // The `Theme` arm of the should-replace match is otherwise
+        // uncovered. A plugin returning `Some(Theme)` (the implicit
+        // theme-padding default) must yield to layout-options.
+        let r = RenderedSegment::with_separator("x", Separator::Theme);
+        let out = apply_separator_override(r, Some(&Separator::powerline()));
+        assert_eq!(out.right_separator(), Some(&Separator::powerline()));
+    }
+
+    #[test]
+    fn apply_separator_override_passes_through_when_runtime_separator_is_none() {
+        // `right_separator: None` means "use my default" — the
+        // override travels via `default_separator` instead, so
+        // apply_separator_override leaves the per-render slot empty.
+        let r = RenderedSegment::new("x"); // no separator set
+        let out = apply_separator_override(r, Some(&Separator::powerline()));
+        assert_eq!(out.right_separator(), None);
+    }
+
+    #[test]
+    fn apply_separator_override_preserves_explicit_runtime_none() {
+        // `Some(Separator::None)` is the segment explicitly saying
+        // "no separator after me." Layout-options must not promote
+        // this to a chevron.
+        let r = RenderedSegment::with_separator("x", Separator::None);
+        let out = apply_separator_override(r, Some(&Separator::powerline()));
+        assert_eq!(out.right_separator(), Some(&Separator::None));
+    }
+
+    #[test]
+    fn apply_separator_override_passes_through_when_no_override() {
+        // `sep_override == None` is the no-layout-options case — the
+        // input must round-trip unchanged through every branch of
+        // the `right_separator` match.
+        for runtime_sep in [
+            None,
+            Some(Separator::Space),
+            Some(Separator::Theme),
+            Some(Separator::None),
+            Some(Separator::powerline()),
+        ] {
+            let r = match &runtime_sep {
+                None => RenderedSegment::new("x"),
+                Some(s) => RenderedSegment::with_separator("x", s.clone()),
+            };
+            let out = apply_separator_override(r, None);
+            assert_eq!(out.right_separator(), runtime_sep.as_ref());
+        }
     }
 
     fn stub_ctx() -> DataContext {

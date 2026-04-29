@@ -265,16 +265,29 @@ fn items_to_runs(items: &[Item<'_>]) -> Vec<StyledRun> {
             style: item.rendered.style.clone(),
         });
         if i + 1 < items.len() {
-            let sep_text = effective_separator(item).text();
+            let sep = effective_separator(item);
+            let sep_text = sep.text();
             if !sep_text.is_empty() {
                 runs.push(StyledRun {
                     text: sep_text.to_string(),
-                    style: Style::default(),
+                    style: separator_style(sep),
                 });
             }
         }
     }
     runs
+}
+
+/// Style for an inter-segment separator run. Plain separators carry
+/// `Style::default()`; powerline chevrons get `Role::Muted` so the
+/// chevron reads as readable secondary text rather than dropping into
+/// the dim divider/border shade (which on most dark themes renders too
+/// close to the background to be legible without bg fill).
+fn separator_style(sep: &Separator) -> Style {
+    match sep {
+        Separator::Powerline { .. } => Style::role(theme::Role::Muted),
+        _ => Style::default(),
+    }
 }
 
 /// Sum of segment widths plus the separators that sit *between* segments
@@ -591,6 +604,33 @@ mod tests {
         let items = vec![item("aaaa", 0), item("bbbb", 0)];
         let out = render_plain(items, 3);
         assert_eq!(out, "aaaa bbbb");
+    }
+
+    #[test]
+    fn priority_drop_recomputes_budget_with_powerline_separators() {
+        // Three priority-0 segments at width 4 with powerline chevrons
+        // between them: full = 4 + chev + 4 + chev + 4. The middle
+        // segment is the only droppable one (priority 200); after one
+        // drop the layout becomes "aaaa <chev> cccc" (4 + chev + 4)
+        // and fits the budget without a second drop. A regression that
+        // forgot to subtract a chevron's cells when its preceding
+        // segment dropped would over-drop or mis-budget.
+        let item_pl = |text: &'static str, priority: u8| Item {
+            rendered: RenderedSegment::new(text),
+            defaults: SegmentDefaults::with_priority(priority)
+                .with_default_separator(Separator::powerline()),
+            segment: noop_segment(),
+        };
+        let items = vec![item_pl("aaaa", 0), item_pl("bbbb", 200), item_pl("cccc", 0)];
+        // Full = 4 + 3 + 4 + 3 + 4 = 18; after drop = 4 + 3 + 4 = 11.
+        let out = render_plain(items, 14);
+        assert!(out.contains("aaaa"));
+        assert!(!out.contains("bbbb"));
+        assert!(out.contains("cccc"));
+        assert!(
+            out.contains('\u{E0B0}'),
+            "chevron survives the drop: {out:?}"
+        );
     }
 
     #[test]
@@ -1402,6 +1442,106 @@ mod tests {
         let runs = render_to_runs(&segments, &empty_ctx(), 1, &mut |_| {});
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].text, "a");
+    }
+
+    #[test]
+    fn render_to_runs_emits_powerline_chevron_with_muted_role() {
+        // Pins both the glyph and the `Role::Muted` style — a future
+        // bg-transition restyle should land as an intentional update
+        // to this assertion.
+        use crate::theme::Role;
+        struct PowerlineSeg;
+        impl Segment for PowerlineSeg {
+            fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+                Ok(Some(RenderedSegment::new("a").with_role(Role::Primary)))
+            }
+            fn defaults(&self) -> SegmentDefaults {
+                SegmentDefaults::with_priority(10).with_default_separator(Separator::powerline())
+            }
+        }
+        let segments: Vec<Box<dyn Segment>> = vec![
+            Box::new(PowerlineSeg),
+            Box::new(StubSegment(Ok(Some(RenderedSegment::new("b"))))),
+        ];
+        let runs = render_to_runs(&segments, &empty_ctx(), 100, &mut |_| {});
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[1].text, " \u{E0B0} ");
+        assert_eq!(runs[1].style.role, Some(Role::Muted));
+    }
+
+    #[test]
+    fn powerline_separator_emits_padded_chevron_with_correct_width() {
+        // The chevron is a Nerd Font glyph in the private-use range;
+        // unicode-width doesn't know its cell count, so the layout's
+        // total_width math depends on `Separator::width()`'s answer.
+        // Pin both the emitted text (single-space pad on each side of
+        // the chevron) and the reported width (1-cell chevron + 2
+        // padding cells = 3).
+        assert_eq!(Separator::powerline().width(), 3);
+        assert_eq!(Separator::powerline().text(), " \u{E0B0} ");
+    }
+
+    #[test]
+    fn powerline_chevrons_are_charged_to_total_width_in_layout() {
+        // total_width counts inter-segment separators. Three priority-0
+        // segments at width 4 plus two powerline chevrons between them
+        // = 4 + chev + 4 + chev + 4. A regression that stopped counting
+        // Powerline width would silently push lines past budget.
+        // Computed (not hardcoded) so a future change to the chevron's
+        // padding-cell count fails this assertion at the right line.
+        let item = |text: &str| Item {
+            rendered: RenderedSegment::new(text),
+            defaults: SegmentDefaults::with_priority(0)
+                .with_default_separator(Separator::powerline()),
+            segment: noop_segment(),
+        };
+        let items = vec![item("aaaa"), item("bbbb"), item("cccc")];
+        let chev = u32::from(Separator::powerline().width());
+        assert_eq!(total_width(&items), 4 + chev + 4 + chev + 4);
+    }
+
+    #[test]
+    fn render_with_warn_emits_powerline_chevron_wrapped_in_muted_sgr() {
+        // End-to-end pin: drive two segments through `render_with_warn`
+        // under Palette16 with powerline separators between them. The
+        // output must contain the padded chevron wrapped in *some* SGR
+        // open + reset; the exact bytes are computed from
+        // `theme::sgr_open` for the Muted role on the default theme,
+        // so this test adapts if the default theme's Muted color is
+        // ever retuned. Decouples "chevron emits styled" from "the
+        // exact ANSI code for Muted on theme X."
+        struct PowerlineSeg(&'static str, theme::Role);
+        impl Segment for PowerlineSeg {
+            fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+                Ok(Some(RenderedSegment::new(self.0).with_role(self.1)))
+            }
+            fn defaults(&self) -> SegmentDefaults {
+                SegmentDefaults::with_priority(10).with_default_separator(Separator::powerline())
+            }
+        }
+        let segments: Vec<Box<dyn Segment>> = vec![
+            Box::new(PowerlineSeg("a", theme::Role::Primary)),
+            Box::new(PowerlineSeg("b", theme::Role::Info)),
+        ];
+        let line = render_with_warn(
+            &segments,
+            &empty_ctx(),
+            100,
+            &mut |_| {},
+            theme::default_theme(),
+            theme::Capability::Palette16,
+            false,
+        );
+        let muted_sgr = theme::sgr_open(
+            &Style::role(theme::Role::Muted),
+            theme::default_theme(),
+            theme::Capability::Palette16,
+        );
+        let expected = format!("{muted_sgr} \u{E0B0} \x1b[0m");
+        assert!(
+            line.contains(&expected),
+            "padded chevron with Muted SGR not in line: {line:?} (expected substring: {expected:?})"
+        );
     }
 
     #[test]

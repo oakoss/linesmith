@@ -100,9 +100,27 @@ segments = [
 # segments = ["workspace", "git_branch", "cost", "effort"]
 
 [layout_options]
-# Separator style: "space" (default), "powerline" (requires Nerd Font),
-# "capsule" (v0.2+), "flex" (v0.2+)
+# Separator: a reserved keyword OR an arbitrary literal string emitted
+# verbatim between segments.
+#   "space"     - single space (default)
+#   "powerline" - Nerd Font right-arrow chevron (U+E0B0); see
+#                 powerline_width below
+#   "capsule"   - reserved for v0.2+; warns and renders as space
+#   "flex"      - reserved for v0.2+; warns and renders as space
+#   ""          - no separator (truly empty string)
+#   <anything>  - rendered verbatim (e.g. " | ", " · ", "->", "   ").
+#                 Whitespace-only literals are preserved as-is; only
+#                 the truly-empty string suppresses the separator.
+# Mixed per-segment separators (e.g., powerline at some boundaries,
+# space at others) require the separator-as-item refactor in a later
+# release.
 separator = "space"
+
+# Cell-count of the powerline chevron. Most modern Nerd Fonts render
+# U+E0B0 as 1 cell at standard sizes; some fonts/sizes render as 2 cells
+# and need this knob to keep `total_width` math correct. Values other
+# than 1 or 2 warn and fall back to 1.
+powerline_width = 1
 
 # Padding added by Claude Code itself (see settings.json statusLine.padding).
 # Duplicated here so linesmith can factor it into width calculations.

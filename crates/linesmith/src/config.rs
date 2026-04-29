@@ -27,12 +27,26 @@ pub struct Config {
 
 /// `[layout_options]` section: render-path tunables that aren't tied
 /// to a specific segment. See `docs/specs/config.md` §layout_options.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 #[non_exhaustive]
 pub struct LayoutOptions {
     pub color: ColorPolicy,
     pub claude_padding: u16,
+    /// Inter-segment separator. Stored as a raw string; the segment
+    /// builder parses it into a [`crate::segments::Separator`] at
+    /// build time so unknown values warn and fall back to `space`
+    /// rather than failing the whole config load. See
+    /// `docs/specs/config.md` for the reserved-keyword set
+    /// (`space`, `powerline`, `capsule`, `flex`, `""`) and the
+    /// arbitrary-literal fallback.
+    pub separator: Option<String>,
+    /// Cell-count for the Nerd Font powerline chevron (U+E0B0). Only
+    /// `1` (the default; matches modern Nerd Fonts at standard sizes)
+    /// and `2` (some older builds / larger sizes) are meaningful.
+    /// Takes effect only when a powerline separator is in use; setting
+    /// it under `separator = "space"` is harmless but inert.
+    pub powerline_width: Option<u16>,
 }
 
 /// Config-level color override. `auto` honors CLI flags and env vars;
@@ -226,7 +240,7 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
 
 /// Fields under `[layout_options]`. `separator` is tolerated ahead
 /// of its implementation so forward-compat configs don't warn.
-const KNOWN_LAYOUT_OPTIONS: &[&str] = &["color", "claude_padding", "separator"];
+const KNOWN_LAYOUT_OPTIONS: &[&str] = &["color", "claude_padding", "separator", "powerline_width"];
 
 /// Per-segment override schema. Returns `None` for segment ids we
 /// don't recognize so plugin segments (which own their own schema)
@@ -570,8 +584,10 @@ mod tests {
 
     #[test]
     fn from_str_validated_allows_separator_and_other_known_layout_options_keys() {
-        // `separator` is spec'd but not yet implemented; the allow-list
-        // tolerates it so forward-compat configs stay silent.
+        // The known-keys allow-list lets `separator` through without
+        // an unknown-key warning; the segment builder parses the
+        // string and emits its own warnings (unknown values, v0.2+
+        // stubs).
         let warnings = collect_warnings(
             r#"
                 [layout_options]
