@@ -280,13 +280,20 @@ jobs:
     # release.yml below.
 ```
 
-**`.github/workflows/release.yml`** — runs on tag push (from release-plz.yml) and via `workflow_dispatch` for dry-runs:
+**`.github/workflows/release.yml`** — runs on tag push (from release-plz.yml), via `workflow_dispatch` for manual dry-runs, and via path-filtered `pull_request:` for auto-validation of release-infra changes (per [ADR-0017](../adrs/0017-release-workflow-pr-validation.md)):
 
 ```text
 on:
   push:
     tags: ['v*.*.*']
   workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'dist-workspace.toml'
+      - 'Cargo.toml'
+      - 'crates/*/Cargo.toml'
+      - 'Cargo.lock'
 
 jobs:
   cargo-dist-plan:
@@ -321,15 +328,22 @@ curl -LsSf https://github.com/oakoss/linesmith/releases/download/v0.2.0-rc.1/lin
 
 ### Dry-run workflow
 
-`release.yml` runs via `workflow_dispatch` from any branch. Dispatched, it runs the build pipeline but:
+`release.yml` exposes two dry-run paths beyond tag-push (per [ADR-0017](../adrs/0017-release-workflow-pr-validation.md)):
 
-- Synthesizes an ephemeral tag string (`v0.0.0-dry-run-<short-sha>`) from the dispatching commit and threads it to `dist build` for artifact naming. Nothing is pushed to git, so no cleanup is needed after the run.
+1. **`workflow_dispatch`** — maintainer-triggered from any branch. Use for ad-hoc validation when you want the full matrix before cutting a tag.
+2. **`pull_request` (paths-filtered)** — auto-fires when a PR touches release-infra files (`release.yml`, `dist-workspace.toml`, `Cargo.toml`, `crates/*/Cargo.toml`, `Cargo.lock`). Catches cross-compile breakage from cargo-update / release-plz auto-bumps / dependabot before merge. SHA is the PR head, not the merge SHA. Filter excludes `release-plz.toml` and `release-plz.yml` (false coverage — release.yml's matrix doesn't run release-plz). Concurrency cancellation: superseded PR runs cancel automatically.
+
+Either path:
+
+- Synthesizes an ephemeral tag string (`v0.0.0-dry-run-<short-sha>`) and threads it to `dist build` for artifact naming. Nothing is pushed to git.
 - Skips the GitHub Release creation (the `host` job is gated on `publishing == 'true'`, set by the `plan` job to `github.event_name == 'push'`).
-- Skips the Homebrew formula push (no write to `oakoss/homebrew-tap`) — `publish-homebrew-formula` is gated on the same `publishing` flag for defense-in-depth.
+- Skips the Homebrew formula push (`publish-homebrew-formula` is gated on the same `publishing` flag for defense-in-depth).
 - Uploads binary artifacts as GitHub Actions workflow artifacts with 7-day retention; real releases keep the 90-day default so maintainers can re-download post-release without re-building.
-- Still generates SLSA build attestations on each target leg so the attestation flow itself is exercised.
+- Still generates SLSA build attestations on each target leg, except on fork PRs where `id-token: write` is clamped — Attest skips gracefully via `if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository`.
 
-Used for validating `release.yml` changes before cutting a real tag. Dry-run runs touch only GitHub Actions artifact storage — no crates.io version slot consumed, no GitHub Release created, no Homebrew formula pushed.
+**Validation surface caveats.** Triggering on `dist-workspace.toml` exercises only the keys cargo-dist reads at runtime (target list, build profile, attestations toggle). Keys that affect generated CI shape — `[dist.github-action-commits]`, runner customizations, the trigger surface itself — only take effect after `dist init` regen rewrites `release.yml`, and under `allow-dirty = ["ci"]` regen skips the file entirely. CI-shape changes require regenerating `release.yml` in the same PR to actually exercise.
+
+Dry-run runs touch only GitHub Actions artifact storage — no crates.io version slot consumed, no GitHub Release created, no Homebrew formula pushed.
 
 cargo-dist 0.31's `--allow-dirty` flag is boolean and covers only "CI scripts out of date" — already permanently allowed via `dist-workspace.toml`'s `allow-dirty = ["ci"]`, so no per-dispatch toggle is needed. Source-tree-dirty dispatch isn't a concept in 0.31; CI checkouts are always clean. `release-plz.yml`'s `cargo publish` step has no dry-run path either, so pipeline-validating crates.io changes still require a local `cargo publish --dry-run` or a real `v0.0.x` patch release.
 
@@ -372,7 +386,8 @@ Follows `AGENTS.md`: workflow changes are tested via dry-run dispatches; pipelin
 
 ### Workflow tests
 
-- Dry-run via `workflow_dispatch` on every PR that touches `.github/workflows/*.yml`, `Cargo.toml` (version fields), `release-plz.toml`, or `dist-workspace.toml`
+- Auto-triggered dry-run on every PR that touches `release.yml`, `dist-workspace.toml`, `Cargo.toml`, `crates/*/Cargo.toml`, or `Cargo.lock` (paths-filtered `pull_request:` trigger per ADR-0017)
+- Manual `workflow_dispatch` dry-run for PRs that touch other release-adjacent files not in the auto-trigger (`release-plz.toml`, `release-plz.yml`, `ci.yml`, `audit.yml`, `codeql.yml`, etc.) — release-plz.toml is intentionally excluded from auto-trigger because release.yml's matrix doesn't run release-plz code (false coverage)
 - Matrix-level tests: the cross-compile step runs on every PR (covered by the existing `check` workflow; release.yml reuses the same build matrix)
 - Attestation verification: post-release, a `verify.yml` workflow downloads the released binary, runs `gh attestation verify`, asserts PASS
 

@@ -42,12 +42,30 @@ on:
   push:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
-  # Dry-run dispatch: build all targets + generate attestations as workflow
-  # artifacts without creating a GitHub Release, publishing to crates.io, or
-  # touching the homebrew tap. Use to validate release-infra changes before
-  # cutting a real tag. Hand-edits below are protected by dist-workspace.toml
-  # `allow-dirty = ["ci"]` so cargo-dist regen preserves them.
+  # Dry-run trigger surface (per ADR-0017). Builds all targets + generates
+  # attestations as workflow artifacts without creating a GitHub Release,
+  # publishing to crates.io, or touching the homebrew tap. Two paths:
+  #   - workflow_dispatch: maintainer hits "Run workflow" to validate.
+  #   - pull_request (paths-filtered): auto-fires when release-infra files
+  #     change, so a PR that breaks release.yml or shifts the dependency
+  #     graph surfaces the failure pre-merge. Path list is restrictive on
+  #     purpose — each run claims 7 of 20 concurrent slots.
+  # Hand-edits below are protected by dist-workspace.toml `allow-dirty =
+  # ["ci"]` so cargo-dist regen preserves them.
   workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'dist-workspace.toml'
+      - 'Cargo.toml'
+      - 'crates/*/Cargo.toml'
+      - 'Cargo.lock'
+
+# Cancel in-flight PR runs when a new push supersedes them. Tag-push and
+# dispatch runs each get their own group so they don't cancel each other.
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
@@ -75,11 +93,13 @@ jobs:
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/dist
-      # On push (real release) the tag is the pushed ref. On dispatch (dry-run)
-      # `github.ref_name` is a branch name, so synthesize an ephemeral tag from
-      # the commit SHA — `dist build` accepts any tag-shaped string for
-      # artifact naming; nothing is pushed back to git. Unknown event_name
-      # exits non-zero rather than silently emitting an empty tag-flag.
+      # On push (real release) the tag is the pushed ref. On dispatch /
+      # pull_request (dry-run) `github.ref_name` is a branch name, so
+      # synthesize an ephemeral tag from the commit SHA — `dist build` accepts
+      # any tag-shaped string for artifact naming; nothing is pushed back to
+      # git. PR events use the head SHA (not ${GITHUB_SHA}, which is the merge
+      # commit on PRs). Unknown event_name exits non-zero rather than silently
+      # emitting an empty tag-flag.
       - id: compute-tag
         shell: bash
         run: |
@@ -89,6 +109,10 @@ jobs:
               ;;
             workflow_dispatch)
               tag="v0.0.0-dry-run-${GITHUB_SHA:0:7}"
+              ;;
+            pull_request)
+              head_sha="${{ github.event.pull_request.head.sha }}"
+              tag="v0.0.0-dry-run-${head_sha:0:7}"
               ;;
             *)
               echo "::error::compute-tag: unsupported event_name '${{ github.event_name }}'. Update release.yml to handle this trigger." >&2
@@ -116,7 +140,7 @@ jobs:
         with:
           name: artifacts-plan-dist-manifest
           path: plan-dist-manifest.json
-          retention-days: ${{ github.event_name == 'workflow_dispatch' && 7 || 90 }}
+          retention-days: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && 7 || 90 }}
 
   # Build and packages all the platform-specific things
   build-local-artifacts:
@@ -124,7 +148,7 @@ jobs:
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
-    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') }}
     strategy:
       fail-fast: false
       # Target platforms/runners are computed by dist in create-release.
@@ -182,6 +206,11 @@ jobs:
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
       - name: Attest
+        # Skip on fork PRs — GitHub clamps `id-token: write` and
+        # `attestations: write` to read on fork-PR contexts, which makes this
+        # step fail with a permission error. Same-repo PRs and tag-push runs
+        # have the writes they need.
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32
         with:
           subject-path: "target/distrib/*${{ join(matrix.targets, ', ') }}*"
@@ -205,7 +234,7 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
-          retention-days: ${{ github.event_name == 'workflow_dispatch' && 7 || 90 }}
+          retention-days: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && 7 || 90 }}
 
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
@@ -253,7 +282,7 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
-          retention-days: ${{ github.event_name == 'workflow_dispatch' && 7 || 90 }}
+          retention-days: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') && 7 || 90 }}
   # Determines if we should publish/announce
   host:
     needs:
