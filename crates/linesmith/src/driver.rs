@@ -627,15 +627,19 @@ fn warn_if_path_needs_user_edit(explicit_path: Option<&Path>, stderr: &mut dyn W
 /// cmd.exe / PowerShell specials (including cmd.exe's `^` escape and
 /// `%` variable expansion). Position-sensitive cases like a leading
 /// `-` are checked separately in [`warn_if_path_needs_user_edit`].
+///
+/// `\` is the POSIX shell escape, but on Windows it isn't a
+/// metacharacter in cmd.exe / PowerShell tokenization (it's the
+/// path separator); flagging it there would warn on every absolute
+/// path.
 fn needs_shell_quoting(c: char) -> bool {
-    matches!(
+    if matches!(
         c,
         ' ' | '\t'
             | '\''
             | '"'
             | '`'
             | '$'
-            | '\\'
             | '*'
             | '?'
             | '['
@@ -655,7 +659,17 @@ fn needs_shell_quoting(c: char) -> bool {
             | '='
             | '^'
             | '%'
-    )
+    ) {
+        return true;
+    }
+    #[cfg(not(windows))]
+    {
+        c == '\\'
+    }
+    #[cfg(windows)]
+    {
+        false
+    }
 }
 
 /// Inject `theme = "<name>"` into a preset body before the first table
@@ -2760,6 +2774,12 @@ mod tests {
         );
     }
 
+    // NTFS forbids `"` in filenames, so this case can't be exercised
+    // on Windows; backslash escaping there is exercised by
+    // `init_snippet_preserves_explicit_config_flag` (Windows tempdir
+    // paths always contain `\`, and `parse_snippet` panics on invalid
+    // JSON).
+    #[cfg(not(windows))]
     #[test]
     fn init_snippet_escapes_quotes_and_backslashes_in_config_path() {
         // The path is interpolated into a JSON string, so backslashes
@@ -3073,6 +3093,19 @@ mod tests {
                 "expected {c:?} to NOT need quoting"
             );
         }
+        // `\` pins the platform split: POSIX shell escape vs. Windows
+        // path separator. Without these arms a future refactor that
+        // collapses the cfg split slips past CI on every host.
+        #[cfg(not(windows))]
+        assert!(
+            super::needs_shell_quoting('\\'),
+            "POSIX: `\\` must need quoting"
+        );
+        #[cfg(windows)]
+        assert!(
+            !super::needs_shell_quoting('\\'),
+            "Windows: `\\` is the path separator and must not need quoting"
+        );
     }
 
     #[test]
