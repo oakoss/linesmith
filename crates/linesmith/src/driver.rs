@@ -170,8 +170,46 @@ where
             config,
         } => presets_apply(&name, force, config, stdin, stdout, stderr, env),
         cli::Action::Init { config } => init_action(config, stdin, stdout, stderr, env),
+        cli::Action::Doctor { plain, config } => doctor_action(plain, config, stdout, stderr),
         cli::Action::Run(args) => run_cli(args, stdin, stdout, stderr, env),
     }
+}
+
+/// Build a doctor report, render it, and return the report's exit
+/// code. Stdout I/O failures are surfaced to stderr but do not
+/// promote a healthy report to a non-zero exit, matching the
+/// `cli_main` convention used by `themes-list`, `presets-list`, etc.:
+/// partial / missing stdout is the user-visible signal that the
+/// writer broke, not the report.
+///
+/// `config_override` is honored at the parser boundary (so the path
+/// isn't silently dropped) and surfaced to stderr as a no-op WARN
+/// until a check actually inspects config. This matches the
+/// warn-and-degrade pattern used elsewhere for accepted-but-not-yet-
+/// consumed inputs.
+fn doctor_action(
+    plain: bool,
+    config_override: Option<PathBuf>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
+    if let Some(path) = &config_override {
+        let _ = writeln!(
+            stderr,
+            "linesmith: doctor: --config {} accepted but not yet inspected (no-op)",
+            path.display(),
+        );
+    }
+    let report = crate::doctor::build_report();
+    let mode = if plain {
+        crate::doctor::RenderMode::Plain
+    } else {
+        crate::doctor::RenderMode::Default
+    };
+    if let Err(err) = crate::doctor::render(stdout, &report, mode) {
+        let _ = writeln!(stderr, "linesmith: doctor: {err}");
+    }
+    report.exit_code()
 }
 
 fn themes_list(stdout: &mut dyn Write, stderr: &mut dyn Write, env: &CliEnv) -> u8 {
@@ -552,11 +590,6 @@ fn init_with_choices(
     let _ = writeln!(stdout, "    \"command\": {},", json_command(&snippet_path));
     let _ = writeln!(stdout, "    \"padding\": 0");
     let _ = writeln!(stdout, "  }}");
-    let _ = writeln!(stdout);
-    // Placeholder string contracted by the bead. Swap for an actual
-    // y/N "run doctor now?" offer once lsm-l35 (linesmith doctor)
-    // wires the subcommand into the CLI.
-    let _ = writeln!(stdout, "linesmith doctor coming soon.");
     0
 }
 
@@ -2677,10 +2710,6 @@ mod tests {
             stdout.contains("merge into the existing top-level object"),
             "merge hint missing — without it, users pasting into an empty file get invalid JSON",
         );
-        assert!(
-            stdout.contains("linesmith doctor coming soon"),
-            "doctor placeholder line missing"
-        );
     }
 
     #[test]
@@ -3226,6 +3255,104 @@ mod tests {
         let (code, _stdout, stderr) = run_cli_main(&["presets", "apply", "minimal"], b"", &env);
         assert_eq!(code, 1);
         assert!(stderr.contains("cannot resolve"));
+    }
+
+    #[test]
+    fn doctor_subcommand_renders_report_and_exits_zero() {
+        let (code, stdout, stderr) = run_cli_main(&["doctor"], b"", &CliEnv::for_tests());
+        assert_eq!(code, 0, "stderr was: {stderr}");
+        assert!(stdout.contains("linesmith doctor"), "{stdout}");
+        assert!(stdout.contains("Self"), "{stdout}");
+        assert!(stdout.contains("Exit: 0"), "{stdout}");
+        assert!(stderr.is_empty(), "{stderr}");
+    }
+
+    #[test]
+    fn doctor_plain_output_is_ascii_only() {
+        let (code, stdout, _stderr) =
+            run_cli_main(&["doctor", "--plain"], b"", &CliEnv::for_tests());
+        assert_eq!(code, 0);
+        assert!(stdout.is_ascii(), "plain output had non-ASCII:\n{stdout}");
+        assert!(stdout.contains("OK"), "{stdout}");
+    }
+
+    #[test]
+    fn doctor_default_output_includes_unicode_glyph() {
+        let (code, stdout, _stderr) = run_cli_main(&["doctor"], b"", &CliEnv::for_tests());
+        assert_eq!(code, 0);
+        assert!(stdout.contains('✓'), "{stdout}");
+    }
+
+    #[test]
+    fn doctor_unknown_flag_exits_two() {
+        let (code, _stdout, stderr) =
+            run_cli_main(&["doctor", "--bogus"], b"", &CliEnv::for_tests());
+        assert_eq!(code, 2);
+        assert!(
+            stderr.contains("bogus") || stderr.contains("Try --help"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn doctor_config_override_warns_and_runs_anyway() {
+        // Pin the warn-and-degrade contract until the Config category
+        // actually inspects the path. Without this test, a future
+        // contributor could silently drop the parameter again
+        // (regressing Codex P2) and parser tests alone wouldn't catch
+        // it. When config inspection lands, this test should be
+        // replaced — not deleted — with one that asserts behavior
+        // changes when the path is supplied.
+        let (code, stdout, stderr) = run_cli_main(
+            &["--config", "/nonexistent.toml", "doctor"],
+            b"",
+            &CliEnv::for_tests(),
+        );
+        assert_eq!(code, 0, "no-op should not change exit code");
+        assert!(
+            stderr.contains("--config /nonexistent.toml accepted but not yet inspected"),
+            "expected no-op warning on stderr, got: {stderr}"
+        );
+        // Output must be identical to a no-config run; the flag is
+        // currently a true no-op for the report itself.
+        let (_, baseline_stdout, _) = run_cli_main(&["doctor"], b"", &CliEnv::for_tests());
+        assert_eq!(stdout, baseline_stdout, "report output must not change");
+    }
+
+    #[test]
+    fn doctor_stdout_failure_logs_to_stderr_and_returns_report_exit_code() {
+        // Pin the documented divergence from `Run`'s render path:
+        // doctor surfaces stdout I/O errors via stderr but lets the
+        // report's exit code through. A future "fix" that promotes
+        // I/O errors to exit 1 would be a contract change.
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut stderr = Vec::new();
+        let env = CliEnv::for_tests();
+        let code = cli_main(
+            ["doctor"].iter().map(std::ffi::OsString::from),
+            Cursor::new(&[][..]),
+            &mut FailingWriter,
+            &mut stderr,
+            &env,
+        );
+        assert_eq!(
+            code, 0,
+            "all-PASS report exits 0 even when stdout is broken"
+        );
+        let stderr_str = String::from_utf8(stderr).expect("utf8");
+        assert!(
+            stderr_str.contains("linesmith: doctor:"),
+            "expected doctor diagnostic on stderr, got: {stderr_str}"
+        );
     }
 
     fn tempdir() -> TempDir {

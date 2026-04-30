@@ -8,6 +8,7 @@
 pub mod cli;
 pub mod config;
 pub mod data_context;
+pub mod doctor;
 pub(crate) mod driver;
 pub mod input;
 pub mod layout;

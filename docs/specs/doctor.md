@@ -2,7 +2,7 @@
 
 - Status: draft
 - Version: 0.1
-- Last updated: 2026-04-19
+- Last updated: 2026-04-29
 - Driving ADRs: [ADR-0001](../adrs/0001-use-rust-for-runtime.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md), [ADR-0011](../adrs/0011-rate-limit-data-source.md)
 
 ## Overview
@@ -23,14 +23,13 @@ Out of scope: remote telemetry; `doctor fix` auto-remediation; `doctor --json` m
 - Exit code contract: any FAIL → exit 1; WARN-only or all-PASS → exit 0
 - Default output is a grouped tree with colors and Unicode status glyphs
 - `--plain` flag disables colors and Unicode glyphs (ASCII only) for CI / log capture
-- `--full` flag enables opt-in slow checks (endpoint reachability probe, update check) that `doctor` skips by default
+- All checks — including network probes (endpoint reachability, update check) — run by default; there is no opt-in flag for slow checks
 - Running `linesmith init` ends with an automatic `linesmith doctor` invocation; users can opt out with `linesmith init --no-doctor`
 - Every failure mode in the data-fetching lane that the ADRs say should "surface via linesmith doctor" is covered by a check here
 
 ### Non-functional
 
-- Default `doctor` run completes in <500ms (no network, no expensive scans)
-- `--full` run may take up to 5s (includes one endpoint probe + update check)
+- Local-only checks complete in <500ms; total runtime including network probes (one endpoint reachability call + one update check) is bounded at ~5s by per-call timeouts. Doctor is run interactively when something's wrong, not in tight loops, so the network cost is acceptable as a default.
 - Fails gracefully when Claude Code isn't installed — reports that as a FAIL, doesn't crash
 - Fails gracefully on permission errors — reports the specific path and OS error
 - Cross-platform: no Unix-only assumptions (no `security` calls on Linux, no `cmd.exe` calls on macOS)
@@ -41,15 +40,14 @@ Out of scope: remote telemetry; `doctor fix` auto-remediation; `doctor --json` m
 ### CLI surface
 
 ```text
-linesmith doctor [--plain] [--full]
+linesmith doctor [--plain]
 
 Options:
   --plain      ASCII output without colors or Unicode glyphs (for CI, logs)
-  --full       Run slow checks: endpoint reachability, update availability
   -h, --help   Show this help
 ```
 
-No positional arguments. Subcommand does one thing; no variants (`doctor check foo`, etc.).
+No positional arguments. Subcommand does one thing; no variants (`doctor check foo`, etc.). All checks run unconditionally — there is no scope-narrowing flag. If users later report friction with the network probes (corporate air-gapped, ultra-tight loops), an `--offline` opt-out is on the table; an opt-in `--full` would force users to remember the flag to get the diagnosis they came for, which inverts the contract.
 
 ### Severity levels
 
@@ -69,6 +67,8 @@ No positional arguments. Subcommand does one thing; no variants (`doctor check f
 1  at least one check FAIL
 2  usage error (unrecognized flag, bad invocation)
 ```
+
+I/O failures while writing the report (broken pipe, ENOSPC, etc.) are surfaced to stderr but do not change the exit code; truncated or missing stdout is the user-visible signal that the writer broke, not the report. This matches the `cli_main` convention used by `themes-list`, `presets-list`, and similar meta-commands.
 
 CI pipelines gate on exit-code 0; install scripts can treat 1 as "setup incomplete, prompt the user to read doctor output."
 
@@ -146,6 +146,8 @@ Summary: 16 PASS / 0 WARN / 0 FAIL / 2 SKIP
 Exit: 0
 ```
 
+**Plain-mode passthrough caveat.** The renderer guarantees no Unicode bytes in the strings it emits (glyphs, separators, fixed labels, summary line). User-supplied label and hint content (paths like `~/café/config`, gix branch names, parser error spans, environment values like `LANG=zh_CN.UTF-8`) passes through verbatim. CI scripts that need byte-clean ASCII should ASCII-fold their environment before invoking doctor, not rely on `--plain` to do it.
+
 ### `linesmith init` integration
 
 After `linesmith init` writes the initial config, it prints:
@@ -210,13 +212,15 @@ The token value itself is NEVER printed in doctor output — only source, scope 
 | `usage.json` shape current    | `schema_version` matches                         | Present but stale schema (will be overwritten) | —                   | `safe to ignore; next fetch rewrites`             |
 | Lock file is fresh            | Absent, or present with `blocked_until > now`    | Present, past `blocked_until` (stale lock)     | —                   | `rm ~/.cache/linesmith/usage.lock to clear`       |
 
-### Rate-limit endpoint (`--full` only)
+### Rate-limit endpoint
 
-| Check                           | PASS                                          | WARN                                          | FAIL                                       | Hint on non-PASS                                      |
-| ------------------------------- | --------------------------------------------- | --------------------------------------------- | ------------------------------------------ | ----------------------------------------------------- |
-| Endpoint reachable              | `GET /api/oauth/usage` returns 200            | Response 2s-5s (slow)                         | Timeout, network error, 4xx other than 429 | `check internet, or Anthropic status page`            |
-| Endpoint returns expected shape | Response deserializes into `UsageApiResponse` | Extra unknown fields present (forward-compat) | Missing required fields                    | `report a linesmith issue; Anthropic changed the API` |
-| Rate-limit headers sane         | No 429 returned                               | 429 with a reasonable `Retry-After`           | 429 with an abusive `Retry-After` (>1h)    | `slow down: you're hitting the rate limit`            |
+| Check                           | PASS                                          | WARN                                                                           | FAIL                                       | Hint on non-PASS                                      |
+| ------------------------------- | --------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------ | ----------------------------------------------------- |
+| Endpoint reachable              | `GET /api/oauth/usage` returns 200            | Response 2s-5s (slow), OR transport-level error (DNS / connect / read timeout) | 4xx other than 429 (definitive bad answer) | `check internet, or Anthropic status page`            |
+| Endpoint returns expected shape | Response deserializes into `UsageApiResponse` | Extra unknown fields present (forward-compat)                                  | Missing required fields                    | `report a linesmith issue; Anthropic changed the API` |
+| Rate-limit headers sane         | No 429 returned                               | 429 with a reasonable `Retry-After`                                            | 429 with an abusive `Retry-After` (>1h)    | `slow down: you're hitting the rate limit`            |
+
+Transport-level errors (no network, captive portal, corporate proxy refusal) are WARN, not FAIL: the user's _setup_ isn't broken, their _network_ is. FAIL is reserved for "we reached the endpoint and it gave us a definitive bad answer" (401 revoked token, 4xx server contract violation). This keeps offline users — including CI runs without network egress — at exit 0 unless their credentials are actually broken.
 
 ### Plugins
 
@@ -237,10 +241,10 @@ The token value itself is NEVER printed in doctor output — only source, scope 
 
 ### Self
 
-| Check                       | PASS                                         | WARN                              | FAIL | Hint on non-PASS                             |
-| --------------------------- | -------------------------------------------- | --------------------------------- | ---- | -------------------------------------------- |
-| Update available (`--full`) | Running on latest release                    | Newer release available on GitHub | —    | `run brew upgrade linesmith (or equivalent)` |
-| Binary integrity            | `linesmith --version` matches build metadata | Build metadata missing (unusual)  | —    | `reinstall from a canonical source`          |
+| Check            | PASS                                         | WARN                                                                                         | FAIL | Hint on non-PASS                             |
+| ---------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------- | ---- | -------------------------------------------- |
+| Update available | Running on latest release                    | Newer release available on GitHub, OR transport-level error reaching the GitHub releases API | —    | `run brew upgrade linesmith (or equivalent)` |
+| Binary integrity | `linesmith --version` matches build metadata | Build metadata missing (unusual)                                                             | —    | `reinstall from a canonical source`          |
 
 ## Behavior
 
@@ -259,7 +263,7 @@ Categories run in the order shown above (Environment → Config → Claude Code 
 
 ### Timing
 
-Default run target: <500ms total on a warm filesystem. Each check's budget:
+Local-only checks complete in <500ms total on a warm filesystem. Each check's budget:
 
 - Environment: sub-ms per check (all in-process)
 - Config: <5ms (one file parse)
@@ -268,9 +272,9 @@ Default run target: <500ms total on a warm filesystem. Each check's budget:
 - Cache: <1ms (stat only)
 - Plugins: <3ms per plugin (rhai parse)
 - Git: <15ms (gix discover + HEAD resolve)
-- Self: <1ms (env var read; `--full` adds a network call)
-
-`--full` adds ~2s for the endpoint probe (2s timeout per rate-limit-segments.md) and up to 2s for the update check (GitHub releases API).
+- Rate-limit endpoint: ~2s worst case (2s timeout per rate-limit-segments.md)
+- Self: <1ms for local checks; the GitHub update check adds up to 2s
+- Total worst case including network: ~5s
 
 ### Color / glyph selection
 
@@ -288,7 +292,7 @@ Per [ADR-0007](../adrs/0007-cargo-dist-distribution.md), linesmith's release pro
 
 ### JSON output (deferred)
 
-`--json` is reserved for v0.2. When implemented, the shape will be:
+`--json` is reserved for v0.2. The v0.1 implementation populates each check's `id` field today (so adding `--json` later is purely a serializer + flag, not a refactor). When implemented, the shape will be:
 
 ```json
 {
@@ -312,26 +316,27 @@ Per [ADR-0007](../adrs/0007-cargo-dist-distribution.md), linesmith's release pro
 }
 ```
 
-The `id` field is stable across versions for CI-script consumers.
+The `id` field is stable across versions for CI-script consumers. Convention: `<category>.<check_name>` in snake_case (e.g. `env.stdout_tty`, `config.parses`, `creds.token_resolvable`, `cache.usage_json_present`, `endpoint.reachable`, `plugins.compile`, `git.repo_detected`, `self.version`). Each category prefix matches its §Check catalog section name lowercased; the suffix names what the check verifies, not what it does (i.e., `env.stdout_tty` not `env.check_stdout_is_tty`). Once a slice publishes an `id`, it's locked — renames are a breaking change for consumers.
 
 ## Edge cases
 
-| Case                                                                 | Handling                                                                                 |
-| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| `linesmith doctor` run inside a CI container                         | Terminal width unknown, `$TERM=dumb` → WARN each; many checks still PASS                 |
-| `~/.claude.json` is a 500MB file (pathological)                      | Cap read at 2MB; FAIL with "file too large — likely corrupt"                             |
-| Keychain prompt appears on macOS during Credentials check            | First-run expected; if user denies, report as FAIL with `SubprocessFailed` hint          |
-| Config references a plugin that exists but fails to compile          | Config check PASSes (reference is legal); Plugins check FAILs (compile error)            |
-| Stale `usage.lock` (mtime > 30s)                                     | WARN with path + rm hint; doesn't block                                                  |
-| Anthropic endpoint returns 401                                       | FAIL (token expired/revoked); hint: `log in to Claude Code to refresh`                   |
-| No internet connection, `--full` specified                           | Endpoint reachability → FAIL with "no network"; other checks unaffected                  |
-| Multiple doctor runs in rapid succession                             | Each is independent; no cross-run state                                                  |
-| User runs `doctor` from a non-git directory                          | Git category's first check reports "not in a repo"; remaining Git checks SKIP. No error. |
-| Default plugin directory doesn't exist (no `plugin_dirs` configured) | SKIP the Plugins category with reason "no plugins configured"; not a failure             |
-| `~/.claude/sessions/{pid}.json` with a PID from a dead process       | Neutral — the stale entry doesn't affect doctor's checks                                 |
-| Terminal width < 80 cells                                            | Tree output wraps; no horizontal-scroll guarantees                                       |
-| `doctor` invoked with unrecognized flag                              | Prints usage; exits 2 (the usage-error code — distinct from FAIL's exit 1)               |
-| Cache dir is a symlink to a read-only filesystem                     | Creatable check FAILs with hint to point cache dir elsewhere                             |
+| Case                                                                 | Handling                                                                                                                                           |
+| -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `linesmith doctor` run inside a CI container                         | Terminal width unknown, `$TERM=dumb` → WARN each; many checks still PASS                                                                           |
+| `~/.claude.json` is a 500MB file (pathological)                      | Cap read at 2MB; FAIL with "file too large — likely corrupt"                                                                                       |
+| Keychain prompt appears on macOS during Credentials check            | First-run expected; if user denies, report as FAIL with `SubprocessFailed` hint                                                                    |
+| Config references a plugin that exists but fails to compile          | Config check PASSes (reference is legal); Plugins check FAILs (compile error)                                                                      |
+| Stale `usage.lock` (mtime > 30s)                                     | WARN with path + rm hint; doesn't block                                                                                                            |
+| Anthropic endpoint returns 401                                       | FAIL (token expired/revoked); hint: `log in to Claude Code to refresh`                                                                             |
+| No internet connection                                               | Endpoint reachability → WARN with "no network" (transport error, not a setup problem); update check → WARN; other checks unaffected; exit 0        |
+| Multiple doctor runs in rapid succession                             | Each is independent; no cross-run state                                                                                                            |
+| User runs `doctor` from a non-git directory                          | Git category's first check reports "not in a repo"; remaining Git checks SKIP. No error.                                                           |
+| Default plugin directory doesn't exist (no `plugin_dirs` configured) | SKIP the Plugins category with reason "no plugins configured"; not a failure                                                                       |
+| `~/.claude/sessions/{pid}.json` with a PID from a dead process       | Neutral — the stale entry doesn't affect doctor's checks                                                                                           |
+| Terminal width < 80 cells                                            | Tree output wraps; no horizontal-scroll guarantees                                                                                                 |
+| `doctor` invoked with unrecognized flag                              | Prints usage; exits 2 (the usage-error code — distinct from FAIL's exit 1)                                                                         |
+| Cache dir is a symlink to a read-only filesystem                     | Creatable check FAILs with hint to point cache dir elsewhere                                                                                       |
+| A check panics                                                       | Whole `doctor` run aborts (per §Panic behavior — `panic = "abort"` forecloses on `catch_unwind`); treat as a doctor bug, not a degradation surface |
 
 ## Testing strategy
 
@@ -342,8 +347,7 @@ Follows `AGENTS.md`: inline `#[cfg(test)] mod tests` for unit tests, `tests/doct
 - Severity-determination logic: given a stub source result, the check produces the documented severity
 - Remediation hints: every non-PASS path prints the expected hint text (tested against inline fixtures)
 - Short-circuit propagation: stubbed `$HOME` missing causes file-based checks to SKIP
-- `--plain` rendering: no ANSI codes, no Unicode glyphs
-- Panic catching: a check that panics reports as FAIL without propagating
+- `--plain` rendering: no ANSI codes, no Unicode glyphs in linesmith-emitted strings (user-supplied labels/hints pass through verbatim — see §Output format — `--plain` caveat)
 
 ### Integration tests
 
@@ -359,11 +363,13 @@ Snapshot each scenario's default and `--plain` output. Assert exit codes match t
 
 ### Benchmarks
 
-- Full run (no --full) on the `all_pass` fixture — criterion target: p95 <500ms
+- Local-only run on the `all_pass` fixture (network checks stubbed out) — criterion target: p95 <500ms
 
 ## Open questions
 
-- **`--json` timeline.** If the v0.1 implementation naturally produces a structured `Vec<CheckResult>` that can be serialized, `--json` is nearly free — include it. If the renderer is string-interpolation-first, defer cleanly to v0.2.
+- **`--json` timeline.** The v0.1 scaffold's `CheckResult` already carries a stable `id` field (per §JSON output), so adding a `serde::Serialize` impl + a `--json` flag is purely additive. Land it whenever a real consumer asks; no spec change needed up front.
+- **`--verbose` / `-v`.** Diagnostic detail level (e.g. show `$TERM` / `$COLORTERM` dumps, full keychain paths, gix HEAD sha, response headers from the endpoint probe) — orthogonal to `--plain`. Defer until at least one check category reveals data worth gating behind it; pair with `-v` short flag per CLI convention.
+- **`--offline` opt-out.** If users in air-gapped or proxy-restricted environments report friction with the always-on network probes, add `--offline` to skip the rate-limit endpoint + GitHub update check. Opt-out for stated need is appropriate; opt-in for speculative need is not.
 - **`doctor fix` subcommand.** Auto-remediation for the ten most common FAILs (regenerate config, clear stale lock, etc.) is tempting but opens a large blast-radius surface. Explicitly out of scope for v0.1; revisit once we have real user failure reports.
 - **Per-segment probes.** Currently doctor checks segment _registration_, not whether each segment actually renders output for the current StatusContext. A deeper mode would `render()` each enabled segment and flag any that return an error. Defer — the overhead isn't justified until users report hard-to-diagnose rendering bugs.
 - **Telemetry opt-in.** A "report this doctor output to Anthropic/linesmith maintainers" hint on fatal FAILs would help us debug installation issues. No PII concerns if we prompt + redact (token, email), but v0.1 sidesteps by making `doctor --plain` output easy to copy manually.
@@ -371,4 +377,5 @@ Snapshot each scenario's default and `--plain` output. Assert exit codes match t
 
 ## Change log
 
+- 2026-04-29: drop `--full` from the v0.1 CLI surface; all checks (including network probes) run unconditionally. Demote transport-level errors on the rate-limit endpoint and GitHub update check to WARN so offline environments stay at exit 0. Add I/O-failure clause to §Exit code contract. Add plain-mode passthrough caveat (renderer guarantees ASCII for its own strings only; user-supplied labels/hints pass through verbatim). Drop the contradictory "Panic catching" unit-test bullet from §Testing strategy — `panic = "abort"` forecloses on `catch_unwind` and §Panic behavior already documents this. Move `--verbose` and `--offline` to §Open questions for future revisits.
 - 2026-04-19: initial draft (v0.1). Defines the check catalog across eight categories (Environment, Config, Claude Code, Credentials, Cache, Rate-limit endpoint, Plugins, Git, Self), severity levels (PASS / WARN / FAIL / SKIP), exit-code contract (any FAIL → 1; WARN-only → 0), default tree-style output + `--plain` ASCII output, short-circuit propagation rules between categories, panic-safety wrapper, and testing strategy with fixture scenarios. `--json` and `doctor fix` flagged for v0.2+.

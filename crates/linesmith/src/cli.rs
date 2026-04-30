@@ -42,6 +42,14 @@ pub enum Action {
     Init {
         config: Option<PathBuf>,
     },
+    // Intentionally absent from `HELP`: advertising "diagnose your
+    // setup" while only emitting one PASS would be a false promise.
+    // Re-list when build_report covers the full eight-category catalog
+    // (see docs/specs/doctor.md §Check catalog).
+    Doctor {
+        plain: bool,
+        config: Option<PathBuf>,
+    },
 }
 
 /// Help text. Kept short; full docs live at
@@ -87,6 +95,7 @@ where
     let mut args = CliArgs::default();
     let mut positional: Vec<OsString> = Vec::new();
     let mut force = false;
+    let mut plain = false;
     while let Some(arg) = parser.next()? {
         match arg {
             Short('c') | Long("config") => {
@@ -115,22 +124,44 @@ where
                 // rather than growing parallel top-level bools.
                 force = true;
             }
+            Long("plain") => {
+                plain = true;
+            }
             Short('h') | Long("help") => return Ok(Action::Help),
             Short('V') | Long("version") => return Ok(Action::Version),
             Value(v) => positional.push(v),
             _ => return Err(arg.unexpected()),
         }
     }
-    let action = match dispatch_subcommand(&positional, force, args.config.clone())? {
+    let color_override_snapshot = args.color_override;
+    let action = match dispatch_subcommand(&positional, force, plain, args.config.clone())? {
         Some(action) => action,
         None => Action::Run(args),
     };
-    // `--force` is a `presets apply` modifier; accepting it on any other
-    // action would encourage muscle-memory misuse (e.g. `linesmith
-    // --force themes list` looks plausible and would otherwise be a
-    // no-op).
+    // `--force` only has meaning under `presets apply`; accepting it
+    // on any other action would encourage muscle-memory misuse.
     if force && !matches!(action, Action::PresetsApply { .. }) {
         return Err(lexopt::Error::UnexpectedOption("--force".to_string()));
+    }
+    // `--plain` only has meaning under `doctor`. Reject elsewhere so a
+    // typo like `linesmith --plain themes list` doesn't silently no-op.
+    if plain && !matches!(action, Action::Doctor { .. }) {
+        return Err(lexopt::Error::UnexpectedOption("--plain".to_string()));
+    }
+    // Doctor renders without ANSI today (glyph alphabet + separator
+    // are the only mode axes), so `--no-color` / `--force-color` would
+    // be silent no-ops. Reject so a user piping doctor output through
+    // a colorized log capture doesn't think they suppressed something
+    // that was never there. Once doctor grows colored output, thread
+    // the override through Action::Doctor at the same time.
+    if matches!(action, Action::Doctor { .. }) {
+        if let Some(override_) = color_override_snapshot {
+            let flag = match override_ {
+                ColorOverride::Never => "--no-color",
+                ColorOverride::Always => "--force-color",
+            };
+            return Err(lexopt::Error::UnexpectedOption(flag.to_string()));
+        }
     }
     Ok(action)
 }
@@ -140,6 +171,7 @@ where
 fn dispatch_subcommand(
     positional: &[OsString],
     force: bool,
+    plain: bool,
     config: Option<PathBuf>,
 ) -> Result<Option<Action>, lexopt::Error> {
     if positional.is_empty() {
@@ -155,6 +187,15 @@ fn dispatch_subcommand(
                 });
             }
             Ok(Some(Action::Init { config }))
+        }
+        "doctor" => {
+            if positional.len() > 1 {
+                return Err(lexopt::Error::UnexpectedValue {
+                    option: "doctor".to_string(),
+                    value: positional[1].to_string_lossy().to_string().into(),
+                });
+            }
+            Ok(Some(Action::Doctor { plain, config }))
         }
         "themes" => {
             let sub = positional.get(1).map(|s| s.to_string_lossy().into_owned());
@@ -530,6 +571,114 @@ mod tests {
         // through the same y/N prompt without a force escape hatch.
         let err = parse_args(&["--force", "init"]).unwrap_err();
         assert!(matches!(err, lexopt::Error::UnexpectedOption(ref s) if s == "--force"));
+    }
+
+    #[test]
+    fn doctor_subcommand_parses_with_no_flags() {
+        assert_eq!(
+            parse_args(&["doctor"]).expect("ok"),
+            Action::Doctor {
+                plain: false,
+                config: None,
+            }
+        );
+    }
+
+    #[test]
+    fn doctor_subcommand_parses_plain_flag() {
+        assert_eq!(
+            parse_args(&["doctor", "--plain"]).expect("ok"),
+            Action::Doctor {
+                plain: true,
+                config: None,
+            }
+        );
+    }
+
+    #[test]
+    fn doctor_plain_before_subcommand_also_parses() {
+        // lexopt interleaves flags and positionals; pinning both
+        // orderings prevents a parser regression that accepts only one.
+        assert_eq!(
+            parse_args(&["--plain", "doctor"]).expect("ok"),
+            Action::Doctor {
+                plain: true,
+                config: None,
+            }
+        );
+    }
+
+    #[test]
+    fn doctor_threads_config_flag_into_action() {
+        // Without this, `linesmith doctor --config /tmp/alt.toml`
+        // silently discarded the path and reported on the default
+        // config instead of the file the user explicitly asked
+        // about.
+        let got = parse_args(&["--config", "/tmp/alt.toml", "doctor"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::Doctor {
+                plain: false,
+                config: Some(PathBuf::from("/tmp/alt.toml")),
+            }
+        );
+    }
+
+    #[test]
+    fn color_overrides_rejected_on_doctor() {
+        // Doctor renders without ANSI today; honoring --no-color /
+        // --force-color silently would let a user think they
+        // suppressed something that was never there. Reject at parse
+        // time. When doctor gains color, thread the override into
+        // Action::Doctor and remove this rejection.
+        for (flag, expected) in [
+            ("--no-color", "--no-color"),
+            ("--force-color", "--force-color"),
+        ] {
+            let err = parse_args(&[flag, "doctor"]).unwrap_err();
+            assert!(
+                matches!(err, lexopt::Error::UnexpectedOption(ref s) if s == expected),
+                "flag {flag} should be rejected on doctor, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn doctor_combines_config_and_plain() {
+        let got = parse_args(&["--config", "/tmp/alt.toml", "doctor", "--plain"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::Doctor {
+                plain: true,
+                config: Some(PathBuf::from("/tmp/alt.toml")),
+            }
+        );
+    }
+
+    #[test]
+    fn doctor_with_extra_positional_errors() {
+        let err = parse_args(&["doctor", "extra"]).unwrap_err();
+        assert!(matches!(err, lexopt::Error::UnexpectedValue { .. }));
+    }
+
+    #[test]
+    fn plain_flag_rejected_outside_doctor() {
+        // Mirror the surface coverage that `--force` gets so a typo
+        // like `linesmith --plain themes list` doesn't silently no-op.
+        for args in [
+            vec!["--plain"],
+            vec!["--plain", "themes", "list"],
+            vec!["--plain", "presets", "list"],
+            vec!["--plain", "presets", "apply", "minimal"],
+            vec!["--plain", "init"],
+            vec!["--plain", "--check-config"],
+        ] {
+            let err = parse_args(&args).unwrap_err();
+            assert!(
+                matches!(err, lexopt::Error::UnexpectedOption(ref s) if s == "--plain"),
+                "args {args:?} should reject --plain, got {err:?}"
+            );
+        }
     }
 
     #[test]

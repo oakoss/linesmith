@@ -13,7 +13,7 @@ This spec defines how linesmith versions are cut, built, packaged, signed (or de
 
 Target-platform coverage, installer choices, and the single-binary story are decided in [ADR-0007](../adrs/0007-cargo-dist-distribution.md). This spec turns those decisions into concrete version semantics, a platform matrix, workflow step ordering, supply-chain signing posture, and a runbook.
 
-Out of scope: user-facing install instructions (those belong in the README); mirror distribution (e.g., APT, DEB, Snap, Nix) — deferred until v0.2+ with a demand signal; auto-update in-binary (deferred indefinitely; `doctor --full` reports newer releases).
+Out of scope: user-facing install instructions (those belong in the README); mirror distribution (e.g., APT, DEB, Snap, Nix) — deferred until v0.2+ with a demand signal; auto-update in-binary (deferred indefinitely; `linesmith doctor` reports newer releases as part of its standard run).
 
 ## Requirements
 
