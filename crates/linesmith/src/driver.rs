@@ -193,6 +193,23 @@ fn doctor_action(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> u8 {
+    let env = crate::doctor::DoctorEnv::from_process();
+    doctor_action_with_env(env, plain, config_override, stdout, stderr)
+}
+
+/// Test seam for `doctor_action`. Tests construct a hermetic
+/// `DoctorEnv` (via `DoctorEnv::healthy()` plus per-test mutation)
+/// and call this directly so the doctor's view of the world is
+/// controlled, not inherited from whatever ambient env the test
+/// runner happens to provide. Production code never calls this
+/// directly; it goes through `doctor_action`.
+fn doctor_action_with_env(
+    env: crate::doctor::DoctorEnv,
+    plain: bool,
+    config_override: Option<PathBuf>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> u8 {
     if let Some(path) = &config_override {
         let _ = writeln!(
             stderr,
@@ -200,7 +217,7 @@ fn doctor_action(
             path.display(),
         );
     }
-    let report = crate::doctor::build_report();
+    let report = crate::doctor::build_report(&env);
     let mode = if plain {
         crate::doctor::RenderMode::Plain
     } else {
@@ -3258,19 +3275,63 @@ mod tests {
     }
 
     #[test]
-    fn doctor_subcommand_renders_report_and_exits_zero() {
-        let (code, stdout, stderr) = run_cli_main(&["doctor"], b"", &CliEnv::for_tests());
-        assert_eq!(code, 0, "stderr was: {stderr}");
+    fn doctor_subcommand_dispatches_via_cli_main() {
+        // CLI-dispatch coverage: parsing reaches doctor_action and
+        // emits a report header. We don't assert exit code here
+        // because doctor_action calls DoctorEnv::from_process() —
+        // exit code depends on the host's $HOME / $TERM / TTY state,
+        // which test runners can leave in any shape (`env -i` etc.).
+        // The hermetic exit-code contracts live in the
+        // `doctor_action_with_env_*` tests below.
+        let (_code, stdout, _stderr) = run_cli_main(&["doctor"], b"", &CliEnv::for_tests());
         assert!(stdout.contains("linesmith doctor"), "{stdout}");
+        assert!(stdout.contains("Self"), "{stdout}");
+    }
+
+    /// Build a doctor-style stdout/stderr pair driven from a hermetic
+    /// `DoctorEnv`. Avoids the `from_process()` call that
+    /// `doctor_action` itself makes, so tests can assert exit codes
+    /// without depending on the host's env.
+    fn run_doctor(
+        env: crate::doctor::DoctorEnv,
+        plain: bool,
+        config_override: Option<PathBuf>,
+    ) -> (u8, String, String) {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = doctor_action_with_env(env, plain, config_override, &mut stdout, &mut stderr);
+        (
+            code,
+            String::from_utf8(stdout).expect("utf8 stdout"),
+            String::from_utf8(stderr).expect("utf8 stderr"),
+        )
+    }
+
+    #[test]
+    fn doctor_action_with_healthy_env_renders_and_exits_zero() {
+        let (code, stdout, stderr) = run_doctor(crate::doctor::DoctorEnv::healthy(), false, None);
+        assert_eq!(code, 0, "healthy env must exit 0; stderr was: {stderr}");
+        assert!(stdout.contains("linesmith doctor"), "{stdout}");
+        assert!(stdout.contains("Environment"), "{stdout}");
         assert!(stdout.contains("Self"), "{stdout}");
         assert!(stdout.contains("Exit: 0"), "{stdout}");
         assert!(stderr.is_empty(), "{stderr}");
     }
 
     #[test]
+    fn doctor_action_with_home_unset_exits_one() {
+        // The hermetic counterpart to the CLI-dispatch smoke: when
+        // env.home FAILs, doctor_action surfaces it as exit 1
+        // end-to-end, not just at the build_report layer.
+        let mut env = crate::doctor::DoctorEnv::healthy();
+        env.home_env = crate::doctor::EnvVarState::Unset;
+        let (code, _stdout, _stderr) = run_doctor(env, false, None);
+        assert_eq!(code, 1);
+    }
+
+    #[test]
     fn doctor_plain_output_is_ascii_only() {
-        let (code, stdout, _stderr) =
-            run_cli_main(&["doctor", "--plain"], b"", &CliEnv::for_tests());
+        let (code, stdout, _stderr) = run_doctor(crate::doctor::DoctorEnv::healthy(), true, None);
         assert_eq!(code, 0);
         assert!(stdout.is_ascii(), "plain output had non-ASCII:\n{stdout}");
         assert!(stdout.contains("OK"), "{stdout}");
@@ -3278,7 +3339,7 @@ mod tests {
 
     #[test]
     fn doctor_default_output_includes_unicode_glyph() {
-        let (code, stdout, _stderr) = run_cli_main(&["doctor"], b"", &CliEnv::for_tests());
+        let (code, stdout, _stderr) = run_doctor(crate::doctor::DoctorEnv::healthy(), false, None);
         assert_eq!(code, 0);
         assert!(stdout.contains('✓'), "{stdout}");
     }
@@ -3299,23 +3360,23 @@ mod tests {
         // Pin the warn-and-degrade contract until the Config category
         // actually inspects the path. Without this test, a future
         // contributor could silently drop the parameter again
-        // (regressing Codex P2) and parser tests alone wouldn't catch
+        // (regressing Codex P2) and the parser tests wouldn't catch
         // it. When config inspection lands, this test should be
         // replaced — not deleted — with one that asserts behavior
         // changes when the path is supplied.
-        let (code, stdout, stderr) = run_cli_main(
-            &["--config", "/nonexistent.toml", "doctor"],
-            b"",
-            &CliEnv::for_tests(),
+        let (code, stdout, stderr) = run_doctor(
+            crate::doctor::DoctorEnv::healthy(),
+            false,
+            Some(PathBuf::from("/nonexistent.toml")),
         );
         assert_eq!(code, 0, "no-op should not change exit code");
         assert!(
             stderr.contains("--config /nonexistent.toml accepted but not yet inspected"),
             "expected no-op warning on stderr, got: {stderr}"
         );
-        // Output must be identical to a no-config run; the flag is
-        // currently a true no-op for the report itself.
-        let (_, baseline_stdout, _) = run_cli_main(&["doctor"], b"", &CliEnv::for_tests());
+        // Report output must be identical to a no-config run; the
+        // flag is a true no-op for the report itself.
+        let (_, baseline_stdout, _) = run_doctor(crate::doctor::DoctorEnv::healthy(), false, None);
         assert_eq!(stdout, baseline_stdout, "report output must not change");
     }
 
@@ -3336,13 +3397,12 @@ mod tests {
         }
 
         let mut stderr = Vec::new();
-        let env = CliEnv::for_tests();
-        let code = cli_main(
-            ["doctor"].iter().map(std::ffi::OsString::from),
-            Cursor::new(&[][..]),
+        let code = doctor_action_with_env(
+            crate::doctor::DoctorEnv::healthy(),
+            false,
+            None,
             &mut FailingWriter,
             &mut stderr,
-            &env,
         );
         assert_eq!(
             code, 0,

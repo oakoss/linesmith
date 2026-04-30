@@ -11,7 +11,8 @@
 //! invariant or `Report` gains check-id-uniqueness, both gain
 //! constructors and seal their fields.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
+use std::path::PathBuf;
 
 /// One of four outcomes a check can report. See `docs/specs/doctor.md`
 /// §Severity levels.
@@ -267,19 +268,252 @@ pub fn render(out: &mut dyn Write, report: &Report, mode: RenderMode) -> std::io
     Ok(())
 }
 
+/// One environment variable's read state. Distinguishes the three
+/// outcomes a check has to remediate differently: not present (set
+/// it), set-to-empty (also set it), set-but-non-UTF-8 (the hint
+/// "set $X" would be wrong — `$X` *is* set, it's just unreadable).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvVarState {
+    Unset,
+    Set(String),
+    /// Variable is set but the value contains bytes that aren't valid
+    /// UTF-8. Carries a lossy preview so the hint can quote the
+    /// actual offending value rather than just say "missing".
+    NonUtf8(String),
+}
+
+impl EnvVarState {
+    fn snapshot(name: &str) -> Self {
+        match std::env::var(name) {
+            Ok(s) => Self::Set(s),
+            Err(std::env::VarError::NotPresent) => Self::Unset,
+            Err(std::env::VarError::NotUnicode(raw)) => {
+                Self::NonUtf8(raw.to_string_lossy().into_owned())
+            }
+        }
+    }
+
+    /// Convenience accessor: `Some(s)` only when the variable is set
+    /// AND non-empty AND valid UTF-8. Centralizes the
+    /// `Some(s) if !s.is_empty()` predicate that every consumer would
+    /// otherwise duplicate.
+    #[must_use]
+    pub fn nonempty(&self) -> Option<&str> {
+        match self {
+            Self::Set(s) if !s.is_empty() => Some(s),
+            _ => None,
+        }
+    }
+}
+
+/// Snapshot of the process state the doctor inspects, taken once at
+/// the call boundary and handed to [`build_report`]. Snapshotting
+/// keeps checks pure and tests hermetic — no test races the live env
+/// or sees mutations from a parallel test.
+///
+/// Deliberately does NOT derive `Clone`: `current_exe` carries an
+/// `io::Error` which isn't `Clone`, and rebuilding the snapshot
+/// (test fixture or `from_process()`) is the right pattern when a
+/// caller wants a fresh one.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct DoctorEnv {
+    /// Raw `$HOME` env var. NOT the `dirs::home_dir()` resolved path
+    /// — Unix `dirs` falls back to passwd entries which this snapshot
+    /// does not capture. Slices that need the resolved home directory
+    /// (e.g. Config) compute it themselves.
+    pub home_env: EnvVarState,
+    pub xdg_config_home: EnvVarState,
+    pub xdg_cache_home: EnvVarState,
+    pub term: EnvVarState,
+    pub colorterm: EnvVarState,
+    pub no_color: bool,
+    /// `Ok(path)` when `std::env::current_exe()` succeeds; the error
+    /// is preserved (rather than collapsed to `None`) so the binary-
+    /// path check can render the actual cause — "permission denied"
+    /// vs "broken symlink" vs "/proc unavailable" all need different
+    /// remediation hints.
+    pub current_exe: Result<PathBuf, std::io::Error>,
+    pub stdout_is_terminal: bool,
+    pub terminal_width_cells: Option<u16>,
+}
+
+impl DoctorEnv {
+    /// Snapshot the live process env. Only the binary entry should
+    /// call this; tests and any non-binary caller construct
+    /// `DoctorEnv` manually to stay hermetic.
+    #[must_use]
+    pub fn from_process() -> Self {
+        Self {
+            home_env: EnvVarState::snapshot("HOME"),
+            xdg_config_home: EnvVarState::snapshot("XDG_CONFIG_HOME"),
+            xdg_cache_home: EnvVarState::snapshot("XDG_CACHE_HOME"),
+            term: EnvVarState::snapshot("TERM"),
+            colorterm: EnvVarState::snapshot("COLORTERM"),
+            no_color: std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
+            current_exe: std::env::current_exe(),
+            stdout_is_terminal: std::io::stdout().is_terminal(),
+            terminal_width_cells: terminal_size::terminal_size()
+                .map(|(terminal_size::Width(w), _)| w),
+        }
+    }
+
+    /// Baseline "everything healthy" fixture for tests. Mutate
+    /// individual fields to exercise specific check branches.
+    /// `cfg(test)` keeps it out of the public API entirely —
+    /// external embedders can't fabricate a snapshot that lies
+    /// about a real environment.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn healthy() -> Self {
+        Self {
+            home_env: EnvVarState::Set("/home/user".to_string()),
+            xdg_config_home: EnvVarState::Unset,
+            xdg_cache_home: EnvVarState::Unset,
+            term: EnvVarState::Set("xterm-256color".to_string()),
+            colorterm: EnvVarState::Set("truecolor".to_string()),
+            no_color: false,
+            current_exe: Ok(PathBuf::from("/usr/local/bin/linesmith")),
+            stdout_is_terminal: true,
+            terminal_width_cells: Some(120),
+        }
+    }
+}
+
 /// Build the diagnostic report. Catalog scope is tracked in
 /// `docs/specs/doctor.md` §Check catalog.
 #[must_use]
-pub fn build_report() -> Report {
+pub fn build_report(env: &DoctorEnv) -> Report {
     Report {
         linesmith_version: env!("CARGO_PKG_VERSION"),
-        categories: vec![Category::new(
-            "Self",
-            vec![CheckResult::pass(
-                "self.version",
-                format!("linesmith {}", env!("CARGO_PKG_VERSION")),
-            )],
-        )],
+        categories: vec![environment_category(env), self_category(env)],
+    }
+}
+
+fn environment_category(env: &DoctorEnv) -> Category {
+    Category::new(
+        "Environment",
+        vec![
+            check_stdout_tty(env),
+            check_terminal_width(env),
+            check_term(env),
+            check_no_color(env),
+            check_home(env),
+        ],
+    )
+}
+
+fn check_stdout_tty(env: &DoctorEnv) -> CheckResult {
+    if env.stdout_is_terminal {
+        CheckResult::pass("env.stdout_tty", "Terminal is a tty (stdout fd 1)")
+    } else {
+        CheckResult::warn(
+            "env.stdout_tty",
+            "Stdout is not a tty (piped or redirected)",
+            "use --plain for CI or log capture",
+        )
+    }
+}
+
+/// Single source for the env.terminal_width and env.term hint
+/// strings — the WARN branches share the same remediation, so any
+/// future wording change touches one place.
+const TERMINAL_WIDTH_HINT: &str = "set $COLUMNS or use --plain; narrow widths may wrap output";
+const TERM_HINT: &str = "set TERM=xterm-256color, or accept plain-mode fallback";
+
+fn check_terminal_width(env: &DoctorEnv) -> CheckResult {
+    match env.terminal_width_cells {
+        Some(0) => CheckResult::warn(
+            "env.terminal_width",
+            "Terminal reported 0 cells (likely driver or terminfo bug)",
+            "set $COLUMNS to override, or report the issue to your terminal emulator",
+        ),
+        Some(w) if w >= 40 => CheckResult::pass(
+            "env.terminal_width",
+            format!("Terminal width detected: {w} cells"),
+        ),
+        Some(w) => CheckResult::warn(
+            "env.terminal_width",
+            format!("Terminal width is {w} cells (narrow)"),
+            TERMINAL_WIDTH_HINT,
+        ),
+        None => CheckResult::warn(
+            "env.terminal_width",
+            "Terminal width could not be detected",
+            TERMINAL_WIDTH_HINT,
+        ),
+    }
+}
+
+fn check_term(env: &DoctorEnv) -> CheckResult {
+    match &env.term {
+        EnvVarState::Set(t) if !t.is_empty() && t != "dumb" => {
+            CheckResult::pass("env.term", format!("$TERM={t}"))
+        }
+        EnvVarState::Set(t) if t == "dumb" => {
+            CheckResult::warn("env.term", "$TERM=dumb", TERM_HINT)
+        }
+        EnvVarState::NonUtf8(raw) => CheckResult::warn(
+            "env.term",
+            format!("$TERM is set but not valid UTF-8 (lossy: {raw:?})"),
+            "rewrite $TERM with a UTF-8 value (e.g. xterm-256color)",
+        ),
+        // Unset OR Set-to-empty.
+        _ => CheckResult::warn("env.term", "$TERM is unset", TERM_HINT),
+    }
+}
+
+fn check_no_color(env: &DoctorEnv) -> CheckResult {
+    if env.no_color {
+        CheckResult::pass(
+            "env.no_color",
+            "NO_COLOR is set — colors disabled per user preference",
+        )
+    } else {
+        CheckResult::pass("env.no_color", "NO_COLOR is unset")
+    }
+}
+
+fn check_home(env: &DoctorEnv) -> CheckResult {
+    match &env.home_env {
+        EnvVarState::Set(h) if !h.is_empty() => CheckResult::pass("env.home", format!("$HOME={h}")),
+        EnvVarState::NonUtf8(raw) => CheckResult::fail(
+            "env.home",
+            format!("$HOME is set but not valid UTF-8 (lossy: {raw:?})"),
+            "rewrite $HOME with a UTF-8 path",
+        ),
+        // Unset OR Set-to-empty: same remediation either way.
+        _ => CheckResult::fail(
+            "env.home",
+            "$HOME is unset",
+            "set $HOME to your user directory",
+        ),
+    }
+}
+
+fn self_category(env: &DoctorEnv) -> Category {
+    Category::new("Self", vec![check_self_version(), check_binary_path(env)])
+}
+
+fn check_self_version() -> CheckResult {
+    CheckResult::pass(
+        "self.version",
+        format!("linesmith {}", env!("CARGO_PKG_VERSION")),
+    )
+}
+
+fn check_binary_path(env: &DoctorEnv) -> CheckResult {
+    match &env.current_exe {
+        Ok(p) => CheckResult::pass("self.binary_path", format!("Binary: {}", p.display())),
+        // Preserve the underlying error so the user sees whether it
+        // was a missing /proc, a deleted exe, a permission issue,
+        // etc. Generic "reinstall" advice is only right for some of
+        // those.
+        Err(err) => CheckResult::warn(
+            "self.binary_path",
+            format!("Could not resolve binary path: {err}"),
+            "std::env::current_exe failed (unusual; check sandbox / permissions or reinstall)",
+        ),
     }
 }
 
@@ -392,7 +626,7 @@ mod tests {
 
     #[test]
     fn exit_code_is_zero_on_all_pass() {
-        assert_eq!(build_report().exit_code(), 0);
+        assert_eq!(build_report(&DoctorEnv::healthy()).exit_code(), 0);
     }
 
     #[test]
@@ -510,7 +744,12 @@ mod tests {
     #[test]
     fn plain_mode_summary_separator_is_ascii() {
         let mut out = Vec::new();
-        render(&mut out, &build_report(), RenderMode::Plain).expect("render ok");
+        render(
+            &mut out,
+            &build_report(&DoctorEnv::healthy()),
+            RenderMode::Plain,
+        )
+        .expect("render ok");
         let s = String::from_utf8(out).expect("utf8");
         assert!(
             s.contains("PASS / "),
@@ -529,7 +768,12 @@ mod tests {
     #[test]
     fn default_mode_summary_separator_is_middle_dot() {
         let mut out = Vec::new();
-        render(&mut out, &build_report(), RenderMode::Default).expect("render ok");
+        render(
+            &mut out,
+            &build_report(&DoctorEnv::healthy()),
+            RenderMode::Default,
+        )
+        .expect("render ok");
         let s = String::from_utf8(out).expect("utf8");
         assert!(
             s.contains("PASS · "),
@@ -540,7 +784,12 @@ mod tests {
     #[test]
     fn render_includes_summary_and_exit_lines() {
         let mut out = Vec::new();
-        render(&mut out, &build_report(), RenderMode::Plain).expect("render ok");
+        render(
+            &mut out,
+            &build_report(&DoctorEnv::healthy()),
+            RenderMode::Plain,
+        )
+        .expect("render ok");
         let s = String::from_utf8(out).expect("utf8");
         assert!(s.contains("Summary:"), "missing Summary line:\n{s}");
         assert!(s.contains("Exit: 0"), "missing Exit line:\n{s}");
@@ -582,7 +831,12 @@ mod tests {
     #[test]
     fn render_includes_category_header() {
         let mut out = Vec::new();
-        render(&mut out, &build_report(), RenderMode::Plain).expect("render ok");
+        render(
+            &mut out,
+            &build_report(&DoctorEnv::healthy()),
+            RenderMode::Plain,
+        )
+        .expect("render ok");
         let s = String::from_utf8(out).expect("utf8");
         assert!(s.contains("\nSelf\n"), "missing category header:\n{s}");
     }
@@ -679,5 +933,272 @@ mod tests {
         let s = CheckResult::skip("s.id", "label-s", "skip-reason");
         assert_eq!(s.label(), "label-s");
         assert_eq!(s.hint(), Some("skip-reason"));
+    }
+
+    // --- Environment / Self check categories ---
+
+    fn find_check<'a>(report: &'a Report, id: &str) -> &'a CheckResult {
+        report
+            .categories
+            .iter()
+            .flat_map(|c| &c.checks)
+            .find(|c| c.id() == id)
+            .unwrap_or_else(|| panic!("check {id} not present in report"))
+    }
+
+    #[test]
+    fn healthy_env_produces_only_pass_checks() {
+        let r = build_report(&DoctorEnv::healthy());
+        for check in r.categories.iter().flat_map(|c| &c.checks) {
+            assert_eq!(
+                check.severity(),
+                Severity::Pass,
+                "check {} should be PASS in healthy env, got {:?}",
+                check.id(),
+                check.severity(),
+            );
+        }
+        assert_eq!(r.exit_code(), 0);
+    }
+
+    #[test]
+    fn report_categories_are_environment_then_self() {
+        let r = build_report(&DoctorEnv::healthy());
+        let names: Vec<_> = r.categories.iter().map(|c| c.name).collect();
+        // Order matters for the user — Environment is the most basic
+        // surface to inspect, Self closes the report. New categories
+        // slot between these two.
+        assert_eq!(names, vec!["Environment", "Self"]);
+    }
+
+    #[test]
+    fn home_unset_fails_and_promotes_exit_code() {
+        let mut env = DoctorEnv::healthy();
+        env.home_env = EnvVarState::Unset;
+        let r = build_report(&env);
+        let home = find_check(&r, "env.home");
+        assert_eq!(home.severity(), Severity::Fail);
+        assert!(home.hint().unwrap().contains("$HOME"));
+        assert_eq!(r.exit_code(), 1);
+    }
+
+    #[test]
+    fn home_empty_string_fails() {
+        // Empty $HOME is the same shape as missing — `dirs::home_dir`
+        // returns None on Unix when $HOME is empty, and the check
+        // mirrors that.
+        let mut env = DoctorEnv::healthy();
+        env.home_env = EnvVarState::Set(String::new());
+        let r = build_report(&env);
+        assert_eq!(find_check(&r, "env.home").severity(), Severity::Fail);
+    }
+
+    #[test]
+    fn home_non_utf8_fails_with_distinct_hint() {
+        // Critical: the user-facing hint must NOT say "$HOME is unset"
+        // when $HOME is in fact set but unreadable. Misleading
+        // remediation makes the user fight a phantom problem.
+        let mut env = DoctorEnv::healthy();
+        env.home_env = EnvVarState::NonUtf8("/home/\u{FFFD}".to_string());
+        let r = build_report(&env);
+        let home = find_check(&r, "env.home");
+        assert_eq!(home.severity(), Severity::Fail);
+        assert!(
+            home.label().contains("UTF-8"),
+            "label should mention UTF-8: {}",
+            home.label()
+        );
+        assert!(
+            home.hint().unwrap().contains("UTF-8") || home.hint().unwrap().contains("rewrite"),
+            "hint should point at the real fix: {:?}",
+            home.hint()
+        );
+    }
+
+    #[test]
+    fn no_color_set_or_unset_both_pass() {
+        for no_color in [true, false] {
+            let mut env = DoctorEnv::healthy();
+            env.no_color = no_color;
+            let r = build_report(&env);
+            assert_eq!(find_check(&r, "env.no_color").severity(), Severity::Pass);
+        }
+    }
+
+    #[test]
+    fn term_dumb_warns_not_fails() {
+        let mut env = DoctorEnv::healthy();
+        env.term = EnvVarState::Set("dumb".to_string());
+        let r = build_report(&env);
+        assert_eq!(find_check(&r, "env.term").severity(), Severity::Warn);
+    }
+
+    #[test]
+    fn term_unset_warns() {
+        let mut env = DoctorEnv::healthy();
+        env.term = EnvVarState::Unset;
+        let r = build_report(&env);
+        assert_eq!(find_check(&r, "env.term").severity(), Severity::Warn);
+    }
+
+    #[test]
+    fn term_empty_warns() {
+        let mut env = DoctorEnv::healthy();
+        env.term = EnvVarState::Set(String::new());
+        let r = build_report(&env);
+        assert_eq!(find_check(&r, "env.term").severity(), Severity::Warn);
+    }
+
+    #[test]
+    fn term_non_utf8_warns_with_distinct_hint() {
+        let mut env = DoctorEnv::healthy();
+        env.term = EnvVarState::NonUtf8("xterm-\u{FFFD}".to_string());
+        let r = build_report(&env);
+        let term = find_check(&r, "env.term");
+        assert_eq!(term.severity(), Severity::Warn);
+        assert!(term.label().contains("UTF-8"));
+    }
+
+    #[test]
+    fn stdout_not_a_tty_warns_not_fails() {
+        // Critical contract: piped/CI stdout is WARN, never FAIL, so
+        // `linesmith doctor --plain | tee log.txt` in CI doesn't gate
+        // exit-1. Per spec §Cross-category short-circuits.
+        let mut env = DoctorEnv::healthy();
+        env.stdout_is_terminal = false;
+        let r = build_report(&env);
+        assert_eq!(find_check(&r, "env.stdout_tty").severity(), Severity::Warn);
+        assert_eq!(r.exit_code(), 0, "non-tty must not promote exit code");
+    }
+
+    #[test]
+    fn terminal_width_unknown_warns() {
+        let mut env = DoctorEnv::healthy();
+        env.terminal_width_cells = None;
+        let r = build_report(&env);
+        assert_eq!(
+            find_check(&r, "env.terminal_width").severity(),
+            Severity::Warn
+        );
+    }
+
+    #[test]
+    fn terminal_width_under_threshold_warns() {
+        // Spec §Environment: Some((W, _)) with W < 40 → WARN.
+        let mut env = DoctorEnv::healthy();
+        env.terminal_width_cells = Some(39);
+        let r = build_report(&env);
+        assert_eq!(
+            find_check(&r, "env.terminal_width").severity(),
+            Severity::Warn
+        );
+    }
+
+    #[test]
+    fn terminal_width_at_threshold_passes() {
+        let mut env = DoctorEnv::healthy();
+        env.terminal_width_cells = Some(40);
+        let r = build_report(&env);
+        assert_eq!(
+            find_check(&r, "env.terminal_width").severity(),
+            Severity::Pass
+        );
+    }
+
+    #[test]
+    fn terminal_width_zero_warns_with_distinct_hint() {
+        // 0 cells is qualitatively different from "narrow" — it's a
+        // driver / terminfo bug. The hint must point at the terminal
+        // emulator, not "set $COLUMNS".
+        let mut env = DoctorEnv::healthy();
+        env.terminal_width_cells = Some(0);
+        let r = build_report(&env);
+        let w = find_check(&r, "env.terminal_width");
+        assert_eq!(w.severity(), Severity::Warn);
+        let hint = w.hint().unwrap();
+        assert!(
+            hint.contains("terminal emulator") || hint.contains("driver"),
+            "hint should distinguish driver bug from narrow width: {hint}"
+        );
+    }
+
+    #[test]
+    fn binary_path_resolves_passes() {
+        let env = DoctorEnv::healthy();
+        let r = build_report(&env);
+        let bin = find_check(&r, "self.binary_path");
+        assert_eq!(bin.severity(), Severity::Pass);
+        assert!(bin.label().contains("Binary"));
+    }
+
+    #[test]
+    fn binary_path_failure_preserves_io_error_in_label() {
+        // Generic "current_exe failed" hides the cause. The label
+        // must include the underlying io::Error so a user sees
+        // whether it's permission-denied vs broken-symlink etc.
+        let mut env = DoctorEnv::healthy();
+        env.current_exe = Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "no access to /proc/self/exe",
+        ));
+        let r = build_report(&env);
+        let bin = find_check(&r, "self.binary_path");
+        assert_eq!(bin.severity(), Severity::Warn);
+        assert!(
+            bin.label().contains("no access to /proc/self/exe"),
+            "io::Error message must surface in label: {}",
+            bin.label()
+        );
+    }
+
+    #[test]
+    fn self_version_check_includes_crate_version() {
+        let r = build_report(&DoctorEnv::healthy());
+        let v = find_check(&r, "self.version");
+        assert_eq!(v.severity(), Severity::Pass);
+        assert!(v.label().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn doctor_env_from_process_does_not_panic() {
+        // Smoke: the production env-snapshot path must not panic
+        // regardless of the host's env state. (The actual values are
+        // host-dependent so we don't assert on them.)
+        let _ = DoctorEnv::from_process();
+    }
+
+    #[test]
+    fn env_var_state_nonempty_filters_unset_empty_and_nonutf8() {
+        assert_eq!(EnvVarState::Unset.nonempty(), None);
+        assert_eq!(EnvVarState::Set(String::new()).nonempty(), None);
+        assert_eq!(
+            EnvVarState::NonUtf8("garbage".into()).nonempty(),
+            None,
+            "non-UTF-8 must not surface as Some — caller would treat the lossy preview as the real value"
+        );
+        assert_eq!(EnvVarState::Set("x".into()).nonempty(), Some("x"));
+    }
+
+    #[test]
+    fn check_ids_follow_namespacing_convention() {
+        // Spec §JSON output: ids are <category>.<check_name> in
+        // snake_case. Extend the prefix allowlist as new categories
+        // ship per spec §Check catalog — this test is a tripwire,
+        // not a free pass.
+        let r = build_report(&DoctorEnv::healthy());
+        for check in r.categories.iter().flat_map(|c| &c.checks) {
+            let id = check.id();
+            assert!(id.contains('.'), "id `{id}` missing dotted namespace",);
+            let prefix = id.split('.').next().unwrap();
+            assert!(
+                matches!(prefix, "env" | "self"),
+                "id `{id}` has unknown category prefix `{prefix}`",
+            );
+            assert!(
+                id.chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c == '.'),
+                "id `{id}` not snake_case",
+            );
+        }
     }
 }

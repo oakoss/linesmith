@@ -243,8 +243,11 @@ Transport-level errors (no network, captive portal, corporate proxy refusal) are
 
 | Check            | PASS                                         | WARN                                                                                         | FAIL | Hint on non-PASS                             |
 | ---------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------- | ---- | -------------------------------------------- |
+| Binary path      | `std::env::current_exe()` returns Ok         | `current_exe()` failed (sandbox / permissions / deleted exe — error message included)        | —    | check sandbox / permissions or reinstall     |
 | Update available | Running on latest release                    | Newer release available on GitHub, OR transport-level error reaching the GitHub releases API | —    | `run brew upgrade linesmith (or equivalent)` |
 | Binary integrity | `linesmith --version` matches build metadata | Build metadata missing (unusual)                                                             | —    | `reinstall from a canonical source`          |
+
+**Binary path vs. Binary integrity.** The first check answers "do we know where this binary lives" — a precondition for any reinstall guidance and for diagnostic context the user copies into bug reports. The second answers "does our advertised version match what was baked in" — a tamper / corruption check that requires build metadata (vergen / built / option_env\!("LINESMITH_BUILD_SHA")). They're independent and can land in separate slices.
 
 ## Behavior
 
@@ -377,5 +380,6 @@ Snapshot each scenario's default and `--plain` output. Assert exit codes match t
 
 ## Change log
 
+- 2026-04-30: split §Self "Binary integrity" row into "Binary path" (current_exe resolution; ships now) + "Binary integrity" (version vs build metadata; future). The two answer different questions and the original row conflated them, leading the implementation to ship the cheaper precondition under the integrity-check label.
 - 2026-04-29: drop `--full` from the v0.1 CLI surface; all checks (including network probes) run unconditionally. Demote transport-level errors on the rate-limit endpoint and GitHub update check to WARN so offline environments stay at exit 0. Add I/O-failure clause to §Exit code contract. Add plain-mode passthrough caveat (renderer guarantees ASCII for its own strings only; user-supplied labels/hints pass through verbatim). Drop the contradictory "Panic catching" unit-test bullet from §Testing strategy — `panic = "abort"` forecloses on `catch_unwind` and §Panic behavior already documents this. Move `--verbose` and `--offline` to §Open questions for future revisits.
 - 2026-04-19: initial draft (v0.1). Defines the check catalog across eight categories (Environment, Config, Claude Code, Credentials, Cache, Rate-limit endpoint, Plugins, Git, Self), severity levels (PASS / WARN / FAIL / SKIP), exit-code contract (any FAIL → 1; WARN-only → 0), default tree-style output + `--plain` ASCII output, short-circuit propagation rules between categories, panic-safety wrapper, and testing strategy with fixture scenarios. `--json` and `doctor fix` flagged for v0.2+.
