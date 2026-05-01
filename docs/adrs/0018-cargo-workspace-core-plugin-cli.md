@@ -1,6 +1,6 @@
 ## Split linesmith into a Cargo workspace with `core`, `plugin`, and `cli` crates
 
-- Status: superseded by [ADR-0019](0019-publish-linesmith-core-as-scaffolding-from-v0-1.md)
+- Status: superseded by [ADR-0019](0019-publish-linesmith-core-as-scaffolding-from-v0-1.md) (publish posture) and [ADR-0020](0020-keep-cli-as-linesmith-bridge-in-core.md) (crate partition refinements)
 - Date: 2026-04-30
 - Deciders: Jace Babin
 
