@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-05-01
+
+### Bug Fixes
+
+- **doctor:** Use FileCascadeEnv::new() in cross-crate test sites([1afa91a](https://github.com/oakoss/linesmith/commit/1afa91aac6dea5eda67760783eb42b71b8fe468b))
+- **doctor:** Make cache-root check read-only + audit snapshot helpers([ff8c0d0](https://github.com/oakoss/linesmith/commit/ff8c0d07d81dcf6264dbc8078f43c70a7d9466c4))
+- **core:** Cfg-gate `~` to POSIX in needs_shell_quoting([8601a45](https://github.com/oakoss/linesmith/commit/8601a4586c234f2bff7f186a3e60feaa952d8a8a))
+- **core:** Correct Windows test failures in driver.rs([c8c213f](https://github.com/oakoss/linesmith/commit/c8c213fe423e93884cc82a4857d7f4728dff0f21))
+- **core:** Tolerate Windows MoveFileEx race losers in cascade persistence([abe697d](https://github.com/oakoss/linesmith/commit/abe697d8c614a2269382fe2e26d1410725a52012))
+- **core:** Gate KEYCHAIN_SERVICE to macOS so Ubuntu clippy passes([769e355](https://github.com/oakoss/linesmith/commit/769e355e70c043a72e4d620a0f61fff1c29755ec))
+- **core:** Tolerate null required leaves in parse_context_window([93506ac](https://github.com/oakoss/linesmith/commit/93506acca6f9cb475b9dc365d74156abf489d02f))
+
+### Features
+
+- **doctor:** Land linesmith doctor v0.1 (Config..Self categories)([16d1950](https://github.com/oakoss/linesmith/commit/16d19509a95eae9cb34b5b395a696f8f136c72ae))
+- **doctor:** Wire Environment + Self check categories([546029c](https://github.com/oakoss/linesmith/commit/546029c6ecf65c0ed7dbda7505d60766cfdd40ad))
+- **doctor:** Scaffold linesmith doctor subcommand([bdac37f](https://github.com/oakoss/linesmith/commit/bdac37f8099374de416d3962bd9c9eaae5301124))
+- **data:** Honor HTTPS_PROXY / HTTP_PROXY / NO_PROXY for OAuth fetcher([4cab952](https://github.com/oakoss/linesmith/commit/4cab95255c699ff62d2cd6a3684a52967f7a69a5))
+- **config:** Publish config.schema.json + wire CI drift check([70f0723](https://github.com/oakoss/linesmith/commit/70f0723dd98d3c93697528a5cf1b3600e20800e4))
+- **input:** Warn-and-degrade for cost / effort / vim / output_style / agent / version([c6ea8cf](https://github.com/oakoss/linesmith/commit/c6ea8cf71a7fc49ed5589c19e344a910860a0906))
+- **input:** Warn-and-degrade parse for model/workspace/context_window([44b8d5a](https://github.com/oakoss/linesmith/commit/44b8d5a5564db7e8cd491bdadee8a9746dcdff78))
+- **layout:** Add multi-line layout via [line.N] + layout key([414d955](https://github.com/oakoss/linesmith/commit/414d95566ad9f6670ac662681a29c96547ba1ae8))
+- **cli:** Add interactive `linesmith init` subcommand([7ce72d8](https://github.com/oakoss/linesmith/commit/7ce72d8d718d5eec0b5e4a5c04899f575570e931))
+- **layout:** Add [layout_options].separator + powerline_width config([f34b8df](https://github.com/oakoss/linesmith/commit/f34b8dfa618fa2e0de45c1e5561a0705bf975568))
+- **themes:** Add 5 curated presets + extract default/minimal([e1d17ae](https://github.com/oakoss/linesmith/commit/e1d17ae4e9bfc6ec17408c3783555d5d71baaf1c))
+- **engine:** Wire OSC 8 hyperlinks end-to-end with sanitized URLs([d016c72](https://github.com/oakoss/linesmith/commit/d016c72d594e5e461db5105f03f040f5f7716bf4))
+- **segments:** Add opt-in version segment for CC CLI version([d0bc5d7](https://github.com/oakoss/linesmith/commit/d0bc5d7a6e51cc2e0633a43727b9a8fbd5e12bd3))
+- **layout:** Add render_to_runs styled-run emit path([06945ad](https://github.com/oakoss/linesmith/commit/06945ad8e1ddb9cc8770d2f2d63681d5aaec9276))
+- **core:** Land render perf benchmarks + cold-start hyperfine task([f2d5096](https://github.com/oakoss/linesmith/commit/f2d5096a18ec29467d8b47257fb9262c09caf9fb))
+- **segments:** Add output_style + vim + agent segments([d249322](https://github.com/oakoss/linesmith/commit/d249322a50abd8a9f73ad9955d52b3151c51fa0e))
+- **core:** Add Segment::shrink_to_fit for layout-pressure compaction([327390f](https://github.com/oakoss/linesmith/commit/327390fb1a831930baa06bcd061b55af25f0f678))
+- **segments:** Add per-marker hide_below_cells thresholds to git_branch([ab74914](https://github.com/oakoss/linesmith/commit/ab7491458397842b49e91e1cd1c870af07284b83))
+- **segments:** Add model.format config (compact strips "context" filler)([8a5c845](https://github.com/oakoss/linesmith/commit/8a5c8458eb09f2ee99b78ce0ae0b9752e5945174))
+- **core:** Add RenderContext arg to Segment::render([fecbf33](https://github.com/oakoss/linesmith/commit/fecbf33e84fc80a70b0c92d7dba79abc22e349d4))
+- **core:** Reflow truncatable segments before dropping([4ea4df1](https://github.com/oakoss/linesmith/commit/4ea4df1372c8b736e44ffc595f6c2113347c61e5))
+- **segments:** Add session_duration segment([5fdf737](https://github.com/oakoss/linesmith/commit/5fdf7370bd9c6938e47420e176fc483c7e23bc4a))
+- **segments:** Add context_bar visual fill segment([b293f03](https://github.com/oakoss/linesmith/commit/b293f03ffe89c2295fe2d5f7dd6786bb2f49d021))
+
+### Refactoring
+
+- **repo:** Split linesmith into linesmith-core + linesmith-cli workspace([602d9f0](https://github.com/oakoss/linesmith/commit/602d9f06e8fe70ebc400c15c8c61b995bb4f40a8))
+- **runtime:** Extract runtime predicates into a dedicated module([88dc4f9](https://github.com/oakoss/linesmith/commit/88dc4f9020a2c3381935eefa0bf8500fcef54d6e))
+- **data:** Collapse XDG cascade + lift credentials env to a snapshot([0141749](https://github.com/oakoss/linesmith/commit/0141749a5f4e6154f5f60d7e9c288c48f748b8ce))
+- **config:** Pin schema URL to main per industry pragma([b1e83cc](https://github.com/oakoss/linesmith/commit/b1e83cce91eec1c8fb1834e86626d5ef560f94be))
+
 ## [0.1.1] - 2026-04-25
 
 ### Bug Fixes
