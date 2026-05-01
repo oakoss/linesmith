@@ -6443,15 +6443,12 @@ mod tests {
         // host without real credentials, but that's the correct
         // outcome, not a doctor false-negative.
         use crate::data_context::credentials::FileCascadeEnv;
+        // `FileCascadeEnv` is `#[non_exhaustive]` in linesmith-core,
+        // so cross-crate struct-literal construction is blocked
+        // (E0639). Build via the public constructor instead.
         for env in [
-            FileCascadeEnv {
-                xdg_config_home: Some(PathBuf::from("/etc/xdg")),
-                ..Default::default()
-            },
-            FileCascadeEnv {
-                claude_config_dir: Some(PathBuf::from("/etc/claude")),
-                ..Default::default()
-            },
+            FileCascadeEnv::new(None, Some("/etc/xdg".into()), None),
+            FileCascadeEnv::new(Some("/etc/claude".into()), None, None),
         ] {
             let snapshot = snapshot_credentials(&env);
             assert!(
