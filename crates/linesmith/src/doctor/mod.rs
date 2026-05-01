@@ -938,12 +938,25 @@ impl DoctorEnv {
             ConfigReadOutcome::Loaded { config, .. } => stat_plugin_dirs(&config.plugin_dirs),
             _ => Vec::new(),
         };
-        let (known_segment_ids, plugins) = snapshot_plugins(
-            &read,
-            xdg_subdir(&xdg_config_home, &home_env, "segments").as_deref(),
+        // Build the runtime XdgEnv once and reuse it across every
+        // runtime predicate doctor calls — eliminates drift if
+        // XdgEnv ever picks up new fields (e.g. XDG_DATA_HOME).
+        //
+        // Both doctor and cli land in `XdgEnv::from_os_options`,
+        // which is the single empty-string filter. Non-UTF-8 was
+        // already dropped upstream by both paths, but for different
+        // reasons: cli via `std::env::var().ok()` (UTF-8-strict),
+        // doctor via `EnvVarState::nonempty()` (which collapses
+        // `NonUtf8 → None`). Net effect is parity today; if either
+        // path ever needs to preserve non-UTF-8 bytes, both have
+        // to change together.
+        let runtime_xdg_env = crate::data_context::xdg::XdgEnv::from_os_options(
+            None,
+            xdg_config_home.nonempty().map(std::ffi::OsString::from),
+            home_env.nonempty().map(std::ffi::OsString::from),
         );
-        let known_theme_names =
-            collect_known_theme_names(xdg_subdir(&xdg_config_home, &home_env, "themes").as_deref());
+        let (known_segment_ids, plugins) = snapshot_plugins(&read, &runtime_xdg_env);
+        let known_theme_names = collect_known_theme_names(&runtime_xdg_env);
         let config = DoctorConfigSnapshot {
             cli_override: cli_config_override,
             resolved,

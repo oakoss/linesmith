@@ -4,11 +4,10 @@
 //! `CliEnv::from_process`; tests pass `Cursor` / `Vec<u8>` buffers
 //! and a hand-built `CliEnv`.
 
-use crate::plugins::{build_engine, PluginRegistry};
+use crate::plugins::PluginRegistry;
 use crate::segments::builder::build_lines;
-use crate::segments::BUILT_IN_SEGMENT_IDS;
 use crate::{
-    cli, config, detect_terminal_width, presets, run_lines_with_context, theme, RunContext,
+    cli, config, detect_terminal_width, presets, run_lines_with_context, runtime, theme, RunContext,
 };
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -778,17 +777,11 @@ fn compose_init_body(preset_body: &str, theme: &str) -> String {
     }
 }
 
-/// Discover and compile plugin scripts. Returns `None` when no
-/// `plugin_dirs` are configured AND no XDG default exists, so the
-/// no-plugins fast path skips engine construction entirely.
-///
-/// The XDG dir is computed from [`CliEnv`] (not `std::env`) so test
-/// harnesses don't inherit the developer's real
-/// `~/.config/linesmith/segments/`.
-///
-/// The returned `error_count` lets `--check-config` fold plugin-load
-/// failures into its summary warning total without re-parsing the
-/// stderr stream.
+/// CLI-side wrapper around [`runtime::plugins::load_plugins`]:
+/// builds the runtime `XdgEnv` from `CliEnv`, calls the predicate,
+/// streams plugin-load errors to stderr, and returns the registry
+/// plus the error count so `check_config` can fold the count into
+/// its summary without re-parsing the stderr stream.
 fn load_plugins(
     cfg: Option<&config::Config>,
     env: &CliEnv,
@@ -797,26 +790,10 @@ fn load_plugins(
     Option<(PluginRegistry, std::sync::Arc<rhai::Engine>)>,
     usize,
 ) {
-    let config_dirs: &[PathBuf] = cfg.map_or(&[], |c| c.plugin_dirs.as_slice());
-    let xdg_dir = xdg_segments_dir(env);
-
-    // Cold-start fast path: skip `build_engine` entirely when no
-    // plugin source exists on disk. The XDG path is set whenever
-    // `HOME` is, but usually points at a directory that was never
-    // created — checking once beats paying engine-construction cost
-    // on every render.
-    let xdg_present = xdg_dir.as_deref().is_some_and(|p| p.is_dir());
-    if config_dirs.is_empty() && !xdg_present {
+    let xdg_env = cli_env_to_xdg(env);
+    let Some((registry, engine)) = runtime::plugins::load_plugins(cfg, &xdg_env) else {
         return (None, 0);
-    }
-
-    let engine = build_engine();
-    let registry = PluginRegistry::load_with_xdg(
-        config_dirs,
-        xdg_dir.as_deref(),
-        &engine,
-        BUILT_IN_SEGMENT_IDS,
-    );
+    };
     let errors = registry.load_errors();
     let error_count = errors.len();
     for err in errors {
@@ -825,18 +802,17 @@ fn load_plugins(
     (Some((registry, engine)), error_count)
 }
 
-/// `$XDG_CONFIG_HOME/linesmith/segments/` if `XDG_CONFIG_HOME` is set,
-/// else `$HOME/.config/linesmith/segments/`. `None` when neither env
-/// var is populated (clean test harness). Delegates to
-/// [`xdg::resolve_subdir`](crate::data_context::xdg::resolve_subdir).
-fn xdg_segments_dir(env: &CliEnv) -> Option<PathBuf> {
-    use crate::data_context::xdg::{resolve_subdir, XdgEnv, XdgScope};
-    let xdg_env = XdgEnv::from_os_options(
+/// Build the runtime's `XdgEnv` snapshot from this caller's
+/// [`CliEnv`]. Centralized so every runtime predicate that needs
+/// XDG inputs gets the same conversion, and so `linesmith-cli`
+/// keeps owning the `CliEnv → XdgEnv` map after the workspace
+/// split (per ADR-0018).
+fn cli_env_to_xdg(env: &CliEnv) -> crate::data_context::xdg::XdgEnv {
+    crate::data_context::xdg::XdgEnv::from_os_options(
         None,
         env.xdg_config_home.clone().map(std::ffi::OsString::from),
         env.home.clone().map(std::ffi::OsString::from),
-    );
-    resolve_subdir(&xdg_env, XdgScope::Config, "segments")
+    )
 }
 
 fn run_cli(
@@ -897,30 +873,12 @@ fn run_cli(
     0
 }
 
-/// Where linesmith looks for user theme files. Prefers
-/// `$XDG_CONFIG_HOME/linesmith/themes/`; falls back to
-/// `$HOME/.config/linesmith/themes/`. Returns `None` when neither
-/// env var is set — tests drive this via `CliEnv::default()` and
-/// should see no user-theme loading attempt. Delegates to
-/// [`xdg::resolve_subdir`](crate::data_context::xdg::resolve_subdir).
-fn user_themes_dir(env: &CliEnv) -> Option<PathBuf> {
-    use crate::data_context::xdg::{resolve_subdir, XdgEnv, XdgScope};
-    let xdg_env = XdgEnv::from_os_options(
-        None,
-        env.xdg_config_home.clone().map(std::ffi::OsString::from),
-        env.home.clone().map(std::ffi::OsString::from),
-    );
-    resolve_subdir(&xdg_env, XdgScope::Config, "themes")
-}
-
 fn build_theme_registry(env: &CliEnv, stderr: &mut dyn Write) -> theme::ThemeRegistry {
-    let mut registry = theme::ThemeRegistry::with_built_ins();
-    if let Some(dir) = user_themes_dir(env) {
-        registry = registry.with_user_themes(&dir, |msg| {
-            let _ = writeln!(stderr, "linesmith: {msg}");
-        });
-    }
-    registry
+    let xdg_env = cli_env_to_xdg(env);
+    let dir = runtime::themes::user_themes_dir(&xdg_env);
+    runtime::themes::build_theme_registry(dir.as_deref(), |msg| {
+        let _ = writeln!(stderr, "linesmith: {msg}");
+    })
 }
 
 fn layout_options(cfg: Option<&config::Config>) -> Option<&config::LayoutOptions> {
@@ -1007,11 +965,11 @@ fn resolve_theme<'a>(
     }
 }
 
-/// Load the config at `resolved` if present. Missing files are silent
-/// for implicit paths (first-run users) but warn for explicit paths
-/// (the user asked for a specific file and it wasn't there). Unknown
-/// keys inside the file are collected as warnings so callers (render
-/// path vs `--check-config`) can decide how to surface them.
+/// `--check-config`-friendly wrapper around
+/// [`runtime::config::load_config`]. Writes user-facing diagnostics
+/// (missing-file for explicit paths, parse / I/O errors) to stderr
+/// and returns the existing 3-tuple shape `run_cli` and
+/// `check_config` consume.
 fn load_config(
     resolved: Option<&config::ConfigPath>,
     stderr: &mut dyn Write,
@@ -1020,27 +978,26 @@ fn load_config(
     Option<config::ConfigError>,
     Vec<String>,
 ) {
-    let Some(cp) = resolved else {
-        return (None, None, Vec::new());
-    };
-    let mut warnings = Vec::new();
-    let load_result =
-        config::Config::load_validated(&cp.path, |msg| warnings.push(msg.to_string()));
-    match load_result {
-        Ok(Some(c)) => (Some(c), None, warnings),
-        Ok(None) => {
-            if cp.explicit {
-                let _ = writeln!(
-                    stderr,
-                    "linesmith: config not found at {}",
-                    cp.path.display()
-                );
+    use runtime::config::ConfigLoadOutcome;
+    match runtime::config::load_config(resolved) {
+        ConfigLoadOutcome::Unresolved => (None, None, Vec::new()),
+        ConfigLoadOutcome::Loaded {
+            config, warnings, ..
+        } => (Some(*config), None, warnings),
+        ConfigLoadOutcome::NotFound { path, explicit } => {
+            if explicit {
+                let _ = writeln!(stderr, "linesmith: config not found at {}", path.display());
             }
-            (None, None, warnings)
+            (None, None, Vec::new())
         }
-        Err(e) => {
-            let _ = writeln!(stderr, "linesmith: {e}");
-            (None, Some(e), warnings)
+        ConfigLoadOutcome::IoError {
+            source, warnings, ..
+        }
+        | ConfigLoadOutcome::ParseError {
+            source, warnings, ..
+        } => {
+            let _ = writeln!(stderr, "linesmith: {source}");
+            (None, Some(source), warnings)
         }
     }
 }
@@ -1979,7 +1936,10 @@ mod tests {
     #[test]
     fn themes_list_includes_user_themes_with_source_path() {
         let dir = tempdir();
-        let themes_dir = dir.path().join(".config/linesmith/themes");
+        // Separator-normalized join to match the XDG cascade's
+        // chained `.join` form on Windows — substring match against
+        // cascade-rendered output requires identical separators.
+        let themes_dir = dir.path().join(".config").join("linesmith").join("themes");
         std::fs::create_dir_all(&themes_dir).unwrap();
         let user_theme = themes_dir.join("neon.toml");
         std::fs::write(

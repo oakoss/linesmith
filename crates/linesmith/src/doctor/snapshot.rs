@@ -19,59 +19,27 @@ use super::{
     EndpointProbe, EndpointProbeOutcome, EnvVarState, LockState, PluginDirState, PluginDirStatus,
     UsageJsonState,
 };
-use crate::config::{Config, ConfigPath};
+use crate::config::ConfigPath;
 use crate::data_context::credentials::FileCascadeEnv;
 
-/// Resolve `$XDG_CONFIG_HOME/linesmith/<sub>` falling back to
-/// `$HOME/.config/linesmith/<sub>`. Delegates to
-/// [`crate::data_context::xdg::resolve_subdir`] — driver and doctor
-/// share the same predicate so the doctor's view of the plugin /
-/// theme dirs lines up with what the runtime actually loads from.
-pub(super) fn xdg_subdir(xdg: &EnvVarState, home: &EnvVarState, sub: &str) -> Option<PathBuf> {
-    use crate::data_context::xdg::{resolve_subdir, XdgEnv, XdgScope};
-    let env = XdgEnv::from_os_options(
-        None,
-        xdg.nonempty().map(std::ffi::OsString::from),
-        home.nonempty().map(std::ffi::OsString::from),
-    );
-    resolve_subdir(&env, XdgScope::Config, sub)
-}
-
-/// Run `PluginRegistry::load_with_xdg` once and produce both
-/// outputs the doctor needs: the union of built-in + plugin
-/// segment ids (for `config.segments_resolvable`) and a snapshot
-/// of load errors / compiled count (for the Plugins category).
-///
-/// Delegating to the runtime predicate is the parity rule from
-/// the parity rule — `linesmith doctor` must not run a cheaper
-/// validation than the runtime it diagnoses, or PASS verdicts
-/// silently drift away from runtime reality.
+/// Build the Plugins-category snapshot by calling
+/// [`crate::runtime::plugins::load_plugins`] directly. The runtime
+/// fn produces the same `PluginRegistry` segment renderers do at
+/// `linesmith` invocation time; doctor wraps the result into a
+/// summary instead of mirroring the load logic.
 pub(super) fn snapshot_plugins(
     read: &ConfigReadOutcome,
-    xdg_segments_dir: Option<&Path>,
+    xdg_env: &crate::data_context::xdg::XdgEnv,
 ) -> (BTreeSet<String>, super::DoctorPluginsSnapshot) {
     use super::{DoctorPluginsSnapshot, PluginsRegistrySummary};
     let mut ids = DoctorConfigSnapshot::built_in_segment_ids();
-    let config_dirs: &[PathBuf] = match read {
-        ConfigReadOutcome::Loaded { config, .. } => &config.plugin_dirs,
-        _ => &[],
+    let cfg = match read {
+        ConfigReadOutcome::Loaded { config, .. } => Some(config.as_ref()),
+        _ => None,
     };
-
-    // Cold-start fast path: skip engine init if no plugin source
-    // exists on disk. Mirrors the runtime's `load_plugins` shape
-    // in `driver.rs`.
-    let xdg_present = xdg_segments_dir.is_some_and(Path::is_dir);
-    if config_dirs.is_empty() && !xdg_present {
+    let Some((registry, _engine)) = crate::runtime::plugins::load_plugins(cfg, xdg_env) else {
         return (ids, DoctorPluginsSnapshot::NoSources);
-    }
-
-    let engine = crate::plugins::build_engine();
-    let registry = crate::plugins::PluginRegistry::load_with_xdg(
-        config_dirs,
-        xdg_segments_dir,
-        &engine,
-        crate::segments::BUILT_IN_SEGMENT_IDS,
-    );
+    };
     let mut compiled_count = 0usize;
     for plugin in registry.iter() {
         ids.insert(plugin.id().to_string());
@@ -119,50 +87,47 @@ pub(super) fn snapshot_git() -> super::DoctorGitSnapshot {
 }
 
 /// Snapshot every theme name known to the runtime: built-ins plus
-/// every `*.toml` loaded from the user themes directory. Theme
-/// loading is best-effort — parse errors are silently dropped at
-/// snapshot time, matching the runtime which warns and skips bad
-/// theme files but doesn't fail to start.
-pub(super) fn collect_known_theme_names(xdg_themes_dir: Option<&Path>) -> BTreeSet<String> {
+/// every `*.toml` loaded from the user themes directory. Delegates
+/// to [`crate::runtime::themes::build_theme_registry`] so doctor
+/// and runtime register the same set. Loader diagnostics are
+/// discarded here (`|_| {}` warn-sink) — surfacing
+/// malformed-theme-file counts as a separate doctor check is a
+/// future enhancement, parallel to the unknown-config-key path.
+pub(super) fn collect_known_theme_names(
+    xdg_env: &crate::data_context::xdg::XdgEnv,
+) -> BTreeSet<String> {
+    let dir = crate::runtime::themes::user_themes_dir(xdg_env);
+    let registry = crate::runtime::themes::build_theme_registry(dir.as_deref(), |_| {});
     let mut names = DoctorConfigSnapshot::built_in_theme_names();
-    let mut registry = crate::theme::ThemeRegistry::with_built_ins();
-    if let Some(dir) = xdg_themes_dir {
-        registry = registry.with_user_themes(dir, |_| {});
-    }
     for registered in registry.iter() {
         names.insert(registered.theme.name().to_string());
     }
     names
 }
 
-/// Read + parse the file at `cp.path`. Lives outside `Config::load`
-/// because doctor needs the four-way distinction (NotFound / IoError /
-/// ParseError / Loaded), which `Config::load` collapses into
-/// `Result<Option<…>>`.
+/// Read + parse the file at `cp.path`. Delegates to
+/// [`crate::runtime::config::load_config`] so doctor and runtime
+/// share the same parse path (`Config::load_validated`), closing
+/// the parity gap that bare `toml::from_str` left open. Warnings
+/// from the validated parse are discarded here; surfacing them
+/// as a separate WARN check is a future doctor enhancement.
 pub(super) fn read_config_at(cp: &ConfigPath) -> ConfigReadOutcome {
-    let raw = match std::fs::read_to_string(&cp.path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return ConfigReadOutcome::NotFound {
-                path: cp.path.clone(),
-                explicit: cp.explicit,
-            };
+    use crate::runtime::config::{load_config, ConfigLoadOutcome};
+    match load_config(Some(cp)) {
+        ConfigLoadOutcome::Unresolved => ConfigReadOutcome::Unresolved,
+        ConfigLoadOutcome::Loaded { path, config, .. } => {
+            ConfigReadOutcome::Loaded { path, config }
         }
-        Err(e) => {
-            return ConfigReadOutcome::IoError {
-                path: cp.path.clone(),
-                message: e.to_string(),
-            };
+        ConfigLoadOutcome::NotFound { path, explicit } => {
+            ConfigReadOutcome::NotFound { path, explicit }
         }
-    };
-    match toml::from_str::<Config>(&raw) {
-        Ok(config) => ConfigReadOutcome::Loaded {
-            path: cp.path.clone(),
-            config: Box::new(config),
+        ConfigLoadOutcome::IoError { path, source, .. } => ConfigReadOutcome::IoError {
+            path,
+            message: source.to_string(),
         },
-        Err(e) => ConfigReadOutcome::ParseError {
-            path: cp.path.clone(),
-            message: e.to_string(),
+        ConfigLoadOutcome::ParseError { path, source, .. } => ConfigReadOutcome::ParseError {
+            path,
+            message: source.to_string(),
         },
     }
 }
