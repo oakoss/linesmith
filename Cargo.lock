@@ -1702,6 +1702,30 @@ dependencies = [
  "gix",
  "httpdate",
  "lexopt",
+ "linesmith-core",
+ "rhai",
+ "schemars",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "supports-color",
+ "supports-hyperlinks",
+ "tempfile",
+ "terminal_size",
+ "toml",
+ "unicode-segmentation",
+ "unicode-width",
+ "ureq",
+]
+
+[[package]]
+name = "linesmith-core"
+version = "0.1.1"
+dependencies = [
+ "catppuccin",
+ "chrono",
+ "gix",
+ "httpdate",
  "rhai",
  "schemars",
  "secrecy",

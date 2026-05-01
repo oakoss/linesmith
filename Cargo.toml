@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/linesmith"]
+members = ["crates/linesmith-core", "crates/linesmith"]
 
 [workspace.package]
 version = "0.1.1"
@@ -16,6 +16,12 @@ keywords = ["statusline", "claude-code", "claude", "cli", "ai"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
+# Internal core engine for linesmith. Version stays in lockstep with
+# the parent binary crate (`linesmith`) via `version.workspace = true`
+# in linesmith-core/Cargo.toml. The `path =` lets workspace builds
+# resolve locally; the `version =` is required for `cargo publish`
+# (cargo strips path at publish time, registry resolution takes over).
+linesmith-core = { path = "crates/linesmith-core", version = "0.1.1" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 catppuccin = "2"

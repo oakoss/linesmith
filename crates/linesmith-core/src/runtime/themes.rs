@@ -11,7 +11,7 @@ use crate::theme::ThemeRegistry;
 /// the cascade in [`crate::data_context::xdg::resolve_subdir`].
 /// `None` when neither env var is populated.
 #[must_use]
-pub(crate) fn user_themes_dir(env: &XdgEnv) -> Option<PathBuf> {
+pub fn user_themes_dir(env: &XdgEnv) -> Option<PathBuf> {
     resolve_subdir(env, XdgScope::Config, "themes")
 }
 
@@ -22,7 +22,7 @@ pub(crate) fn user_themes_dir(env: &XdgEnv) -> Option<PathBuf> {
 /// diagnostics: malformed files, name collisions (built-in
 /// override, duplicate user theme), and unreadable directory
 /// entries. Pass `|_| {}` to discard.
-pub(crate) fn build_theme_registry(
+pub fn build_theme_registry(
     user_themes_dir: Option<&Path>,
     on_warn: impl FnMut(&str),
 ) -> ThemeRegistry {

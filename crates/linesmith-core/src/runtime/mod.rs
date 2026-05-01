@@ -9,6 +9,6 @@
 //! without constructing a synthetic CLI environment. The driver
 //! builds the snapshots at the call site.
 
-pub(crate) mod config;
-pub(crate) mod plugins;
-pub(crate) mod themes;
+pub mod config;
+pub mod plugins;
+pub mod themes;

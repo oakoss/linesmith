@@ -13,7 +13,7 @@ use crate::segments::BUILT_IN_SEGMENT_IDS;
 /// per the cascade in [`crate::data_context::xdg::resolve_subdir`].
 /// `None` when neither env var is populated.
 #[must_use]
-pub(crate) fn xdg_segments_dir(env: &XdgEnv) -> Option<PathBuf> {
+pub fn xdg_segments_dir(env: &XdgEnv) -> Option<PathBuf> {
     resolve_subdir(env, XdgScope::Config, "segments")
 }
 
@@ -23,12 +23,13 @@ pub(crate) fn xdg_segments_dir(env: &XdgEnv) -> Option<PathBuf> {
 /// cold-start fast path that skips `build_engine` entirely.
 /// (Configured-but-missing entries in `cfg.plugin_dirs` take the
 /// `Some` path and surface as load errors on the registry.)
-/// Callers handle `registry.load_errors()` however they want: the
-/// driver writes them to stderr. Doctor currently discards them;
-/// folding them into the Plugins-category snapshot is tracked as
-/// follow-up work alongside the equivalent gap for themes.
+/// Callers consume `registry.load_errors()` per their needs: the
+/// driver writes them to stderr; doctor classifies them across the
+/// `plugins.compile` / `plugins.deps_valid` /
+/// `plugins.no_id_collisions` / `plugins.no_builtin_collisions`
+/// check rows.
 #[must_use]
-pub(crate) fn load_plugins(
+pub fn load_plugins(
     cfg: Option<&Config>,
     xdg_env: &XdgEnv,
 ) -> Option<(PluginRegistry, Arc<rhai::Engine>)> {

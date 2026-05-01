@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
 
 pub mod agent;
-pub(crate) mod builder;
+pub mod builder;
 pub mod context_bar;
 pub mod context_window;
 pub mod cost;

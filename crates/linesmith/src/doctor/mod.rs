@@ -1867,6 +1867,10 @@ fn source_label(source: &crate::data_context::credentials::CredentialSource) -> 
         }
         CredentialSource::XdgConfig { path } => format!("XDG file ({})", path.display()),
         CredentialSource::ClaudeLegacy { path } => format!("legacy file ({})", path.display()),
+        // CredentialSource is `#[non_exhaustive]` per ADR-0018.
+        // Future variants render generically until cli wires an
+        // explicit label.
+        _ => "unknown credential source".to_string(),
     }
 }
 
@@ -2214,6 +2218,11 @@ fn plugins_category(env: &DoctorEnv) -> Category {
                 );
                 unexpected.push(err);
             }
+            // PluginError is `#[non_exhaustive]` per ADR-0018.
+            // Future variants from linesmith-core route to
+            // `unexpected` so the doctor surfaces them on a
+            // "compile" row until cli adds explicit categorization.
+            _ => unexpected.push(err),
         }
     }
 
@@ -2238,11 +2247,14 @@ fn check_plugins_compile(
     // in `load_errors()`. Surface them as FAIL on the compile row
     // (the closest fit) with a "report this as a doctor bug" hint
     // so the user knows to file an issue rather than chase a
-    // phantom config problem.
+    // phantom config problem. Render via `kind()` rather than
+    // `Display`/`Debug` because Runtime / MalformedReturn variants
+    // carry plugin-author-controlled `message` strings that could
+    // include secrets from a hostile `throw("...")`.
     if !unexpected.is_empty() {
         let detail = unexpected
             .iter()
-            .map(|e| format!("unexpected variant: {e:?}"))
+            .map(|e| format!("unexpected variant: {}", e.kind()))
             .collect::<Vec<_>>()
             .join("; ");
         return CheckResult::fail(
@@ -2442,6 +2454,10 @@ fn check_git_head_resolves(snapshot: &DoctorGitSnapshot) -> CheckResult {
                 crate::data_context::git::Head::OtherRef { full_name } => {
                     format!("HEAD -> {full_name}")
                 }
+                // Head is `#[non_exhaustive]` per ADR-0018. A future
+                // variant in linesmith-core renders generically
+                // until cli adds an explicit label.
+                _ => "HEAD (unrecognized)".to_string(),
             };
             CheckResult::pass(GIT_HEAD_RESOLVES_ID, label)
         }
@@ -2465,6 +2481,9 @@ fn check_git_repo_kind(snapshot: &DoctorGitSnapshot) -> CheckResult {
                 RepoKind::Bare => "RepoKind: bare",
                 RepoKind::Submodule => "RepoKind: submodule",
                 RepoKind::LinkedWorktree { .. } => "RepoKind: linked worktree",
+                // RepoKind is `#[non_exhaustive]` per ADR-0018.
+                // Future variants render generically.
+                _ => "RepoKind: unrecognized",
             };
             // Worktree carries a name field; surface it in the
             // label so a user can tell which worktree.

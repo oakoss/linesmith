@@ -96,6 +96,29 @@ pub enum PluginError {
     },
 }
 
+impl PluginError {
+    /// Static variant tag — guaranteed token-free `&'static str`,
+    /// safe to render in any user-facing diagnostic. Use this in
+    /// place of `Display` or `Debug` when the consumer might be
+    /// rendering plugin-author-controlled data (e.g., `Runtime
+    /// { message }` and `MalformedReturn { message }` carry strings
+    /// the script author wrote, which can leak secrets via
+    /// `throw("...")`).
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Compile { .. } => "Compile",
+            Self::Runtime { .. } => "Runtime",
+            Self::ResourceExceeded { .. } => "ResourceExceeded",
+            Self::Timeout { .. } => "Timeout",
+            Self::MalformedReturn { .. } => "MalformedReturn",
+            Self::UnknownDataDep { .. } => "UnknownDataDep",
+            Self::MalformedDataDeps { .. } => "MalformedDataDeps",
+            Self::IdCollision { .. } => "IdCollision",
+        }
+    }
+}
+
 /// What "won" an [`PluginError::IdCollision`] — either a built-in
 /// segment (which plugins can never shadow) or another plugin (keyed
 /// by path). Avoids the stringly-typed `PathBuf::from("<built-in>")`

@@ -1,6 +1,12 @@
 [package]
-name = "linesmith"
-description = "A Rust status line for Claude Code and other AI coding CLIs"
+name = "linesmith-core"
+description = "Internal core engine for linesmith. No SemVer guarantee for direct dependents — depend on the `linesmith` binary or accept breakage between minor versions."
+# Published to crates.io as scaffolding for `linesmith` (the parent
+# binary crate). Public surface intentionally unstable while linesmith
+# is pre-1.0; minor-version bumps may rearrange types freely. Same
+# pattern as serde_derive / tokio-macros / clap_derive: the crate
+# exists on the registry to satisfy cargo's transitive-dep rule, not
+# to advertise a stable API.
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,18 +23,12 @@ categories.workspace = true
 unsafe_code = "forbid"
 
 [dependencies]
-# Sibling crate hosting the segment / theme / layout / data_context
-# / config / runtime predicates the CLI driver and doctor both depend
-# on. Shape and version are governed by `[workspace.dependencies]`.
-linesmith-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 catppuccin.workspace = true
 chrono.workspace = true
-dialoguer.workspace = true
 gix.workspace = true
 httpdate.workspace = true
-lexopt.workspace = true
 rhai.workspace = true
 schemars.workspace = true
 secrecy.workspace = true
@@ -40,18 +40,3 @@ ureq.workspace = true
 toml.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
-
-[dev-dependencies]
-criterion.workspace = true
-
-[[bin]]
-name = "linesmith"
-path = "src/main.rs"
-
-[[bench]]
-name = "plugins"
-harness = false
-
-[[bench]]
-name = "render"
-harness = false

@@ -294,7 +294,7 @@ impl Capability {
     /// Returns `None` for `TERM=dumb`, empty `TERM`, or no `TERM` at
     /// all.
     #[must_use]
-    pub(crate) fn from_env_vars(colorterm: Option<&str>, term: Option<&str>) -> Self {
+    pub fn from_env_vars(colorterm: Option<&str>, term: Option<&str>) -> Self {
         if let Some(c) = colorterm {
             if c.eq_ignore_ascii_case("truecolor") || c.eq_ignore_ascii_case("24bit") {
                 return Self::TrueColor;
@@ -316,7 +316,7 @@ impl Capability {
     /// `TERM=dumb` — the user explicitly asked for color, so a dumb
     /// terminal signal loses.
     #[must_use]
-    pub(crate) fn force_from(tty: Self, env: Self) -> Self {
+    pub fn force_from(tty: Self, env: Self) -> Self {
         tty.max(env).max(Self::Palette16)
     }
 }

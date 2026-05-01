@@ -129,6 +129,16 @@ pub(super) fn read_config_at(cp: &ConfigPath) -> ConfigReadOutcome {
             path,
             message: source.to_string(),
         },
+        // ConfigLoadOutcome is `#[non_exhaustive]` per ADR-0018. A
+        // new variant added in linesmith-core without an updated
+        // mapping surfaces as IoError so doctor renders a FAIL row.
+        // Doctor's job is surfacing latent issues; mapping unknowns
+        // to "Unresolved" would downgrade a real cli/core skew to a
+        // SKIP that the user would never see.
+        _ => ConfigReadOutcome::IoError {
+            path: cp.path.clone(),
+            message: "unrecognized config load outcome (cli/core version skew); upgrade `linesmith` to match the installed `linesmith-core`".to_string(),
+        },
     }
 }
 
@@ -385,6 +395,17 @@ pub(super) fn snapshot_credentials(env: &FileCascadeEnv) -> DoctorCredentialsSna
             CredentialError::ParseError { path, .. } => CredentialErrorSummary::ParseError { path },
             CredentialError::MissingField { path } => CredentialErrorSummary::MissingField { path },
             CredentialError::EmptyToken { path } => CredentialErrorSummary::EmptyToken { path },
+            // CredentialError is `#[non_exhaustive]` per ADR-0018.
+            // A future variant from linesmith-core surfaces as a
+            // generic SubprocessFailed so doctor still renders a
+            // FAIL row instead of failing to compile. Use the static
+            // `.code()` tag — never `{other:?}` — because the manual
+            // `Debug` impl filters token-bearing fields today, but a
+            // future variant author could forget; `.code()` returns
+            // a guaranteed-token-free `&'static str`.
+            other => CredentialErrorSummary::SubprocessFailed {
+                message: format!("unrecognized credential error ({})", other.code()),
+            },
         }),
     }
 }

@@ -226,6 +226,10 @@ fn themes_list(stdout: &mut dyn Write, stderr: &mut dyn Write, env: &CliEnv) -> 
         let source = match &rt.source {
             theme::ThemeSource::BuiltIn => "built-in".to_string(),
             theme::ThemeSource::UserFile(p) => p.display().to_string(),
+            // ThemeSource is `#[non_exhaustive]` per ADR-0018; a
+            // future variant in linesmith-core renders generically
+            // until the cli adds an explicit label.
+            _ => "unknown source".to_string(),
         };
         let _ = writeln!(stdout, "{}\t{}", rt.theme.name(), source);
     }
@@ -914,7 +918,11 @@ fn resolve_color_capability(
     match layout_options(cfg).map(|l| l.color).unwrap_or_default() {
         config::ColorPolicy::Never => theme::Capability::None,
         config::ColorPolicy::Always => force_color_detect(env),
-        config::ColorPolicy::Auto => theme::Capability::from_terminal(),
+        // Auto plus any future variant routes to terminal detection.
+        // ColorPolicy is `#[non_exhaustive]` per ADR-0018, so the
+        // catch-all also handles unknown variants — auto-detect is
+        // the safe degradation while the cli wires explicit handling.
+        _ => theme::Capability::from_terminal(),
     }
 }
 
@@ -998,6 +1006,19 @@ fn load_config(
         } => {
             let _ = writeln!(stderr, "linesmith: {source}");
             (None, Some(source), warnings)
+        }
+        // ConfigLoadOutcome is `#[non_exhaustive]` per ADR-0018. A
+        // new variant in linesmith-core without an updated mapping
+        // here falls back to defaults so the CLI still renders a
+        // status line — but write a stderr line so the cli/core
+        // version skew is visible instead of silently producing
+        // default-themed output the user can't explain.
+        _ => {
+            let _ = writeln!(
+                stderr,
+                "linesmith: unrecognized config load outcome (cli/core version skew); using defaults",
+            );
+            (None, None, Vec::new())
         }
     }
 }
@@ -2123,13 +2144,20 @@ mod tests {
         );
     }
 
+    // `LayoutOptions` is `#[non_exhaustive]` in linesmith-core,
+    // which blocks both literal AND struct-update construction
+    // across the crate boundary (E0639). Tests build through
+    // Default + field assignment instead.
+    fn layout_options_with_color(color: config::ColorPolicy) -> config::LayoutOptions {
+        let mut opts = config::LayoutOptions::default();
+        opts.color = color;
+        opts
+    }
+
     #[test]
     fn color_policy_no_color_env_wins_over_config_always() {
         let cfg = config::Config {
-            layout_options: Some(config::LayoutOptions {
-                color: config::ColorPolicy::Always,
-                ..config::LayoutOptions::default()
-            }),
+            layout_options: Some(layout_options_with_color(config::ColorPolicy::Always)),
             ..config::Config::default()
         };
         let env = CliEnv {
@@ -2145,10 +2173,7 @@ mod tests {
     #[test]
     fn color_policy_config_never_strips_color() {
         let cfg = config::Config {
-            layout_options: Some(config::LayoutOptions {
-                color: config::ColorPolicy::Never,
-                ..config::LayoutOptions::default()
-            }),
+            layout_options: Some(layout_options_with_color(config::ColorPolicy::Never)),
             ..config::Config::default()
         };
         assert_eq!(
@@ -2161,10 +2186,7 @@ mod tests {
     fn color_policy_config_always_forces_color() {
         // Mirror of the `Never` test for the other explicit branch.
         let cfg = config::Config {
-            layout_options: Some(config::LayoutOptions {
-                color: config::ColorPolicy::Always,
-                ..config::LayoutOptions::default()
-            }),
+            layout_options: Some(layout_options_with_color(config::ColorPolicy::Always)),
             ..config::Config::default()
         };
         let got = resolve_color_capability(None, &policy_env(), Some(&cfg));
@@ -2174,10 +2196,7 @@ mod tests {
     #[test]
     fn color_policy_config_auto_falls_through_to_terminal_detection() {
         let cfg = config::Config {
-            layout_options: Some(config::LayoutOptions {
-                color: config::ColorPolicy::Auto,
-                ..config::LayoutOptions::default()
-            }),
+            layout_options: Some(layout_options_with_color(config::ColorPolicy::Auto)),
             ..config::Config::default()
         };
         // Without a TTY under `cargo test`, `from_terminal` returns None;

@@ -28,7 +28,7 @@ use crate::config::{Config, ConfigError, ConfigPath};
 /// parsing).
 #[derive(Debug)]
 #[non_exhaustive]
-pub(crate) enum ConfigLoadOutcome {
+pub enum ConfigLoadOutcome {
     /// No config-path source resolved. Doctor renders this as
     /// "Unresolved" (different from "NotFound" — the cascade itself
     /// failed); driver treats it as "use defaults silently."
@@ -74,7 +74,7 @@ pub(crate) enum ConfigLoadOutcome {
 /// the caller via the [`ConfigLoadOutcome::Loaded`] variant rather
 /// than being collected by side effect on a sink.
 #[must_use]
-pub(crate) fn load_config(resolved: Option<&ConfigPath>) -> ConfigLoadOutcome {
+pub fn load_config(resolved: Option<&ConfigPath>) -> ConfigLoadOutcome {
     let Some(cp) = resolved else {
         return ConfigLoadOutcome::Unresolved;
     };

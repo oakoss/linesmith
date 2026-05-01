@@ -177,13 +177,13 @@ pub struct SegmentOverride {
 /// it. Versioned per-tag self-hosted URLs (biome's model) are the
 /// destination once `linesmith` has its own website plus
 /// schemastore.org coverage.
-pub(crate) const SCHEMA_URL: &str =
+pub const SCHEMA_URL: &str =
     "https://raw.githubusercontent.com/oakoss/linesmith/main/config.schema.json";
 
 /// Prepend `#:schema <url>` directive (taplo / VS Code / Zed
 /// convention) to a freshly-generated config body so editors pick up
 /// the published schema without per-user setup.
-pub(crate) fn with_schema_directive(body: &str) -> String {
+pub fn with_schema_directive(body: &str) -> String {
     format!("#:schema {SCHEMA_URL}\n\n{body}")
 }
 
