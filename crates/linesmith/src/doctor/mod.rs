@@ -961,8 +961,15 @@ impl DoctorEnv {
             path_env,
         };
         let xdg_cache_home = EnvVarState::snapshot("XDG_CACHE_HOME");
-        let claude_config_dir = EnvVarState::snapshot("CLAUDE_CONFIG_DIR");
-        let credentials = snapshot_credentials(&home_env, &xdg_config_home, &claude_config_dir);
+        // Build the cascade env via `var_os` (preserves non-UTF-8
+        // bytes; Unix paths are byte-strings) rather than threading
+        // the EnvVarState lossy preview through. Without this, doctor
+        // would falsely report `Unresolvable` for any user with a
+        // non-UTF-8 $HOME / $XDG_CONFIG_HOME / $CLAUDE_CONFIG_DIR
+        // even though the runtime cascade resolves them correctly.
+        let credentials = snapshot_credentials(
+            &crate::data_context::credentials::FileCascadeEnv::from_process_env(),
+        );
         let cache = snapshot_cache(&xdg_cache_home, &home_env);
         // Per spec §Cross-category short-circuits: OAuth token
         // missing → endpoint SKIP. The probe runs only when
@@ -6354,6 +6361,29 @@ mod tests {
     // --- Credentials: cascade-source short-circuit ---
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn snapshot_credentials_does_not_short_circuit_on_macos_without_env() {
+        // The cfg gate in `snapshot_credentials`'s short-circuit is
+        // load-bearing rather than decorative: on macOS the
+        // `security` subprocess can resolve from the user's Keychain
+        // even with no env vars set, so the function MUST run the
+        // cascade rather than reporting Unresolvable. A future
+        // refactor that drops the `cfg!(target_os = "macos")` guard
+        // would silently regress macOS users with no configured
+        // env vars but valid Keychain entries.
+        use crate::data_context::credentials::FileCascadeEnv;
+        let snapshot = snapshot_credentials(&FileCascadeEnv::default());
+        // On macOS without env vars the cascade still runs; result
+        // is Resolved (real Keychain hit) or Failed (no Keychain
+        // entry, NoCredentials). Both are valid; what's NOT valid
+        // is short-circuiting to Unresolvable.
+        assert!(
+            !matches!(snapshot, DoctorCredentialsSnapshot::Unresolvable),
+            "macOS must run the cascade even with no env vars; got {snapshot:?}"
+        );
+    }
+
+    #[test]
     #[cfg(not(target_os = "macos"))]
     fn snapshot_credentials_returns_unresolvable_when_no_path_source_non_macos() {
         // On non-macOS hosts with no `$HOME`, no `$XDG_CONFIG_HOME`,
@@ -6361,11 +6391,8 @@ mod tests {
         // and there's no keychain — the cascade can't even be
         // attempted. Per spec §Cross-category short-circuits this
         // is SKIP, not FAIL.
-        let snapshot = snapshot_credentials(
-            &EnvVarState::Unset,
-            &EnvVarState::Unset,
-            &EnvVarState::Unset,
-        );
+        use crate::data_context::credentials::FileCascadeEnv;
+        let snapshot = snapshot_credentials(&FileCascadeEnv::default());
         assert!(
             matches!(snapshot, DoctorCredentialsSnapshot::Unresolvable),
             "expected Unresolvable, got {snapshot:?}",
@@ -6379,18 +6406,25 @@ mod tests {
         // one of the override env vars (`$XDG_CONFIG_HOME`,
         // `$CLAUDE_CONFIG_DIR`). The file cascade still has a root
         // in those cases, so the snapshot must NOT short-circuit
-        // to Unresolvable. The actual `resolve_credentials()` call
-        // will likely return `Failed(NoCredentials)` on a CI host
-        // without real credentials, but that's the correct
+        // to Unresolvable. The actual `resolve_credentials_with`
+        // call will likely return `Failed(NoCredentials)` on a CI
+        // host without real credentials, but that's the correct
         // outcome, not a doctor false-negative.
-        for (xdg, claude_dir) in [
-            (EnvVarState::Set("/etc/xdg".into()), EnvVarState::Unset),
-            (EnvVarState::Unset, EnvVarState::Set("/etc/claude".into())),
+        use crate::data_context::credentials::FileCascadeEnv;
+        for env in [
+            FileCascadeEnv {
+                xdg_config_home: Some(PathBuf::from("/etc/xdg")),
+                ..Default::default()
+            },
+            FileCascadeEnv {
+                claude_config_dir: Some(PathBuf::from("/etc/claude")),
+                ..Default::default()
+            },
         ] {
-            let snapshot = snapshot_credentials(&EnvVarState::Unset, &xdg, &claude_dir);
+            let snapshot = snapshot_credentials(&env);
             assert!(
                 !matches!(snapshot, DoctorCredentialsSnapshot::Unresolvable),
-                "override env should keep the cascade attemptable; got Unresolvable for xdg={xdg:?} claude_dir={claude_dir:?}",
+                "override env should keep the cascade attemptable; got Unresolvable for env={env:?}",
             );
         }
     }

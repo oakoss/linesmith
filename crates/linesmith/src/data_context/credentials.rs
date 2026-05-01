@@ -315,6 +315,18 @@ where
 /// platforms. Memoization for process-lifetime reuse is the caller's
 /// responsibility; each invocation re-runs the full cascade.
 pub fn resolve_credentials() -> Result<Credentials, CredentialError> {
+    resolve_credentials_with(&FileCascadeEnv::from_process_env())
+}
+
+/// Same cascade as [`resolve_credentials`] but with an explicit
+/// [`FileCascadeEnv`]. Lets doctor and tests pin the file-cascade
+/// inputs without mutating process env, which is racy under Rust's
+/// default parallel test execution.
+///
+/// macOS Keychain probes don't depend on the file-cascade env vars
+/// in `FileCascadeEnv`; they shell out to `security` (which reads
+/// `$USER` independently to scope the lookup).
+pub fn resolve_credentials_with(env: &FileCascadeEnv) -> Result<Credentials, CredentialError> {
     // Hold the first "fall-through" subprocess error so if every
     // later cascade step also yields nothing, we surface the real
     // reason (e.g., Keychain locked) instead of a generic
@@ -340,7 +352,7 @@ pub fn resolve_credentials() -> Result<Credentials, CredentialError> {
         }
     }
 
-    match try_file_cascade() {
+    match try_file_cascade_with(env) {
         Ok(creds) => Ok(creds),
         Err(CredentialError::NoCredentials) => {
             // Prefer a recorded subprocess failure over the generic
@@ -353,32 +365,71 @@ pub fn resolve_credentials() -> Result<Credentials, CredentialError> {
 
 // --- File cascade -------------------------------------------------------
 
-/// Environmental inputs for the file cascade. Process-env reads are
-/// centralized here so tests can inject values without touching the
-/// (thread-unsafe) real env.
+/// Environmental inputs for the file-cascade portion of credential
+/// resolution. macOS Keychain probes shell out to `security` and
+/// don't depend on these fields, so only the file-cascade env vars
+/// live here. Treats empty string as unset per `credentials.md`
+/// §Edge cases.
+///
+/// Built once at the call boundary — `driver.rs` and `lib.rs::run_*`
+/// pull from process env via [`Self::from_process_env`]; doctor
+/// builds via the same factory; tests construct directly. The
+/// cascade itself never touches `std::env`.
+///
+/// **Construction safety**: prefer [`Self::new`] or
+/// [`Self::from_process_env`] over struct-literal construction. Both
+/// constructors enforce the empty-string-as-unset invariant; direct
+/// field assignment trusts the caller. An empty `PathBuf` (`""`)
+/// passed in via direct construction would make the cascade walk
+/// `"".join(".credentials.json")` = `".credentials.json"` (a
+/// CWD-relative path), which `try_file_cascade_with` would then
+/// stat against whatever directory the binary happened to launch
+/// in. That's a security-relevant footgun for a credential
+/// resolver — use the constructors.
 #[derive(Debug, Clone, Default)]
-struct FileCascadeEnv {
-    /// `$CLAUDE_CONFIG_DIR` (treating empty string as unset per
-    /// `credentials.md` §Edge cases).
-    claude_config_dir: Option<PathBuf>,
-    /// `$XDG_CONFIG_HOME` (treating empty string as unset).
-    xdg_config_home: Option<PathBuf>,
-    /// `$HOME` (treating empty string as unset).
-    home: Option<PathBuf>,
+#[non_exhaustive]
+pub struct FileCascadeEnv {
+    /// `$CLAUDE_CONFIG_DIR`.
+    pub claude_config_dir: Option<PathBuf>,
+    /// `$XDG_CONFIG_HOME`.
+    pub xdg_config_home: Option<PathBuf>,
+    /// `$HOME`.
+    pub home: Option<PathBuf>,
 }
 
 impl FileCascadeEnv {
-    fn from_process_env() -> Self {
-        fn non_empty_var(key: &str) -> Option<PathBuf> {
-            std::env::var_os(key)
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
+    /// Build a [`FileCascadeEnv`] with empty-string-as-unset
+    /// normalization. Pass `None` for "unset"; pass `Some(path)` for
+    /// "set to this value." Empty-string `OsString` values collapse
+    /// to `None` per `credentials.md` §Edge cases.
+    #[must_use]
+    pub fn new(
+        claude_config_dir: Option<std::ffi::OsString>,
+        xdg_config_home: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+    ) -> Self {
+        fn nonempty(v: Option<std::ffi::OsString>) -> Option<PathBuf> {
+            v.filter(|s| !s.is_empty()).map(PathBuf::from)
         }
         Self {
-            claude_config_dir: non_empty_var("CLAUDE_CONFIG_DIR"),
-            xdg_config_home: non_empty_var("XDG_CONFIG_HOME"),
-            home: non_empty_var("HOME"),
+            claude_config_dir: nonempty(claude_config_dir),
+            xdg_config_home: nonempty(xdg_config_home),
+            home: nonempty(home),
         }
+    }
+
+    /// Snapshot the three relevant env vars from the process via
+    /// `var_os` so non-UTF-8 values (Unix byte-string paths) survive
+    /// through to the cascade. Empty strings collapse to `None`.
+    /// Used by the bare [`resolve_credentials`] wrapper; explicit-env
+    /// callers go through [`Self::new`].
+    #[must_use]
+    pub fn from_process_env() -> Self {
+        Self::new(
+            std::env::var_os("CLAUDE_CONFIG_DIR"),
+            std::env::var_os("XDG_CONFIG_HOME"),
+            std::env::var_os("HOME"),
+        )
     }
 }
 
@@ -440,10 +491,6 @@ fn try_file_cascade_with(env: &FileCascadeEnv) -> Result<Credentials, Credential
         }
     }
     Err(CredentialError::NoCredentials)
-}
-
-fn try_file_cascade() -> Result<Credentials, CredentialError> {
-    try_file_cascade_with(&FileCascadeEnv::from_process_env())
 }
 
 fn read_and_parse_file(

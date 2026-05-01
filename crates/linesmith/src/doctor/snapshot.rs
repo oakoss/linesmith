@@ -20,19 +20,21 @@ use super::{
     UsageJsonState,
 };
 use crate::config::{Config, ConfigPath};
+use crate::data_context::credentials::FileCascadeEnv;
 
 /// Resolve `$XDG_CONFIG_HOME/linesmith/<sub>` falling back to
-/// `$HOME/.config/linesmith/<sub>`. `None` when neither source has a
-/// usable value. Mirrors the runtime helpers in `driver.rs`
-/// (`user_themes_dir`, `xdg_segments_dir`) so the doctor's view of
-/// the plugin / theme dirs lines up with what the runtime actually
-/// loads from.
+/// `$HOME/.config/linesmith/<sub>`. Delegates to
+/// [`crate::data_context::xdg::resolve_subdir`] — driver and doctor
+/// share the same predicate so the doctor's view of the plugin /
+/// theme dirs lines up with what the runtime actually loads from.
 pub(super) fn xdg_subdir(xdg: &EnvVarState, home: &EnvVarState, sub: &str) -> Option<PathBuf> {
-    if let Some(x) = xdg.nonempty() {
-        return Some(PathBuf::from(x).join("linesmith").join(sub));
-    }
-    home.nonempty()
-        .map(|h| PathBuf::from(h).join(".config/linesmith").join(sub))
+    use crate::data_context::xdg::{resolve_subdir, XdgEnv, XdgScope};
+    let env = XdgEnv::from_os_options(
+        None,
+        xdg.nonempty().map(std::ffi::OsString::from),
+        home.nonempty().map(std::ffi::OsString::from),
+    );
+    resolve_subdir(&env, XdgScope::Config, sub)
 }
 
 /// Run `PluginRegistry::load_with_xdg` once and produce both
@@ -380,19 +382,24 @@ pub(super) fn stat_claude_sessions(path: &Path) -> ClaudeSessionsState {
 /// vars still hit the file cascade and resolve normally — only the
 /// genuinely-no-source case maps to SKIP per spec §Cross-category
 /// short-circuits.
-pub(super) fn snapshot_credentials(
-    home_env: &EnvVarState,
-    xdg_config_home: &EnvVarState,
-    claude_config_dir: &EnvVarState,
-) -> DoctorCredentialsSnapshot {
-    let has_path_source = home_env.nonempty().is_some()
-        || xdg_config_home.nonempty().is_some()
-        || claude_config_dir.nonempty().is_some();
-    if !has_path_source && !cfg!(target_os = "macos") {
+pub(super) fn snapshot_credentials(env: &FileCascadeEnv) -> DoctorCredentialsSnapshot {
+    use crate::data_context::credentials::{resolve_credentials_with, CredentialError};
+    // On non-macOS targets with no file-cascade env source, the file
+    // cascade has nothing to walk and macOS Keychain isn't compiled
+    // in. The cfg gate on macOS is load-bearing rather than
+    // decorative: it forces the cascade to run because the
+    // `security` subprocess can resolve from the user's Keychain
+    // even when env vars are absent, so an early `Unresolvable`
+    // return on macOS would falsely report no credentials for
+    // accounts that are perfectly retrievable.
+    if !cfg!(target_os = "macos")
+        && env.claude_config_dir.is_none()
+        && env.xdg_config_home.is_none()
+        && env.home.is_none()
+    {
         return DoctorCredentialsSnapshot::Unresolvable;
     }
-    use crate::data_context::credentials::{resolve_credentials, CredentialError};
-    match resolve_credentials() {
+    match resolve_credentials_with(env) {
         Ok(creds) => DoctorCredentialsSnapshot::Resolved(CredentialsSummary {
             source: creds.source().clone(),
             scopes: creds.scopes().to_vec(),
@@ -445,14 +452,17 @@ pub(super) fn snapshot_cache(
 }
 
 /// Mirror of `cache::default_root` taking env state from a snapshot
-/// rather than reading process env. Keeps the snapshot pure.
+/// rather than reading process env. Delegates to the single XDG
+/// cascade in [`crate::data_context::xdg`] so doctor and runtime
+/// answer the same question with the same code.
 fn derive_cache_root(xdg_cache_home: &EnvVarState, home_env: &EnvVarState) -> Option<PathBuf> {
-    if let Some(xdg) = xdg_cache_home.nonempty() {
-        return Some(PathBuf::from(xdg).join("linesmith"));
-    }
-    home_env
-        .nonempty()
-        .map(|h| PathBuf::from(h).join(".cache").join("linesmith"))
+    use crate::data_context::xdg::{resolve_subdir, XdgEnv, XdgScope};
+    let env = XdgEnv::from_os_options(
+        xdg_cache_home.nonempty().map(std::ffi::OsString::from),
+        None,
+        home_env.nonempty().map(std::ffi::OsString::from),
+    );
+    resolve_subdir(&env, XdgScope::Cache, "")
 }
 
 /// Read-only stat of the cache root. Doctor must not perform

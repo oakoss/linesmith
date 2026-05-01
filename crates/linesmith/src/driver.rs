@@ -827,15 +827,16 @@ fn load_plugins(
 
 /// `$XDG_CONFIG_HOME/linesmith/segments/` if `XDG_CONFIG_HOME` is set,
 /// else `$HOME/.config/linesmith/segments/`. `None` when neither env
-/// var is populated (clean test harness).
+/// var is populated (clean test harness). Delegates to
+/// [`xdg::resolve_subdir`](crate::data_context::xdg::resolve_subdir).
 fn xdg_segments_dir(env: &CliEnv) -> Option<PathBuf> {
-    if let Some(xdg) = env.xdg_config_home.as_deref().filter(|s| !s.is_empty()) {
-        return Some(PathBuf::from(xdg).join("linesmith").join("segments"));
-    }
-    env.home
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|home| PathBuf::from(home).join(".config/linesmith/segments"))
+    use crate::data_context::xdg::{resolve_subdir, XdgEnv, XdgScope};
+    let xdg_env = XdgEnv::from_os_options(
+        None,
+        env.xdg_config_home.clone().map(std::ffi::OsString::from),
+        env.home.clone().map(std::ffi::OsString::from),
+    );
+    resolve_subdir(&xdg_env, XdgScope::Config, "segments")
 }
 
 fn run_cli(
@@ -900,15 +901,16 @@ fn run_cli(
 /// `$XDG_CONFIG_HOME/linesmith/themes/`; falls back to
 /// `$HOME/.config/linesmith/themes/`. Returns `None` when neither
 /// env var is set — tests drive this via `CliEnv::default()` and
-/// should see no user-theme loading attempt.
+/// should see no user-theme loading attempt. Delegates to
+/// [`xdg::resolve_subdir`](crate::data_context::xdg::resolve_subdir).
 fn user_themes_dir(env: &CliEnv) -> Option<PathBuf> {
-    if let Some(xdg) = env.xdg_config_home.as_deref().filter(|s| !s.is_empty()) {
-        return Some(PathBuf::from(xdg).join("linesmith").join("themes"));
-    }
-    env.home
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|h| PathBuf::from(h).join(".config/linesmith/themes"))
+    use crate::data_context::xdg::{resolve_subdir, XdgEnv, XdgScope};
+    let xdg_env = XdgEnv::from_os_options(
+        None,
+        env.xdg_config_home.clone().map(std::ffi::OsString::from),
+        env.home.clone().map(std::ffi::OsString::from),
+    );
+    resolve_subdir(&xdg_env, XdgScope::Config, "themes")
 }
 
 fn build_theme_registry(env: &CliEnv, stderr: &mut dyn Write) -> theme::ThemeRegistry {

@@ -25,6 +25,7 @@ pub mod fetcher;
 pub mod git;
 pub mod jsonl;
 pub mod usage;
+pub mod xdg;
 
 use std::cell::OnceCell;
 use std::path::PathBuf;

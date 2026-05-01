@@ -206,24 +206,14 @@ pub struct Lock {
 // --- Path resolution ----------------------------------------------------
 
 /// Locate the linesmith cache root. Returns `None` in environments
-/// that provide neither `$XDG_CACHE_HOME` nor `$HOME`.
+/// that provide neither `$XDG_CACHE_HOME` nor `$HOME`. Delegates to
+/// [`xdg::resolve_subdir`](super::xdg::resolve_subdir); the
+/// `from_process_env` factory uses `var_os` so non-UTF-8 paths
+/// (Unix byte-string paths) survive through to the cache reader.
 #[must_use]
 pub fn default_root() -> Option<PathBuf> {
-    cache_root(
-        std::env::var_os("XDG_CACHE_HOME")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from),
-        std::env::var_os("HOME")
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from),
-    )
-}
-
-fn cache_root(xdg_cache_home: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
-    if let Some(xdg) = xdg_cache_home {
-        return Some(xdg.join("linesmith"));
-    }
-    home.map(|h| h.join(".cache").join("linesmith"))
+    use super::xdg::{resolve_subdir, XdgEnv, XdgScope};
+    resolve_subdir(&XdgEnv::from_process_env(), XdgScope::Cache, "")
 }
 
 // --- CacheStore ---------------------------------------------------------
@@ -414,27 +404,9 @@ mod tests {
         serde_json::from_str(json).expect("parse")
     }
 
-    // --- Path resolution -----------------------------------------------
-
-    #[test]
-    fn cache_root_prefers_xdg() {
-        let xdg = PathBuf::from("/custom/xdg");
-        let home = PathBuf::from("/home/alice");
-        let root = cache_root(Some(xdg.clone()), Some(home)).unwrap();
-        assert_eq!(root, xdg.join("linesmith"));
-    }
-
-    #[test]
-    fn cache_root_falls_back_to_home_dot_cache() {
-        let home = PathBuf::from("/home/alice");
-        let root = cache_root(None, Some(home.clone())).unwrap();
-        assert_eq!(root, home.join(".cache").join("linesmith"));
-    }
-
-    #[test]
-    fn cache_root_none_without_home_or_xdg() {
-        assert_eq!(cache_root(None, None), None);
-    }
+    // Path-resolution tests live with the XDG cascade in
+    // `data_context/xdg.rs`; `default_root` is a thin wrapper that
+    // reads process env into `XdgEnv` and delegates.
 
     // --- CacheStore round-trip -----------------------------------------
 
