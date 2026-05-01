@@ -21,11 +21,13 @@ categories = ["command-line-utilities", "development-tools"]
 # in linesmith-core/Cargo.toml. The `path =` lets workspace builds
 # resolve locally; the `version =` is required for `cargo publish`
 # (cargo strips path at publish time, registry resolution takes over).
-linesmith-core = { path = "crates/linesmith-core", version = "0.1.1" }
+linesmith-core = { path = "crates/linesmith-core", version = "0.1.2" }
 # Internal rhai plugin host. Same publish posture as `linesmith-core`:
 # scaffolding for the parent `linesmith` binary; no SemVer guarantee
-# for direct dependents until v1.0.
-linesmith-plugin = { path = "crates/linesmith-plugin", version = "0.1.1" }
+# for direct dependents until v1.0. Floor matches the first published
+# version on crates.io — release-please bumps this in lockstep with
+# workspace.package.version on subsequent releases.
+linesmith-plugin = { path = "crates/linesmith-plugin", version = "0.1.2" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 catppuccin = "2"
