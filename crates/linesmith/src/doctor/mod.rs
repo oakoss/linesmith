@@ -460,17 +460,39 @@ pub enum DoctorCredentialsSnapshot {
     Unresolvable,
 }
 
-/// State of the cache root directory.
+/// State of the cache root directory. Determined by read-only stat
+/// only: doctor does NOT probe-write. POSIX permission bits and
+/// existence checks let us distinguish the "first-run, runtime will
+/// create it" case (PASS) from the "absent under a permanently
+/// non-creatable path" case (WARN), without the read-only-contract
+/// violation an actual probe-write would cause.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum CacheRootState {
     /// Directory exists and is readable.
     Exists,
-    /// Directory doesn't exist but the parent does and is writable —
-    /// `linesmith` will create the cache dir on first write.
-    ParentWritable,
-    /// Parent doesn't exist or isn't writable — FAIL territory.
-    ParentNotWritable,
+    /// Directory doesn't exist and the first existing ancestor is
+    /// writable. Expected first-run state — PASS with a "will be
+    /// created on first fetch" hint.
+    Absent,
+    /// Directory doesn't exist AND the first existing ancestor is
+    /// read-only (e.g. `XDG_CACHE_HOME` points into a read-only mount
+    /// like `/proc`, or the user pointed it at a path under an
+    /// ancestor with the user-write bit cleared). WARN: the runtime's
+    /// `create_dir_all` will fail on every fetch; without this signal
+    /// doctor would report all-green forever for an unfixable setup.
+    /// `parent` is the read-only ancestor for the hint.
+    AbsentParentReadOnly { parent: PathBuf },
+    /// Path exists but as a regular file. (`std::fs::metadata` follows
+    /// symlinks, so a symlink resolving to a non-directory lands here
+    /// too; broken symlinks resolve to `Absent` via the NotFound arm.)
+    /// Real misconfiguration — WARN so the user knows to remove it
+    /// before runtime tries to use the path.
+    NotADirectory,
+    /// `metadata()` failed for a reason other than NotFound (e.g.
+    /// permission denied on an ancestor). `message` carries the
+    /// rendered `io::Error` so the hint can name the cause.
+    Unreadable { message: String },
     /// `$HOME` and `$XDG_CACHE_HOME` both unresolvable; no cache
     /// path could be derived.
     Unresolved,
@@ -1857,17 +1879,42 @@ fn check_cache_dir(snapshot: &DoctorCacheSnapshot) -> CheckResult {
         (CacheRootState::Exists, Some(path)) => {
             CheckResult::pass(CACHE_DIR_ID, format!("Cache dir: {}", path.display()))
         }
-        (CacheRootState::ParentWritable, Some(path)) => CheckResult::pass(
+        // Absent + writable parent: expected first-run state. PASS
+        // with a hint that the runtime will create the directory.
+        (CacheRootState::Absent, Some(path)) => CheckResult::pass(
             CACHE_DIR_ID,
             format!(
-                "Cache dir: {} (parent writable; will be created on first fetch)",
+                "Cache dir: {} (will be created on first fetch)",
                 path.display()
             ),
         ),
-        (CacheRootState::ParentNotWritable, Some(path)) => CheckResult::fail(
+        // Absent + read-only ancestor: runtime's `create_dir_all`
+        // will fail every time. Without this WARN doctor would PASS
+        // forever for setups like `XDG_CACHE_HOME=/proc/cache/...`
+        // where the cache can never be created — the next-run
+        // recovery path doesn't apply because the failed fetch
+        // leaves the path Absent.
+        (CacheRootState::AbsentParentReadOnly { parent }, Some(path)) => CheckResult::warn(
             CACHE_DIR_ID,
-            format!("Cache dir parent not writable: {}", path.display()),
-            "check filesystem permissions on $XDG_CACHE_HOME",
+            format!(
+                "Cache dir cannot be created: {} (read-only ancestor: {})",
+                path.display(),
+                parent.display(),
+            ),
+            "point $XDG_CACHE_HOME (or $HOME) at a writable location",
+        ),
+        (CacheRootState::NotADirectory, Some(path)) => CheckResult::warn(
+            CACHE_DIR_ID,
+            format!(
+                "Cache path exists but is not a directory: {}",
+                path.display()
+            ),
+            "remove or rename the file at the cache path so linesmith can create the cache dir",
+        ),
+        (CacheRootState::Unreadable { message }, Some(path)) => CheckResult::warn(
+            CACHE_DIR_ID,
+            format!("Cache dir unreadable: {} ({message})", path.display()),
+            "check filesystem permissions on the cache path or its parents",
         ),
         (CacheRootState::Unresolved, _) | (_, None) => CheckResult::skip(
             CACHE_DIR_ID,
@@ -2930,8 +2977,24 @@ mod tests {
         envs.push(("cache.unreadable_and_stale_lock", env));
 
         let mut env = DoctorEnv::healthy();
-        env.cache.root = CacheRootState::ParentNotWritable;
-        envs.push(("cache.parent_not_writable", env));
+        env.cache.root = CacheRootState::NotADirectory;
+        envs.push(("cache.not_a_directory", env));
+
+        let mut env = DoctorEnv::healthy();
+        env.cache.root = CacheRootState::Unreadable {
+            message: "Permission denied (os error 13)".to_string(),
+        };
+        envs.push(("cache.unreadable", env));
+
+        let mut env = DoctorEnv::healthy();
+        env.cache.root = CacheRootState::Absent;
+        envs.push(("cache.absent_first_run", env));
+
+        let mut env = DoctorEnv::healthy();
+        env.cache.root = CacheRootState::AbsentParentReadOnly {
+            parent: PathBuf::from("/proc"),
+        };
+        envs.push(("cache.absent_parent_read_only", env));
 
         // --- Endpoint FAIL/WARN labels ---
         let mut env = DoctorEnv::healthy();
@@ -5420,10 +5483,16 @@ mod tests {
     }
 
     #[test]
-    fn cache_dir_pass_when_parent_writable_with_root_missing() {
+    fn cache_dir_passes_when_absent_with_creatable_hint() {
+        // Doctor stat-only, no probe-write. Expected first-run
+        // case: directory doesn't exist yet AND first existing
+        // ancestor is writable. PASS with a hint that the runtime
+        // will create it. If the ancestor is read-only, that's a
+        // separate `AbsentParentReadOnly` WARN — see
+        // `cache_dir_warns_when_absent_parent_read_only`.
         let env = with_cache(DoctorCacheSnapshot {
             root_path: Some(PathBuf::from("/home/user/.cache/linesmith")),
-            root: CacheRootState::ParentWritable,
+            root: CacheRootState::Absent,
             usage_json: UsageJsonState::Missing,
             lock: LockState::Absent,
         });
@@ -5435,22 +5504,232 @@ mod tests {
             "label should explain the creatable state: {}",
             dir.label(),
         );
+        // Guard against a revert that re-introduces the old
+        // probe-write "parent writable" phrasing without the
+        // current "will be created" semantics.
+        assert!(
+            !dir.label().contains("parent writable"),
+            "label should not carry the old probe-write phrasing: {}",
+            dir.label(),
+        );
+        assert_eq!(r.exit_code(), 0, "Absent must not gate exit-1");
     }
 
     #[test]
-    fn cache_dir_fails_when_parent_not_writable() {
+    fn cache_dir_warns_when_absent_parent_read_only() {
+        // Invariant: an Absent cache root under a permanently
+        // non-creatable parent (read-only mount, /proc, unwritable
+        // XDG_CACHE_HOME) must WARN, not silently PASS. A failed
+        // first-fetch leaves the path Absent so neither usage.json
+        // nor usage.lock rows catch it on the next run; the
+        // AbsentParentReadOnly variant carries the only signal the
+        // user gets from doctor for this misconfig.
         let env = with_cache(DoctorCacheSnapshot {
-            root_path: Some(PathBuf::from("/readonly/.cache/linesmith")),
-            root: CacheRootState::ParentNotWritable,
+            root_path: Some(PathBuf::from("/proc/cache/linesmith")),
+            root: CacheRootState::AbsentParentReadOnly {
+                parent: PathBuf::from("/proc"),
+            },
             usage_json: UsageJsonState::Missing,
             lock: LockState::Absent,
         });
         let r = build_report(&env);
-        assert_eq!(
-            find_check(&r, "cache.dir_writable").severity(),
-            Severity::Fail,
+        let dir = find_check(&r, "cache.dir_writable");
+        assert_eq!(dir.severity(), Severity::Warn);
+        assert!(
+            dir.label().contains("Cache dir cannot be created"),
+            "label should name the failure mode: {}",
+            dir.label()
         );
-        assert_eq!(r.exit_code(), 1);
+        assert!(
+            dir.label().contains("/proc"),
+            "label should name the read-only ancestor: {}",
+            dir.label()
+        );
+        assert!(
+            dir.hint().is_some_and(|h| h.contains("XDG_CACHE_HOME")),
+            "hint should point at the env var to fix: {:?}",
+            dir.hint()
+        );
+        assert_eq!(r.exit_code(), 0, "AbsentParentReadOnly is WARN, not FAIL");
+    }
+
+    #[test]
+    fn stat_cache_root_returns_exists_for_a_real_directory() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        match stat_cache_root(tempdir.path()) {
+            CacheRootState::Exists => {}
+            other => panic!("expected Exists for real directory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stat_cache_root_returns_not_a_directory_when_path_is_a_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let file = tempdir.path().join("cache");
+        std::fs::write(&file, b"not a dir").expect("write");
+        match stat_cache_root(&file) {
+            CacheRootState::NotADirectory => {}
+            other => panic!("expected NotADirectory for a regular file, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stat_cache_root_returns_absent_parent_read_only_when_intermediate_is_a_file() {
+        // The classify_absent_cache_root walk handles three cases on
+        // top of the writable-directory PASS: readonly directory,
+        // file-in-the-middle, and PermissionDenied during walk.
+        // Pin the file-in-the-middle case directly: stat
+        // `tempdir/middle/sub/cache` where `tempdir/middle` is a
+        // regular file. The walk should land on `tempdir/middle`
+        // and return AbsentParentReadOnly with that path.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let middle = tempdir.path().join("middle");
+        std::fs::write(&middle, b"file in the middle of the chain").expect("write");
+        let cache = middle.join("sub").join("cache");
+        match stat_cache_root(&cache) {
+            CacheRootState::AbsentParentReadOnly { parent } => {
+                assert_eq!(
+                    parent, middle,
+                    "parent should point at the file blocking the chain"
+                );
+            }
+            other => panic!("expected AbsentParentReadOnly with file ancestor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stat_cache_root_returns_absent_when_path_missing_under_writable_parent() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let missing = tempdir.path().join("cache").join("linesmith");
+        match stat_cache_root(&missing) {
+            // Tempdirs default to 0700 — writable by the user, so the
+            // parent walk lands in `Absent`, not `AbsentParentReadOnly`.
+            CacheRootState::Absent => {}
+            other => {
+                panic!("expected Absent for missing path under writable parent, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn cache_dir_check_never_produces_fail_severity_for_any_variant() {
+        // Spec contract guard: the cache.dir_writable row has no
+        // FAIL column (see §Cache row "Cache dir exists or
+        // creatable"). A future patch that re-introduces FAIL on
+        // any CacheRootState variant must fail this test. Drives
+        // every variant through build_report and asserts no Fail
+        // surfaces — including the Unresolved/SKIP path.
+        //
+        // The exhaustive `match` below makes a 6th variant a
+        // compile error here, forcing a corresponding addition
+        // to the iterated list — without it, a new variant
+        // could silently slip past this guard and re-introduce
+        // FAIL semantics undetected.
+        fn _exhaustiveness_tripwire(v: &CacheRootState) {
+            match v {
+                CacheRootState::Exists
+                | CacheRootState::Absent
+                | CacheRootState::AbsentParentReadOnly { .. }
+                | CacheRootState::NotADirectory
+                | CacheRootState::Unreadable { .. }
+                | CacheRootState::Unresolved => {}
+            }
+        }
+        let path = Some(PathBuf::from("/home/user/.cache/linesmith"));
+        let variants: [(&'static str, CacheRootState); 5] = [
+            ("Exists", CacheRootState::Exists),
+            ("Absent", CacheRootState::Absent),
+            (
+                "AbsentParentReadOnly",
+                CacheRootState::AbsentParentReadOnly {
+                    parent: PathBuf::from("/proc"),
+                },
+            ),
+            ("NotADirectory", CacheRootState::NotADirectory),
+            (
+                "Unreadable",
+                CacheRootState::Unreadable {
+                    message: "Permission denied".to_string(),
+                },
+            ),
+        ];
+        for (name, root) in variants {
+            let env = with_cache(DoctorCacheSnapshot {
+                root_path: path.clone(),
+                root,
+                usage_json: UsageJsonState::Missing,
+                lock: LockState::Absent,
+            });
+            let r = build_report(&env);
+            let dir = find_check(&r, "cache.dir_writable");
+            assert_ne!(
+                dir.severity(),
+                Severity::Fail,
+                "{name} variant must not produce FAIL on cache.dir_writable",
+            );
+        }
+        // Unresolved (no path) variant rendered through SKIP.
+        let env = with_cache(DoctorCacheSnapshot {
+            root_path: None,
+            root: CacheRootState::Unresolved,
+            usage_json: UsageJsonState::Missing,
+            lock: LockState::Absent,
+        });
+        let r = build_report(&env);
+        let dir = find_check(&r, "cache.dir_writable");
+        assert_ne!(
+            dir.severity(),
+            Severity::Fail,
+            "Unresolved variant must not produce FAIL"
+        );
+    }
+
+    #[test]
+    fn cache_dir_warns_when_path_is_a_file_not_a_directory() {
+        // Real read-only-detectable misconfiguration: a stale leftover
+        // where the user has `~/.cache/linesmith` as a file. Runtime
+        // would fail to use it, so WARN preemptively.
+        let env = with_cache(DoctorCacheSnapshot {
+            root_path: Some(PathBuf::from("/home/user/.cache/linesmith")),
+            root: CacheRootState::NotADirectory,
+            usage_json: UsageJsonState::Missing,
+            lock: LockState::Absent,
+        });
+        let r = build_report(&env);
+        let dir = find_check(&r, "cache.dir_writable");
+        assert_eq!(dir.severity(), Severity::Warn);
+        assert!(
+            dir.hint().is_some_and(|h| h.contains("remove")),
+            "hint should suggest removal: {:?}",
+            dir.hint()
+        );
+        assert_eq!(r.exit_code(), 0, "NotADirectory is WARN, not FAIL");
+    }
+
+    #[test]
+    fn cache_dir_warns_when_unreadable_with_io_message() {
+        let env = with_cache(DoctorCacheSnapshot {
+            root_path: Some(PathBuf::from("/home/user/.cache/linesmith")),
+            root: CacheRootState::Unreadable {
+                message: "Permission denied (os error 13)".to_string(),
+            },
+            usage_json: UsageJsonState::Missing,
+            lock: LockState::Absent,
+        });
+        let r = build_report(&env);
+        let dir = find_check(&r, "cache.dir_writable");
+        assert_eq!(dir.severity(), Severity::Warn);
+        assert!(
+            dir.label().contains("Cache dir unreadable"),
+            "label should carry the spec-required prefix: {}",
+            dir.label()
+        );
+        assert!(
+            dir.label().contains("Permission denied"),
+            "label should surface the io::Error message: {}",
+            dir.label()
+        );
+        assert_eq!(r.exit_code(), 0);
     }
 
     #[test]
@@ -5778,29 +6057,34 @@ mod tests {
 
     #[test]
     fn classify_endpoint_response_at_2s_boundary_classifies_as_slow() {
-        // Pin the spec's 2s WARN threshold so a `>` vs `>=` swap or
-        // a ms/s unit drift in `classify_endpoint_response` would
-        // surface as a test failure.
+        // Pin the spec's WARN threshold so a `>` vs `>=` swap or a
+        // ms/s unit drift in `classify_endpoint_response` would
+        // surface as a test failure. Read from `DOCTOR_SLOW_THRESHOLD`
+        // (not a literal) so the test follows the constant if it ever
+        // moves — and so a regression that re-points the classifier
+        // at `DEFAULT_TIMEOUT` (the request budget, which doctor
+        // intentionally splits from the user-facing slow signal)
+        // doesn't silently still pass.
         use crate::data_context::fetcher::HttpResponse;
+        let threshold = DOCTOR_SLOW_THRESHOLD;
+        let just_under = threshold - std::time::Duration::from_millis(1);
         let body = br#"{}"#;
-        // 1999ms = under threshold, expected Ok
         let resp = HttpResponse {
             status: 200,
             body: body.to_vec(),
             retry_after: None,
         };
         assert!(matches!(
-            classify_endpoint_response(Ok(resp), std::time::Duration::from_millis(1999)),
+            classify_endpoint_response(Ok(resp), just_under),
             EndpointProbeOutcome::Ok
         ));
-        // 2000ms = exactly at threshold, expected Slow
         let resp = HttpResponse {
             status: 200,
             body: body.to_vec(),
             retry_after: None,
         };
         assert!(matches!(
-            classify_endpoint_response(Ok(resp), std::time::Duration::from_millis(2000)),
+            classify_endpoint_response(Ok(resp), threshold),
             EndpointProbeOutcome::Slow
         ));
     }

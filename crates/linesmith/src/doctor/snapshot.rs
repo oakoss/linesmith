@@ -455,46 +455,153 @@ fn derive_cache_root(xdg_cache_home: &EnvVarState, home_env: &EnvVarState) -> Op
         .map(|h| PathBuf::from(h).join(".cache").join("linesmith"))
 }
 
-fn stat_cache_root(path: &Path) -> CacheRootState {
+/// Read-only stat of the cache root. Doctor must not perform
+/// filesystem writes — an earlier probe-write to the first existing
+/// ancestor violated the read-only contract on fresh-setup runs
+/// (`XDG_CACHE_HOME=/tmp/new-root`).
+///
+/// Also routes `NotADirectory` errors (e.g. the leaf of
+/// `/tmp/file/sub/cache` where `/tmp/file` is a regular file)
+/// through the parent-walk path: `metadata()` doesn't return
+/// `NotFound` for those, so a naive "only NotFound walks" rule
+/// would land them in `Unreadable` with a confusing message
+/// instead of pointing at the real cause (a file blocking the
+/// chain) via `AbsentParentReadOnly`.
+///
+/// On `NotFound`, walks up the parent chain to the first existing
+/// ancestor and inspects its `permissions().readonly()` bit. A
+/// readonly ancestor (e.g. `XDG_CACHE_HOME` under `/proc`, or under
+/// a path whose user-write bit is cleared) means `create_dir_all`
+/// will fail on every runtime fetch; flag it as
+/// `AbsentParentReadOnly` so the WARN steers the user toward the
+/// real fix instead of silently passing forever.
+///
+/// The check is intentionally weaker than a probe-write because
+/// `permissions().readonly()` only inspects mode bits. Known false
+/// negatives (paths the bit reports writable but the process can
+/// not actually write):
+/// - cross-user ownership: a directory owned by another user with
+///   mode 0755 reads as not-readonly even though the doctor process
+///   can't create entries in it (the dominant case)
+/// - POSIX ACLs that deny write to the running user
+/// - the BSD/macOS user-immutable flag (`chflags uchg`)
+/// - NFS root-squash mapping the user to `nobody`
+///
+/// The unstatable-ancestor branch in `classify_absent_cache_root`
+/// catches the cross-user case for unstatable intermediate
+/// directories; everything else still false-PASSes here, surfacing
+/// only as a runtime error on first fetch.
+pub(super) fn stat_cache_root(path: &Path) -> CacheRootState {
     match std::fs::metadata(path) {
         Ok(meta) if meta.is_dir() => CacheRootState::Exists,
-        Ok(_) => CacheRootState::ParentNotWritable,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Mirror the runtime: `atomic_write_json` does
-            // `create_dir_all(parent)` before writing, so any
-            // ancestor that's writable is enough. Walk up the
-            // parent chain to the first existing ancestor and
-            // probe-write there. Without this loop, doctor FAILs
-            // on legitimate first-run setups like
-            // `XDG_CACHE_HOME=/tmp/new-root` where `/tmp/new-root`
-            // doesn't exist yet but `/tmp` is fine.
-            //
-            // `permissions().readonly()` lies about ACLs, ro
-            // mounts, NFS root-squash, and immutable flags — the
-            // actual write attempt is the only honest answer.
-            let mut existing = path.parent();
-            while let Some(dir) = existing {
-                match std::fs::metadata(dir) {
-                    Ok(meta) if meta.is_dir() => {
-                        return match tempfile::Builder::new()
-                            .prefix(".linesmith-doctor-write-test-")
-                            .tempfile_in(dir)
-                        {
-                            Ok(_) => CacheRootState::ParentWritable,
-                            Err(_) => CacheRootState::ParentNotWritable,
-                        };
-                    }
-                    _ => existing = dir.parent(),
-                }
+        Ok(_) => CacheRootState::NotADirectory,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => classify_absent_cache_root(path),
+        // ENOTDIR from a path like `/tmp/file/sub/cache` where
+        // `/tmp/file` is a regular file: walk the parent chain so
+        // we land at the file ancestor as `AbsentParentReadOnly`
+        // instead of leaving the user with a generic "Not a
+        // directory" Unreadable message.
+        Err(e) if is_not_a_directory(&e) => classify_absent_cache_root(path),
+        Err(e) => CacheRootState::Unreadable {
+            message: e.to_string(),
+        },
+    }
+}
+
+/// `io::ErrorKind::NotADirectory` is unstable in older Rust
+/// versions; substring-match the OS error's display. Linux + macOS
+/// surface this as "Not a directory" + ENOTDIR (errno 20).
+fn is_not_a_directory(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(20)
+}
+
+/// Walk parent chain to classify a missing cache root. Branches:
+/// - first stat-able ancestor is a writable directory AND no
+///   ancestor along the way returned `PermissionDenied` → `Absent`
+///   (PASS — runtime can `create_dir_all` it on first fetch)
+/// - first stat-able ancestor is a directory marked `readonly()` OR
+///   any earlier ancestor returned `PermissionDenied` →
+///   `AbsentParentReadOnly` with that ancestor as the WARN target.
+///   The PermissionDenied bias is load-bearing: a stat error on
+///   `/root/cache` followed by a writable `/root` doesn't mean the
+///   runtime can create `/root/cache` — `create_dir_all` needs
+///   traverse on every path component, and an unstatable middle
+///   directory blocks that. Without this bias an unprivileged user
+///   with `XDG_CACHE_HOME=/root/cache` would PASS forever.
+/// - first stat-able ancestor is not a directory (file in the
+///   middle of the chain) → `AbsentParentReadOnly` with that path
+///   as the offending ancestor.
+///
+/// Other walk-time errors (NotFound on intermediate components,
+/// transient I/O) are NOT bias triggers — they're the common case
+/// of "this whole subtree doesn't exist yet" and the runtime
+/// `create_dir_all` will create through them fine.
+///
+/// Read-only stat only — no probe-write.
+fn classify_absent_cache_root(path: &Path) -> CacheRootState {
+    let mut existing = path.parent();
+    let mut blocked_by_perm: Option<PathBuf> = None;
+    while let Some(dir) = existing {
+        match std::fs::metadata(dir) {
+            Ok(meta) if meta.is_dir() => {
+                let parent = if let Some(blocked) = blocked_by_perm {
+                    blocked
+                } else if meta.permissions().readonly() {
+                    dir.to_path_buf()
+                } else {
+                    return CacheRootState::Absent;
+                };
+                return CacheRootState::AbsentParentReadOnly { parent };
             }
-            CacheRootState::ParentNotWritable
+            // Ancestor exists but isn't a directory (e.g. a file
+            // earlier in the chain) — caller can't create the cache
+            // through it; same WARN class.
+            Ok(_) => {
+                return CacheRootState::AbsentParentReadOnly {
+                    parent: dir.to_path_buf(),
+                };
+            }
+            // PermissionDenied: capture the path so we'll WARN
+            // even if a higher writable ancestor exists. The
+            // runtime needs traverse permission on every component;
+            // a writable `/root` doesn't help if `/root/cache`
+            // can't be stat'd.
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                if blocked_by_perm.is_none() {
+                    blocked_by_perm = Some(dir.to_path_buf());
+                }
+                existing = dir.parent();
+            }
+            // Other walk errors (NotFound on intermediate
+            // components is the common case) — keep walking but
+            // don't bias toward WARN. The runtime's
+            // `create_dir_all` creates through missing
+            // intermediates fine.
+            Err(_) => existing = dir.parent(),
         }
-        Err(_) => CacheRootState::ParentNotWritable,
+    }
+    // No ancestor was stat-able (path is the filesystem root, or
+    // every component up to the root failed). `derive_cache_root`
+    // never produces such a path; this exists for direct unit-test
+    // callers of `stat_cache_root` and as a defensive fallback if
+    // `derive_cache_root` ever changes shape.
+    CacheRootState::AbsentParentReadOnly {
+        parent: blocked_by_perm.unwrap_or_else(|| PathBuf::from("/")),
     }
 }
 
 pub(super) fn stat_usage_json(path: &Path) -> UsageJsonState {
     use crate::data_context::cache::{CachedUsage, CACHE_SCHEMA_VERSION};
+    // Intentional divergence from `CacheStore::read` (which uses
+    // `fs::read` + `from_utf8` and silently collapses non-UTF-8 to
+    // a cache miss): doctor's job is to surface corruption so the
+    // user can fix it, not to silently treat it as transient. A
+    // non-UTF-8 file lands in `Unreadable` here so the next render
+    // points at the actual problem. The runtime will *attempt* to
+    // overwrite on next fetch via `atomic_write_json`; if that also
+    // fails (read-only mount, EACCES on the file, ENOSPC, EDQUOT),
+    // it logs `lsm_error!` to stderr — visible to the user only when
+    // stderr is open.
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return UsageJsonState::Missing,
@@ -504,12 +611,11 @@ pub(super) fn stat_usage_json(path: &Path) -> UsageJsonState {
             };
         }
     };
-    // Match the runtime cache reader's predicate exactly: full
-    // `CachedUsage` deserialize plus `schema_version` and
-    // `cached_at <= now` gates. A peek-only check that ignores
-    // `cached_at` would PASS files the runtime treats as a miss
-    // (clock skew) and leave the user puzzled when their data
-    // looks stale.
+    // Schema-version + `cached_at <= now` gates match the runtime
+    // cache reader's predicate exactly (cache.rs::CacheStore::read).
+    // A peek-only check that ignores `cached_at` would PASS files
+    // the runtime treats as a miss (clock skew) and leave the user
+    // puzzled when their data looks stale.
     //
     // Read the schema_version separately first so we can render
     // `Stale { schema_version }` rather than collapsing every
@@ -570,13 +676,21 @@ pub(super) fn stat_usage_lock(cache_root: &Path) -> LockState {
     }
 }
 
+/// Doctor-owned WARN threshold for the spec's 2s endpoint budget.
+/// Kept separate from `fetcher::DEFAULT_TIMEOUT` so a future timeout
+/// bump for transport resilience doesn't silently move the
+/// user-facing slow signal.
+pub(super) const DOCTOR_SLOW_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Probe the rate-limit endpoint with the resolved credentials.
-/// Spec §Timing: ~2s timeout per call. Any non-`Resolved`
-/// credentials short-circuit before this is reached.
+/// Request timeout uses `fetcher::DEFAULT_TIMEOUT` (parity with the
+/// runtime); see `DOCTOR_SLOW_THRESHOLD` for the Slow-vs-Ok cutoff.
+/// Any non-`Resolved` credentials short-circuit before this is
+/// reached.
 pub(super) fn probe_endpoint_via_ureq() -> DoctorEndpointSnapshot {
     use crate::data_context::credentials::resolve_credentials;
-    use crate::data_context::fetcher::{UreqTransport, UsageTransport};
-    use std::time::{Duration, Instant};
+    use crate::data_context::fetcher::{UreqTransport, UsageTransport, DEFAULT_TIMEOUT};
+    use std::time::Instant;
 
     // Re-resolve here because `CredentialsSummary` deliberately
     // drops the token bytes before the snapshot crosses the
@@ -599,7 +713,7 @@ pub(super) fn probe_endpoint_via_ureq() -> DoctorEndpointSnapshot {
         crate::data_context::cascade::DEFAULT_API_BASE_URL,
         crate::data_context::fetcher::OAUTH_USAGE_PATH,
     );
-    let result = transport.get(&url, creds.token(), Duration::from_secs(2));
+    let result = transport.get(&url, creds.token(), DEFAULT_TIMEOUT);
     let elapsed = start.elapsed();
     let outcome = classify_endpoint_response(result, elapsed);
     DoctorEndpointSnapshot {
@@ -641,7 +755,10 @@ pub(super) fn classify_endpoint_response(
                 if !extra_keys.is_empty() {
                     return EndpointProbeOutcome::UnexpectedShape { extra_keys };
                 }
-                if elapsed >= std::time::Duration::from_secs(2) {
+                // Slow threshold is doctor-owned; it tracks the
+                // spec's user-facing 2s budget, not the runtime's
+                // request-timeout constant.
+                if elapsed >= DOCTOR_SLOW_THRESHOLD {
                     EndpointProbeOutcome::Slow
                 } else {
                     EndpointProbeOutcome::Ok
