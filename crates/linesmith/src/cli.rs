@@ -41,6 +41,12 @@ pub enum Action {
     },
     Init {
         config: Option<PathBuf>,
+        /// Skip the post-init `linesmith doctor` invocation.
+        /// Per spec §`linesmith init` integration: doctor runs
+        /// automatically after init writes the config; users
+        /// pass `--no-doctor` to opt out (CI / scripted onboarding,
+        /// or a host where doctor's network probe would block).
+        no_doctor: bool,
     },
     // Intentionally absent from `HELP`: advertising "diagnose your
     // setup" while only emitting one PASS would be a false promise.
@@ -59,7 +65,8 @@ linesmith — status line for Claude Code and other AI coding CLIs
 
 USAGE:
     linesmith [OPTIONS]
-    linesmith init
+    linesmith init [--no-doctor]
+    linesmith doctor [--plain]
     linesmith themes list
     linesmith presets list
     linesmith presets apply <NAME> [--force]
@@ -70,12 +77,19 @@ OPTIONS:
         --no-color         Strip all color (equivalent to NO_COLOR=1)
         --force-color      Emit color even in non-TTY output
         --force            For `presets apply`: overwrite without confirmation
+        --no-doctor        For `init`: skip the post-init doctor run
+        --plain            For `doctor`: ASCII output (no Unicode glyphs)
     -h, --help             Print this help text
     -V, --version          Print version
 
 SUBCOMMANDS:
     init                   Interactive onboarding: pick a preset + theme,
-                           write config.toml, print Claude Code snippet
+                           write config.toml, print Claude Code snippet,
+                           and run a setup-verification check (`--no-doctor`
+                           to skip)
+    doctor                 Run setup diagnostics (env, config, Claude Code
+                           integration, credentials, cache, plugins, git);
+                           exits 1 on any FAIL
     themes list            List available themes (built-in + user)
     presets list           List available config presets
     presets apply <NAME>   Write a preset's config.toml to the resolved path
@@ -96,6 +110,7 @@ where
     let mut positional: Vec<OsString> = Vec::new();
     let mut force = false;
     let mut plain = false;
+    let mut no_doctor = false;
     while let Some(arg) = parser.next()? {
         match arg {
             Short('c') | Long("config") => {
@@ -127,6 +142,9 @@ where
             Long("plain") => {
                 plain = true;
             }
+            Long("no-doctor") => {
+                no_doctor = true;
+            }
             Short('h') | Long("help") => return Ok(Action::Help),
             Short('V') | Long("version") => return Ok(Action::Version),
             Value(v) => positional.push(v),
@@ -134,10 +152,11 @@ where
         }
     }
     let color_override_snapshot = args.color_override;
-    let action = match dispatch_subcommand(&positional, force, plain, args.config.clone())? {
-        Some(action) => action,
-        None => Action::Run(args),
-    };
+    let action =
+        match dispatch_subcommand(&positional, force, plain, no_doctor, args.config.clone())? {
+            Some(action) => action,
+            None => Action::Run(args),
+        };
     // `--force` only has meaning under `presets apply`; accepting it
     // on any other action would encourage muscle-memory misuse.
     if force && !matches!(action, Action::PresetsApply { .. }) {
@@ -147,6 +166,13 @@ where
     // typo like `linesmith --plain themes list` doesn't silently no-op.
     if plain && !matches!(action, Action::Doctor { .. }) {
         return Err(lexopt::Error::UnexpectedOption("--plain".to_string()));
+    }
+    // `--no-doctor` only opts out of the post-`init` doctor run.
+    // Accepting it on any other action would let a user pass
+    // `--no-doctor doctor` (a doctor invocation that opts out of
+    // itself) and other absurdities.
+    if no_doctor && !matches!(action, Action::Init { .. }) {
+        return Err(lexopt::Error::UnexpectedOption("--no-doctor".to_string()));
     }
     // Doctor renders without ANSI today (glyph alphabet + separator
     // are the only mode axes), so `--no-color` / `--force-color` would
@@ -172,6 +198,7 @@ fn dispatch_subcommand(
     positional: &[OsString],
     force: bool,
     plain: bool,
+    no_doctor: bool,
     config: Option<PathBuf>,
 ) -> Result<Option<Action>, lexopt::Error> {
     if positional.is_empty() {
@@ -186,7 +213,7 @@ fn dispatch_subcommand(
                     value: positional[1].to_string_lossy().to_string().into(),
                 });
             }
-            Ok(Some(Action::Init { config }))
+            Ok(Some(Action::Init { config, no_doctor }))
         }
         "doctor" => {
             if positional.len() > 1 {
@@ -544,7 +571,10 @@ mod tests {
     fn init_subcommand_parses_with_no_config_override() {
         assert_eq!(
             parse_args(&["init"]).expect("ok"),
-            Action::Init { config: None }
+            Action::Init {
+                config: None,
+                no_doctor: false,
+            }
         );
     }
 
@@ -554,9 +584,55 @@ mod tests {
         assert_eq!(
             got,
             Action::Init {
-                config: Some(PathBuf::from("/tmp/init.toml"))
+                config: Some(PathBuf::from("/tmp/init.toml")),
+                no_doctor: false,
             }
         );
+    }
+
+    #[test]
+    fn init_no_doctor_flag_sets_field() {
+        assert_eq!(
+            parse_args(&["init", "--no-doctor"]).expect("ok"),
+            Action::Init {
+                config: None,
+                no_doctor: true,
+            }
+        );
+    }
+
+    #[test]
+    fn init_no_doctor_before_subcommand_also_parses() {
+        // lexopt interleaves flags and positionals; pin both
+        // orderings so a parser regression that rejects one
+        // ordering trips here.
+        assert_eq!(
+            parse_args(&["--no-doctor", "init"]).expect("ok"),
+            Action::Init {
+                config: None,
+                no_doctor: true,
+            }
+        );
+    }
+
+    #[test]
+    fn no_doctor_flag_rejected_outside_init() {
+        // `--no-doctor` only opts out of init's post-write doctor
+        // run; using it elsewhere (`linesmith --no-doctor doctor`,
+        // bare `--no-doctor`) should error rather than silently
+        // no-op.
+        for args in [
+            vec!["--no-doctor"],
+            vec!["--no-doctor", "doctor"],
+            vec!["--no-doctor", "themes", "list"],
+            vec!["--no-doctor", "presets", "list"],
+        ] {
+            let err = parse_args(&args).unwrap_err();
+            assert!(
+                matches!(err, lexopt::Error::UnexpectedOption(ref s) if s == "--no-doctor"),
+                "args {args:?} should reject --no-doctor, got {err:?}",
+            );
+        }
     }
 
     #[test]

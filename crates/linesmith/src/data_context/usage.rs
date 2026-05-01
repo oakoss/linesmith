@@ -65,6 +65,39 @@ pub struct UsageApiResponse {
     pub unknown_buckets: HashMap<String, serde_json::Value>,
 }
 
+/// Names of every recognized top-level field on
+/// [`UsageApiResponse`]. Exported so `linesmith doctor` can check
+/// "did the endpoint return any forward-compat keys?" without
+/// duplicating the field list — the [`KNOWN_BUCKETS_PARITY`] test
+/// below pins this against `UsageApiResponse` so the two can't
+/// drift.
+pub const KNOWN_BUCKETS: &[&str] = &[
+    "five_hour",
+    "seven_day",
+    "seven_day_opus",
+    "seven_day_sonnet",
+    "seven_day_oauth_apps",
+    "extra_usage",
+];
+
+/// Codenamed forward-compat buckets observed in the live endpoint
+/// during research captures (see `docs/research/claude-data-files.md`
+/// §Raw data, 2026-04-18 capture). These are unrecognized by
+/// `UsageApiResponse`'s strict struct fields but Anthropic ships
+/// them on every response — gating the doctor's
+/// "endpoint.shape_current" WARN on this list keeps the report quiet
+/// on healthy accounts while preserving the WARN for *new* unknown
+/// keys (the actual signal a maintainer wants).
+///
+/// Refresh whenever the research doc captures a new live response.
+pub const RESEARCH_DOCUMENTED_BUCKETS: &[&str] = &[
+    "iguana_necktie",
+    "omelette_promotional",
+    "seven_day_cowork",
+    "seven_day_omelette",
+    "tangelo",
+];
+
 /// Utilization plus reset-time for a single rolling window.
 ///
 /// `resets_at` is `Option` because the live endpoint has been observed
@@ -269,6 +302,60 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tripwire: `KNOWN_BUCKETS` must list every recognized field
+    /// on `UsageApiResponse`. If a new bucket lands here without
+    /// the const being updated, `linesmith doctor` would WARN
+    /// forever on every healthy endpoint response. Build a struct
+    /// with all known fields populated and verify a JSON round-trip
+    /// produces exactly the expected key set.
+    #[test]
+    fn known_buckets_matches_usage_api_response_fields() {
+        let response = UsageApiResponse {
+            five_hour: Some(UsageBucket {
+                utilization: Percent::new(0.0).expect("0 percent"),
+                resets_at: None,
+            }),
+            seven_day: Some(UsageBucket {
+                utilization: Percent::new(0.0).expect("0 percent"),
+                resets_at: None,
+            }),
+            seven_day_opus: Some(UsageBucket {
+                utilization: Percent::new(0.0).expect("0 percent"),
+                resets_at: None,
+            }),
+            seven_day_sonnet: Some(UsageBucket {
+                utilization: Percent::new(0.0).expect("0 percent"),
+                resets_at: None,
+            }),
+            seven_day_oauth_apps: Some(UsageBucket {
+                utilization: Percent::new(0.0).expect("0 percent"),
+                resets_at: None,
+            }),
+            extra_usage: Some(ExtraUsage {
+                is_enabled: Some(false),
+                utilization: None,
+                monthly_limit: None,
+                used_credits: None,
+                currency: None,
+            }),
+            unknown_buckets: HashMap::new(),
+        };
+        let value = serde_json::to_value(&response).expect("serialize");
+        let mut keys: Vec<String> = value
+            .as_object()
+            .expect("response is an object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        let mut expected: Vec<String> = KNOWN_BUCKETS.iter().map(|s| (*s).to_string()).collect();
+        expected.sort();
+        assert_eq!(
+            keys, expected,
+            "KNOWN_BUCKETS drifted from UsageApiResponse; update both lists",
+        );
+    }
 
     /// Live `/api/oauth/usage` capture from 2026-04-18 (Max-tier user),
     /// payload-equivalent to `docs/research/claude-data-files.md`
