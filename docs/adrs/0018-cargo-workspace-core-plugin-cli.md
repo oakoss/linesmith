@@ -1,6 +1,6 @@
 ## Split linesmith into a Cargo workspace with `core`, `plugin`, and `cli` crates
 
-- Status: accepted
+- Status: superseded by [ADR-0019](0019-publish-linesmith-core-as-scaffolding-from-v0-1.md)
 - Date: 2026-04-30
 - Deciders: Jace Babin
 
