@@ -35,7 +35,7 @@ fn run_git(cwd: &std::path::Path, args: &[&str]) {
 #[test]
 fn renders_model_and_workspace_when_outside_worktree() {
     let mut out = Vec::new();
-    linesmith::run(Cursor::new(CLAUDE_MINIMAL), &mut out).expect("run ok");
+    linesmith_core::run(Cursor::new(CLAUDE_MINIMAL), &mut out).expect("run ok");
     assert_eq!(
         String::from_utf8(out).expect("utf8"),
         "Claude Sonnet 4.6 linesmith\n"
@@ -47,7 +47,7 @@ fn renders_full_payload_with_cost_effort_and_workspace() {
     // Rate-limit segments are opt-in, so a first-run user doesn't
     // trigger a Keychain prompt from the default line.
     let mut out = Vec::new();
-    linesmith::run(Cursor::new(CLAUDE_WORKTREE), &mut out).expect("run ok");
+    linesmith_core::run(Cursor::new(CLAUDE_WORKTREE), &mut out).expect("run ok");
     let rendered = String::from_utf8(out).expect("utf8");
 
     for substring in [
@@ -82,7 +82,7 @@ fn renders_full_payload_with_cost_effort_and_workspace() {
 #[test]
 fn malformed_json_exits_zero_with_marker_line() {
     let mut out = Vec::new();
-    linesmith::run(Cursor::new(b"{not json"), &mut out).expect("run should not error");
+    linesmith_core::run(Cursor::new(b"{not json"), &mut out).expect("run should not error");
     assert_eq!(String::from_utf8(out).expect("utf8"), "?\n");
 }
 
@@ -91,7 +91,7 @@ fn narrow_terminal_drops_cost_and_effort_first() {
     // Budget chosen so the two highest drop-priorities (cost, effort)
     // drop before context_window or workspace get touched.
     let mut out = Vec::new();
-    linesmith::run_with_width(Cursor::new(CLAUDE_WORKTREE), &mut out, 40).expect("run ok");
+    linesmith_core::run_with_width(Cursor::new(CLAUDE_WORKTREE), &mut out, 40).expect("run ok");
     let rendered = String::from_utf8(out).expect("utf8");
     assert!(!rendered.contains("$1.23"), "cost should drop first");
     assert!(!rendered.contains("high"), "effort should drop second");
@@ -108,7 +108,7 @@ fn extreme_narrow_keeps_only_lowest_priority_segments() {
     // Budget tight enough that only workspace (lowest drop-priority)
     // survives, even though context_window would fit alone.
     let mut out = Vec::new();
-    linesmith::run_with_width(Cursor::new(CLAUDE_WORKTREE), &mut out, 10).expect("run ok");
+    linesmith_core::run_with_width(Cursor::new(CLAUDE_WORKTREE), &mut out, 10).expect("run ok");
     assert_eq!(String::from_utf8(out).expect("utf8"), "linesmith\n");
 }
 
@@ -359,17 +359,22 @@ fn git_branch_hides_outside_repo() {
 #[test]
 fn config_reorders_and_filters_segments() {
     // Config picks only model + workspace, in that custom order.
-    let cfg = linesmith::config::Config::from_str(
+    let cfg = linesmith_core::config::Config::from_str(
         r#"
             [line]
             segments = ["workspace", "model"]
         "#,
     )
     .expect("parse");
-    let segments = linesmith::build_segments(Some(&cfg), None, |_| {});
+    let segments = linesmith_core::build_segments(Some(&cfg), None, |_| {});
     let mut out = Vec::new();
-    linesmith::run_with_segments_and_width(Cursor::new(CLAUDE_WORKTREE), &mut out, &segments, 200)
-        .expect("run ok");
+    linesmith_core::run_with_segments_and_width(
+        Cursor::new(CLAUDE_WORKTREE),
+        &mut out,
+        &segments,
+        200,
+    )
+    .expect("run ok");
     let rendered = String::from_utf8(out).expect("utf8");
     assert_eq!(rendered, "linesmith Claude Sonnet 4.6\n");
 }
@@ -379,7 +384,7 @@ fn config_style_override_emits_sgr_bytes_end_to_end() {
     // TOML → SegmentOverride → parse_style → with_user_style → render_with_warn
     // pipeline: the model segment's rendered text should be wrapped in a
     // TrueColor-red + bold SGR prefix followed by a reset.
-    let cfg = linesmith::config::Config::from_str(
+    let cfg = linesmith_core::config::Config::from_str(
         r#"
             [line]
             segments = ["model"]
@@ -388,17 +393,17 @@ fn config_style_override_emits_sgr_bytes_end_to_end() {
         "#,
     )
     .expect("parse");
-    let segments = linesmith::build_segments(Some(&cfg), None, |_| {});
-    let status_ctx =
-        linesmith::input::parse(include_bytes!("fixtures/claude_minimal.json")).expect("parse");
-    let ctx = linesmith::data_context::DataContext::new(status_ctx);
-    let line = linesmith::layout::render_with_warn(
+    let segments = linesmith_core::build_segments(Some(&cfg), None, |_| {});
+    let status_ctx = linesmith_core::input::parse(include_bytes!("fixtures/claude_minimal.json"))
+        .expect("parse");
+    let ctx = linesmith_core::data_context::DataContext::new(status_ctx);
+    let line = linesmith_core::layout::render_with_warn(
         &segments,
         &ctx,
         200,
         &mut |_| {},
-        linesmith::theme::default_theme(),
-        linesmith::theme::Capability::TrueColor,
+        linesmith_core::theme::default_theme(),
+        linesmith_core::theme::Capability::TrueColor,
         false,
     );
     assert!(
@@ -411,7 +416,7 @@ fn config_style_override_emits_sgr_bytes_end_to_end() {
 
 #[test]
 fn config_style_override_invalid_warns_and_render_still_succeeds() {
-    let cfg = linesmith::config::Config::from_str(
+    let cfg = linesmith_core::config::Config::from_str(
         r#"
             [line]
             segments = ["model"]
@@ -421,13 +426,19 @@ fn config_style_override_invalid_warns_and_render_still_succeeds() {
     )
     .expect("parse");
     let mut warnings = Vec::new();
-    let segments = linesmith::build_segments(Some(&cfg), None, |m| warnings.push(m.to_string()));
+    let segments =
+        linesmith_core::build_segments(Some(&cfg), None, |m| warnings.push(m.to_string()));
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].contains("segments.model.style"));
     assert!(warnings[0].contains("mauve"));
     let mut out = Vec::new();
-    linesmith::run_with_segments_and_width(Cursor::new(CLAUDE_MINIMAL), &mut out, &segments, 200)
-        .expect("run ok");
+    linesmith_core::run_with_segments_and_width(
+        Cursor::new(CLAUDE_MINIMAL),
+        &mut out,
+        &segments,
+        200,
+    )
+    .expect("run ok");
     // Render still succeeds; the bad override is skipped.
     assert!(String::from_utf8(out)
         .expect("utf8")
@@ -440,14 +451,14 @@ fn model_format_compact_strips_context_word_end_to_end() {
     // from `(X context)` parentheticals. Pins the from_extras wiring
     // (segments/mod.rs::built_in_by_id → ModelSegment::from_extras)
     // through the full Config → build_segments → render path.
-    let cfg = linesmith::config::Config::from_str(
+    let cfg = linesmith_core::config::Config::from_str(
         r#"
             [line]
             segments = ["model"]
         "#,
     )
     .expect("parse");
-    let segments = linesmith::build_segments(Some(&cfg), None, |_| {});
+    let segments = linesmith_core::build_segments(Some(&cfg), None, |_| {});
     let payload = br#"{
         "model": { "id": "claude-opus-4-7", "display_name": "Opus 4.7 (1M context)" },
         "session_id": "test-session",
@@ -460,8 +471,13 @@ fn model_format_compact_strips_context_word_end_to_end() {
         }
     }"#;
     let mut out = Vec::new();
-    linesmith::run_with_segments_and_width(Cursor::new(&payload[..]), &mut out, &segments, 200)
-        .expect("run ok");
+    linesmith_core::run_with_segments_and_width(
+        Cursor::new(&payload[..]),
+        &mut out,
+        &segments,
+        200,
+    )
+    .expect("run ok");
     let rendered = String::from_utf8(out).expect("utf8");
     assert!(rendered.contains("Opus 4.7 (1M)"), "got {rendered:?}");
     assert!(
@@ -472,7 +488,7 @@ fn model_format_compact_strips_context_word_end_to_end() {
 
 #[test]
 fn model_format_full_preserves_anthropics_verbatim_string_end_to_end() {
-    let cfg = linesmith::config::Config::from_str(
+    let cfg = linesmith_core::config::Config::from_str(
         r#"
             [line]
             segments = ["model"]
@@ -481,7 +497,7 @@ fn model_format_full_preserves_anthropics_verbatim_string_end_to_end() {
         "#,
     )
     .expect("parse");
-    let segments = linesmith::build_segments(Some(&cfg), None, |_| {});
+    let segments = linesmith_core::build_segments(Some(&cfg), None, |_| {});
     let payload = br#"{
         "model": { "id": "claude-opus-4-7", "display_name": "Opus 4.7 (1M context)" },
         "session_id": "test-session",
@@ -494,8 +510,13 @@ fn model_format_full_preserves_anthropics_verbatim_string_end_to_end() {
         }
     }"#;
     let mut out = Vec::new();
-    linesmith::run_with_segments_and_width(Cursor::new(&payload[..]), &mut out, &segments, 200)
-        .expect("run ok");
+    linesmith_core::run_with_segments_and_width(
+        Cursor::new(&payload[..]),
+        &mut out,
+        &segments,
+        200,
+    )
+    .expect("run ok");
     let rendered = String::from_utf8(out).expect("utf8");
     assert!(
         rendered.contains("Opus 4.7 (1M context)"),
@@ -508,7 +529,7 @@ fn config_priority_override_flips_drop_order_under_pressure() {
     // With default priorities, a narrow terminal drops cost (192)
     // before model (64). Override model's priority to 250 and it drops
     // first instead.
-    let cfg = linesmith::config::Config::from_str(
+    let cfg = linesmith_core::config::Config::from_str(
         r#"
             [line]
             segments = ["model", "cost"]
@@ -517,11 +538,16 @@ fn config_priority_override_flips_drop_order_under_pressure() {
         "#,
     )
     .expect("parse");
-    let segments = linesmith::build_segments(Some(&cfg), None, |_| {});
+    let segments = linesmith_core::build_segments(Some(&cfg), None, |_| {});
     let mut out = Vec::new();
     // Budget tight enough to force one drop but fit the other.
-    linesmith::run_with_segments_and_width(Cursor::new(CLAUDE_WORKTREE), &mut out, &segments, 10)
-        .expect("run ok");
+    linesmith_core::run_with_segments_and_width(
+        Cursor::new(CLAUDE_WORKTREE),
+        &mut out,
+        &segments,
+        10,
+    )
+    .expect("run ok");
     let rendered = String::from_utf8(out).expect("utf8");
     // Model dropped; cost survived.
     assert!(!rendered.contains("Claude"));

@@ -9,7 +9,7 @@
 //! Zed) via the `#:schema` directive that `linesmith init` writes
 //! into user-generated configs.
 
-use linesmith::config::Config;
+use linesmith_core::config::Config;
 
 fn main() {
     let schema = schemars::schema_for!(Config);

@@ -4,11 +4,11 @@
 //! `CliEnv::from_process`; tests pass `Cursor` / `Vec<u8>` buffers
 //! and a hand-built `CliEnv`.
 
-use crate::plugins::PluginRegistry;
 use crate::segments::builder::build_lines;
 use crate::{
     cli, config, detect_terminal_width, presets, run_lines_with_context, runtime, theme, RunContext,
 };
+use linesmith_plugin::PluginRegistry;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 

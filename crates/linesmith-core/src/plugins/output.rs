@@ -22,10 +22,10 @@
 
 use rhai::{Array, Dynamic, Map};
 
+use linesmith_plugin::PluginError;
+
 use crate::segments::{sanitize_control_chars, RenderedSegment, Separator};
 use crate::theme::{Color, Role, Style};
-
-use super::PluginError;
 
 /// Convert a plugin's render-return value into a [`RenderedSegment`].
 /// `()` yields `Ok(None)` (segment hidden); any other shape mismatch

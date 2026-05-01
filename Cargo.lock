@@ -1729,6 +1729,7 @@ dependencies = [
  "httpdate",
  "lexopt",
  "linesmith-core",
+ "linesmith-plugin",
  "rhai",
  "schemars",
  "secrecy",

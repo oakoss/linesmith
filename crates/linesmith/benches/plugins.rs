@@ -23,9 +23,10 @@ use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use rhai::{Dynamic, Engine};
 use tempfile::TempDir;
 
-use linesmith::data_context::DataContext;
-use linesmith::plugins::{build_engine, CompiledPlugin, PluginRegistry, RhaiSegment};
-use linesmith::segments::{RenderContext, Segment, BUILT_IN_SEGMENT_IDS};
+use linesmith_core::data_context::DataContext;
+use linesmith_core::plugins::{build_engine, RhaiSegment};
+use linesmith_core::segments::{RenderContext, Segment, BUILT_IN_SEGMENT_IDS};
+use linesmith_plugin::{CompiledPlugin, PluginRegistry};
 
 const MINIMAL_PLUGIN: &str = include_str!("../tests/fixtures/plugins/minimal.rhai");
 const MINIMAL_PAYLOAD: &[u8] = include_bytes!("../tests/fixtures/claude_minimal.json");
@@ -62,7 +63,7 @@ fn rc() -> RenderContext {
 }
 
 fn data_context() -> DataContext {
-    DataContext::new(linesmith::input::parse(MINIMAL_PAYLOAD).expect("payload parses"))
+    DataContext::new(linesmith_core::input::parse(MINIMAL_PAYLOAD).expect("payload parses"))
 }
 
 fn bench_engine_init(c: &mut Criterion) {

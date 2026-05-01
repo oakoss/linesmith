@@ -12,10 +12,11 @@ use std::time::{Duration, Instant};
 use rhai::{Dynamic, Engine};
 use tempfile::TempDir;
 
-use linesmith::data_context::DataContext;
-use linesmith::input::StatusContext;
-use linesmith::plugins::{build_engine, CompiledPlugin, PluginError, PluginRegistry, RhaiSegment};
-use linesmith::segments::{RenderContext, Segment, BUILT_IN_SEGMENT_IDS};
+use linesmith_core::data_context::DataContext;
+use linesmith_core::input::StatusContext;
+use linesmith_core::plugins::{build_engine, RhaiSegment};
+use linesmith_core::segments::{RenderContext, Segment, BUILT_IN_SEGMENT_IDS};
+use linesmith_plugin::{CompiledPlugin, PluginError, PluginRegistry};
 
 const MINIMAL: &str = include_str!("fixtures/plugins/minimal.rhai");
 const USES_CTX_CONFIG: &str = include_str!("fixtures/plugins/uses_ctx_config.rhai");
@@ -73,13 +74,13 @@ fn rc() -> RenderContext {
 }
 
 fn minimal_status() -> StatusContext {
-    linesmith::input::parse(MINIMAL_PAYLOAD).expect("minimal fixture parses")
+    linesmith_core::input::parse(MINIMAL_PAYLOAD).expect("minimal fixture parses")
 }
 
 fn worktree_status() -> StatusContext {
     // Carries `cost` so the visibility fixture can render its
     // `Some(_)` branch end-to-end.
-    linesmith::input::parse(WORKTREE_PAYLOAD).expect("worktree fixture parses")
+    linesmith_core::input::parse(WORKTREE_PAYLOAD).expect("worktree fixture parses")
 }
 
 #[test]
@@ -130,7 +131,7 @@ fn declares_usage_fixture_sees_delegated_error_code() {
     // Pins `UsageError::Jsonl(_).code()` → inner `JsonlError` tag
     // delegation. Seeded so the real cascade doesn't touch Keychain,
     // network, or ~/.claude on every run.
-    use linesmith::data_context::{JsonlError, UsageError};
+    use linesmith_core::data_context::{JsonlError, UsageError};
 
     let (registry, engine, _tmp) = load_isolated("declares_usage.rhai", DECLARES_USAGE);
     let seg = first_segment(registry, engine);

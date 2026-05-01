@@ -516,7 +516,7 @@ pub const DEFAULT_SEGMENT_IDS: &[&str] = &[
 /// plugins whose `const ID` shadows a built-in. Add new built-ins
 /// here AND to [`built_in_by_id`].
 ///
-/// [`PluginRegistry`]: crate::plugins::PluginRegistry
+/// [`PluginRegistry`]: linesmith_plugin::PluginRegistry
 pub const BUILT_IN_SEGMENT_IDS: &[&str] = &[
     "model",
     "context_window",

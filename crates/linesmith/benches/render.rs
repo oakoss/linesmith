@@ -44,13 +44,10 @@ use std::sync::OnceLock;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use tempfile::TempDir;
 
-use linesmith::data_context::DataDep;
-use linesmith::theme::{self, Capability};
-use linesmith::{
-    run_with_context,
-    segments::{Segment, BUILT_IN_SEGMENT_IDS, DEFAULT_SEGMENT_IDS},
-    RunContext,
-};
+use linesmith_core::data_context::DataDep;
+use linesmith_core::segments::{Segment, BUILT_IN_SEGMENT_IDS, DEFAULT_SEGMENT_IDS};
+use linesmith_core::theme::{self, Capability};
+use linesmith_core::{run_with_context, RunContext};
 
 const MINIMAL_PAYLOAD: &[u8] = include_bytes!("../tests/fixtures/claude_minimal.json");
 const WORKTREE_PAYLOAD: &[u8] = include_bytes!("../tests/fixtures/claude_worktree.json");
@@ -103,7 +100,7 @@ fn fixture_repo() -> &'static std::path::Path {
 fn build_named_segments(ids: &[&str], name: &str, forbid_usage: bool) -> Vec<Box<dyn Segment>> {
     let cfg = build_config(ids, name);
     let mut warnings: Vec<String> = Vec::new();
-    let segs = linesmith::build_segments(Some(&cfg), None, |w| warnings.push(w.to_string()));
+    let segs = linesmith_core::build_segments(Some(&cfg), None, |w| warnings.push(w.to_string()));
     if !warnings.is_empty() {
         panic!("bench '{name}' build_segments emitted warnings: {warnings:?}");
     }
@@ -128,7 +125,7 @@ fn build_named_segments(ids: &[&str], name: &str, forbid_usage: bool) -> Vec<Box
     segs
 }
 
-fn build_config(ids: &[&str], name: &str) -> linesmith::config::Config {
+fn build_config(ids: &[&str], name: &str) -> linesmith_core::config::Config {
     let toml_src = format!(
         "[line]\nsegments = [{}]\n",
         ids.iter()

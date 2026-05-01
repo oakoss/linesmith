@@ -21,6 +21,15 @@ categories.workspace = true
 [lints.rust]
 unsafe_code = "forbid"
 
+[lints.clippy]
+# Workspace-level `clippy.toml` disallows `linesmith_plugin::build_engine`
+# to channel consumers through `linesmith_core::plugins::build_engine`'s
+# warn-emitter wrapper. This crate IS that function's home — its own
+# tests legitimately call the bare constructor. Disabling the lint
+# here keeps the consumer-facing nudge while letting the defining
+# crate test itself.
+disallowed_methods = "allow"
+
 [dependencies]
 chrono.workspace = true
 rhai.workspace = true

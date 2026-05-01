@@ -635,7 +635,7 @@ pub struct PluginsRegistrySummary {
     /// `UnknownDataDep`, `IdCollision`). Render-time errors
     /// (Runtime / Timeout / ResourceExceeded / MalformedReturn)
     /// don't surface here — the doctor doesn't render plugins.
-    pub errors: Vec<crate::plugins::errors::PluginError>,
+    pub errors: Vec<linesmith_plugin::PluginError>,
 }
 
 /// Snapshot of `gix::discover(cwd)` outcome for the Git category.
@@ -2157,7 +2157,7 @@ const PLUGINS_ID_COLLISIONS_ID: &str = "plugins.no_id_collisions";
 const PLUGINS_BUILTIN_COLLISIONS_ID: &str = "plugins.no_builtin_collisions";
 
 fn plugins_category(env: &DoctorEnv) -> Category {
-    use crate::plugins::errors::{CollisionWinner, PluginError};
+    use linesmith_plugin::{CollisionWinner, PluginError};
     let summary = match &env.plugins {
         DoctorPluginsSnapshot::NoSources => {
             // Spec §Edge cases: "Default plugin directory doesn't
@@ -2239,10 +2239,10 @@ fn plugins_category(env: &DoctorEnv) -> Category {
 
 fn check_plugins_compile(
     compiled_count: usize,
-    errors: &[&crate::plugins::errors::PluginError],
-    unexpected: &[&crate::plugins::errors::PluginError],
+    errors: &[&linesmith_plugin::PluginError],
+    unexpected: &[&linesmith_plugin::PluginError],
 ) -> CheckResult {
-    use crate::plugins::errors::PluginError;
+    use linesmith_plugin::PluginError;
     // `unexpected` carries render-time variants that shouldn't be
     // in `load_errors()`. Surface them as FAIL on the compile row
     // (the closest fit) with a "report this as a doctor bug" hint
@@ -2291,8 +2291,8 @@ fn check_plugins_compile(
     )
 }
 
-fn check_plugins_deps_valid(errors: &[&crate::plugins::errors::PluginError]) -> CheckResult {
-    use crate::plugins::errors::PluginError;
+fn check_plugins_deps_valid(errors: &[&linesmith_plugin::PluginError]) -> CheckResult {
+    use linesmith_plugin::PluginError;
     if errors.is_empty() {
         return CheckResult::pass(PLUGINS_DEPS_ID, "All `@data_deps` valid");
     }
@@ -2317,8 +2317,8 @@ fn check_plugins_deps_valid(errors: &[&crate::plugins::errors::PluginError]) -> 
     )
 }
 
-fn check_plugins_id_collisions(errors: &[&crate::plugins::errors::PluginError]) -> CheckResult {
-    use crate::plugins::errors::PluginError;
+fn check_plugins_id_collisions(errors: &[&linesmith_plugin::PluginError]) -> CheckResult {
+    use linesmith_plugin::PluginError;
     if errors.is_empty() {
         return CheckResult::pass(PLUGINS_ID_COLLISIONS_ID, "No id collisions");
     }
@@ -2344,10 +2344,8 @@ fn check_plugins_id_collisions(errors: &[&crate::plugins::errors::PluginError]) 
     )
 }
 
-fn check_plugins_builtin_collisions(
-    errors: &[&crate::plugins::errors::PluginError],
-) -> CheckResult {
-    use crate::plugins::errors::PluginError;
+fn check_plugins_builtin_collisions(errors: &[&linesmith_plugin::PluginError]) -> CheckResult {
+    use linesmith_plugin::PluginError;
     if errors.is_empty() {
         return CheckResult::pass(PLUGINS_BUILTIN_COLLISIONS_ID, "No built-in collisions");
     }
@@ -2891,7 +2889,7 @@ mod tests {
     fn plain_mode_coverage_envs() -> Vec<(&'static str, DoctorEnv)> {
         use crate::data_context::credentials::CredentialSource;
         use crate::data_context::git::{Head, RepoKind};
-        use crate::plugins::errors::{CollisionWinner, PluginError};
+        use linesmith_plugin::{CollisionWinner, PluginError};
 
         let mut envs: Vec<(&'static str, DoctorEnv)> = Vec::new();
 
@@ -6538,7 +6536,7 @@ mod tests {
 
     // --- Plugins category ---
 
-    use crate::plugins::errors::{CollisionWinner, PluginError};
+    use linesmith_plugin::{CollisionWinner, PluginError};
 
     fn with_plugins(snapshot: DoctorPluginsSnapshot) -> DoctorEnv {
         let mut env = DoctorEnv::healthy();
@@ -6756,7 +6754,7 @@ mod tests {
             },
             PluginError::ResourceExceeded {
                 id: "x".to_string(),
-                limit: crate::plugins::errors::ResourceLimit::MaxOperations,
+                limit: linesmith_plugin::ResourceLimit::MaxOperations,
             },
             PluginError::MalformedReturn {
                 id: "x".to_string(),

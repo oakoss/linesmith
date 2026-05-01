@@ -4,9 +4,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use linesmith_plugin::PluginRegistry;
+
 use crate::config::Config;
 use crate::data_context::xdg::{resolve_subdir, XdgEnv, XdgScope};
-use crate::plugins::{build_engine, PluginRegistry};
+use crate::plugins::build_engine;
 use crate::segments::BUILT_IN_SEGMENT_IDS;
 
 /// `$XDG_CONFIG_HOME/linesmith/segments/` (with `$HOME` fallback)

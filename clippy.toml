@@ -1,0 +1,11 @@
+# Channel `linesmith_plugin::build_engine` callers toward
+# `linesmith_core::plugins::build_engine` (the wrapper that installs
+# the `LINESMITH_LOG`-respecting warn emitter). The bare constructor
+# is still reachable for direct embedders who genuinely don't want
+# linesmith-core's logger — they `#[allow]` the lint locally and
+# inherit the eprintln fallback. Restores the structural nudge that
+# the dropped `engine` shim used to provide before ADR-0020 made the
+# bypass an explicit cross-crate import.
+disallowed-methods = [
+    { path = "linesmith_plugin::build_engine", reason = "use linesmith_core::plugins::build_engine; the wrapper installs the LINESMITH_LOG bridge before delegating. If you genuinely want the bare constructor, #[allow(clippy::disallowed_methods)] at the call site." },
+]

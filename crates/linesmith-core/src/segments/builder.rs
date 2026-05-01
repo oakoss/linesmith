@@ -11,8 +11,10 @@ use super::{
     built_in_by_id, OverriddenSegment, PowerlineWidth, Segment, Separator, WidthBounds,
     DEFAULT_SEGMENT_IDS,
 };
+use linesmith_plugin::{CompiledPlugin, PluginRegistry};
+
 use crate::config;
-use crate::plugins::{CompiledPlugin, PluginRegistry, RhaiSegment};
+use crate::plugins::RhaiSegment;
 use crate::theme;
 
 /// Build the default segment list: every built-in in canonical order,
@@ -1566,7 +1568,7 @@ mod tests {
             "#,
         );
         let engine = crate::plugins::build_engine();
-        let registry = crate::plugins::PluginRegistry::load_with_xdg(
+        let registry = PluginRegistry::load_with_xdg(
             &[tmp.path().to_path_buf()],
             None,
             &engine,
@@ -1655,7 +1657,7 @@ mod tests {
             "#,
         );
         let engine = crate::plugins::build_engine();
-        let registry = crate::plugins::PluginRegistry::load_with_xdg(
+        let registry = PluginRegistry::load_with_xdg(
             &[tmp.path().to_path_buf()],
             None,
             &engine,
@@ -1713,7 +1715,7 @@ mod tests {
             "#,
         );
         let engine = crate::plugins::build_engine();
-        let registry = crate::plugins::PluginRegistry::load_with_xdg(
+        let registry = PluginRegistry::load_with_xdg(
             &[tmp.path().to_path_buf()],
             None,
             &engine,
@@ -1754,7 +1756,7 @@ mod tests {
             "#,
         );
         let engine = crate::plugins::build_engine();
-        let registry = crate::plugins::PluginRegistry::load_with_xdg(
+        let registry = PluginRegistry::load_with_xdg(
             &[tmp.path().to_path_buf()],
             None,
             &engine,
@@ -1799,12 +1801,8 @@ mod tests {
             "#,
         );
         let engine = crate::plugins::build_engine();
-        let registry = crate::plugins::PluginRegistry::load_with_xdg(
-            &[tmp.path().to_path_buf()],
-            None,
-            &engine,
-            &[],
-        );
+        let registry =
+            PluginRegistry::load_with_xdg(&[tmp.path().to_path_buf()], None, &engine, &[]);
 
         let cfg = config::Config::from_str(
             r#"
@@ -2134,7 +2132,7 @@ mod tests {
             "#,
         );
         let engine = crate::plugins::build_engine();
-        let registry = crate::plugins::PluginRegistry::load_with_xdg(
+        let registry = PluginRegistry::load_with_xdg(
             &[tmp.path().to_path_buf()],
             None,
             &engine,

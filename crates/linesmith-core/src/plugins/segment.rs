@@ -17,17 +17,17 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use linesmith_plugin::engine::{
+    is_deadline_abort, set_current_plugin_id, set_render_deadline, DEFAULT_RENDER_DEADLINE_MS,
+};
+use linesmith_plugin::{CompiledPlugin, CompiledPluginParts};
 use rhai::{Dynamic, Engine, EvalAltResult, Scope, AST};
 
 use crate::data_context::{DataContext, DataDep};
 use crate::segments::{RenderContext, RenderResult, Segment, SegmentError};
 
 use super::ctx_mirror::build_ctx;
-use super::engine::{
-    is_deadline_abort, set_current_plugin_id, set_render_deadline, DEFAULT_RENDER_DEADLINE_MS,
-};
 use super::output::validate_return;
-use super::{CompiledPlugin, CompiledPluginParts};
 
 /// Map a header-declared dep token (as parsed by
 /// `linesmith_plugin::header`) to its [`DataDep`] enum variant. The
@@ -64,11 +64,11 @@ impl RenderState {
         // a Drop handler (e.g. caught by `catch_unwind`). Production
         // wouldn't notice; dev / test surfaces it loudly.
         debug_assert!(
-            super::engine::render_deadline_snapshot().is_none(),
+            linesmith_plugin::engine::render_deadline_snapshot().is_none(),
             "RENDER_DEADLINE leaked from a prior render"
         );
         debug_assert!(
-            super::engine::current_plugin_id_snapshot().is_none(),
+            linesmith_plugin::engine::current_plugin_id_snapshot().is_none(),
             "CURRENT_PLUGIN_ID leaked from a prior render"
         );
         set_render_deadline(Some(deadline));
@@ -174,7 +174,8 @@ impl Segment for RhaiSegment {
 mod tests {
     use super::*;
     use crate::input::{ModelInfo, StatusContext, Tool, WorkspaceInfo};
-    use crate::plugins::{build_engine, PluginRegistry};
+    use crate::plugins::build_engine;
+    use linesmith_plugin::PluginRegistry;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -513,7 +514,7 @@ mod tests {
         // scope exit. A regression that removed either set_*(None)
         // call from Drop would silently leak a stale deadline or
         // plugin id into subsequent renders on this thread.
-        use crate::plugins::engine::{current_plugin_id_snapshot, render_deadline_snapshot};
+        use linesmith_plugin::engine::{current_plugin_id_snapshot, render_deadline_snapshot};
         {
             let _state =
                 RenderState::install("guard_test", Instant::now() + Duration::from_secs(60));
@@ -558,7 +559,7 @@ mod tests {
         // the classifier path the segment uses on a real abort, drive
         // the engine directly with a past deadline, then feed the
         // resulting EvalAltResult through `classify_render_error`.
-        use crate::plugins::engine::set_render_deadline;
+        use linesmith_plugin::engine::set_render_deadline;
         let tmp = TempDir::new().expect("tempdir");
         let (plugin, engine) =
             load_single(&tmp, "x.rhai", r#"const ID = "x"; fn render(ctx) { () }"#);

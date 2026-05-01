@@ -14,10 +14,10 @@
 
 use std::sync::OnceLock;
 
+use linesmith_plugin::engine::{MAX_ARRAY_SIZE, MAX_EXPR_DEPTH, MAX_MAP_SIZE, MAX_STRING_SIZE};
 use rhai::{Array, Dynamic, Map};
 use serde_json::Value as JsonValue;
 
-use super::engine::{MAX_ARRAY_SIZE, MAX_EXPR_DEPTH, MAX_MAP_SIZE, MAX_STRING_SIZE};
 use crate::data_context::{
     DataContext, DataDep, DirtyCounts, DirtyState, EndpointUsage, ExtraUsage, FiveHourWindow,
     GitContext, Head, JsonlUsage, RepoKind, SevenDayWindow, TokenCounts, UpstreamState,
