@@ -31,7 +31,7 @@ pub fn scan_plugin_dirs(config_dirs: &[PathBuf]) -> Vec<PathBuf> {
 /// from the env-reading public API so callers (and tests) can pin
 /// `xdg_dir` to a specific value without mutating process env (which
 /// is racy under the default parallel test runner).
-pub(super) fn scan_dirs(config_dirs: &[PathBuf], xdg_dir: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn scan_dirs(config_dirs: &[PathBuf], xdg_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut ordered: Vec<&Path> = config_dirs.iter().map(PathBuf::as_path).collect();
     if let Some(p) = xdg_dir {
         ordered.push(p);

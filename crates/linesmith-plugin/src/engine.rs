@@ -20,12 +20,12 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use chrono::Utc;
 use rhai::packages::{Package, StandardPackage};
-use rhai::{Dynamic, Engine};
+use rhai::{Dynamic, Engine, EvalAltResult};
 
 /// Max script operations per plugin invocation.
 pub const MAX_OPERATIONS: u64 = 50_000;
@@ -91,6 +91,46 @@ thread_local! {
 /// silently dropped to keep a chatty plugin from flooding stderr.
 pub const LOG_LINES_PER_PLUGIN: u32 = 1;
 
+/// Process-global emitter for plugin `log()` output. Set once by the
+/// consumer so plugin diagnostics route through the host's logging
+/// level (e.g. `LINESMITH_LOG`) without dragging linesmith-core into
+/// this crate's dep graph. The consumer is expected to install at
+/// the same chokepoint where it builds plugin engines, so the
+/// emitter is in place before the first render.
+///
+/// Stderr fallback (when unset) is for unit tests and direct
+/// embedders that never go through a host. Production consumers
+/// install an emitter before any plugin renders, so the fallback
+/// never fires in production.
+type WarnEmitter = Box<dyn Fn(&str) + Send + Sync>;
+static WARN_EMITTER: OnceLock<WarnEmitter> = OnceLock::new();
+
+/// Install the host's warn-emitter. The `OnceLock` keeps the first
+/// installation authoritative so consumers like
+/// `linesmith-core::runtime::plugins::load_plugins` can call this
+/// from a `Once::call_once` without worrying about racing tests.
+///
+/// `debug_assert` catches accidental double-install with conflicting
+/// emitters (a buggy embedder wiring two bridges) so dev/test surfaces
+/// the silent-mis-route loudly while production keeps the safe ignore.
+pub fn install_warn_emitter(emitter: WarnEmitter) {
+    debug_assert!(
+        WARN_EMITTER.get().is_none(),
+        "install_warn_emitter called twice — first install wins, subsequent emitter is dropped"
+    );
+    let _ = WARN_EMITTER.set(emitter);
+}
+
+/// Emit a warn-level diagnostic through the installed host emitter,
+/// or fall back to stderr when none is installed.
+fn emit_warn(msg: &str) {
+    if let Some(emitter) = WARN_EMITTER.get() {
+        emitter(msg);
+    } else {
+        eprintln!("linesmith [warn] {msg}");
+    }
+}
+
 /// Install a per-render deadline visible to the engine's `on_progress`
 /// callback. Pass `None` to clear after the render completes.
 pub fn set_render_deadline(deadline: Option<Instant>) {
@@ -117,19 +157,39 @@ pub(crate) fn reset_log_counts() {
 /// Snapshot of the current thread's `RENDER_DEADLINE`. Used by the
 /// segment wrapper's `debug_assert!` leak-check and by tests; the
 /// production render path doesn't need to read the deadline back.
-pub(crate) fn render_deadline_snapshot() -> Option<Instant> {
+pub fn render_deadline_snapshot() -> Option<Instant> {
     RENDER_DEADLINE.with(Cell::get)
+}
+
+/// True when `err` was produced by the per-render wallclock deadline
+/// aborting the script (the engine's `on_progress` callback). Lets
+/// the consumer-side segment wrapper distinguish a host-imposed
+/// timeout from a script-issued `throw`/runtime error without
+/// reaching for the host-only marker type directly.
+///
+/// A plugin cannot forge this classification: the marker is a
+/// host-only Rust type that's never registered with the rhai engine,
+/// so a `throw "..."` payload — even one carrying an identical
+/// string message — won't satisfy the inner type-id check.
+#[must_use]
+pub fn is_deadline_abort(err: &EvalAltResult) -> bool {
+    if let EvalAltResult::ErrorTerminated(token, _) = err {
+        token.is::<DeadlineAbortMarker>()
+    } else {
+        false
+    }
 }
 
 /// Snapshot of the current thread's `CURRENT_PLUGIN_ID`. Same niche
 /// as [`render_deadline_snapshot`].
-pub(crate) fn current_plugin_id_snapshot() -> Option<String> {
+pub fn current_plugin_id_snapshot() -> Option<String> {
     CURRENT_PLUGIN_ID.with(|c| c.borrow().clone())
 }
 
 /// Build the shared rhai engine used by every plugin segment. Returns
-/// an `Arc` so the layout engine can clone cheaply into each
-/// `RhaiSegment`. The engine is immutable after this call.
+/// an `Arc` so the consumer's layout engine can clone cheaply into
+/// each segment adapter that wraps a [`crate::CompiledPlugin`]. The
+/// engine is immutable after this call.
 #[must_use]
 pub fn build_engine() -> Arc<Engine> {
     let mut engine = Engine::new_raw();
@@ -203,18 +263,20 @@ const _: fn() = || {
 };
 
 /// Host-registered `log(msg)` for plugin scripts. Emits one warn-
-/// level line per plugin per process through the crate logger;
-/// subsequent calls from the same plugin are silently dropped to
-/// keep a chatty plugin from flooding stderr. The active plugin id
-/// comes from a thread-local set by `RhaiSegment::render`; calls
-/// outside a render (e.g. tests that `eval` directly) attribute to
-/// a synthetic `<unscoped>` bucket.
+/// level line per plugin per process through the installed host
+/// emitter; subsequent calls from the same plugin are silently
+/// dropped to keep a chatty plugin from flooding stderr. The active
+/// plugin id comes from `CURRENT_PLUGIN_ID`, set by the consumer's
+/// segment wrapper via [`set_current_plugin_id`] for the duration
+/// of a render; calls outside a render (e.g. tests that `eval`
+/// directly) attribute to a synthetic `<unscoped>` bucket.
 ///
 /// `log()` is a diagnostic channel, not a user-feedback channel.
-/// It routes through `LINESMITH_LOG` and a user who sets
-/// `LINESMITH_LOG=off` will not see plugin log lines. Plugins that
-/// want to communicate with users should emit via segment output
-/// (the return of `fn render(ctx)`), not `log()`.
+/// It routes through the host's logging level (e.g. `LINESMITH_LOG`)
+/// when a host emitter is installed; a user who turns that off will
+/// not see plugin log lines. Plugins that want to communicate with
+/// users should emit via segment output (the return of `fn render(ctx)`),
+/// not `log()`.
 ///
 /// Bumping the counter *before* emitting is deliberate: a chatty
 /// plugin should pay at most a single `to_owned` per process for its
@@ -240,10 +302,7 @@ fn rhai_log(msg: &str) {
         }
     });
     if let Some(id) = allowed {
-        // The existing per-plugin counter still gates chattiness; the
-        // logger just adds `LINESMITH_LOG=off` suppression and the
-        // uniform `[warn]` prefix.
-        crate::lsm_warn!("plugin {id}: {msg}");
+        emit_warn(&format!("plugin {id}: {msg}"));
     }
 }
 
@@ -353,8 +412,8 @@ mod tests {
 
     /// RAII guard for the per-render thread-locals so a test panic
     /// can't leak state into siblings on the same thread. The
-    /// production [`super::super::segment::RhaiSegment::render`] uses
-    /// the same pattern.
+    /// consumer-side segment wrapper (linesmith-core's
+    /// `RhaiSegment::render`) uses the same RAII pattern in production.
     struct ThreadLocalGuard;
 
     impl ThreadLocalGuard {

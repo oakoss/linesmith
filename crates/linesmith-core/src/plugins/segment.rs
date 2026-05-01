@@ -24,10 +24,32 @@ use crate::segments::{RenderContext, RenderResult, Segment, SegmentError};
 
 use super::ctx_mirror::build_ctx;
 use super::engine::{
-    set_current_plugin_id, set_render_deadline, DeadlineAbortMarker, DEFAULT_RENDER_DEADLINE_MS,
+    is_deadline_abort, set_current_plugin_id, set_render_deadline, DEFAULT_RENDER_DEADLINE_MS,
 };
 use super::output::validate_return;
-use super::registry::CompiledPlugin;
+use super::{CompiledPlugin, CompiledPluginParts};
+
+/// Map a header-declared dep token (as parsed by
+/// `linesmith_plugin::header`) to its [`DataDep`] enum variant. The
+/// plugin crate's header parser already validates names against the
+/// plugin-accessible set, so a missing case here is a programming
+/// error (the two name lists drifted) rather than a user-facing
+/// failure — panicking surfaces it loudly during tests / `linesmith
+/// doctor` instead of silently dropping a dep at render time.
+fn dep_from_token(name: &str) -> DataDep {
+    match name {
+        "status" => DataDep::Status,
+        "settings" => DataDep::Settings,
+        "claude_json" => DataDep::ClaudeJson,
+        "usage" => DataDep::Usage,
+        "sessions" => DataDep::Sessions,
+        "git" => DataDep::Git,
+        other => panic!(
+            "linesmith-plugin's header validator accepted `{other}` but \
+             linesmith-core has no matching DataDep variant — name lists drifted"
+        ),
+    }
+}
 
 /// RAII guard for the engine's per-render thread-local state
 /// (`RENDER_DEADLINE` + `CURRENT_PLUGIN_ID`). Drop restores both to
@@ -83,10 +105,17 @@ impl RhaiSegment {
     /// [`Vec::leak`] — see [`Segment::data_deps`] for why.
     #[must_use]
     pub fn from_compiled(plugin: CompiledPlugin, engine: Arc<Engine>, config: Dynamic) -> Self {
-        let declared_deps: &'static [DataDep] = Vec::leak(plugin.declared_deps);
+        let CompiledPluginParts {
+            id,
+            path: _,
+            ast,
+            declared_deps: dep_tokens,
+        } = plugin.into_parts();
+        let deps: Vec<DataDep> = dep_tokens.iter().map(|t| dep_from_token(t)).collect();
+        let declared_deps: &'static [DataDep] = Vec::leak(deps);
         Self {
-            id: plugin.id,
-            ast: plugin.ast,
+            id,
+            ast,
             engine,
             config,
             declared_deps,
@@ -108,13 +137,11 @@ impl RhaiSegment {
     /// Plugin `throw` also surfaces as `ErrorTerminated`, but with a
     /// script-supplied payload that can't impersonate the marker.
     fn classify_render_error(&self, err: Box<EvalAltResult>) -> SegmentError {
-        if let EvalAltResult::ErrorTerminated(token, _) = err.as_ref() {
-            if token.is::<DeadlineAbortMarker>() {
-                return SegmentError::new(format!(
-                    "plugin `{}` exceeded the {}ms render deadline",
-                    self.id, DEFAULT_RENDER_DEADLINE_MS
-                ));
-            }
+        if is_deadline_abort(err.as_ref()) {
+            return SegmentError::new(format!(
+                "plugin `{}` exceeded the {}ms render deadline",
+                self.id, DEFAULT_RENDER_DEADLINE_MS
+            ));
         }
         SegmentError::new(format!("plugin `{}` render failed: {err}", self.id))
     }
@@ -147,8 +174,7 @@ impl Segment for RhaiSegment {
 mod tests {
     use super::*;
     use crate::input::{ModelInfo, StatusContext, Tool, WorkspaceInfo};
-    use crate::plugins::build_engine;
-    use crate::plugins::registry::PluginRegistry;
+    use crate::plugins::{build_engine, PluginRegistry};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -347,6 +373,64 @@ mod tests {
         let seg = RhaiSegment::from_compiled(plugin, engine, Dynamic::UNIT);
         assert!(seg.data_deps().contains(&DataDep::Status));
         assert!(seg.data_deps().contains(&DataDep::Usage));
+    }
+
+    #[test]
+    fn dep_from_token_covers_every_known_dep() {
+        // Drift guard: iterates linesmith-plugin's `KNOWN_DEPS`
+        // catalog (the source of truth for plugin-accessible names)
+        // and asserts every entry resolves to a `DataDep` variant
+        // via the consumer-side mapper. A regression that adds a
+        // token to `KNOWN_DEPS` without updating `dep_from_token`
+        // would silently panic at render time on real user data;
+        // this test surfaces the gap at `cargo test`. Driving from
+        // `KNOWN_DEPS` directly (rather than a parallel literal)
+        // means a contributor can't add a new plugin-accessible
+        // name without updating the mapper to compile.
+        for token in linesmith_plugin::header::KNOWN_DEPS {
+            // `dep_from_token` panics on unknown names; reaching
+            // the assert means the variant exists.
+            let variant = dep_from_token(token);
+            assert_eq!(
+                variant.as_str(),
+                *token,
+                "round-trip drift: KNOWN_DEPS entry {token:?} maps to \
+                 DataDep::{variant:?} whose as_str() is {as_str:?}",
+                as_str = variant.as_str(),
+            );
+        }
+    }
+
+    #[test]
+    fn known_deps_surface_through_segment_render_pipeline() {
+        // Companion to `dep_from_token_covers_every_known_dep`:
+        // pins the full pipeline (header parse → registry compile →
+        // `RhaiSegment::from_compiled` → `Segment::data_deps`) so a
+        // refactor that bypasses the mapper or drops a token
+        // mid-flight surfaces here too. Builds the `@data_deps`
+        // literal from `KNOWN_DEPS` so adding a new entry to the
+        // catalog automatically extends this test's assertion set.
+        let header_array = linesmith_plugin::header::KNOWN_DEPS
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let src = format!(
+            "// @data_deps = [{header_array}]\nconst ID = \"all_deps\";\nfn render(ctx) {{ () }}\n"
+        );
+
+        let tmp = TempDir::new().expect("tempdir");
+        let (plugin, engine) = load_single(&tmp, "all_deps.rhai", &src);
+        let seg = RhaiSegment::from_compiled(plugin, engine, Dynamic::UNIT);
+        let surfaced = seg.data_deps();
+        for token in linesmith_plugin::header::KNOWN_DEPS {
+            let expected = dep_from_token(token);
+            assert!(
+                surfaced.contains(&expected),
+                "missing {expected:?} (token {token:?}) from Segment::data_deps; \
+                 pipeline dropped a known dep between header parse and trait surface"
+            );
+        }
     }
 
     #[test]

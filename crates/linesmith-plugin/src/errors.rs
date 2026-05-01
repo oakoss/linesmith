@@ -10,8 +10,8 @@
 use std::path::PathBuf;
 
 /// Which of the configured rhai resource ceilings tripped. One-to-one
-/// with the `MAX_*` constants in [`crate::plugins::engine`]; a typed
-/// enum here (rather than `&'static str`) keeps [`PluginError::ResourceExceeded`]
+/// with the `MAX_*` constants in [`crate::engine`]; a typed enum here
+/// (rather than `&'static str`) keeps [`PluginError::ResourceExceeded`]
 /// and `linesmith doctor` output typo-proof.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -75,10 +75,13 @@ pub enum PluginError {
     MalformedReturn { id: String, message: String },
 
     /// `@data_deps` declared a name that isn't in the plugin-accessible
-    /// set. Per `plugin-api.md`, `credentials` and `jsonl` are reserved
-    /// and surface here even though they're real `DataDep` variants.
-    /// `path` rather than `id` because header parsing fires before
-    /// `const ID` has been extracted from the script.
+    /// set defined by `header::KNOWN_DEPS`. Per
+    /// `plugin-api.md` §@data_deps header syntax, `credentials` and
+    /// `jsonl` are reserved and surface here alongside truly unknown
+    /// names; consumer-side handling of those reserved names lives
+    /// in linesmith-core. `path` rather than `id` because header
+    /// parsing fires before `const ID` has been extracted from the
+    /// script.
     UnknownDataDep { path: PathBuf, name: String },
 
     /// `@data_deps = ...` header didn't parse as a JSON-style array of

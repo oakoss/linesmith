@@ -1,0 +1,29 @@
+[package]
+name = "linesmith-plugin"
+description = "Internal rhai plugin host for linesmith. No SemVer guarantee for direct dependents — depend on the `linesmith` binary or accept breakage between minor versions."
+# Workspace-internal in v0.1 per ADR-0018. Like `linesmith-core`, this
+# crate is published to crates.io as scaffolding so the parent
+# `linesmith` binary's transitive-dep graph resolves on the registry;
+# the public surface is free to refactor without SemVer cost until a
+# publish decision lands (post-v1.0 at the earliest).
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+chrono.workspace = true
+rhai.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

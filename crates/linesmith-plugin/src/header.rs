@@ -3,12 +3,31 @@
 //! script. See `docs/specs/plugin-api.md` §@data_deps header syntax for
 //! the full contract.
 //!
-//! Resolved dep list is always a superset of
-//! `&[DataDep::Status]` — every plugin implicitly has access to the
-//! stdin payload — even if the author lists other deps explicitly or
-//! declares no header at all.
+//! Resolved dep list is always a superset of `["status"]` — every
+//! plugin implicitly has access to the stdin payload — even if the
+//! author lists other deps explicitly or declares no header at all.
+//!
+//! Names are returned as raw lowercase tokens (`Vec<String>`); the
+//! consumer maps them to its own dep enum at registration time. Names
+//! reserved from plugins per spec (`credentials`, `jsonl`) and any
+//! token outside the plugin-accessible set surface as
+//! [`HeaderError::UnknownDep`] so the consumer doesn't have to repeat
+//! the validation.
 
-use crate::data_context::DataDep;
+/// Plugin-accessible dep names per `docs/specs/plugin-api.md`. The
+/// header validator rejects any token outside this list; the
+/// consumer maps these strings back to its own enum at registration
+/// time. Exposed `pub` so consumer-side drift-detection tests can
+/// iterate the same catalog rather than hard-coding a parallel list
+/// (a third copy that could itself fall out of sync).
+pub const KNOWN_DEPS: &[&str] = &[
+    "status",
+    "settings",
+    "claude_json",
+    "usage",
+    "sessions",
+    "git",
+];
 
 /// Error surface for header parsing. The registry layer wraps these
 /// into [`PluginError`](super::errors::PluginError) variants with
@@ -18,54 +37,38 @@ pub enum HeaderError {
     /// The `@data_deps = ...` RHS didn't parse as a JSON-style array
     /// of bare-string dep names.
     Malformed(String),
-    /// A listed dep name is not in the plugin-accessible set.
-    /// Per `plugin-api.md`, `credentials` and `jsonl` are reserved
-    /// and surface here even though they're real `DataDep` variants.
+    /// A listed dep name is not in the plugin-accessible set
+    /// defined by [`KNOWN_DEPS`]. `credentials` and `jsonl` are
+    /// reserved per spec and surface here alongside truly unknown
+    /// names.
     UnknownDep(String),
 }
 
-/// Map a header token to its [`DataDep`]. Rejects `credentials` and
-/// `jsonl` (reserved-from-plugin per `plugin-api.md` §@data_deps
-/// header syntax) by returning `None`, so the parser can report them
-/// as [`HeaderError::UnknownDep`].
-fn dep_from_token(token: &str) -> Option<DataDep> {
-    match token {
-        "status" => Some(DataDep::Status),
-        "settings" => Some(DataDep::Settings),
-        "claude_json" => Some(DataDep::ClaudeJson),
-        "usage" => Some(DataDep::Usage),
-        "sessions" => Some(DataDep::Sessions),
-        "git" => Some(DataDep::Git),
-        _ => None,
-    }
-}
-
 /// Parse a plugin script's `@data_deps` header. Returns the resolved
-/// dep list (always including [`DataDep::Status`]), `HeaderError` on
-/// malformed syntax or an unknown / reserved dep name.
+/// dep list as raw lowercase token strings (always including
+/// `"status"`), or [`HeaderError`] on malformed syntax / unknown /
+/// reserved dep name.
 ///
 /// Accepts:
-/// - No header at all (defaults to `[Status]`)
+/// - No header at all (defaults to `["status"]`)
 /// - Empty array (`@data_deps = []`) — same as no header
 /// - Single-line (`@data_deps = ["status", "usage"]`)
 /// - Multi-line across multiple `//` comment lines
 /// - Trailing commas
 /// - Single or double quotes around each name
-pub fn parse_data_deps_header(src: &str) -> Result<Vec<DataDep>, HeaderError> {
+pub fn parse_data_deps_header(src: &str) -> Result<Vec<String>, HeaderError> {
     let header_block = collect_header_block(src);
     let Some(rhs) = find_data_deps_rhs(&header_block)? else {
-        return Ok(vec![DataDep::Status]);
+        return Ok(vec!["status".to_string()]);
     };
     let tokens = split_array_body(rhs)?;
-    let mut deps = vec![DataDep::Status];
+    let mut deps = vec!["status".to_string()];
     for token in tokens {
-        match dep_from_token(&token) {
-            Some(dep) => {
-                if !deps.contains(&dep) {
-                    deps.push(dep);
-                }
-            }
-            None => return Err(HeaderError::UnknownDep(token)),
+        if !KNOWN_DEPS.contains(&token.as_str()) {
+            return Err(HeaderError::UnknownDep(token));
+        }
+        if !deps.iter().any(|d| d == &token) {
+            deps.push(token);
         }
     }
     Ok(deps)
@@ -96,7 +99,7 @@ fn collect_header_block(src: &str) -> String {
 /// Locate `@data_deps = [ ... ]` in the header block and return the
 /// text starting right after the opening `[`. `Ok(None)` when no
 /// `@data_deps` declaration exists at all (a valid "no header" state
-/// resolved to the default `[Status]` by the caller). If the key is
+/// resolved to the default `["status"]` by the caller). If the key is
 /// present but the `= [` shape is missing (e.g. `@data_deps ["x"]`
 /// or `@data_deps = "x"`), returns [`HeaderError::Malformed`] rather
 /// than silently degrading to the default — writing `@data_deps`
@@ -175,26 +178,27 @@ fn unquote(s: &str) -> Result<String, HeaderError> {
 mod tests {
     use super::*;
 
+    fn deps(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
     #[test]
     fn no_header_defaults_to_status_only() {
         let src = "fn render(ctx) { () }";
-        assert_eq!(parse_data_deps_header(src), Ok(vec![DataDep::Status]));
+        assert_eq!(parse_data_deps_header(src), Ok(deps(&["status"])));
     }
 
     #[test]
     fn empty_array_defaults_to_status_only() {
         let src = "// @data_deps = []\nfn render(ctx) {}";
-        assert_eq!(parse_data_deps_header(src), Ok(vec![DataDep::Status]));
+        assert_eq!(parse_data_deps_header(src), Ok(deps(&["status"])));
     }
 
     #[test]
     fn single_line_single_entry_unions_with_status() {
         let src = r#"// @data_deps = ["usage"]
 fn render(ctx) {}"#;
-        assert_eq!(
-            parse_data_deps_header(src),
-            Ok(vec![DataDep::Status, DataDep::Usage])
-        );
+        assert_eq!(parse_data_deps_header(src), Ok(deps(&["status", "usage"])));
     }
 
     #[test]
@@ -203,12 +207,7 @@ fn render(ctx) {}"#;
 fn render(ctx) {}"#;
         assert_eq!(
             parse_data_deps_header(src),
-            Ok(vec![
-                DataDep::Status,
-                DataDep::Settings,
-                DataDep::Usage,
-                DataDep::Git
-            ])
+            Ok(deps(&["status", "settings", "usage", "git"]))
         );
     }
 
@@ -216,12 +215,12 @@ fn render(ctx) {}"#;
     fn explicit_status_is_accepted_without_duplication() {
         let src = r#"// @data_deps = ["status", "usage"]
 fn render(ctx) {}"#;
-        let deps = parse_data_deps_header(src).unwrap();
-        assert_eq!(deps, vec![DataDep::Status, DataDep::Usage]);
+        let resolved = parse_data_deps_header(src).unwrap();
+        assert_eq!(resolved, deps(&["status", "usage"]));
         assert_eq!(
-            deps.iter().filter(|d| **d == DataDep::Status).count(),
+            resolved.iter().filter(|d| *d == "status").count(),
             1,
-            "Status must not be duplicated when listed explicitly"
+            "status must not be duplicated when listed explicitly"
         );
     }
 
@@ -235,12 +234,7 @@ fn render(ctx) {}"#;
 fn render(ctx) {}"#;
         assert_eq!(
             parse_data_deps_header(src),
-            Ok(vec![
-                DataDep::Status,
-                DataDep::Settings,
-                DataDep::Usage,
-                DataDep::Git
-            ])
+            Ok(deps(&["status", "settings", "usage", "git"]))
         );
     }
 
@@ -248,19 +242,13 @@ fn render(ctx) {}"#;
     fn trailing_comma_in_single_line_ok() {
         let src = r#"// @data_deps = ["usage",]
 fn render(ctx) {}"#;
-        assert_eq!(
-            parse_data_deps_header(src),
-            Ok(vec![DataDep::Status, DataDep::Usage])
-        );
+        assert_eq!(parse_data_deps_header(src), Ok(deps(&["status", "usage"])));
     }
 
     #[test]
     fn single_quotes_accepted() {
         let src = "// @data_deps = ['usage']\nfn render(ctx) {}";
-        assert_eq!(
-            parse_data_deps_header(src),
-            Ok(vec![DataDep::Status, DataDep::Usage])
-        );
+        assert_eq!(parse_data_deps_header(src), Ok(deps(&["status", "usage"])));
     }
 
     #[test]
@@ -275,10 +263,9 @@ fn render(ctx) {}"#;
 
     #[test]
     fn reserved_credentials_dep_rejected_as_unknown() {
-        // `credentials` is a real DataDep variant but not plugin-
-        // accessible per spec §@data_deps header syntax. Header
-        // parser must reject it with UnknownDep, matching the
-        // error surface for truly unknown names.
+        // `credentials` is plugin-reserved per spec §@data_deps
+        // header syntax. Header parser must reject it with UnknownDep,
+        // matching the error surface for truly unknown names.
         let src = r#"// @data_deps = ["credentials"]
 fn render(ctx) {}"#;
         assert_eq!(
@@ -307,8 +294,8 @@ fn render(ctx) {}"#;
 // @data_deps = ["usage"]
 fn render(ctx) {}"#;
         // The `@data_deps` line is in a second block, so the first
-        // block's resolution defaults to [Status] only.
-        assert_eq!(parse_data_deps_header(src), Ok(vec![DataDep::Status]));
+        // block's resolution defaults to [status] only.
+        assert_eq!(parse_data_deps_header(src), Ok(deps(&["status"])));
     }
 
     #[test]
@@ -318,7 +305,7 @@ fn render(ctx) {}"#;
         let src = r#"// top comment
 fn render(ctx) {}
 // @data_deps = ["usage"]"#;
-        assert_eq!(parse_data_deps_header(src), Ok(vec![DataDep::Status]));
+        assert_eq!(parse_data_deps_header(src), Ok(deps(&["status"])));
     }
 
     #[test]
@@ -330,17 +317,14 @@ fn render(ctx) {}
 // Authored by me
 // @data_deps = ["usage"]
 fn render(ctx) {}"#;
-        assert_eq!(
-            parse_data_deps_header(src),
-            Ok(vec![DataDep::Status, DataDep::Usage])
-        );
+        assert_eq!(parse_data_deps_header(src), Ok(deps(&["status", "usage"])));
     }
 
     #[test]
     fn malformed_missing_equals_rejected() {
         // Spec intent: writing `@data_deps` declares a header, so
         // malformed RHS must surface as an error — not silently
-        // downgrade to the default `[Status]`.
+        // downgrade to the default `[status]`.
         let src = r#"// @data_deps ["usage"]
 fn render(ctx) {}"#;
         assert!(matches!(
@@ -384,7 +368,7 @@ fn render(ctx) {}"#;
         // Per spec: `/* @data_deps = [...] */` is NOT parsed.
         let src = r#"/* @data_deps = ["usage"] */
 fn render(ctx) {}"#;
-        assert_eq!(parse_data_deps_header(src), Ok(vec![DataDep::Status]));
+        assert_eq!(parse_data_deps_header(src), Ok(deps(&["status"])));
     }
 
     #[test]
@@ -398,7 +382,7 @@ fn render(ctx) {}"#;
 fn render(ctx) {}"#;
         assert_eq!(
             parse_data_deps_header(src),
-            Ok(vec![DataDep::Status, DataDep::Usage, DataDep::Git])
+            Ok(deps(&["status", "usage", "git"]))
         );
     }
 
@@ -414,7 +398,7 @@ fn render(ctx) {}"#;
 fn render(ctx) {}"#;
         assert_eq!(
             parse_data_deps_header(src),
-            Ok(vec![DataDep::Status, DataDep::Usage, DataDep::Git])
+            Ok(deps(&["status", "usage", "git"]))
         );
     }
 
@@ -422,9 +406,6 @@ fn render(ctx) {}"#;
     fn whitespace_before_double_slash_is_tolerated() {
         let src = r#"    // @data_deps = ["usage"]
 fn render(ctx) {}"#;
-        assert_eq!(
-            parse_data_deps_header(src),
-            Ok(vec![DataDep::Status, DataDep::Usage])
-        );
+        assert_eq!(parse_data_deps_header(src), Ok(deps(&["status", "usage"])));
     }
 }

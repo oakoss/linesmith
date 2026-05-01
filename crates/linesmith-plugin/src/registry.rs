@@ -1,7 +1,8 @@
 //! Plugin registry: the single source of truth for compiled `.rhai`
 //! scripts after discovery. Owns the parsed ASTs + resolved header
-//! data. Wrapping a [`CompiledPlugin`] in the `Segment` trait is the
-//! `RhaiSegment` adapter's job, not this module's.
+//! data. Wrapping a [`CompiledPlugin`] in a `Segment` adapter is the
+//! consumer's job (see linesmith-core's `RhaiSegment`), not this
+//! module's.
 //!
 //! [`PluginRegistry::load`] walks the discovery order from
 //! [`super::discovery::scan_plugin_dirs`], compiles each script,
@@ -19,23 +20,21 @@ use rhai::{Engine, AST};
 use super::discovery::{scan_dirs, scan_plugin_dirs};
 use super::errors::{CollisionWinner, PluginError};
 use super::header::{parse_data_deps_header, HeaderError};
-use crate::data_context::DataDep;
 
-/// A single compiled plugin ready to be wrapped by the `RhaiSegment`
-/// adapter.
+/// A single compiled plugin ready to be wrapped by a consumer-side
+/// `Segment` adapter.
 ///
 /// Field visibility is `pub(crate)` — the registry is the only
 /// factory (`compile_plugin` is the sole construction site), and
-/// the only consumers live inside this crate. This keeps the
-/// non-empty-id, Status-first-dep, non-reserved-dep invariants the
-/// factory enforces from being silently violated by a third-party
-/// caller that constructs the struct directly.
+/// the only mutator. This keeps the non-empty-id, status-first-dep,
+/// non-reserved-dep invariants the factory enforces from being
+/// silently violated by a third-party caller that constructs the
+/// struct directly. Field accessors are `pub` for consumers.
 ///
-/// `declared_deps` is a raw `Vec<DataDep>` rather than the
-/// `&'static` slice the `Segment::data_deps` contract requires; the
-/// `RhaiSegment` wrapper does the `Vec::leak` promotion at segment-
-/// build time so the registry itself doesn't leak memory on every
-/// reload.
+/// `declared_deps` is a raw `Vec<String>` of the header-declared dep
+/// tokens (always with `"status"` first). The consumer maps these
+/// back to its own dep enum at registration time and is responsible
+/// for any `&'static` promotion required by its `Segment` trait.
 ///
 /// Construction runs the script's top-level statements once to
 /// extract `const ID`; plugin authors with side effects at module
@@ -45,7 +44,7 @@ pub struct CompiledPlugin {
     pub(crate) id: String,
     pub(crate) path: PathBuf,
     pub(crate) ast: AST,
-    pub(crate) declared_deps: Vec<DataDep>,
+    pub(crate) declared_deps: Vec<String>,
 }
 
 impl CompiledPlugin {
@@ -60,9 +59,38 @@ impl CompiledPlugin {
     }
 
     #[must_use]
-    pub fn declared_deps(&self) -> &[DataDep] {
+    pub fn declared_deps(&self) -> &[String] {
         &self.declared_deps
     }
+
+    /// Consume the plugin, yielding its constituent fields as a
+    /// named-field [`CompiledPluginParts`]. Used by consumer-side
+    /// `Segment` adapters that need to take ownership of the `AST`
+    /// and the dep list. Named fields keep the call site readable
+    /// and let new fields be added without breaking destructures.
+    #[must_use]
+    pub fn into_parts(self) -> CompiledPluginParts {
+        CompiledPluginParts {
+            id: self.id,
+            path: self.path,
+            ast: self.ast,
+            declared_deps: self.declared_deps,
+        }
+    }
+}
+
+/// Owned-by-value view of a [`CompiledPlugin`]'s fields, returned by
+/// [`CompiledPlugin::into_parts`]. Pure transport DTO — the
+/// non-empty-id and status-first-dep invariants `compile_plugin`
+/// enforces are implicit on the values, but this struct doesn't
+/// re-check them since callers can only obtain it by consuming a
+/// registry-built [`CompiledPlugin`].
+#[derive(Debug)]
+pub struct CompiledPluginParts {
+    pub id: String,
+    pub path: PathBuf,
+    pub ast: AST,
+    pub declared_deps: Vec<String>,
 }
 
 /// Keyed collection of compiled plugins. Lookup is by `id`; iteration
@@ -95,8 +123,8 @@ impl PluginRegistry {
     /// through to the discovery scan rather than reading
     /// `XDG_CONFIG_HOME` from the process env. Use `None` to skip the
     /// XDG fallback entirely — driver paths pass an env-derived
-    /// [`PathBuf`] so test harnesses with a hermetic `CliEnv` don't
-    /// pick up the developer's real `~/.config/linesmith/segments/`.
+    /// [`PathBuf`] so test harnesses with a hermetic env snapshot
+    /// don't pick up the developer's real `~/.config/linesmith/segments/`.
     #[must_use]
     pub fn load_with_xdg(
         config_dirs: &[PathBuf],
@@ -180,9 +208,7 @@ impl PluginRegistry {
 
     /// Consume the registry, yielding every compiled plugin by value.
     /// The segment builder pulls plugins out by id this way to move
-    /// each [`CompiledPlugin`] into a [`RhaiSegment`].
-    ///
-    /// [`RhaiSegment`]: super::segment::RhaiSegment
+    /// each [`CompiledPlugin`] into a consumer-side adapter.
     #[must_use]
     pub fn into_plugins(self) -> Vec<CompiledPlugin> {
         self.plugins
@@ -273,7 +299,7 @@ fn compile_plugin(path: &Path, engine: &Engine) -> Result<CompiledPlugin, Plugin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::build_engine;
+    use crate::engine::build_engine;
     use std::fs;
     use tempfile::TempDir;
 
@@ -283,6 +309,10 @@ mod tests {
         let path = dir.join(name);
         fs::write(&path, src).expect("write plugin");
         path
+    }
+
+    fn deps(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
     }
 
     #[test]
@@ -318,7 +348,7 @@ mod tests {
         assert_eq!(reg.len(), 1);
         let plugin = reg.get("foo").expect("registered by id");
         assert_eq!(plugin.id, "foo");
-        assert_eq!(plugin.declared_deps, vec![DataDep::Status]);
+        assert_eq!(plugin.declared_deps, deps(&["status"]));
     }
 
     #[test]
@@ -338,10 +368,7 @@ mod tests {
         let errors = reg.load_errors();
         assert!(errors.is_empty());
         let plugin = reg.get("u").expect("registered");
-        assert_eq!(
-            plugin.declared_deps,
-            vec![DataDep::Status, DataDep::Usage, DataDep::Git]
-        );
+        assert_eq!(plugin.declared_deps, deps(&["status", "usage", "git"]));
     }
 
     #[test]
@@ -486,7 +513,7 @@ mod tests {
         let PluginError::IdCollision { winner, .. } = &errors[0] else {
             panic!("expected IdCollision, got {:?}", errors[0]);
         };
-        assert_eq!(*winner, super::super::errors::CollisionWinner::BuiltIn);
+        assert_eq!(*winner, CollisionWinner::BuiltIn);
     }
 
     #[test]
@@ -554,10 +581,7 @@ mod tests {
             panic!("expected IdCollision, got {:?}", errors[0]);
         };
         assert_eq!(id, "dup");
-        assert_eq!(
-            *collision_winner,
-            super::super::errors::CollisionWinner::Plugin(winner.clone())
-        );
+        assert_eq!(*collision_winner, CollisionWinner::Plugin(winner.clone()));
         assert_eq!(loser_path, &loser);
     }
 
