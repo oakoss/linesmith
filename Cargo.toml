@@ -16,18 +16,11 @@ keywords = ["statusline", "claude-code", "claude", "cli", "ai"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
-# Internal core engine for linesmith. Version stays in lockstep with
-# the parent binary crate (`linesmith`) via `version.workspace = true`
-# in linesmith-core/Cargo.toml. The `path =` lets workspace builds
-# resolve locally; the `version =` is required for `cargo publish`
-# (cargo strips path at publish time, registry resolution takes over).
-linesmith-core = { path = "crates/linesmith-core", version = "0.1.2" }
-# Internal rhai plugin host. Same publish posture as `linesmith-core`:
-# scaffolding for the parent `linesmith` binary; no SemVer guarantee
-# for direct dependents until v1.0. Floor matches the first published
-# version on crates.io — release-please bumps this in lockstep with
-# workspace.package.version on subsequent releases.
-linesmith-plugin = { path = "crates/linesmith-plugin", version = "0.1.2" }
+# Internal workspace deps (linesmith-core, linesmith-plugin) live in
+# each consumer's per-crate `[dependencies]` block, not here, so
+# release-plz auto-bumps the version pins in lockstep with each
+# crate's own version on every release. `[workspace.dependencies]`
+# stays focused on shared third-party version centralization.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 catppuccin = "2"

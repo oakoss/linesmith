@@ -19,8 +19,10 @@ unsafe_code = "forbid"
 [dependencies]
 # Sibling crate hosting the segment / theme / layout / data_context
 # / config / runtime predicates the CLI driver and doctor both depend
-# on. Shape and version are governed by `[workspace.dependencies]`.
-linesmith-core.workspace = true
+# on. Declared per-crate (not via `[workspace.dependencies]`) so
+# release-plz updates the version pin automatically in lockstep
+# with linesmith-core's own version on each release.
+linesmith-core = { version = "0.1.2", path = "../linesmith-core" }
 serde.workspace = true
 serde_json.workspace = true
 catppuccin.workspace = true
