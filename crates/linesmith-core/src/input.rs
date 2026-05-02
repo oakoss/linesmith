@@ -456,7 +456,7 @@ mod claude {
 
     const TOOL: Tool = Tool::ClaudeCode;
 
-    pub fn normalize(raw: Arc<serde_json::Value>) -> Result<StatusContext, ParseError> {
+    pub(super) fn normalize(raw: Arc<serde_json::Value>) -> Result<StatusContext, ParseError> {
         let root = expect_object(&raw, "")?;
 
         let model = parse_model(root);

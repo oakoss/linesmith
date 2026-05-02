@@ -19,9 +19,15 @@ keywords.workspace = true
 categories.workspace = true
 
 [lints.rust]
+# `[lints] workspace = true` is all-or-nothing in stable Cargo and
+# can't coexist with the per-crate clippy override below; per-lint
+# workspace inheritance isn't supported either. So this block
+# duplicates `[workspace.lints]` inline. Keep in sync with the root.
 unsafe_code = "forbid"
+unreachable_pub = "warn"
 
 [lints.clippy]
+redundant_pub_crate = "warn"
 # Workspace-level `clippy.toml` disallows `linesmith_plugin::build_engine`
 # to channel consumers through `linesmith_core::plugins::build_engine`'s
 # warn-emitter wrapper. This crate IS that function's home — its own

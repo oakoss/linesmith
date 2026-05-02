@@ -73,6 +73,20 @@ toml = "1"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 
+[workspace.lints.rust]
+# `forbid` so no per-crate `#[allow(unsafe_code)]` can reopen the door
+# without an explicit manifest-level override.
+unsafe_code = "forbid"
+# Enforces ADR-0021 rule 6: pushes `pub` items down toward `pub(crate)`
+# when their enclosing module isn't reachable from a crate root.
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+# Counterpart to `unreachable_pub` — pushes `pub(crate)` items back up
+# to plain `pub` when their enclosing module is already private. The
+# pair settles each item at its tightest stable visibility.
+redundant_pub_crate = "warn"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
