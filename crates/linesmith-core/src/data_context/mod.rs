@@ -8,7 +8,7 @@
 //! credentials, live sessions, git).
 //!
 //! This module ships the v0.1 skeleton: the struct shape, the accessor
-//! surface, and stub [`NotImplemented`](errors::SettingsError::NotImplemented)
+//! surface, and stub [`NotImplemented`](error::SettingsError::NotImplemented)
 //! errors. Real source implementations arrive with their owning epics
 //! (lsm-y6m for usage, lsm-8jl for git, etc.). Plugin scripts see a
 //! uniform `{ kind: "error", error: "NotImplemented" }` shape until
@@ -20,7 +20,7 @@ pub mod cache;
 pub mod cascade;
 pub mod credentials;
 pub mod deps;
-pub mod errors;
+pub mod error;
 pub mod fetcher;
 pub mod git;
 pub mod jsonl;
@@ -35,7 +35,7 @@ use crate::input::StatusContext;
 
 pub use credentials::{CredentialSource, Credentials};
 pub use deps::DataDep;
-pub use errors::{
+pub use error::{
     ClaudeJsonError, CredentialError, GitError, JsonlError, SessionError, SettingsError, UsageError,
 };
 pub use git::{DirtyCounts, DirtyState, GitContext, Head, RepoKind, UpstreamState};

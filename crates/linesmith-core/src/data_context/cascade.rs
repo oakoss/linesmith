@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 
 use super::cache::{CacheError, CacheStore, CachedUsage, Lock, LockStore};
 use super::credentials::Credentials;
-use super::errors::{CredentialError, JsonlError, UsageError};
+use super::error::{CredentialError, JsonlError, UsageError};
 use super::fetcher::{self, UsageTransport};
 use super::jsonl::{self, JsonlAggregate};
 use super::usage::{FiveHourWindow, JsonlUsage, SevenDayWindow, UsageApiResponse, UsageData};
@@ -470,7 +470,7 @@ mod tests {
 
     use crate::data_context::cache::{CacheStore, CachedUsage, Lock, LockStore};
     use crate::data_context::credentials::Credentials;
-    use crate::data_context::errors::CredentialError;
+    use crate::data_context::error::CredentialError;
     use crate::data_context::fetcher::{HttpResponse, UsageTransport};
     use crate::data_context::jsonl::{
         FiveHourBlock, JsonlAggregate, SevenDayWindow as JsonlSevenDayWindow, TokenCounts,

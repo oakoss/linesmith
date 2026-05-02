@@ -12,7 +12,7 @@ use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use super::errors::GitError;
+use super::error::GitError;
 
 /// Which flavor of repository `gix::discover` found.
 #[derive(Debug, Clone, PartialEq, Eq)]

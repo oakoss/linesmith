@@ -30,7 +30,7 @@ pub const KNOWN_DEPS: &[&str] = &[
 ];
 
 /// Error surface for header parsing. The registry layer wraps these
-/// into [`PluginError`](super::errors::PluginError) variants with
+/// into [`PluginError`](super::error::PluginError) variants with
 /// the plugin id attached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeaderError {

@@ -102,7 +102,7 @@ impl std::error::Error for GitError {}
 
 // `CredentialError` and `JsonlError` are real types from their own
 // modules — re-exported at the data_context module root so
-// `pub use errors::{CredentialError, JsonlError}` still resolves.
+// `pub use error::{CredentialError, JsonlError}` still resolves.
 // When other error types graduate, follow the same pattern.
 pub use super::credentials::CredentialError;
 pub use super::jsonl::JsonlError;

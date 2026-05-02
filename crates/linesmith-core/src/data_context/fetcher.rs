@@ -16,7 +16,7 @@ use std::io;
 use std::time::{Duration, SystemTime};
 
 use super::credentials::Credentials;
-use super::errors::UsageError;
+use super::error::UsageError;
 use super::usage::UsageApiResponse;
 
 /// Forward-compat header Anthropic currently requires for the OAuth

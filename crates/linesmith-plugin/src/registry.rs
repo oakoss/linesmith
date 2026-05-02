@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use rhai::{Engine, AST};
 
 use super::discovery::{scan_dirs, scan_plugin_dirs};
-use super::errors::{CollisionWinner, PluginError};
+use super::error::{CollisionWinner, PluginError};
 use super::header::{parse_data_deps_header, HeaderError};
 
 /// A single compiled plugin ready to be wrapped by a consumer-side
