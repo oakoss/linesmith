@@ -1,6 +1,6 @@
 # Adopt module organization conventions for the linesmith workspace
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-05-02
 - Deciders: Jace Babin
 
