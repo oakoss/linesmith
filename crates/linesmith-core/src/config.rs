@@ -341,7 +341,7 @@ const KNOWN_LAYOUT_OPTIONS: &[&str] = &["color", "claude_padding", "separator", 
 /// don't recognize so plugin segments (which own their own schema)
 /// bypass validation. Most built-ins share the universal allow-list;
 /// rate-limit segments extend it with per-family knobs that
-/// `segments::rate_limit_format` reads from the TOML extras bag.
+/// `segments::rate_limit::format` reads from the TOML extras bag.
 fn segment_override_schema(id: &str) -> Option<&'static [&'static str]> {
     const BUILT_IN_COMMON: &[&str] = &["priority", "width", "style", "visible_if"];
     const RATE_LIMIT_COMMON: &[&str] = &[

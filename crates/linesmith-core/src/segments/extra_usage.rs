@@ -2,10 +2,10 @@
 //! the account has not enabled overage (`is_enabled = false`); surfaces
 //! error strings for fetch failures per spec §Render semantics.
 
-use super::rate_limit_5h::PRIORITY;
+use super::rate_limit::five_hour::PRIORITY;
 use std::collections::BTreeMap;
 
-use super::rate_limit_format::{
+use super::rate_limit::format::{
     apply_common_extras, format_extra_usage, parse_extra_usage_format, render_error,
     CommonRateLimitConfig, ExtraUsageFormat,
 };

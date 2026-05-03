@@ -1,17 +1,17 @@
-//! 7-day rate-limit utilization segment. Mirrors `rate_limit_5h` but
-//! reads `data.seven_day`. Hidden when the bucket is absent (JSONL
-//! fallback always omits it per `rate-limit-segments.md`
-//! §JSONL-fallback display).
+//! 7-day rate-limit utilization segment. Mirrors the `five_hour`
+//! segment but reads `data.seven_day`. Hidden when the bucket is
+//! absent (JSONL fallback always omits it per
+//! `rate-limit-segments.md` §JSONL-fallback display).
 
-use super::rate_limit_5h::PRIORITY;
+use super::five_hour::PRIORITY;
 use std::collections::BTreeMap;
 
-use super::rate_limit_format::{
+use super::format::{
     apply_common_extras, format_jsonl_tokens, format_percent, parse_bool, parse_percent_format,
     render_error, CommonRateLimitConfig, PercentFormat,
 };
-use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::{DataContext, DataDep, UsageData};
+use crate::segments::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::theme::Role;
 
 #[non_exhaustive]

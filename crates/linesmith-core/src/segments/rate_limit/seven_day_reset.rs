@@ -1,15 +1,15 @@
-//! 7-day window reset countdown. Mirrors the 5h-reset segment shape
-//! (see `rate_limit_5h_reset.rs`) but reads `data.seven_day`.
+//! 7-day window reset countdown. Mirrors the `five_hour_reset`
+//! segment shape but reads `data.seven_day`.
 
-use super::rate_limit_5h::PRIORITY;
+use super::five_hour::PRIORITY;
 use std::collections::BTreeMap;
 
-use super::rate_limit_format::{
+use super::format::{
     apply_common_extras, format_duration, parse_bool, parse_duration_format, render_error,
     CommonRateLimitConfig, DurationFormat, ResetWindow,
 };
-use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::{DataContext, DataDep, UsageData};
+use crate::segments::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::theme::Role;
 
 #[non_exhaustive]

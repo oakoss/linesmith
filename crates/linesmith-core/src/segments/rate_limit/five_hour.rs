@@ -8,12 +8,12 @@
 
 use std::collections::BTreeMap;
 
-use super::rate_limit_format::{
+use super::format::{
     apply_common_extras, format_jsonl_tokens, format_percent, parse_bool, parse_percent_format,
     render_error, CommonRateLimitConfig, PercentFormat,
 };
-use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::{DataContext, DataDep, UsageData};
+use crate::segments::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::theme::Role;
 
 /// Between model (64) and effort (160). Rate-limit visibility is

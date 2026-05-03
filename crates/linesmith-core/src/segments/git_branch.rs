@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use super::rate_limit_format::parse_bool;
+use super::rate_limit::format::parse_bool;
 use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::{DataContext, DataDep, GitContext, Head, RepoKind};
 use crate::theme::Role;

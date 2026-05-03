@@ -11,7 +11,7 @@
 //! (see `docs/research/jsonl-data-source.md` §7 "ccstatusline widget
 //! catalog").
 
-use super::rate_limit_format::format_tokens;
+use super::rate_limit::format::format_tokens;
 use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::DataContext;
 use crate::input::TurnUsage;
@@ -172,7 +172,7 @@ mod tests {
         })
     }
 
-    // format_tokens itself is covered in `rate_limit_format` tests;
+    // format_tokens itself is covered in `rate_limit::format` tests;
     // here we only assert the segment-level integration.
 
     // --- tokens_input ---

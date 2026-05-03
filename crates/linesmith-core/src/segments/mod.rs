@@ -18,11 +18,7 @@ pub mod extra_usage;
 pub mod git_branch;
 pub mod model;
 pub mod output_style;
-pub mod rate_limit_5h;
-pub mod rate_limit_5h_reset;
-pub mod rate_limit_7d;
-pub mod rate_limit_7d_reset;
-pub mod rate_limit_format;
+pub mod rate_limit;
 pub mod session_duration;
 pub mod tokens;
 pub mod version;
@@ -568,17 +564,17 @@ pub fn built_in_by_id(
         "vim" => Some(Box::new(vim::VimSegment)),
         "agent" => Some(Box::new(agent::AgentSegment)),
         "git_branch" => Some(Box::new(git_branch::GitBranchSegment::from_extras(e, warn))),
-        "rate_limit_5h" => Some(Box::new(rate_limit_5h::RateLimit5hSegment::from_extras(
-            e, warn,
-        ))),
-        "rate_limit_7d" => Some(Box::new(rate_limit_7d::RateLimit7dSegment::from_extras(
-            e, warn,
-        ))),
+        "rate_limit_5h" => Some(Box::new(
+            rate_limit::five_hour::RateLimit5hSegment::from_extras(e, warn),
+        )),
+        "rate_limit_7d" => Some(Box::new(
+            rate_limit::seven_day::RateLimit7dSegment::from_extras(e, warn),
+        )),
         "rate_limit_5h_reset" => Some(Box::new(
-            rate_limit_5h_reset::RateLimit5hResetSegment::from_extras(e, warn),
+            rate_limit::five_hour_reset::RateLimit5hResetSegment::from_extras(e, warn),
         )),
         "rate_limit_7d_reset" => Some(Box::new(
-            rate_limit_7d_reset::RateLimit7dResetSegment::from_extras(e, warn),
+            rate_limit::seven_day_reset::RateLimit7dResetSegment::from_extras(e, warn),
         )),
         "extra_usage" => Some(Box::new(extra_usage::ExtraUsageSegment::from_extras(
             e, warn,
