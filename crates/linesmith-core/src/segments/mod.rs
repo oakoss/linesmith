@@ -15,6 +15,7 @@ pub mod context_window;
 pub mod cost;
 pub mod effort;
 pub mod extra_usage;
+pub mod extras;
 pub mod git_branch;
 pub mod model;
 pub mod output_style;
@@ -571,10 +572,10 @@ pub fn built_in_by_id(
             rate_limit::seven_day::RateLimit7dSegment::from_extras(e, warn),
         )),
         "rate_limit_5h_reset" => Some(Box::new(
-            rate_limit::five_hour_reset::RateLimit5hResetSegment::from_extras(e, warn),
+            rate_limit::five_hour::RateLimit5hResetSegment::from_extras(e, warn),
         )),
         "rate_limit_7d_reset" => Some(Box::new(
-            rate_limit::seven_day_reset::RateLimit7dResetSegment::from_extras(e, warn),
+            rate_limit::seven_day::RateLimit7dResetSegment::from_extras(e, warn),
         )),
         "extra_usage" => Some(Box::new(extra_usage::ExtraUsageSegment::from_extras(
             e, warn,

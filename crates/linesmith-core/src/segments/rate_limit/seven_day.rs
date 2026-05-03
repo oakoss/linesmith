@@ -1,16 +1,26 @@
-//! 7-day rate-limit utilization segment. Mirrors the `five_hour`
-//! segment but reads `data.seven_day`. Hidden when the bucket is
-//! absent (JSONL fallback always omits it per
-//! `rate-limit-segments.md` §JSONL-fallback display).
+//! 7-day rate-limit segments: utilization (`RateLimit7dSegment`) and
+//! reset countdown (`RateLimit7dResetSegment`). Both mirror the
+//! `five_hour` segments but read `data.seven_day`.
+//!
+//! - Utilization hides only when the endpoint bucket is absent — the
+//!   7d JSONL window is always populated (zero-valued on empty
+//!   transcripts per `rate-limit-segments.md` §JSONL-fallback display).
+//! - Reset countdown hides under JSONL entirely (rolling 7d window
+//!   has no hard reset; ADR-0013 §Decision drivers explicitly rejects
+//!   synthesizing one).
 
-use super::five_hour::PRIORITY;
 use std::collections::BTreeMap;
 
-use super::format::{
-    apply_common_extras, format_jsonl_tokens, format_percent, parse_bool, parse_percent_format,
-    render_error, CommonRateLimitConfig, PercentFormat,
+use super::config::{
+    apply_common_extras, parse_duration_format, parse_percent_format, CommonRateLimitConfig,
+    DurationFormat, PercentFormat, PRIORITY,
 };
-use crate::data_context::{DataContext, DataDep, UsageData};
+use super::format::{
+    format_duration, format_jsonl_tokens, format_percent, render_error, ResetWindow,
+};
+use super::window::{resolve_seven_day_reset, UsageWindow, WindowResolution};
+use crate::data_context::{DataContext, DataDep};
+use crate::segments::extras::parse_bool;
 use crate::segments::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::theme::Role;
 
@@ -56,17 +66,103 @@ impl Segment for RateLimit7dSegment {
     fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let usage = ctx.usage();
         let text = match &*usage {
-            Ok(UsageData::Endpoint(e)) => match &e.seven_day {
-                Some(bucket) => format_percent(bucket, self.format, self.invert, &self.config),
-                None => {
-                    crate::lsm_debug!("rate_limit_7d: endpoint usage.seven_day absent; hiding");
+            Ok(data) => match UsageWindow::SevenDay.resolve_percent(data) {
+                Ok(WindowResolution::Endpoint(bucket)) => {
+                    format_percent(bucket, self.format, self.invert, &self.config)
+                }
+                Ok(WindowResolution::JsonlTokens(total)) => {
+                    format_jsonl_tokens(total, &self.config)
+                }
+                Err(reason) => {
+                    crate::lsm_debug!("rate_limit_7d: {reason}; hiding");
                     return Ok(None);
                 }
             },
-            // 7d window is always populated under JSONL (zero-valued
-            // on empty transcripts), so this branch never hides.
-            Ok(UsageData::Jsonl(j)) => {
-                format_jsonl_tokens(j.seven_day.tokens.total(), &self.config)
+            Err(err) => render_error(err, &self.config),
+        };
+        Ok(Some(RenderedSegment::new(text).with_role(Role::Info)))
+    }
+
+    fn data_deps(&self) -> &'static [DataDep] {
+        &[DataDep::Usage]
+    }
+
+    fn defaults(&self) -> SegmentDefaults {
+        SegmentDefaults::with_priority(PRIORITY)
+    }
+}
+
+#[non_exhaustive]
+pub struct RateLimit7dResetSegment {
+    pub format: DurationFormat,
+    pub compact: bool,
+    pub use_days: bool,
+    pub config: CommonRateLimitConfig,
+}
+
+impl Default for RateLimit7dResetSegment {
+    fn default() -> Self {
+        Self {
+            format: DurationFormat::Duration,
+            compact: false,
+            use_days: true,
+            config: CommonRateLimitConfig::new("7d reset"),
+        }
+    }
+}
+
+impl RateLimit7dResetSegment {
+    #[must_use]
+    pub fn from_extras(
+        extras: &BTreeMap<String, toml::Value>,
+        warn: &mut impl FnMut(&str),
+    ) -> Self {
+        let mut seg = Self::default();
+        apply_common_extras(&mut seg.config, extras, "rate_limit_7d_reset", warn);
+        if let Some(f) = parse_duration_format(extras, "rate_limit_7d_reset", warn) {
+            seg.format = f;
+        }
+        if let Some(b) = parse_bool(extras, "compact", "rate_limit_7d_reset", warn) {
+            seg.compact = b;
+        }
+        if let Some(b) = parse_bool(extras, "use_days", "rate_limit_7d_reset", warn) {
+            seg.use_days = b;
+        }
+        if seg.config.invalid_progress_width {
+            seg.format = DurationFormat::Duration;
+        }
+        seg
+    }
+}
+
+impl Segment for RateLimit7dResetSegment {
+    fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
+        let usage = ctx.usage();
+        let text = match &*usage {
+            Ok(data) => {
+                let resets_at = match resolve_seven_day_reset(data) {
+                    Ok(at) => at,
+                    Err(reason) => {
+                        crate::lsm_debug!("rate_limit_7d_reset: {reason}; hiding");
+                        return Ok(None);
+                    }
+                };
+                let remaining = resets_at.signed_duration_since(chrono::Utc::now());
+                if remaining <= chrono::Duration::zero() {
+                    crate::lsm_debug!(
+                        "rate_limit_7d_reset: seven_day.resets_at in the past ({resets_at}); hiding"
+                    );
+                    return Ok(None);
+                }
+                format_duration(
+                    remaining,
+                    self.format,
+                    self.compact,
+                    self.use_days,
+                    ResetWindow::SevenDay,
+                    false,
+                    &self.config,
+                )
             }
             Err(err) => render_error(err, &self.config),
         };
@@ -89,6 +185,7 @@ mod tests {
         EndpointUsage, JsonlUsage, SevenDayWindow, TokenCounts, UsageBucket, UsageData, UsageError,
     };
     use crate::input::{ModelInfo, Percent, StatusContext, Tool, WorkspaceInfo};
+    use chrono::Duration;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -137,6 +234,28 @@ mod tests {
     fn jsonl_data_with_seven_day_tokens(total: u64) -> UsageData {
         let tokens = TokenCounts::from_parts(total, 0, 0, 0);
         UsageData::Jsonl(JsonlUsage::new(None, SevenDayWindow::new(tokens)))
+    }
+
+    fn data_with_reset_in(duration: Duration) -> UsageData {
+        // 30s of slack so clock drift between setup and render doesn't
+        // round the minute boundary down and flip expected output.
+        let slack = if duration > Duration::zero() {
+            Duration::seconds(30)
+        } else {
+            Duration::zero()
+        };
+        UsageData::Endpoint(EndpointUsage {
+            five_hour: None,
+            seven_day: Some(UsageBucket {
+                utilization: Percent::new(33.0).unwrap(),
+                resets_at: Some(chrono::Utc::now() + duration + slack),
+            }),
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            seven_day_oauth_apps: None,
+            extra_usage: None,
+            unknown_buckets: std::collections::HashMap::new(),
+        })
     }
 
     #[test]
@@ -229,5 +348,174 @@ mod tests {
         assert_eq!(seg.format, PercentFormat::Progress);
         assert!(seg.invert);
         assert_eq!(seg.config.label, "week");
+    }
+
+    // ---- RateLimit7dResetSegment tests ----
+
+    #[test]
+    fn reset_renders_countdown_with_days_by_default() {
+        let dc = ctx_with_usage(Ok(data_with_reset_in(
+            Duration::days(4) + Duration::hours(8),
+        )));
+        let rendered = RateLimit7dResetSegment::default()
+            .render(&dc, &rc())
+            .unwrap()
+            .expect("visible");
+        assert_eq!(rendered.text(), "7d reset: 4d 8hr");
+    }
+
+    #[test]
+    fn reset_use_days_false_emits_hours_only() {
+        let seg = RateLimit7dResetSegment {
+            use_days: false,
+            ..Default::default()
+        };
+        let dc = ctx_with_usage(Ok(data_with_reset_in(
+            Duration::days(1) + Duration::hours(3),
+        )));
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
+        assert_eq!(rendered.text(), "7d reset: 27hr");
+    }
+
+    #[test]
+    fn reset_hidden_when_resets_at_in_past() {
+        let dc = ctx_with_usage(Ok(data_with_reset_in(Duration::minutes(-10))));
+        assert_eq!(
+            RateLimit7dResetSegment::default()
+                .render(&dc, &rc())
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn reset_hidden_when_seven_day_bucket_absent() {
+        let data = UsageData::Endpoint(EndpointUsage {
+            five_hour: None,
+            seven_day: None,
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            seven_day_oauth_apps: None,
+            extra_usage: None,
+            unknown_buckets: std::collections::HashMap::new(),
+        });
+        assert_eq!(
+            RateLimit7dResetSegment::default()
+                .render(&ctx_with_usage(Ok(data)), &rc())
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn reset_renders_error_when_usage_fails() {
+        let dc = ctx_with_usage(Err(UsageError::RateLimited { retry_after: None }));
+        let rendered = RateLimit7dResetSegment::default()
+            .render(&dc, &rc())
+            .unwrap()
+            .expect("visible");
+        assert_eq!(rendered.text(), "7d reset: [Rate limited]");
+    }
+
+    #[test]
+    fn reset_hidden_under_jsonl_fallback() {
+        // Spec §JSONL-fallback display: 7d reset hides entirely
+        // under JSONL because the 7d window is rolling (no hard reset).
+        // ADR-0013 §Decision drivers: faking one is the exact failure
+        // mode the ADR rejects.
+        let data = UsageData::Jsonl(JsonlUsage::new(
+            None,
+            SevenDayWindow::new(TokenCounts::default()),
+        ));
+        let dc = ctx_with_usage(Ok(data));
+        assert_eq!(
+            RateLimit7dResetSegment::default()
+                .render(&dc, &rc())
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn reset_progress_format_divides_by_seven_day_window_not_five_hour() {
+        // Regression guard for the deleted magnitude heuristic: a 7d
+        // reset at 4h remaining must render ~97% elapsed, not ~20%.
+        // If anyone re-introduces per-magnitude window derivation, this
+        // test flips.
+        let dc = ctx_with_usage(Ok(data_with_reset_in(Duration::hours(4))));
+        let seg = RateLimit7dResetSegment {
+            format: DurationFormat::Progress,
+            ..Default::default()
+        };
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
+        let pct_str = rendered
+            .text()
+            .rsplit(' ')
+            .next()
+            .expect("percent suffix")
+            .trim_end_matches('%');
+        let pct: f64 = pct_str.parse().expect("numeric percent");
+        assert!(
+            (96.0..=98.5).contains(&pct),
+            "expected ~97% elapsed, got {pct}% from {:?}",
+            rendered.text(),
+        );
+    }
+
+    #[test]
+    fn reset_hidden_when_resets_at_missing() {
+        let data = UsageData::Endpoint(EndpointUsage {
+            five_hour: None,
+            seven_day: Some(UsageBucket {
+                utilization: Percent::new(33.0).unwrap(),
+                resets_at: None,
+            }),
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            seven_day_oauth_apps: None,
+            extra_usage: None,
+            unknown_buckets: std::collections::HashMap::new(),
+        });
+        assert_eq!(
+            RateLimit7dResetSegment::default()
+                .render(&ctx_with_usage(Ok(data)), &rc())
+                .unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn reset_declares_usage_as_its_only_data_dep() {
+        assert_eq!(
+            RateLimit7dResetSegment::default().data_deps(),
+            &[DataDep::Usage],
+        );
+    }
+
+    #[test]
+    fn reset_from_extras_applies_duration_format_knobs() {
+        let mut extras = std::collections::BTreeMap::new();
+        extras.insert("format".into(), toml::Value::String("progress".into()));
+        extras.insert("compact".into(), toml::Value::Boolean(true));
+        let mut warnings = Vec::new();
+        let seg =
+            RateLimit7dResetSegment::from_extras(&extras, &mut |m| warnings.push(m.to_string()));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(seg.format, DurationFormat::Progress);
+        assert!(seg.compact);
+    }
+
+    #[test]
+    fn reset_from_extras_warns_on_percent_format_string() {
+        // Parity with five_hour: `format = "percent"` is valid for
+        // utilization segments but NOT for reset segments;
+        // parse_duration_format rejects it.
+        let mut extras = std::collections::BTreeMap::new();
+        extras.insert("format".into(), toml::Value::String("percent".into()));
+        let mut warnings = Vec::new();
+        let _ =
+            RateLimit7dResetSegment::from_extras(&extras, &mut |m| warnings.push(m.to_string()));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("format"), "{:?}", warnings[0]);
     }
 }

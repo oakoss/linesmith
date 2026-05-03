@@ -7,13 +7,11 @@
 //! wires the user-facing `[segments.rate_limit_*]` config keys to the
 //! segment structs re-exported below.
 
+pub mod config;
 pub mod five_hour;
-pub mod five_hour_reset;
 pub mod format;
 pub mod seven_day;
-pub mod seven_day_reset;
+pub mod window;
 
-pub use five_hour::RateLimit5hSegment;
-pub use five_hour_reset::RateLimit5hResetSegment;
-pub use seven_day::RateLimit7dSegment;
-pub use seven_day_reset::RateLimit7dResetSegment;
+pub use five_hour::{RateLimit5hResetSegment, RateLimit5hSegment};
+pub use seven_day::{RateLimit7dResetSegment, RateLimit7dSegment};
