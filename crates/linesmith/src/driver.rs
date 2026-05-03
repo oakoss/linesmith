@@ -55,9 +55,14 @@ fn force_color_env(name: &str) -> bool {
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct CliEnv {
-    pub linesmith_config: Option<String>,
-    pub xdg_config_home: Option<String>,
-    pub home: Option<String>,
+    /// Path-bearing fields are `OsString` (not `String`) because Unix
+    /// paths are byte-strings — a user with `XDG_CONFIG_HOME=/srv/
+    /// café-bin` in a non-UTF-8 locale must not silently lose their
+    /// setting. `from_process` uses `var_os` to preserve those bytes;
+    /// `for_tests` and `Default` leave them `None`.
+    pub linesmith_config: Option<std::ffi::OsString>,
+    pub xdg_config_home: Option<std::ffi::OsString>,
+    pub home: Option<std::ffi::OsString>,
     pub no_color: bool,
     pub force_color: bool,
     /// Raw `COLORTERM`, or `None` if unset. Threaded to the
@@ -91,9 +96,9 @@ impl CliEnv {
     #[must_use]
     pub fn from_process() -> Self {
         Self {
-            linesmith_config: std::env::var("LINESMITH_CONFIG").ok(),
-            xdg_config_home: std::env::var("XDG_CONFIG_HOME").ok(),
-            home: std::env::var("HOME").ok(),
+            linesmith_config: std::env::var_os("LINESMITH_CONFIG"),
+            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
+            home: std::env::var_os("HOME"),
             no_color: no_color_env("NO_COLOR"),
             force_color: force_color_env("FORCE_COLOR"),
             colorterm: std::env::var("COLORTERM").ok(),
@@ -814,8 +819,8 @@ fn load_plugins(
 fn cli_env_to_xdg(env: &CliEnv) -> crate::data_context::xdg::XdgEnv {
     crate::data_context::xdg::XdgEnv::from_os_options(
         None,
-        env.xdg_config_home.clone().map(std::ffi::OsString::from),
-        env.home.clone().map(std::ffi::OsString::from),
+        env.xdg_config_home.clone(),
+        env.home.clone(),
     )
 }
 
@@ -1464,7 +1469,7 @@ mod tests {
         .unwrap();
 
         let env = CliEnv {
-            home: Some(dir.path().to_string_lossy().into_owned()),
+            home: Some(dir.path().as_os_str().to_owned()),
             ..CliEnv::for_tests()
         };
         let (code, _stdout, stderr) = run_cli_main(&["--check-config"], b"", &env);
@@ -1480,8 +1485,8 @@ mod tests {
         std::fs::write(xdg_cfg.join("config.toml"), "[line]\nsegments = []\n").unwrap();
 
         let env = CliEnv {
-            xdg_config_home: Some(dir.path().join("xdg").to_string_lossy().into_owned()),
-            home: Some("/nowhere/that/exists".to_string()),
+            xdg_config_home: Some(dir.path().join("xdg").as_os_str().to_owned()),
+            home: Some("/nowhere/that/exists".into()),
             ..CliEnv::for_tests()
         };
         let (code, _stdout, stderr) = run_cli_main(&["--check-config"], b"", &env);
@@ -1842,7 +1847,7 @@ mod tests {
             "workspace": { "project_dir": "/x" }
         }"#;
         let env = CliEnv {
-            home: Some(dir.path().to_string_lossy().into_owned()),
+            home: Some(dir.path().as_os_str().to_owned()),
             color_capability: Some(theme::Capability::TrueColor),
             ..CliEnv::for_tests()
         };
@@ -1864,7 +1869,7 @@ mod tests {
         std::fs::create_dir_all(&cfg_dir).unwrap();
         std::fs::write(cfg_dir.join("config.toml"), "theme = \"nonexistent\"\n").unwrap();
         let env = CliEnv {
-            home: Some(dir.path().to_string_lossy().into_owned()),
+            home: Some(dir.path().as_os_str().to_owned()),
             ..CliEnv::for_tests()
         };
         let json = br#"{
@@ -1884,7 +1889,7 @@ mod tests {
         std::fs::create_dir_all(&themes_dir).unwrap();
         std::fs::write(themes_dir.join("broken.toml"), "not valid toml [[").unwrap();
         let env = CliEnv {
-            home: Some(dir.path().to_string_lossy().into_owned()),
+            home: Some(dir.path().as_os_str().to_owned()),
             ..CliEnv::for_tests()
         };
         let json = br#"{
@@ -1924,7 +1929,7 @@ mod tests {
         let cfg_dir = dir.path().join(".config/linesmith");
         std::fs::write(cfg_dir.join("config.toml"), "theme = \"myuser\"\n").unwrap();
         let env = CliEnv {
-            home: Some(dir.path().to_string_lossy().into_owned()),
+            home: Some(dir.path().as_os_str().to_owned()),
             ..CliEnv::for_tests()
         };
         let (code, _stdout, stderr) = run_cli_main(&["--check-config"], b"", &env);
@@ -1981,7 +1986,7 @@ mod tests {
         )
         .unwrap();
         let env = CliEnv {
-            home: Some(dir.path().to_string_lossy().into_owned()),
+            home: Some(dir.path().as_os_str().to_owned()),
             ..CliEnv::for_tests()
         };
         let (code, stdout, _stderr) = run_cli_main(&["themes", "list"], b"", &env);
@@ -2042,8 +2047,8 @@ mod tests {
         )
         .unwrap();
         let env = CliEnv {
-            xdg_config_home: Some(dir.path().join("xdg").to_string_lossy().into_owned()),
-            home: Some(dir.path().join("home").to_string_lossy().into_owned()),
+            xdg_config_home: Some(dir.path().join("xdg").as_os_str().to_owned()),
+            home: Some(dir.path().join("home").as_os_str().to_owned()),
             ..CliEnv::for_tests()
         };
         let (code, stdout, _stderr) = run_cli_main(&["themes", "list"], b"", &env);
@@ -2373,7 +2378,7 @@ mod tests {
 
     fn env_with_home(dir: &Path) -> CliEnv {
         CliEnv {
-            home: Some(dir.to_string_lossy().into_owned()),
+            home: Some(dir.as_os_str().to_owned()),
             ..CliEnv::for_tests()
         }
     }
@@ -2783,8 +2788,8 @@ mod tests {
         let xdg_dir = tempdir();
         let home_dir = tempdir();
         let env = CliEnv {
-            xdg_config_home: Some(xdg_dir.path().to_string_lossy().into_owned()),
-            home: Some(home_dir.path().to_string_lossy().into_owned()),
+            xdg_config_home: Some(xdg_dir.path().as_os_str().to_owned()),
+            home: Some(home_dir.path().as_os_str().to_owned()),
             ..CliEnv::for_tests()
         };
         let (code, _stdout, stderr) = run_init(init_choices("minimal", "default"), None, b"", &env);
@@ -2885,7 +2890,7 @@ mod tests {
         let dir = tempdir();
         let custom = dir.path().join("env-init.toml");
         let env = CliEnv {
-            linesmith_config: Some(custom.to_string_lossy().into_owned()),
+            linesmith_config: Some(custom.as_os_str().to_owned()),
             ..env_with_home(dir.path())
         };
         let (code, stdout, _stderr) = run_init(init_choices("minimal", "default"), None, b"", &env);
@@ -2926,7 +2931,7 @@ mod tests {
         let dir = tempdir();
         let custom = dir.path().join("env path with spaces.toml");
         let env = CliEnv {
-            linesmith_config: Some(custom.to_string_lossy().into_owned()),
+            linesmith_config: Some(custom.as_os_str().to_owned()),
             ..env_with_home(dir.path())
         };
         let (code, _stdout, stderr) = run_init(init_choices("minimal", "default"), None, b"", &env);

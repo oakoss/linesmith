@@ -483,12 +483,15 @@ pub struct ConfigPath {
 }
 
 /// Where linesmith looks for its config file, in precedence order.
+/// `OsStr`-typed env args so non-UTF-8 paths (`/srv/café-bin` in a
+/// non-UTF-8 locale) survive the cascade rather than collapse to
+/// `None` upstream.
 #[must_use]
 pub fn resolve_config_path(
     cli_override: Option<PathBuf>,
-    env_override: Option<&str>,
-    xdg_config_home: Option<&str>,
-    home: Option<&str>,
+    env_override: Option<&std::ffi::OsStr>,
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
 ) -> Option<ConfigPath> {
     if let Some(p) = cli_override.filter(|p| !p.as_os_str().is_empty()) {
         return Some(ConfigPath {
@@ -518,9 +521,9 @@ pub fn resolve_config_path(
 /// env directly. Used at startup.
 #[must_use]
 pub fn detect_config_path(cli_override: Option<PathBuf>) -> Option<ConfigPath> {
-    let env_override = std::env::var("LINESMITH_CONFIG").ok();
-    let xdg_config_home = std::env::var("XDG_CONFIG_HOME").ok();
-    let home = std::env::var("HOME").ok();
+    let env_override = std::env::var_os("LINESMITH_CONFIG");
+    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+    let home = std::env::var_os("HOME");
     resolve_config_path(
         cli_override,
         env_override.as_deref(),
@@ -1294,7 +1297,12 @@ mod tests {
         xdg: Option<&str>,
         home: Option<&str>,
     ) -> Option<ConfigPath> {
-        resolve_config_path(cli.map(PathBuf::from), env, xdg, home)
+        resolve_config_path(
+            cli.map(PathBuf::from),
+            env.map(std::ffi::OsStr::new),
+            xdg.map(std::ffi::OsStr::new),
+            home.map(std::ffi::OsStr::new),
+        )
     }
 
     #[test]

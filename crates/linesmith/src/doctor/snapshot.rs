@@ -179,7 +179,7 @@ pub(super) fn stat_plugin_dirs(paths: &[PathBuf]) -> Vec<PluginDirStatus> {
 /// (`claude.cmd`) rather than a native `claude.exe`, so probe both;
 /// pick the first match in PATHEXT order so a user with both
 /// installed gets the same one their shell would invoke.
-pub(super) fn find_claude_binary(path_env: Option<&str>) -> Option<PathBuf> {
+pub(super) fn find_claude_binary(path_env: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     let path = path_env?;
     let candidates: &[&str] = if cfg!(windows) {
         &["claude.exe", "claude.cmd", "claude.bat"]
@@ -444,9 +444,9 @@ pub(super) fn snapshot_cache(
 fn derive_cache_root(xdg_cache_home: &EnvVarState, home_env: &EnvVarState) -> Option<PathBuf> {
     use crate::data_context::xdg::{resolve_subdir, XdgEnv, XdgScope};
     let env = XdgEnv::from_os_options(
-        xdg_cache_home.nonempty().map(std::ffi::OsString::from),
+        xdg_cache_home.nonempty_os().map(std::ffi::OsString::from),
         None,
-        home_env.nonempty().map(std::ffi::OsString::from),
+        home_env.nonempty_os().map(std::ffi::OsString::from),
     );
     resolve_subdir(&env, XdgScope::Cache, "")
 }

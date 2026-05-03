@@ -147,7 +147,7 @@ fn xdg_plugin_renders_via_full_driver_path() {
     .expect("write config");
 
     let mut env = linesmith::CliEnv::for_tests();
-    env.xdg_config_home = Some(xdg.path().to_string_lossy().into_owned());
+    env.xdg_config_home = Some(xdg.path().as_os_str().to_owned());
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -188,7 +188,7 @@ fn git_branch_renders_unborn_head_via_full_driver_path() {
         "#,
     )
     .expect("write config");
-    env.xdg_config_home = Some(xdg.path().to_string_lossy().into_owned());
+    env.xdg_config_home = Some(xdg.path().as_os_str().to_owned());
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -253,7 +253,7 @@ fn cli_env_with_config(
 
     let mut env = linesmith::CliEnv::for_tests();
     env.cwd = Some(worktree_dir);
-    env.xdg_config_home = Some(xdg.path().to_string_lossy().into_owned());
+    env.xdg_config_home = Some(xdg.path().as_os_str().to_owned());
     (env, xdg)
 }
 
@@ -339,7 +339,7 @@ fn git_branch_hides_outside_repo() {
         "#,
     )
     .expect("write config");
-    env.xdg_config_home = Some(xdg.path().to_string_lossy().into_owned());
+    env.xdg_config_home = Some(xdg.path().as_os_str().to_owned());
 
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();

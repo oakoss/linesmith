@@ -297,9 +297,14 @@ pub enum EnvVarState {
     Unset,
     Set(String),
     /// Variable is set but the value contains bytes that aren't valid
-    /// UTF-8. Carries a lossy preview so the hint can quote the
-    /// actual offending value rather than just say "missing".
-    NonUtf8(String),
+    /// UTF-8. Carries both a `lossy` preview (for hint output) and the
+    /// `raw` `OsString` (for plumbing through to APIs that accept
+    /// `OsStr` — e.g., the XDG cascade preserves these bytes through
+    /// `Path` operations).
+    NonUtf8 {
+        lossy: String,
+        raw: std::ffi::OsString,
+    },
 }
 
 impl EnvVarState {
@@ -308,19 +313,43 @@ impl EnvVarState {
             Ok(s) => Self::Set(s),
             Err(std::env::VarError::NotPresent) => Self::Unset,
             Err(std::env::VarError::NotUnicode(raw)) => {
-                Self::NonUtf8(raw.to_string_lossy().into_owned())
+                let lossy = raw.to_string_lossy().into_owned();
+                Self::NonUtf8 { lossy, raw }
             }
         }
+    }
+
+    /// Test-only constructor for the `NonUtf8` variant. Real code
+    /// always goes through [`Self::snapshot`].
+    #[cfg(test)]
+    fn non_utf8_for_test(s: impl Into<String>) -> Self {
+        let lossy = s.into();
+        let raw = std::ffi::OsString::from(&lossy);
+        Self::NonUtf8 { lossy, raw }
     }
 
     /// Convenience accessor: `Some(s)` only when the variable is set
     /// AND non-empty AND valid UTF-8. Centralizes the
     /// `Some(s) if !s.is_empty()` predicate that every consumer would
-    /// otherwise duplicate.
+    /// otherwise duplicate. Use [`Self::nonempty_os`] when the
+    /// downstream API accepts `OsStr` and non-UTF-8 bytes should
+    /// survive.
     #[must_use]
     pub fn nonempty(&self) -> Option<&str> {
         match self {
             Self::Set(s) if !s.is_empty() => Some(s),
+            _ => None,
+        }
+    }
+
+    /// `OsStr`-typed companion to [`Self::nonempty`]. Returns `Some`
+    /// for both `Set` and `NonUtf8` non-empty values, preserving
+    /// non-UTF-8 bytes for path-shaped consumers.
+    #[must_use]
+    pub fn nonempty_os(&self) -> Option<&std::ffi::OsStr> {
+        match self {
+            Self::Set(s) if !s.is_empty() => Some(std::ffi::OsStr::new(s)),
+            Self::NonUtf8 { raw, .. } if !raw.is_empty() => Some(raw),
             _ => None,
         }
     }
@@ -927,9 +956,9 @@ impl DoctorEnv {
         let linesmith_config = EnvVarState::snapshot("LINESMITH_CONFIG");
         let resolved = crate::config::resolve_config_path(
             cli_config_override.clone(),
-            linesmith_config.nonempty(),
-            xdg_config_home.nonempty(),
-            home_env.nonempty(),
+            linesmith_config.nonempty_os(),
+            xdg_config_home.nonempty_os(),
+            home_env.nonempty_os(),
         );
         let read = resolved
             .as_ref()
@@ -943,17 +972,14 @@ impl DoctorEnv {
         // XdgEnv ever picks up new fields (e.g. XDG_DATA_HOME).
         //
         // Both doctor and cli land in `XdgEnv::from_os_options`,
-        // which is the single empty-string filter. Non-UTF-8 was
-        // already dropped upstream by both paths, but for different
-        // reasons: cli via `std::env::var().ok()` (UTF-8-strict),
-        // doctor via `EnvVarState::nonempty()` (which collapses
-        // `NonUtf8 → None`). Net effect is parity today; if either
-        // path ever needs to preserve non-UTF-8 bytes, both have
-        // to change together.
+        // which is the single empty-string filter. Both paths
+        // preserve non-UTF-8 bytes: cli via `var_os` on `CliEnv`'s
+        // `OsString` fields, doctor via `EnvVarState::nonempty_os`
+        // (which surfaces both `Set` and `NonUtf8` raw bytes).
         let runtime_xdg_env = crate::data_context::xdg::XdgEnv::from_os_options(
             None,
-            xdg_config_home.nonempty().map(std::ffi::OsString::from),
-            home_env.nonempty().map(std::ffi::OsString::from),
+            xdg_config_home.nonempty_os().map(std::ffi::OsString::from),
+            home_env.nonempty_os().map(std::ffi::OsString::from),
         );
         let (known_segment_ids, plugins) = snapshot_plugins(&read, &runtime_xdg_env);
         let known_theme_names = collect_known_theme_names(&runtime_xdg_env);
@@ -967,9 +993,9 @@ impl DoctorEnv {
         };
         let path_env = EnvVarState::snapshot("PATH");
         let claude_code = DoctorClaudeCodeSnapshot {
-            binary_path: find_claude_binary(path_env.nonempty()),
+            binary_path: find_claude_binary(path_env.nonempty_os()),
             home_state: home_env
-                .nonempty()
+                .nonempty_os()
                 .map(|h| snapshot_claude_home(Path::new(h))),
             path_env,
         };
@@ -1173,9 +1199,9 @@ fn check_term(env: &DoctorEnv) -> CheckResult {
         EnvVarState::Set(t) if t == "dumb" => {
             CheckResult::warn("env.term", "$TERM=dumb", TERM_HINT)
         }
-        EnvVarState::NonUtf8(raw) => CheckResult::warn(
+        EnvVarState::NonUtf8 { lossy, .. } => CheckResult::warn(
             "env.term",
-            format!("$TERM is set but not valid UTF-8 (lossy: {raw:?})"),
+            format!("$TERM is set but not valid UTF-8 (lossy: {lossy:?})"),
             "rewrite $TERM with a UTF-8 value (e.g. xterm-256color)",
         ),
         // Unset OR Set-to-empty.
@@ -1197,9 +1223,9 @@ fn check_no_color(env: &DoctorEnv) -> CheckResult {
 fn check_home(env: &DoctorEnv) -> CheckResult {
     match &env.home_env {
         EnvVarState::Set(h) if !h.is_empty() => CheckResult::pass("env.home", format!("$HOME={h}")),
-        EnvVarState::NonUtf8(raw) => CheckResult::fail(
+        EnvVarState::NonUtf8 { lossy, .. } => CheckResult::fail(
             "env.home",
-            format!("$HOME is set but not valid UTF-8 (lossy: {raw:?})"),
+            format!("$HOME is set but not valid UTF-8 (lossy: {lossy:?})"),
             "rewrite $HOME with a UTF-8 path",
         ),
         // Unset OR Set-to-empty: same remediation either way.
@@ -1590,7 +1616,7 @@ fn path_env_problem(path_env: &EnvVarState) -> &'static str {
     match path_env {
         EnvVarState::Unset => "$PATH is unset",
         EnvVarState::Set(s) if s.is_empty() => "$PATH is empty",
-        EnvVarState::NonUtf8(_) => "$PATH is not valid UTF-8",
+        EnvVarState::NonUtf8 { .. } => "$PATH is not valid UTF-8",
         EnvVarState::Set(_) => "$PATH searched", // reachable only if `nonempty()` is Some
     }
 }
@@ -1604,7 +1630,7 @@ fn path_env_problem_hint(path_env: &EnvVarState) -> Option<&'static str> {
         EnvVarState::Set(s) if s.is_empty() => {
             Some("set $PATH to include the directory holding `claude`")
         }
-        EnvVarState::NonUtf8(_) => {
+        EnvVarState::NonUtf8 { .. } => {
             Some("rewrite $PATH with valid UTF-8 (check shell init for stray bytes)")
         }
         EnvVarState::Set(_) => None,
@@ -2902,7 +2928,7 @@ mod tests {
         // FAIL branch on the variant tag, not the value bytes,
         // and any Unicode in the value would correctly pass
         // through per the renderer's user-content caveat.
-        env.home_env = EnvVarState::NonUtf8("nonutf8-placeholder".to_string());
+        env.home_env = EnvVarState::non_utf8_for_test("nonutf8-placeholder");
         envs.push(("env.home_non_utf8", env));
 
         let mut env = DoctorEnv::healthy();
@@ -2948,7 +2974,7 @@ mod tests {
         envs.push(("claude.binary_missing", env));
 
         let mut env = DoctorEnv::healthy();
-        env.claude_code.path_env = EnvVarState::NonUtf8("nonutf8-placeholder".to_string());
+        env.claude_code.path_env = EnvVarState::non_utf8_for_test("nonutf8-placeholder");
         env.claude_code.binary_path = None;
         envs.push(("claude.path_env_non_utf8", env));
 
@@ -3464,7 +3490,7 @@ mod tests {
         // when $HOME is in fact set but unreadable. Misleading
         // remediation makes the user fight a phantom problem.
         let mut env = DoctorEnv::healthy();
-        env.home_env = EnvVarState::NonUtf8("/home/\u{FFFD}".to_string());
+        env.home_env = EnvVarState::non_utf8_for_test("/home/\u{FFFD}");
         let r = build_report(&env);
         let home = find_check(&r, "env.home");
         assert_eq!(home.severity(), Severity::Fail);
@@ -3517,7 +3543,7 @@ mod tests {
     #[test]
     fn term_non_utf8_warns_with_distinct_hint() {
         let mut env = DoctorEnv::healthy();
-        env.term = EnvVarState::NonUtf8("xterm-\u{FFFD}".to_string());
+        env.term = EnvVarState::non_utf8_for_test("xterm-\u{FFFD}");
         let r = build_report(&env);
         let term = find_check(&r, "env.term");
         assert_eq!(term.severity(), Severity::Warn);
@@ -3834,7 +3860,7 @@ mod tests {
         assert_eq!(EnvVarState::Unset.nonempty(), None);
         assert_eq!(EnvVarState::Set(String::new()).nonempty(), None);
         assert_eq!(
-            EnvVarState::NonUtf8("garbage".into()).nonempty(),
+            EnvVarState::non_utf8_for_test("garbage").nonempty(),
             None,
             "non-UTF-8 must not surface as Some — caller would treat the lossy preview as the real value"
         );
@@ -4889,7 +4915,8 @@ mod tests {
             .expect("join_paths")
             .into_string()
             .expect("utf8");
-        let found = find_claude_binary(Some(&path_var)).expect("found claude");
+        let found =
+            find_claude_binary(Some(std::ffi::OsStr::new(&path_var))).expect("found claude");
         assert_eq!(found, bin);
     }
 
@@ -4919,7 +4946,7 @@ mod tests {
         );
         let path_var = dir.to_string_lossy().into_owned();
         assert!(
-            find_claude_binary(Some(&path_var)).is_none(),
+            find_claude_binary(Some(std::ffi::OsStr::new(&path_var))).is_none(),
             "non-executable file must not be reported as the claude binary",
         );
     }
@@ -4930,7 +4957,7 @@ mod tests {
         // Empty PATH entries (which arise from shell expansions
         // like `:$NEWPATH`) should not be resolved as the
         // current working directory by accident.
-        assert!(find_claude_binary(Some(":")).is_none());
+        assert!(find_claude_binary(Some(std::ffi::OsStr::new(":"))).is_none());
     }
 
     #[test]
@@ -5209,7 +5236,7 @@ mod tests {
     fn claude_binary_fail_with_path_nonutf8_hint() {
         let env = with_claude_snapshot(DoctorClaudeCodeSnapshot {
             binary_path: None,
-            path_env: EnvVarState::NonUtf8("/usr/bin\u{FFFD}".to_string()),
+            path_env: EnvVarState::non_utf8_for_test("/usr/bin\u{FFFD}"),
             home_state: Some(claude_home_state(
                 ClaudeDirState::Ok,
                 ClaudeJsonState::Ok,
