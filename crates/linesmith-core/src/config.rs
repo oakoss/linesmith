@@ -142,7 +142,7 @@ pub enum LayoutMode {
 /// replaces the segment's built-in default. Any unrecognized keys land
 /// in [`extra`](Self::extra), which the segment builder forwards to
 /// plugin scripts as `ctx.config.<key>`. `style` is stored as a raw
-/// string; `segments::builder::apply_override` parses it at build time
+/// string; the segment builder parses it at build time
 /// so parse errors emit warnings through the same callback that
 /// handles unknown-ID and inverted-bounds diagnostics.
 ///
