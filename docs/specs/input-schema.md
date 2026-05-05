@@ -36,7 +36,7 @@ Everything downstream (segments, themes, config, plugins) consumes `StatusContex
 - `StatusContext::clone` is O(1) (raw JSON lives behind `Arc`)
 - Zero unsafe code; this is a trust boundary, safety matters more than the 5% allocator win
 - Work on macOS, Linux, and Windows (cwd / path fields must be `PathBuf`, not `String`)
-- Binary-size cost: schema types should not pull in heavy dependencies (chrono is the only justified extra for timestamps; avoid uuid, url, etc. unless required)
+- Binary-size cost: schema types should not pull in heavy dependencies (jiff is the only justified extra for timestamps; avoid uuid, url, etc. unless required)
 
 ## Interface / Contract
 
@@ -46,7 +46,7 @@ Everything downstream (segments, themes, config, plugins) consumes `StatusContex
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 /// The canonical, tool-agnostic input to linesmith's rendering pipeline.
 /// Every segment receives a reference to this. Cloning is O(1) because
@@ -339,7 +339,7 @@ If heuristic matching is ambiguous, emit a warning-level log line once (to stder
 - Each normalizer parses only fields in the canonical model; everything else stays in `raw`
 - Unknown enum values (e.g. a new `EffortLevel` string) warn-and-degrade to `None` per ADR-0014, with the unknown raw value logged at the JSON path
 - Paths (`project_dir`, `git_worktree.path`, etc.) use `PathBuf::from`, preserving platform-native separators
-- Timestamps parse with `chrono::DateTime::parse_from_rfc3339` and convert to UTC
+- Timestamps parse via `s.parse::<jiff::Timestamp>()` (RFC 3339, always UTC)
 - Nullable fields stay `None` when absent or JSON-null
 - `Percent::new` failure on a negative or NaN `used_percentage` becomes `ParseError::InvalidValue` (ADR-0014 carve-out: undocumented CC state surfaces loud rather than degrading silently). An above-100 value clamps to 100 with a warn (claude-code#37163).
 
@@ -449,7 +449,7 @@ For each fixture, assert the parsed `StatusContext` matches an `insta` snapshot,
 
 ## Open questions
 
-- **Chrono vs. a lighter time crate?** Chrono is ~350KB; `time` is lighter but has had API churn. Decision: chrono for now (widely used, stable); revisit if binary size becomes a problem.
+- **Datetime library choice.** Resolved 2026-05-04 (lsm-3912): jiff replaces chrono workspace-wide. jiff reads the system tzdb on macOS/Linux at runtime, so the IANA database isn't embedded in the binary on the most common platforms.
 - **Should `parse` consume the `&[u8]` or take ownership?** Current design: borrow. If we need the raw bytes for plugin access, we clone into `raw` anyway (then `Arc`-wrap).
 - **How do we version the schema itself?** No explicit version field in the canonical model; we version via breaking type changes + migration guides. A v2 schema would mean a new `StatusContextV2` type and a migration path.
 - **Should `OutputStyle.name` become an enum with `Custom(String)`?** Deferred until we enumerate Claude's actual output-style values.

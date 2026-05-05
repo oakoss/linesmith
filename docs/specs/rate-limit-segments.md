@@ -219,8 +219,8 @@ fn render(&self, ctx: &DataContext) -> Option<String> {
         },
         Err(e) => return Some(self.render_error(e)),
     };
-    let remaining = resets_at.signed_duration_since(chrono::Utc::now());
-    if remaining <= chrono::Duration::zero() {
+    let remaining = resets_at.duration_since(jiff::Timestamp::now());
+    if remaining <= jiff::SignedDuration::ZERO {
         return None;  // already reset; stale data, hide
     }
     Some(self.format_duration(remaining, is_jsonl))
