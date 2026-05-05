@@ -105,7 +105,7 @@ pub(crate) fn resolve_five_hour_reset(data: &UsageData) -> Result<ResetSource, &
 }
 
 /// Resolve the 7d reset path. Always returns the endpoint-sourced
-/// `resets_at` on success; the return type is `DateTime<Utc>` (not
+/// `resets_at` on success; the return type is `jiff::Timestamp` (not
 /// `ResetSource`) because ADR-0013 rejects synthesizing a 7d reset
 /// timestamp under JSONL — the rolling 7d window has no hard reset,
 /// and the signature encodes that. JSONL data always returns `Err`.
@@ -132,7 +132,7 @@ mod tests {
         // Pins ADR-0013's invariant: the 7d rolling window has no hard
         // reset under JSONL. If a future contributor adds a JSONL arm
         // that synthesizes a timestamp, this test fails before the
-        // signature's `Result<DateTime<Utc>, _>` shape can be silently
+        // signature's `Result<jiff::Timestamp, _>` shape can be silently
         // relaxed back into a sum type.
         let data = UsageData::Jsonl(JsonlUsage::new(
             None,

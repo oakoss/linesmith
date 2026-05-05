@@ -230,13 +230,13 @@ fn build_jsonl_usage(
             return None;
         }
     };
-    // Clamp `block.start` to `floor_to_hour(now)` so a future-dated
+    // Clamp `block.start` to `floor_to_grain(now, 3600)` so a future-dated
     // entry (clock skew) can't produce an `ends_at` further out than
     // the current window's nominal close. The aggregator deliberately
     // keeps token counts intact under mild skew so users don't lose
     // their current session; this clamp normalizes the reset-timer
     // surface without corrupting those totals.
-    let now_floor = jsonl::floor_to_hour(now);
+    let now_floor = jsonl::floor_to_grain(now, 3600);
     let five_hour = agg.five_hour.as_ref().map(|block| {
         let start = block.start.min(now_floor);
         FiveHourWindow::new(block.token_counts, start)

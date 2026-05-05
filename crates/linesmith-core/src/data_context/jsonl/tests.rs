@@ -3,13 +3,6 @@ use super::*;
 use jiff::civil;
 use tempfile::TempDir;
 
-/// Floor a timestamp to the given second-grain so test fixtures
-/// produce stable, repeatable instants.
-fn floor_to_grain(ts: Timestamp, grain_secs: i64) -> Timestamp {
-    let s = ts.as_second();
-    Timestamp::from_second(s - s.rem_euclid(grain_secs)).expect("in range")
-}
-
 fn env_from(claude: Option<&Path>, xdg: Option<&Path>, home: Option<&Path>) -> DiscoveryEnv {
     DiscoveryEnv {
         claude_config_dir: claude.map(Path::to_path_buf),
@@ -457,16 +450,16 @@ fn jsonl_error_code_taxonomy_is_unique() {
     }
 }
 
-// --- floor_to_hour edge case --------------------------------------
+// --- floor_to_grain edge case -------------------------------------
 
 #[test]
-fn floor_to_hour_truncates_subhour_components() {
+fn floor_to_grain_hourly_truncates_subhour_components() {
     let ts = civil::date(2026, 4, 20)
         .at(14, 37, 52, 0)
         .in_tz("UTC")
         .unwrap()
         .timestamp();
-    let floored = floor_to_hour(ts);
+    let floored = floor_to_grain(ts, 3600);
     assert_eq!(
         floored,
         civil::date(2026, 4, 20)

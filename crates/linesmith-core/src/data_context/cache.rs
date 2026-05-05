@@ -722,7 +722,7 @@ mod tests {
     // --- atomic_write_json failure paths ------------------------------
     //
     // Serialization failure isn't covered by a dedicated test: our
-    // cache types (chrono, Option<String>, HashMap<String, Value>)
+    // cache types (jiff::Timestamp, Option<String>, HashMap<String, Value>)
     // are JSON-safe end to end, and `serde_json` turns pathological
     // floats into `null` rather than erroring. The branch remains
     // for defensive correctness if a future type introduces a failing

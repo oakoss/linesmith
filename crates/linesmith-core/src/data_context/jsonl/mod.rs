@@ -600,7 +600,7 @@ fn compute_active_block(entries: &[UsageEntry], now: Timestamp) -> Option<FiveHo
 
 fn start_block(entry: &UsageEntry) -> FiveHourBlock {
     let mut block = FiveHourBlock {
-        start: floor_to_hour(entry.timestamp),
+        start: floor_to_grain(entry.timestamp, 3600),
         actual_last_activity: entry.timestamp,
         token_counts: TokenCounts::default(),
         models: Vec::new(),
@@ -625,13 +625,14 @@ fn extend_block(block: &mut FiveHourBlock, entry: &UsageEntry) {
     block.actual_last_activity = entry.timestamp;
 }
 
-pub(super) fn floor_to_hour(ts: Timestamp) -> Timestamp {
-    // `as_second` / `from_second` round-trip cleanly because jiff's
-    // `Timestamp` is i64 seconds + i32 nanos internally; second-grained
-    // construction stays well inside the supported range.
+/// Floor a timestamp to a whole multiple of `grain_secs` seconds (UTC).
+/// `as_second` / `from_second` round-trip cleanly because jiff's
+/// `Timestamp` is i64 seconds + i32 nanos internally; second-grained
+/// construction stays well inside the supported range.
+pub(super) fn floor_to_grain(ts: Timestamp, grain_secs: i64) -> Timestamp {
     let secs = ts.as_second();
-    let floored = secs - secs.rem_euclid(3600);
-    Timestamp::from_second(floored).expect("hour-grained timestamp fits jiff range")
+    let floored = secs - secs.rem_euclid(grain_secs);
+    Timestamp::from_second(floored).expect("grained timestamp fits jiff range")
 }
 
 #[cfg(test)]

@@ -368,13 +368,13 @@ fn endpoint_401_falls_through_to_jsonl_when_available() {
 #[test]
 fn jsonl_fallback_clamps_future_dated_block_start_to_now() {
     // Clock-skew regression (Codex P2, 2026-04-22): a future-dated
-    // entry makes `block.start = floor_to_hour(future_timestamp)`,
+    // entry makes `block.start = floor_to_grain(future_timestamp)`,
     // which lies beyond `now`. Without clamping, `FiveHourWindow`
     // would derive an `ends_at` further in the future than 5h,
     // inflating the reset countdown and distorting `rate_limit_5h`
     // tokens. The aggregator keeps the skewed block so mild-skew
     // users don't lose their session; the cascade clamps
-    // `block.start` to `floor_to_hour(now)` before surfacing.
+    // `block.start` to `floor_to_grain(now)` before surfacing.
     let now = Timestamp::now();
     // Build a skewed block at +2h so `block.start` starts in the
     // future and `ends_at = start + 5h` would land ~7h out.
@@ -415,8 +415,8 @@ fn jsonl_fallback_clamps_future_dated_block_start_to_now() {
         .five_hour
         .as_ref()
         .expect("active block should populate five_hour window");
-    // Clamped: start cannot exceed floor_to_hour(now), so
-    // ends_at <= floor_to_hour(now) + 5h <= now + 5h.
+    // Clamped: start cannot exceed floor_to_grain(now), so
+    // ends_at <= floor_to_grain(now) + 5h <= now + 5h.
     assert!(
         window.ends_at() <= now + ChronoDuration::from_hours(5),
         "ends_at={:?} must be clamped at/before now + 5h ({:?})",
