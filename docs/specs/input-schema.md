@@ -449,7 +449,7 @@ For each fixture, assert the parsed `StatusContext` matches an `insta` snapshot,
 
 ## Open questions
 
-- **Datetime library choice.** Resolved 2026-05-04 (lsm-3912): jiff replaces chrono workspace-wide. jiff reads the system tzdb on macOS/Linux at runtime, so the IANA database isn't embedded in the binary on the most common platforms.
+- **Datetime library choice.** Resolved 2026-05-04 (lsm-3912): jiff replaces chrono workspace-wide. jiff reads the system tzdb on macOS/Linux at runtime; only Windows builds embed the IANA database via `jiff-tzdb`.
 - **Should `parse` consume the `&[u8]` or take ownership?** Current design: borrow. If we need the raw bytes for plugin access, we clone into `raw` anyway (then `Arc`-wrap).
 - **How do we version the schema itself?** No explicit version field in the canonical model; we version via breaking type changes + migration guides. A v2 schema would mean a new `StatusContextV2` type and a migration path.
 - **Should `OutputStyle.name` become an enum with `Custom(String)`?** Deferred until we enumerate Claude's actual output-style values.
