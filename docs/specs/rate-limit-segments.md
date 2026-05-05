@@ -19,13 +19,13 @@ This spec does NOT cover: how `UsageData` is fetched ([data-fetching.md](data-fe
 
 Five segment IDs, each opt-in via config:
 
-| Segment ID            | Surfaces                             | Format               |
-| --------------------- | ------------------------------------ | -------------------- |
-| `rate_limit_5h`       | 5-hour window utilization %          | percent or progress  |
-| `rate_limit_7d`       | 7-day window utilization %           | percent or progress  |
-| `rate_limit_5h_reset` | Time until the 5-hour window resets  | duration or progress |
-| `rate_limit_7d_reset` | Time until the 7-day window resets   | duration or progress |
-| `extra_usage`         | Credits remaining in monthly overage | currency or percent  |
+| Segment ID            | Surfaces                             | Format                          |
+| --------------------- | ------------------------------------ | ------------------------------- |
+| `rate_limit_5h`       | 5-hour window utilization %          | percent or progress             |
+| `rate_limit_7d`       | 7-day window utilization %           | percent or progress             |
+| `rate_limit_5h_reset` | Time until the 5-hour window resets  | duration, absolute, or progress |
+| `rate_limit_7d_reset` | Time until the 7-day window resets   | duration, absolute, or progress |
+| `extra_usage`         | Credits remaining in monthly overage | currency or percent             |
 
 Behavior requirements:
 
@@ -71,17 +71,23 @@ stale_marker = "~"
 
 [segments.rate_limit_5h_reset]
 enabled = false
-format  = "duration"        # "duration" | "progress"
-compact = false             # false = "4hr 37m"; true = "4h37m"
-use_days = true             # true = "1d 3hr"; false = "27hr"
+format  = "duration"        # "duration" | "absolute" | "progress"
+compact = false             # false = "4hr 37m"; true = "4h37m"; ignored under "absolute"
+use_days = true             # true = "1d 3hr"; false = "27hr"; ignored under "absolute"
 progress_width = 20
 icon = ""
 label = "5h reset"
 stale_marker = "~"
 
+# Wall-clock knobs — only consulted when `format = "absolute"`.
+# Renders e.g. "5h reset: 7:00 PM PDT" (12h) or "19:00 PDT" (24h).
+timezone    = "America/Los_Angeles"   # IANA name; absent = system local via jiff auto-detect
+hour_format = "24h"                   # "12h" | "24h"; default 24h
+locale      = "en-US"                 # v0.1 ships English-only; unsupported values warn-and-fallback
+
 [segments.rate_limit_7d_reset]
 enabled = false
-format  = "duration"
+format  = "duration"        # same enum as the 5h variant
 compact = false
 use_days = true
 progress_width = 20
@@ -129,6 +135,10 @@ The render snippets below use `Option<String>` shorthand to focus on the rate-li
 7d: ██████░░░░░░░░░░░░░░ 33%
 5h reset: ██░░░░░░░░░░░░░░░░░░  7%
 7d reset: ████████░░░░░░░░░░░░ 40%
+
+# Absolute (wall-clock) reset format
+5h reset: 7:00 PM PDT       # format = "absolute", hour_format = "12h"
+5h reset: 19:00 PDT         # format = "absolute", hour_format = "24h"
 
 # Inverted (remaining instead of used)
 5h: 78%

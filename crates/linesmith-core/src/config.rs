@@ -379,6 +379,11 @@ fn segment_override_schema(id: &str) -> Option<&'static [&'static str]> {
         "format",
         "compact",
         "use_days",
+        // Absolute-format knobs — consumed when `format = "absolute"`,
+        // ignored (without warning) under "duration" / "progress".
+        "timezone",
+        "hour_format",
+        "locale",
     ];
     // Nested tables like `dirty` are validated shallowly per
     // `validate_segments_table` — their inner keys pass through
@@ -983,6 +988,25 @@ mod tests {
                 width = { min = 10, max = 40 }
                 style = "role:info"
                 visible_if = "true"
+            "#,
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn reset_segment_allows_absolute_format_keys_without_warning() {
+        let warnings = collect_warnings(
+            r#"
+                [segments.rate_limit_5h_reset]
+                format = "absolute"
+                timezone = "America/Los_Angeles"
+                hour_format = "12h"
+                locale = "en-US"
+
+                [segments.rate_limit_7d_reset]
+                format = "absolute"
+                timezone = "Europe/London"
+                hour_format = "24h"
             "#,
         );
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");

@@ -5,13 +5,16 @@
 //! Canonical spec: `docs/specs/rate-limit-segments.md` §Render
 //! semantics and §Error message table.
 
-use chrono::Duration;
+use chrono::{DateTime, Duration, Utc};
 
-use super::config::{CommonRateLimitConfig, DurationFormat, ExtraUsageFormat, PercentFormat};
+use super::config::{
+    AbsoluteFormat, CommonRateLimitConfig, ExtraUsageFormat, HourFormat, Locale, PercentFormat,
+    ResetFormat, Timezone,
+};
 use crate::data_context::{CredentialError, ExtraUsage, JsonlError, UsageBucket, UsageError};
 
 /// Which rolling window a reset segment represents. Determines the
-/// denominator when [`DurationFormat::Progress`] computes elapsed %.
+/// denominator when [`ResetFormat::Progress`] computes elapsed %.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResetWindow {
     FiveHour,
@@ -61,13 +64,15 @@ pub(crate) fn format_jsonl_tokens(total: u64, cfg: &CommonRateLimitConfig) -> St
 }
 
 /// Render `rate_limit_5h_reset` / `rate_limit_7d_reset`. Assumes the
-/// caller already gated on `remaining > 0`. `window` identifies the
-/// rolling window so the progress bar divides by the right total.
-/// `jsonl` adds the stale-marker prefix.
+/// caller already gated on `remaining > 0`. `resets_at` is passed
+/// even for the duration/progress branches so the caller doesn't
+/// need to know which fields each variant consumes.
 #[must_use]
-pub(crate) fn format_duration(
+#[allow(clippy::too_many_arguments)] // an args struct here just renames the indirection.
+pub(crate) fn format_reset(
+    resets_at: DateTime<Utc>,
     remaining: Duration,
-    format: DurationFormat,
+    format: &ResetFormat,
     compact: bool,
     use_days: bool,
     window: ResetWindow,
@@ -75,12 +80,35 @@ pub(crate) fn format_duration(
     cfg: &CommonRateLimitConfig,
 ) -> String {
     let value = match format {
-        DurationFormat::Duration => format_duration_text(remaining, compact, use_days),
-        DurationFormat::Progress => {
+        ResetFormat::Duration => format_duration_text(remaining, compact, use_days),
+        ResetFormat::Absolute(absolute) => format_absolute_text(resets_at, absolute),
+        ResetFormat::Progress => {
             format_progress_bar(reset_progress_pct(remaining, window), cfg.progress_width)
         }
     };
     wrap(&value, jsonl, cfg)
+}
+
+/// Render an absolute wall-clock time like `"7:00 PM PT"` (12h) or
+/// `"19:00 PT"` (24h).
+fn format_absolute_text(resets_at: DateTime<Utc>, cfg: &AbsoluteFormat) -> String {
+    let secs = resets_at.timestamp();
+    let nanos = i32::try_from(resets_at.timestamp_subsec_nanos()).unwrap_or(0);
+    let Ok(ts) = jiff::Timestamp::new(secs, nanos) else {
+        // `chrono::DateTime<Utc>` always fits jiff's range; this arm
+        // is defensive against future chrono-side range changes.
+        return String::new();
+    };
+    let tz = match &cfg.timezone {
+        Timezone::SystemLocal => jiff::tz::TimeZone::system(),
+        Timezone::Iana(tz) => tz.clone(),
+    };
+    let zdt = ts.to_zoned(tz);
+    let pattern = match (cfg.hour, cfg.locale) {
+        (HourFormat::Hour24, Locale::EnUs) => "%H:%M %Z",
+        (HourFormat::Hour12, Locale::EnUs) => "%-I:%M %p %Z",
+    };
+    zdt.strftime(pattern).to_string()
 }
 
 /// Render `extra_usage` (endpoint only). Falls back from currency →
@@ -625,5 +653,143 @@ mod tests {
         let mut c = cfg();
         c.label = String::new();
         assert_eq!(render_error(&UsageError::Timeout, &c), "[Timeout]");
+    }
+
+    // --- absolute reset format ---
+
+    fn fixed_utc(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
+        chrono::TimeZone::with_ymd_and_hms(&Utc, year, month, day, hour, minute, 0)
+            .single()
+            .expect("valid utc")
+    }
+
+    #[test]
+    fn absolute_24h_renders_with_tz_abbreviation() {
+        // 19:00 UTC → 12:00 PDT in Los Angeles on July 15, 2025
+        let resets_at = fixed_utc(2025, 7, 15, 19, 0);
+        let cfg = AbsoluteFormat {
+            timezone: Timezone::Iana(jiff::tz::TimeZone::get("America/Los_Angeles").unwrap()),
+            hour: HourFormat::Hour24,
+            locale: Locale::EnUs,
+        };
+        assert_eq!(format_absolute_text(resets_at, &cfg), "12:00 PDT");
+    }
+
+    #[test]
+    fn absolute_12h_renders_with_am_pm() {
+        // 19:00 UTC → 12:00 PM PDT (12-hour clock, post-meridiem boundary)
+        let resets_at = fixed_utc(2025, 7, 15, 19, 0);
+        let cfg = AbsoluteFormat {
+            timezone: Timezone::Iana(jiff::tz::TimeZone::get("America/Los_Angeles").unwrap()),
+            hour: HourFormat::Hour12,
+            locale: Locale::EnUs,
+        };
+        assert_eq!(format_absolute_text(resets_at, &cfg), "12:00 PM PDT");
+    }
+
+    #[test]
+    fn absolute_12h_morning_strips_zero_pad() {
+        // 14:30 UTC → 7:30 AM PDT — `%-I` strips leading zero from
+        // single-digit 12h hours per the bead's "7:00 PM PT" example.
+        let resets_at = fixed_utc(2025, 7, 15, 14, 30);
+        let cfg = AbsoluteFormat {
+            timezone: Timezone::Iana(jiff::tz::TimeZone::get("America/Los_Angeles").unwrap()),
+            hour: HourFormat::Hour12,
+            locale: Locale::EnUs,
+        };
+        assert_eq!(format_absolute_text(resets_at, &cfg), "7:30 AM PDT");
+    }
+
+    #[test]
+    fn absolute_renders_in_explicit_zone_distinct_from_utc() {
+        // Tokyo is UTC+9 with no DST — pinning a non-American zone so
+        // any future tz-detection regression that silently picks UTC
+        // instead of the configured zone fails this test loudly.
+        let resets_at = fixed_utc(2025, 1, 15, 0, 0);
+        let cfg = AbsoluteFormat {
+            timezone: Timezone::Iana(jiff::tz::TimeZone::get("Asia/Tokyo").unwrap()),
+            hour: HourFormat::Hour24,
+            locale: Locale::EnUs,
+        };
+        assert_eq!(format_absolute_text(resets_at, &cfg), "09:00 JST");
+    }
+
+    #[test]
+    fn format_reset_dispatches_absolute_branch() {
+        // Pin: `ResetFormat::Absolute` reaches `format_absolute_text`
+        // and the result is wrapped with the common label, rather
+        // than silently collapsing to a duration string.
+        let cfg = cfg();
+        let resets_at = fixed_utc(2025, 7, 15, 19, 0);
+        let format = ResetFormat::Absolute(AbsoluteFormat {
+            timezone: Timezone::Iana(jiff::tz::TimeZone::get("America/Los_Angeles").unwrap()),
+            hour: HourFormat::Hour24,
+            locale: Locale::EnUs,
+        });
+        let out = format_reset(
+            resets_at,
+            Duration::hours(1),
+            &format,
+            false,
+            true,
+            ResetWindow::FiveHour,
+            false,
+            &cfg,
+        );
+        assert!(
+            out.contains("12:00 PDT"),
+            "absolute output missing time string: {out}"
+        );
+        assert!(out.contains("5h"), "absolute output missing label: {out}");
+    }
+
+    #[test]
+    fn format_reset_absolute_under_jsonl_keeps_stale_marker() {
+        // Pin that the JSONL stale-marker prefix lands on the
+        // absolute-time string, not just on duration text.
+        let mut cfg = cfg();
+        cfg.stale_marker = "~".into();
+        let resets_at = fixed_utc(2025, 7, 15, 19, 0);
+        let format = ResetFormat::Absolute(AbsoluteFormat {
+            timezone: Timezone::Iana(jiff::tz::TimeZone::get("America/Los_Angeles").unwrap()),
+            hour: HourFormat::Hour24,
+            locale: Locale::EnUs,
+        });
+        let out = format_reset(
+            resets_at,
+            Duration::hours(1),
+            &format,
+            false,
+            true,
+            ResetWindow::FiveHour,
+            true, // jsonl
+            &cfg,
+        );
+        assert!(
+            out.starts_with("~"),
+            "expected stale marker on JSONL absolute output: {out}"
+        );
+        assert!(
+            out.contains("12:00 PDT"),
+            "absolute output missing time string: {out}"
+        );
+    }
+
+    #[test]
+    fn absolute_renders_correct_zone_across_dst_transition() {
+        // 2025-03-09: America/Los_Angeles springs forward at 02:00
+        // PST → 03:00 PDT (= 10:00 UTC). Pin both sides of the jump
+        // so a regression that picks the wrong offset shows up.
+        let cfg = AbsoluteFormat {
+            timezone: Timezone::Iana(jiff::tz::TimeZone::get("America/Los_Angeles").unwrap()),
+            hour: HourFormat::Hour24,
+            locale: Locale::EnUs,
+        };
+        // 09:30 UTC = 01:30 PST (pre-jump, UTC-8).
+        let pre = fixed_utc(2025, 3, 9, 9, 30);
+        assert_eq!(format_absolute_text(pre, &cfg), "01:30 PST");
+        // 11:30 UTC = 04:30 PDT (post-jump, UTC-7).
+        let post = fixed_utc(2025, 3, 9, 11, 30);
+        assert_eq!(format_absolute_text(post, &cfg), "04:30 PDT");
     }
 }

@@ -12,12 +12,10 @@
 use std::collections::BTreeMap;
 
 use super::config::{
-    apply_common_extras, parse_duration_format, parse_percent_format, CommonRateLimitConfig,
-    DurationFormat, PercentFormat, PRIORITY,
+    apply_common_extras, parse_percent_format, parse_reset_format, CommonRateLimitConfig,
+    PercentFormat, ResetFormat, PRIORITY,
 };
-use super::format::{
-    format_duration, format_jsonl_tokens, format_percent, render_error, ResetWindow,
-};
+use super::format::{format_jsonl_tokens, format_percent, format_reset, render_error, ResetWindow};
 use super::window::{resolve_seven_day_reset, UsageWindow, WindowResolution};
 use crate::data_context::{DataContext, DataDep};
 use crate::segments::extras::parse_bool;
@@ -94,7 +92,7 @@ impl Segment for RateLimit7dSegment {
 
 #[non_exhaustive]
 pub struct RateLimit7dResetSegment {
-    pub format: DurationFormat,
+    pub format: ResetFormat,
     pub compact: bool,
     pub use_days: bool,
     pub config: CommonRateLimitConfig,
@@ -103,7 +101,7 @@ pub struct RateLimit7dResetSegment {
 impl Default for RateLimit7dResetSegment {
     fn default() -> Self {
         Self {
-            format: DurationFormat::Duration,
+            format: ResetFormat::Duration,
             compact: false,
             use_days: true,
             config: CommonRateLimitConfig::new("7d reset"),
@@ -119,7 +117,7 @@ impl RateLimit7dResetSegment {
     ) -> Self {
         let mut seg = Self::default();
         apply_common_extras(&mut seg.config, extras, "rate_limit_7d_reset", warn);
-        if let Some(f) = parse_duration_format(extras, "rate_limit_7d_reset", warn) {
+        if let Some(f) = parse_reset_format(extras, "rate_limit_7d_reset", warn) {
             seg.format = f;
         }
         if let Some(b) = parse_bool(extras, "compact", "rate_limit_7d_reset", warn) {
@@ -128,8 +126,12 @@ impl RateLimit7dResetSegment {
         if let Some(b) = parse_bool(extras, "use_days", "rate_limit_7d_reset", warn) {
             seg.use_days = b;
         }
-        if seg.config.invalid_progress_width {
-            seg.format = DurationFormat::Duration;
+        // `progress_width` only matters for `Progress`. An invalid
+        // value forced the spec's "fall back to duration" rule onto
+        // every variant pre-Absolute; now scope it so a stale
+        // `progress_width` doesn't clobber `format = "absolute"`.
+        if seg.config.invalid_progress_width && matches!(seg.format, ResetFormat::Progress) {
+            seg.format = ResetFormat::Duration;
         }
         seg
     }
@@ -154,9 +156,10 @@ impl Segment for RateLimit7dResetSegment {
                     );
                     return Ok(None);
                 }
-                format_duration(
+                format_reset(
+                    resets_at,
                     remaining,
-                    self.format,
+                    &self.format,
                     self.compact,
                     self.use_days,
                     ResetWindow::SevenDay,
@@ -444,7 +447,7 @@ mod tests {
         // test flips.
         let dc = ctx_with_usage(Ok(data_with_reset_in(Duration::hours(4))));
         let seg = RateLimit7dResetSegment {
-            format: DurationFormat::Progress,
+            format: ResetFormat::Progress,
             ..Default::default()
         };
         let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
@@ -501,7 +504,7 @@ mod tests {
         let seg =
             RateLimit7dResetSegment::from_extras(&extras, &mut |m| warnings.push(m.to_string()));
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(seg.format, DurationFormat::Progress);
+        assert_eq!(seg.format, ResetFormat::Progress);
         assert!(seg.compact);
     }
 
@@ -509,7 +512,7 @@ mod tests {
     fn reset_from_extras_warns_on_percent_format_string() {
         // Parity with five_hour: `format = "percent"` is valid for
         // utilization segments but NOT for reset segments;
-        // parse_duration_format rejects it.
+        // parse_reset_format rejects it.
         let mut extras = std::collections::BTreeMap::new();
         extras.insert("format".into(), toml::Value::String("percent".into()));
         let mut warnings = Vec::new();
@@ -517,5 +520,26 @@ mod tests {
             RateLimit7dResetSegment::from_extras(&extras, &mut |m| warnings.push(m.to_string()));
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("format"), "{:?}", warnings[0]);
+    }
+
+    #[test]
+    fn reset_invalid_progress_width_does_not_clobber_absolute_format() {
+        // Parity with five_hour: a stale `progress_width` must not
+        // silently downgrade `format = "absolute"` to `Duration`.
+        let mut extras = std::collections::BTreeMap::new();
+        extras.insert("format".into(), toml::Value::String("absolute".into()));
+        extras.insert("progress_width".into(), toml::Value::Integer(0));
+        let mut warnings = Vec::new();
+        let seg =
+            RateLimit7dResetSegment::from_extras(&extras, &mut |m| warnings.push(m.to_string()));
+        assert!(
+            matches!(seg.format, ResetFormat::Absolute(_)),
+            "absolute survived: {:?}",
+            seg.format
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("progress_width")),
+            "expected progress_width warning: {warnings:?}"
+        );
     }
 }

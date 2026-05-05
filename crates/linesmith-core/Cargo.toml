@@ -36,6 +36,7 @@ serde_json.workspace = true
 catppuccin.workspace = true
 chrono.workspace = true
 gix.workspace = true
+jiff.workspace = true
 httpdate.workspace = true
 rhai.workspace = true
 schemars.workspace = true
