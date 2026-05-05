@@ -482,8 +482,8 @@ fn build_five_hour_window(w: &FiveHourWindow) -> Dynamic {
     let FiveHourWindow { tokens, start } = w;
     let mut m = Map::new();
     m.insert("tokens".into(), build_token_counts(tokens));
-    m.insert("start".into(), Dynamic::from(start.to_rfc3339()));
-    m.insert("ends_at".into(), Dynamic::from(w.ends_at().to_rfc3339()));
+    m.insert("start".into(), Dynamic::from(start.to_string()));
+    m.insert("ends_at".into(), Dynamic::from(w.ends_at().to_string()));
     Dynamic::from_map(m)
 }
 
@@ -571,7 +571,7 @@ fn build_usage_bucket(b: &UsageBucket) -> Dynamic {
     );
     m.insert(
         "resets_at".into(),
-        resets_at.map_or(Dynamic::UNIT, |t| Dynamic::from(t.to_rfc3339())),
+        resets_at.map_or(Dynamic::UNIT, |t| Dynamic::from(t.to_string())),
     );
     Dynamic::from_map(m)
 }
@@ -941,14 +941,20 @@ mod tests {
         // `EndpointUsage` / `UsageBucket` / `ExtraUsage` must either
         // break this test or update it so spec drift surfaces in CI.
         use crate::data_context::{EndpointUsage, ExtraUsage, UsageBucket, UsageData};
-        use chrono::{TimeZone, Utc};
+        use jiff::civil;
 
         let mut unknown_buckets = std::collections::HashMap::new();
         unknown_buckets.insert("iguana_necktie".to_string(), serde_json::Value::Null);
         let data = UsageData::Endpoint(EndpointUsage {
             five_hour: Some(UsageBucket {
                 utilization: Percent::new(42.0).unwrap(),
-                resets_at: Some(Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap()),
+                resets_at: Some(
+                    civil::date(2099, 1, 1)
+                        .at(0, 0, 0, 0)
+                        .in_tz("UTC")
+                        .unwrap()
+                        .timestamp(),
+                ),
             }),
             seven_day: Some(UsageBucket {
                 utilization: Percent::new(33.0).unwrap(),
@@ -1058,11 +1064,19 @@ mod tests {
         use crate::data_context::{
             FiveHourWindow, JsonlUsage, SevenDayWindow, TokenCounts, UsageData,
         };
-        use chrono::{TimeZone, Utc};
+        use jiff::civil;
         let tokens = TokenCounts::from_parts(400_000, 20_000, 0, 0);
         // `start + 5h` = ends_at; encode as `start` per the invariant.
-        let start = Utc.with_ymd_and_hms(2099, 1, 1, 0, 0, 0).unwrap();
-        let ends_at = Utc.with_ymd_and_hms(2099, 1, 1, 5, 0, 0).unwrap();
+        let start = civil::date(2099, 1, 1)
+            .at(0, 0, 0, 0)
+            .in_tz("UTC")
+            .unwrap()
+            .timestamp();
+        let ends_at = civil::date(2099, 1, 1)
+            .at(5, 0, 0, 0)
+            .in_tz("UTC")
+            .unwrap()
+            .timestamp();
         let data = UsageData::Jsonl(JsonlUsage::new(
             Some(FiveHourWindow::new(tokens, start)),
             SevenDayWindow::new(TokenCounts::from_parts(1_000_000, 0, 0, 0)),
@@ -1096,7 +1110,7 @@ mod tests {
         assert_eq!(
             five.get("ends_at")
                 .and_then(|d| d.clone().try_cast::<String>()),
-            Some(ends_at.to_rfc3339()),
+            Some(ends_at.to_string()),
         );
         let token_map: Map = five.get("tokens").unwrap().clone().try_cast().unwrap();
         assert_eq!(

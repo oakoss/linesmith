@@ -17,7 +17,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, DurationRound, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
 
 /// Billing-block duration, matching ccusage's
@@ -46,11 +46,11 @@ pub struct JsonlAggregate {
 /// a derivation from `start` — see [`Self::end`].
 #[derive(Debug, Clone)]
 pub struct FiveHourBlock {
-    pub start: DateTime<Utc>,
-    pub actual_last_activity: DateTime<Utc>,
+    pub start: Timestamp,
+    pub actual_last_activity: Timestamp,
     pub token_counts: TokenCounts,
     pub models: Vec<String>,
-    pub usage_limit_reset: Option<DateTime<Utc>>,
+    pub usage_limit_reset: Option<Timestamp>,
 }
 
 impl FiveHourBlock {
@@ -58,8 +58,8 @@ impl FiveHourBlock {
     /// Derived rather than stored so the invariant can't drift from
     /// `start` after construction.
     #[must_use]
-    pub fn end(&self) -> DateTime<Utc> {
-        self.start + Duration::hours(BLOCK_DURATION_HOURS)
+    pub fn end(&self) -> Timestamp {
+        self.start + SignedDuration::from_hours(BLOCK_DURATION_HOURS)
     }
 }
 
@@ -67,7 +67,7 @@ impl FiveHourBlock {
 /// the aggregator ran.
 #[derive(Debug, Clone)]
 pub struct SevenDayWindow {
-    pub window_start: DateTime<Utc>,
+    pub window_start: Timestamp,
     pub token_counts: TokenCounts,
 }
 
@@ -226,10 +226,10 @@ impl std::error::Error for JsonlError {
 /// ADR-0009.
 #[derive(Debug, Deserialize)]
 pub(crate) struct UsageEntry {
-    timestamp: DateTime<Utc>,
+    timestamp: Timestamp,
     message: MessageFields,
     #[serde(default, rename = "usageLimitResetTime")]
-    usage_limit_reset_time: Option<DateTime<Utc>>,
+    usage_limit_reset_time: Option<Timestamp>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -534,8 +534,8 @@ fn collect_from_root(
 }
 
 fn build_aggregate(entries: &[UsageEntry], source_paths: Vec<PathBuf>) -> JsonlAggregate {
-    let now = Utc::now();
-    let window_start = now - Duration::days(WINDOW_DAYS);
+    let now = Timestamp::now();
+    let window_start = now - SignedDuration::from_hours(WINDOW_DAYS * 24);
 
     let five_hour = compute_active_block(entries, now);
 
@@ -574,14 +574,14 @@ fn build_aggregate(entries: &[UsageEntry], source_paths: Vec<PathBuf>) -> JsonlA
 /// clamps `block.start` to `now`'s hour-floor before surfacing the
 /// window to segments, which neutralizes skewed `ends_at` without
 /// corrupting the token totals.
-fn compute_active_block(entries: &[UsageEntry], now: DateTime<Utc>) -> Option<FiveHourBlock> {
-    let block_duration = Duration::hours(BLOCK_DURATION_HOURS);
+fn compute_active_block(entries: &[UsageEntry], now: Timestamp) -> Option<FiveHourBlock> {
+    let block_duration = SignedDuration::from_hours(BLOCK_DURATION_HOURS);
     let mut current: Option<FiveHourBlock> = None;
     for entry in entries {
         match &mut current {
             None => current = Some(start_block(entry)),
             Some(block) => {
-                let gap = entry.timestamp - block.actual_last_activity;
+                let gap = entry.timestamp.duration_since(block.actual_last_activity);
                 if gap > block_duration {
                     current = Some(start_block(entry));
                 } else {
@@ -591,7 +591,7 @@ fn compute_active_block(entries: &[UsageEntry], now: DateTime<Utc>) -> Option<Fi
         }
     }
     let block = current?;
-    if now - block.actual_last_activity > block_duration {
+    if now.duration_since(block.actual_last_activity) > block_duration {
         None
     } else {
         Some(block)
@@ -625,11 +625,13 @@ fn extend_block(block: &mut FiveHourBlock, entry: &UsageEntry) {
     block.actual_last_activity = entry.timestamp;
 }
 
-pub(super) fn floor_to_hour(ts: DateTime<Utc>) -> DateTime<Utc> {
-    // `duration_trunc(hours(1))` only errors on zero / overflow
-    // durations, which can't arise from a 1-hour grain.
-    ts.duration_trunc(Duration::hours(1))
-        .expect("1-hour grain never overflows DateTime<Utc>")
+pub(super) fn floor_to_hour(ts: Timestamp) -> Timestamp {
+    // `as_second` / `from_second` round-trip cleanly because jiff's
+    // `Timestamp` is i64 seconds + i32 nanos internally; second-grained
+    // construction stays well inside the supported range.
+    let secs = ts.as_second();
+    let floored = secs - secs.rem_euclid(3600);
+    Timestamp::from_second(floored).expect("hour-grained timestamp fits jiff range")
 }
 
 #[cfg(test)]

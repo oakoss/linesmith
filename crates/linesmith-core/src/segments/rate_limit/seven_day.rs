@@ -149,8 +149,8 @@ impl Segment for RateLimit7dResetSegment {
                         return Ok(None);
                     }
                 };
-                let remaining = resets_at.signed_duration_since(chrono::Utc::now());
-                if remaining <= chrono::Duration::zero() {
+                let remaining = resets_at.duration_since(jiff::Timestamp::now());
+                if remaining <= jiff::SignedDuration::ZERO {
                     crate::lsm_debug!(
                         "rate_limit_7d_reset: seven_day.resets_at in the past ({resets_at}); hiding"
                     );
@@ -188,7 +188,7 @@ mod tests {
         EndpointUsage, JsonlUsage, SevenDayWindow, TokenCounts, UsageBucket, UsageData, UsageError,
     };
     use crate::input::{ModelInfo, Percent, StatusContext, Tool, WorkspaceInfo};
-    use chrono::Duration;
+    use jiff::SignedDuration;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -239,19 +239,19 @@ mod tests {
         UsageData::Jsonl(JsonlUsage::new(None, SevenDayWindow::new(tokens)))
     }
 
-    fn data_with_reset_in(duration: Duration) -> UsageData {
+    fn data_with_reset_in(duration: SignedDuration) -> UsageData {
         // 30s of slack so clock drift between setup and render doesn't
         // round the minute boundary down and flip expected output.
-        let slack = if duration > Duration::zero() {
-            Duration::seconds(30)
+        let slack = if duration > SignedDuration::ZERO {
+            SignedDuration::from_secs(30)
         } else {
-            Duration::zero()
+            SignedDuration::ZERO
         };
         UsageData::Endpoint(EndpointUsage {
             five_hour: None,
             seven_day: Some(UsageBucket {
                 utilization: Percent::new(33.0).unwrap(),
-                resets_at: Some(chrono::Utc::now() + duration + slack),
+                resets_at: Some(jiff::Timestamp::now() + duration + slack),
             }),
             seven_day_opus: None,
             seven_day_sonnet: None,
@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn reset_renders_countdown_with_days_by_default() {
         let dc = ctx_with_usage(Ok(data_with_reset_in(
-            Duration::days(4) + Duration::hours(8),
+            SignedDuration::from_hours(4 * 24) + SignedDuration::from_hours(8),
         )));
         let rendered = RateLimit7dResetSegment::default()
             .render(&dc, &rc())
@@ -374,7 +374,7 @@ mod tests {
             ..Default::default()
         };
         let dc = ctx_with_usage(Ok(data_with_reset_in(
-            Duration::days(1) + Duration::hours(3),
+            SignedDuration::from_hours(24) + SignedDuration::from_hours(3),
         )));
         let rendered = seg.render(&dc, &rc()).unwrap().expect("visible");
         assert_eq!(rendered.text(), "7d reset: 27hr");
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn reset_hidden_when_resets_at_in_past() {
-        let dc = ctx_with_usage(Ok(data_with_reset_in(Duration::minutes(-10))));
+        let dc = ctx_with_usage(Ok(data_with_reset_in(SignedDuration::from_mins(-10))));
         assert_eq!(
             RateLimit7dResetSegment::default()
                 .render(&dc, &rc())
@@ -445,7 +445,7 @@ mod tests {
         // reset at 4h remaining must render ~97% elapsed, not ~20%.
         // If anyone re-introduces per-magnitude window derivation, this
         // test flips.
-        let dc = ctx_with_usage(Ok(data_with_reset_in(Duration::hours(4))));
+        let dc = ctx_with_usage(Ok(data_with_reset_in(SignedDuration::from_hours(4))));
         let seg = RateLimit7dResetSegment {
             format: ResetFormat::Progress,
             ..Default::default()

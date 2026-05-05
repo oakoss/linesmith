@@ -23,7 +23,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use super::usage::{ExtraUsage, UsageApiResponse, UsageBucket};
@@ -99,7 +99,7 @@ impl std::error::Error for CacheError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CachedUsage {
     pub schema_version: u32,
-    pub cached_at: DateTime<Utc>,
+    pub cached_at: Timestamp,
     #[serde(default)]
     pub data: Option<CachedData>,
     #[serde(default)]
@@ -111,7 +111,7 @@ impl CachedUsage {
     pub fn with_data(data: UsageApiResponse) -> Self {
         Self {
             schema_version: CACHE_SCHEMA_VERSION,
-            cached_at: Utc::now(),
+            cached_at: Timestamp::now(),
             data: Some(CachedData::from(data)),
             error: None,
         }
@@ -121,7 +121,7 @@ impl CachedUsage {
     pub fn with_error(code: &str) -> Self {
         Self {
             schema_version: CACHE_SCHEMA_VERSION,
-            cached_at: Utc::now(),
+            cached_at: Timestamp::now(),
             data: None,
             error: Some(CachedError {
                 code: code.to_string(),
@@ -255,7 +255,7 @@ impl CacheStore {
         match serde_json::from_str::<CachedUsage>(text) {
             Ok(entry)
                 if entry.schema_version == CACHE_SCHEMA_VERSION
-                    && entry.cached_at <= Utc::now() =>
+                    && entry.cached_at <= Timestamp::now() =>
             {
                 Ok(Some(entry))
             }
@@ -347,7 +347,7 @@ impl LockStore {
 }
 
 fn cap_blocked_until(blocked_until: &mut i64) {
-    let max = Utc::now().timestamp() + MAX_LOCK_DURATION_SECS;
+    let max = Timestamp::now().as_second() + MAX_LOCK_DURATION_SECS;
     if *blocked_until > max {
         *blocked_until = max;
     }
@@ -393,7 +393,7 @@ pub fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Cac
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
+    use jiff::SignedDuration;
     use tempfile::TempDir;
 
     fn sample_response() -> UsageApiResponse {
@@ -439,6 +439,42 @@ mod tests {
     }
 
     #[test]
+    fn cache_reads_rfc3339_z_suffix_serde_format() {
+        // Pin the on-disk RFC 3339 (`Z` suffix) timestamp shape so a
+        // future datetime-library bump that changes the default serde
+        // format fails loudly here, and existing cache files don't
+        // start silently failing to parse. Bump CACHE_SCHEMA_VERSION
+        // when the wire format intentionally changes.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(USAGE_FILE);
+        let payload = r#"{
+            "schema_version": 1,
+            "cached_at": "2026-04-19T12:00:00.000Z",
+            "data": {
+                "five_hour": { "utilization": 42.0, "resets_at": "2026-04-19T17:00:00.000Z" },
+                "seven_day": null,
+                "seven_day_opus": null,
+                "seven_day_sonnet": null,
+                "seven_day_oauth_apps": null,
+                "extra_usage": null,
+                "unknown_buckets": {}
+            },
+            "error": null
+        }"#;
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, payload).unwrap();
+        let store = CacheStore::new(tmp.path().to_path_buf());
+        let read_back = store.read().expect("read").expect("some");
+        assert_eq!(read_back.cached_at.to_string(), "2026-04-19T12:00:00Z");
+        let bucket = read_back.data.as_ref().unwrap().five_hour.as_ref().unwrap();
+        assert_eq!(bucket.utilization.value(), 42.0);
+        assert_eq!(
+            bucket.resets_at.unwrap().to_string(),
+            "2026-04-19T17:00:00Z",
+        );
+    }
+
+    #[test]
     fn cache_read_returns_none_for_schema_mismatch() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join(USAGE_FILE);
@@ -458,7 +494,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = CacheStore::new(tmp.path().to_path_buf());
         let mut entry = CachedUsage::with_data(sample_response());
-        entry.cached_at = Utc::now() + Duration::minutes(10);
+        entry.cached_at = Timestamp::now() + SignedDuration::from_mins(10);
         store.write(&entry).expect("write");
         assert!(store.read().expect("read").is_none());
     }
@@ -586,7 +622,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = LockStore::new(tmp.path().to_path_buf());
         // A recent timestamp that falls well within the cap window.
-        let now = Utc::now().timestamp();
+        let now = Timestamp::now().as_second();
         let lock = Lock {
             blocked_until: now + 60,
             error: Some("rate-limited".into()),
@@ -656,7 +692,7 @@ mod tests {
         };
         store.write(&malicious).expect("write");
         let read_back = store.read().expect("read").expect("some");
-        let ceiling = Utc::now().timestamp() + MAX_LOCK_DURATION_SECS;
+        let ceiling = Timestamp::now().as_second() + MAX_LOCK_DURATION_SECS;
         // Cap may drift by a second during the test; allow a small
         // window but reject the raw i64::MAX that was persisted.
         assert!(
@@ -675,7 +711,7 @@ mod tests {
         let store = LockStore::new(tmp.path().to_path_buf());
         store
             .write(&Lock {
-                blocked_until: Utc::now().timestamp() + 60,
+                blocked_until: Timestamp::now().as_second() + 60,
                 error: None,
             })
             .expect("write");

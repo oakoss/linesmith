@@ -634,7 +634,7 @@ pub(super) fn stat_usage_json(path: &Path) -> UsageJsonState {
         };
     }
     match serde_json::from_value::<CachedUsage>(value) {
-        Ok(entry) if entry.cached_at <= chrono::Utc::now() => UsageJsonState::Current {
+        Ok(entry) if entry.cached_at <= jiff::Timestamp::now() => UsageJsonState::Current {
             schema_version: entry.schema_version,
         },
         Ok(_) => UsageJsonState::FutureTimestamp,
@@ -655,7 +655,7 @@ pub(super) fn stat_usage_lock(cache_root: &Path) -> LockState {
     match store.read() {
         Ok(None) => LockState::Absent,
         Ok(Some(lock)) => {
-            let now = chrono::Utc::now().timestamp();
+            let now = jiff::Timestamp::now().as_second();
             if lock.blocked_until > now {
                 LockState::Active {
                     blocked_until_secs: lock.blocked_until,

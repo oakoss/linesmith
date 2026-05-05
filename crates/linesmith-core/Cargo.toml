@@ -34,7 +34,6 @@ linesmith-plugin = { version = "0.1.2", path = "../linesmith-plugin" }
 serde.workspace = true
 serde_json.workspace = true
 catppuccin.workspace = true
-chrono.workspace = true
 gix.workspace = true
 jiff.workspace = true
 httpdate.workspace = true

@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use super::jsonl::TokenCounts;
@@ -113,7 +113,7 @@ pub struct UsageBucket {
     pub utilization: Percent,
 
     #[serde(default)]
-    pub resets_at: Option<DateTime<Utc>>,
+    pub resets_at: Option<Timestamp>,
 }
 
 /// Overage-credit tracking for accounts with extra-usage enabled.
@@ -211,12 +211,12 @@ impl JsonlUsage {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FiveHourWindow {
     pub(crate) tokens: TokenCounts,
-    pub(crate) start: DateTime<Utc>,
+    pub(crate) start: Timestamp,
 }
 
 impl FiveHourWindow {
     #[must_use]
-    pub(crate) fn new(tokens: TokenCounts, start: DateTime<Utc>) -> Self {
+    pub(crate) fn new(tokens: TokenCounts, start: Timestamp) -> Self {
         Self { tokens, start }
     }
 
@@ -225,8 +225,8 @@ impl FiveHourWindow {
     /// [`FiveHourBlock::end`]; otherwise it's just the direct
     /// derivation from whatever `start` the caller passed.
     #[must_use]
-    pub(crate) fn ends_at(&self) -> DateTime<Utc> {
-        self.start + chrono::Duration::hours(5)
+    pub(crate) fn ends_at(&self) -> Timestamp {
+        self.start + jiff::SignedDuration::from_hours(5)
     }
 }
 

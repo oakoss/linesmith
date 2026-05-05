@@ -2,7 +2,7 @@ use super::*;
 use std::cell::{Cell, RefCell};
 use std::io;
 
-use chrono::Duration as ChronoDuration;
+use jiff::SignedDuration as ChronoDuration;
 use tempfile::TempDir;
 
 use crate::data_context::cache::{CacheStore, CachedUsage, Lock, LockStore};
@@ -65,8 +65,8 @@ fn config() -> UsageCascadeConfig {
     UsageCascadeConfig::default()
 }
 
-fn now_fn() -> impl Fn() -> DateTime<Utc> {
-    let ts = Utc::now();
+fn now_fn() -> impl Fn() -> Timestamp {
+    let ts = Timestamp::now();
     move || ts
 }
 
@@ -89,7 +89,7 @@ fn jsonl_ok() -> Result<JsonlAggregate, JsonlError> {
     Ok(JsonlAggregate {
         five_hour: None,
         seven_day: JsonlSevenDayWindow {
-            window_start: Utc::now() - ChronoDuration::days(7),
+            window_start: Timestamp::now() - ChronoDuration::from_hours(7 * 24),
             token_counts: TokenCounts::from_parts(1_000_000, 200_000, 0, 0),
         },
         source_paths: Vec::new(),
@@ -100,8 +100,8 @@ fn jsonl_ok() -> Result<JsonlAggregate, JsonlError> {
 /// the block's `end()` (= start + 5h) lies ~4h in the future, a
 /// realistic reset-timer window for the 5h-reset segment tests.
 fn jsonl_ok_with_active_block() -> Result<JsonlAggregate, JsonlError> {
-    let now = Utc::now();
-    let start = now - ChronoDuration::hours(1);
+    let now = Timestamp::now();
+    let start = now - ChronoDuration::from_hours(1);
     Ok(JsonlAggregate {
         five_hour: Some(FiveHourBlock {
             start,
@@ -111,7 +111,7 @@ fn jsonl_ok_with_active_block() -> Result<JsonlAggregate, JsonlError> {
             usage_limit_reset: None,
         }),
         seven_day: JsonlSevenDayWindow {
-            window_start: now - ChronoDuration::days(7),
+            window_start: now - ChronoDuration::from_hours(7 * 24),
             token_counts: TokenCounts::from_parts(1_000_000, 200_000, 0, 0),
         },
         source_paths: Vec::new(),
@@ -120,7 +120,7 @@ fn jsonl_ok_with_active_block() -> Result<JsonlAggregate, JsonlError> {
 
 fn stale_cache_entry(age: ChronoDuration) -> CachedUsage {
     let mut entry = CachedUsage::with_data(sample_response());
-    entry.cached_at = Utc::now() - age;
+    entry.cached_at = Timestamp::now() - age;
     entry
 }
 
@@ -191,7 +191,7 @@ fn stale_cache_without_lock_triggers_fetch_and_overwrites() {
     let tmp = TempDir::new().unwrap();
     let cache = CacheStore::new(tmp.path().to_path_buf());
     cache
-        .write(&stale_cache_entry(ChronoDuration::minutes(10)))
+        .write(&stale_cache_entry(ChronoDuration::from_mins(10)))
         .unwrap();
     let lock = LockStore::new(tmp.path().to_path_buf());
 
@@ -210,8 +210,8 @@ fn stale_cache_without_lock_triggers_fetch_and_overwrites() {
     assert!(matches!(data, UsageData::Endpoint(_)));
     assert_eq!(transport.calls.get(), 1);
     let refreshed = cache.read().unwrap().unwrap();
-    let age = Utc::now().signed_duration_since(refreshed.cached_at);
-    assert!(age.num_seconds() < 5, "cache must be re-stamped on success");
+    let age = Timestamp::now().duration_since(refreshed.cached_at);
+    assert!(age.as_secs() < 5, "cache must be re-stamped on success");
 }
 
 #[test]
@@ -219,11 +219,11 @@ fn stale_cache_with_active_lock_serves_stale_without_credentials() {
     let tmp = TempDir::new().unwrap();
     let cache = CacheStore::new(tmp.path().to_path_buf());
     cache
-        .write(&stale_cache_entry(ChronoDuration::minutes(10)))
+        .write(&stale_cache_entry(ChronoDuration::from_mins(10)))
         .unwrap();
     let lock = LockStore::new(tmp.path().to_path_buf());
     lock.write(&Lock {
-        blocked_until: Utc::now().timestamp() + 60,
+        blocked_until: Timestamp::now().as_second() + 60,
         error: Some("rate-limited".into()),
     })
     .unwrap();
@@ -330,7 +330,8 @@ fn endpoint_200_writes_cache_and_lock() {
     assert!(matches!(data, UsageData::Endpoint(_)));
     assert!(cache.read().unwrap().is_some(), "cache must be populated");
     let persisted_lock = lock.read().unwrap().unwrap();
-    let expected_blocked_until = Utc::now().timestamp() + config().cache_duration.as_secs() as i64;
+    let expected_blocked_until =
+        Timestamp::now().as_second() + config().cache_duration.as_secs() as i64;
     assert!(
         (persisted_lock.blocked_until - expected_blocked_until).abs() < 5,
         "lock blocked_until = {}, expected near {}",
@@ -374,20 +375,20 @@ fn jsonl_fallback_clamps_future_dated_block_start_to_now() {
     // tokens. The aggregator keeps the skewed block so mild-skew
     // users don't lose their session; the cascade clamps
     // `block.start` to `floor_to_hour(now)` before surfacing.
-    let now = Utc::now();
+    let now = Timestamp::now();
     // Build a skewed block at +2h so `block.start` starts in the
     // future and `ends_at = start + 5h` would land ~7h out.
-    let skewed_start = now + ChronoDuration::hours(2);
+    let skewed_start = now + ChronoDuration::from_hours(2);
     let skewed: Result<JsonlAggregate, JsonlError> = Ok(JsonlAggregate {
         five_hour: Some(FiveHourBlock {
             start: skewed_start,
-            actual_last_activity: now + ChronoDuration::minutes(30),
+            actual_last_activity: now + ChronoDuration::from_mins(30),
             token_counts: TokenCounts::from_parts(100, 0, 0, 0),
             models: vec!["claude-opus-4-7".into()],
             usage_limit_reset: None,
         }),
         seven_day: JsonlSevenDayWindow {
-            window_start: now - ChronoDuration::days(7),
+            window_start: now - ChronoDuration::from_hours(7 * 24),
             token_counts: TokenCounts::from_parts(100, 0, 0, 0),
         },
         source_paths: Vec::new(),
@@ -417,10 +418,10 @@ fn jsonl_fallback_clamps_future_dated_block_start_to_now() {
     // Clamped: start cannot exceed floor_to_hour(now), so
     // ends_at <= floor_to_hour(now) + 5h <= now + 5h.
     assert!(
-        window.ends_at() <= now + ChronoDuration::hours(5),
+        window.ends_at() <= now + ChronoDuration::from_hours(5),
         "ends_at={:?} must be clamped at/before now + 5h ({:?})",
         window.ends_at(),
-        now + ChronoDuration::hours(5),
+        now + ChronoDuration::from_hours(5),
     );
 }
 
@@ -447,8 +448,12 @@ fn jsonl_fallback_surfaces_five_hour_window_with_ends_at() {
         .five_hour
         .as_ref()
         .expect("active block should populate five_hour window");
-    let expected_ends_at = Utc::now() + ChronoDuration::hours(4);
-    let drift = (window.ends_at() - expected_ends_at).num_seconds().abs();
+    let expected_ends_at = Timestamp::now() + ChronoDuration::from_hours(4);
+    let drift = window
+        .ends_at()
+        .duration_since(expected_ends_at)
+        .as_secs()
+        .abs();
     assert!(
         drift < 5,
         "ends_at={:?} drifted {drift}s from expected",
@@ -478,7 +483,7 @@ fn endpoint_401_does_not_serve_stale_cache() {
     let tmp = TempDir::new().unwrap();
     let cache = CacheStore::new(tmp.path().to_path_buf());
     cache
-        .write(&stale_cache_entry(ChronoDuration::minutes(10)))
+        .write(&stale_cache_entry(ChronoDuration::from_mins(10)))
         .unwrap();
     let err = resolve_usage(
         Some(&cache),
@@ -505,7 +510,7 @@ fn invocation_after_401_does_not_serve_stale_cache_via_lock_active() {
     let tmp = TempDir::new().unwrap();
     let cache = CacheStore::new(tmp.path().to_path_buf());
     cache
-        .write(&stale_cache_entry(ChronoDuration::minutes(10)))
+        .write(&stale_cache_entry(ChronoDuration::from_mins(10)))
         .unwrap();
     let lock = LockStore::new(tmp.path().to_path_buf());
 
@@ -553,7 +558,7 @@ fn invocation_after_401_falls_through_to_jsonl_when_available() {
     let tmp = TempDir::new().unwrap();
     let cache = CacheStore::new(tmp.path().to_path_buf());
     cache
-        .write(&stale_cache_entry(ChronoDuration::minutes(10)))
+        .write(&stale_cache_entry(ChronoDuration::from_mins(10)))
         .unwrap();
     let lock = LockStore::new(tmp.path().to_path_buf());
 
@@ -596,11 +601,11 @@ fn active_unauthorized_lock_rejects_stale_cached_data() {
     let tmp = TempDir::new().unwrap();
     let cache = CacheStore::new(tmp.path().to_path_buf());
     cache
-        .write(&stale_cache_entry(ChronoDuration::minutes(10)))
+        .write(&stale_cache_entry(ChronoDuration::from_mins(10)))
         .unwrap();
     let lock = LockStore::new(tmp.path().to_path_buf());
     lock.write(&Lock {
-        blocked_until: Utc::now().timestamp() + 30,
+        blocked_until: Timestamp::now().as_second() + 30,
         error: Some("Unauthorized".into()),
     })
     .unwrap();
@@ -639,7 +644,7 @@ fn endpoint_429_writes_lock_with_retry_after_backoff() {
     );
 
     let persisted = lock.read().unwrap().expect("lock must be written");
-    let expected = Utc::now().timestamp() + 120;
+    let expected = Timestamp::now().as_second() + 120;
     assert!(
         (persisted.blocked_until - expected).abs() < 5,
         "blocked_until={}, expected near {}",
@@ -665,7 +670,7 @@ fn endpoint_timeout_writes_lock_with_error_ttl() {
     );
 
     let persisted = lock.read().unwrap().expect("lock must be written");
-    let expected = Utc::now().timestamp() + DEFAULT_ERROR_TTL.as_secs() as i64;
+    let expected = Timestamp::now().as_second() + DEFAULT_ERROR_TTL.as_secs() as i64;
     assert!(
         (persisted.blocked_until - expected).abs() < 5,
         "blocked_until={}, expected near {}",
@@ -738,7 +743,7 @@ fn endpoint_429_with_stale_cache_serves_stale() {
     let tmp = TempDir::new().unwrap();
     let cache = CacheStore::new(tmp.path().to_path_buf());
     cache
-        .write(&stale_cache_entry(ChronoDuration::minutes(10)))
+        .write(&stale_cache_entry(ChronoDuration::from_mins(10)))
         .unwrap();
     let data = resolve_usage(
         Some(&cache),
@@ -797,7 +802,7 @@ fn endpoint_timeout_with_stale_cache_serves_stale() {
     let tmp = TempDir::new().unwrap();
     let cache = CacheStore::new(tmp.path().to_path_buf());
     cache
-        .write(&stale_cache_entry(ChronoDuration::minutes(10)))
+        .write(&stale_cache_entry(ChronoDuration::from_mins(10)))
         .unwrap();
     let data = resolve_usage(
         Some(&cache),
@@ -903,11 +908,11 @@ fn expired_lock_does_not_gate_fetch() {
     let tmp = TempDir::new().unwrap();
     let cache = CacheStore::new(tmp.path().to_path_buf());
     cache
-        .write(&stale_cache_entry(ChronoDuration::minutes(10)))
+        .write(&stale_cache_entry(ChronoDuration::from_mins(10)))
         .unwrap();
     let lock = LockStore::new(tmp.path().to_path_buf());
     lock.write(&Lock {
-        blocked_until: Utc::now().timestamp() - 60,
+        blocked_until: Timestamp::now().as_second() - 60,
         error: None,
     })
     .unwrap();
@@ -940,7 +945,7 @@ fn active_lock_with_no_cached_data_does_not_hit_endpoint() {
     let cache = CacheStore::new(tmp.path().to_path_buf());
     let lock = LockStore::new(tmp.path().to_path_buf());
     lock.write(&Lock {
-        blocked_until: Utc::now().timestamp() + 60,
+        blocked_until: Timestamp::now().as_second() + 60,
         error: Some("RateLimited".into()),
     })
     .unwrap();
@@ -976,7 +981,7 @@ fn active_lock_falls_through_to_jsonl_when_available() {
     let cache = CacheStore::new(tmp.path().to_path_buf());
     let lock = LockStore::new(tmp.path().to_path_buf());
     lock.write(&Lock {
-        blocked_until: Utc::now().timestamp() + 60,
+        blocked_until: Timestamp::now().as_second() + 60,
         error: Some("RateLimited".into()),
     })
     .unwrap();
@@ -1013,7 +1018,7 @@ fn active_lock_serves_cached_error_without_hitting_endpoint() {
         .unwrap();
     let lock = LockStore::new(tmp.path().to_path_buf());
     lock.write(&Lock {
-        blocked_until: Utc::now().timestamp() + 60,
+        blocked_until: Timestamp::now().as_second() + 60,
         error: Some("RateLimited".into()),
     })
     .unwrap();
@@ -1048,7 +1053,7 @@ fn active_lock_with_cached_error_falls_through_to_jsonl_when_available() {
         .unwrap();
     let lock = LockStore::new(tmp.path().to_path_buf());
     lock.write(&Lock {
-        blocked_until: Utc::now().timestamp() + 60,
+        blocked_until: Timestamp::now().as_second() + 60,
         error: Some("RateLimited".into()),
     })
     .unwrap();
@@ -1204,7 +1209,7 @@ fn clock_skew_future_cached_at_treats_entry_as_stale() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("usage.json");
     let mut entry = CachedUsage::with_data(sample_response());
-    entry.cached_at = Utc::now() + ChronoDuration::hours(1);
+    entry.cached_at = Timestamp::now() + ChronoDuration::from_hours(1);
     std::fs::write(&path, serde_json::to_string(&entry).unwrap()).unwrap();
     let cache = CacheStore::new(tmp.path().to_path_buf());
 

@@ -39,8 +39,8 @@ pub(crate) enum WindowResolution<'a> {
 /// block's derived `ends_at()` (= block.start + 5h) and signals
 /// stale-marker rendering at the segment.
 pub(crate) enum ResetSource {
-    Endpoint(chrono::DateTime<chrono::Utc>),
-    JsonlBlockEnd(chrono::DateTime<chrono::Utc>),
+    Endpoint(jiff::Timestamp),
+    JsonlBlockEnd(jiff::Timestamp),
 }
 
 impl UsageWindow {
@@ -109,9 +109,7 @@ pub(crate) fn resolve_five_hour_reset(data: &UsageData) -> Result<ResetSource, &
 /// `ResetSource`) because ADR-0013 rejects synthesizing a 7d reset
 /// timestamp under JSONL — the rolling 7d window has no hard reset,
 /// and the signature encodes that. JSONL data always returns `Err`.
-pub(crate) fn resolve_seven_day_reset(
-    data: &UsageData,
-) -> Result<chrono::DateTime<chrono::Utc>, &'static str> {
+pub(crate) fn resolve_seven_day_reset(data: &UsageData) -> Result<jiff::Timestamp, &'static str> {
     match data {
         UsageData::Endpoint(e) => {
             let bucket = e

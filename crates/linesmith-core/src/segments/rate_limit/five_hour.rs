@@ -156,8 +156,8 @@ impl Segment for RateLimit5hResetSegment {
                         return Ok(None);
                     }
                 };
-                let remaining = resets_at.signed_duration_since(chrono::Utc::now());
-                if remaining <= chrono::Duration::zero() {
+                let remaining = resets_at.duration_since(jiff::Timestamp::now());
+                if remaining <= jiff::SignedDuration::ZERO {
                     crate::lsm_debug!(
                         "rate_limit_5h_reset: resets_at in the past ({resets_at}); hiding"
                     );
@@ -196,7 +196,7 @@ mod tests {
         UsageBucket, UsageData, UsageError,
     };
     use crate::input::{ModelInfo, Percent, StatusContext, Tool, WorkspaceInfo};
-    use chrono::{Duration, Utc};
+    use jiff::{SignedDuration, Timestamp};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -257,7 +257,7 @@ mod tests {
     fn jsonl_with_five_hour_tokens(total: u64) -> UsageData {
         let tokens = TokenCounts::from_parts(total, 0, 0, 0);
         // Block start ~1h ago → ends_at() lands ~4h in the future.
-        let start = Utc::now() - Duration::hours(1);
+        let start = Timestamp::now() - SignedDuration::from_hours(1);
         UsageData::Jsonl(JsonlUsage::new(
             Some(FiveHourWindow::new(tokens, start)),
             SevenDayWindow::new(TokenCounts::default()),
@@ -269,14 +269,14 @@ mod tests {
         // round `num_minutes()` down a boundary (e.g. 277m → 276m), which
         // would flip `"4hr 37m"` to `"4hr 36m"`.
         let slack = if minutes > 0 {
-            Duration::seconds(30)
+            SignedDuration::from_secs(30)
         } else {
-            Duration::zero()
+            SignedDuration::ZERO
         };
         UsageData::Endpoint(EndpointUsage {
             five_hour: Some(UsageBucket {
                 utilization: Percent::new(42.0).unwrap(),
-                resets_at: Some(Utc::now() + Duration::minutes(minutes) + slack),
+                resets_at: Some(Timestamp::now() + SignedDuration::from_mins(minutes) + slack),
             }),
             seven_day: None,
             seven_day_opus: None,
@@ -289,13 +289,14 @@ mod tests {
 
     fn jsonl_data_with_reset_in(minutes: i64) -> UsageData {
         let slack = if minutes > 0 {
-            Duration::seconds(30)
+            SignedDuration::from_secs(30)
         } else {
-            Duration::zero()
+            SignedDuration::ZERO
         };
         // Block must start 5h before the desired reset because
         // `FiveHourWindow::ends_at()` is derived as `start + 5h`.
-        let start = Utc::now() + Duration::minutes(minutes) + slack - Duration::hours(5);
+        let start = Timestamp::now() + SignedDuration::from_mins(minutes) + slack
+            - SignedDuration::from_hours(5);
         UsageData::Jsonl(JsonlUsage::new(
             Some(FiveHourWindow::new(TokenCounts::default(), start)),
             SevenDayWindow::new(TokenCounts::default()),

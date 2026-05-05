@@ -23,7 +23,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-use chrono::Utc;
+#[cfg(test)]
+use jiff::SignedDuration;
+use jiff::Timestamp;
 use rhai::packages::{Package, StandardPackage};
 use rhai::{Dynamic, Engine, EvalAltResult};
 
@@ -361,23 +363,20 @@ fn rhai_format_tokens(count: i64) -> String {
 /// (which use a different format per spec) — this is a stable
 /// plugin-facing API and moving cadence shouldn't track segment refactors.
 fn rhai_format_countdown_until(rfc3339_ts: &str) -> String {
-    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rfc3339_ts) else {
+    let Ok(target) = rfc3339_ts.parse::<Timestamp>() else {
         return "?".to_string();
     };
-    let target = dt.with_timezone(&Utc);
-    let now = Utc::now();
-    let delta = target - now;
-    let total_minutes = delta.num_minutes();
+    let total_minutes = (target.as_second() - Timestamp::now().as_second()) / 60;
     if total_minutes <= 0 {
         return "now".to_string();
     }
-    let days = delta.num_days();
+    let days = total_minutes / (24 * 60);
     if days >= 2 {
         return format!("{days}d");
     }
-    let hours = delta.num_hours();
+    let hours = total_minutes / 60;
     if hours >= 1 {
-        let minutes = (total_minutes - hours * 60).max(0);
+        let minutes = total_minutes - hours * 60;
         return if minutes == 0 {
             format!("{hours}h")
         } else {
@@ -741,8 +740,8 @@ mod tests {
         // end (not just the bad-input fallback). Shape assertion only
         // so the test isn't time-sensitive: result is neither "?"
         // (parse failure) nor "now" (for a timestamp > 1 minute out).
-        let target = chrono::Utc::now() + chrono::Duration::hours(2);
-        let rendered = rhai_format_countdown_until(&target.to_rfc3339());
+        let target = Timestamp::now() + SignedDuration::from_hours(2);
+        let rendered = rhai_format_countdown_until(&target.to_string());
         assert_ne!(rendered, "?", "expected successful parse + format");
         assert_ne!(rendered, "now", "expected future-duration output");
         assert!(!rendered.is_empty());

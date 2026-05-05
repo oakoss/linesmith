@@ -37,7 +37,7 @@ redundant_pub_crate = "warn"
 disallowed_methods = "allow"
 
 [dependencies]
-chrono.workspace = true
+jiff.workspace = true
 rhai.workspace = true
 
 [dev-dependencies]

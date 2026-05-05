@@ -24,14 +24,12 @@ categories = ["command-line-utilities", "development-tools"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 catppuccin = "2"
-chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
-# IANA timezone handling for the rate-limit reset segments. Reads the
-# system `/usr/share/zoneinfo/*` on macOS/Linux at runtime so no tzdata
-# is embedded in the binary; falls back to the bundled `jiff-tzdb` only
-# on Windows where the OS has no system copy. Picked over chrono-tz to
-# avoid the unconditional ~250-400KB IANA DB embed. Migration of the
-# rest of the workspace from chrono is tracked in lsm-3912.
-jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform"] }
+# Datetime / IANA timezone handling. Reads the system tzdb on
+# macOS/Linux at runtime (no embedded IANA DB); the bundled `jiff-tzdb`
+# is only linked on Windows where the OS has no system copy.
+# `serde` enables `Timestamp` (de)serialization in the on-disk cache
+# (RFC 3339 wire format, identical to chrono::DateTime<Utc>'s default).
+jiff = { version = "0.2", default-features = false, features = ["serde", "std", "tz-system", "tzdb-bundle-platform"] }
 # Interactive prompts for `linesmith init` (Select for preset/theme pickers).
 # `default-features = false` drops the optional history/fuzzy-select code we
 # don't use, keeping the binary smaller.

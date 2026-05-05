@@ -5,7 +5,9 @@
 //! Canonical spec: `docs/specs/rate-limit-segments.md` §Render
 //! semantics and §Error message table.
 
-use chrono::{DateTime, Duration, Utc};
+#[cfg(test)]
+use jiff::civil;
+use jiff::{SignedDuration, Timestamp};
 
 use super::config::{
     AbsoluteFormat, CommonRateLimitConfig, ExtraUsageFormat, HourFormat, Locale, PercentFormat,
@@ -22,10 +24,10 @@ pub(crate) enum ResetWindow {
 }
 
 impl ResetWindow {
-    fn total(self) -> Duration {
+    fn total(self) -> SignedDuration {
         match self {
-            Self::FiveHour => Duration::hours(5),
-            Self::SevenDay => Duration::days(7),
+            Self::FiveHour => SignedDuration::from_hours(5),
+            Self::SevenDay => SignedDuration::from_hours(7 * 24),
         }
     }
 }
@@ -70,8 +72,8 @@ pub(crate) fn format_jsonl_tokens(total: u64, cfg: &CommonRateLimitConfig) -> St
 #[must_use]
 #[allow(clippy::too_many_arguments)] // an args struct here just renames the indirection.
 pub(crate) fn format_reset(
-    resets_at: DateTime<Utc>,
-    remaining: Duration,
+    resets_at: Timestamp,
+    remaining: SignedDuration,
     format: &ResetFormat,
     compact: bool,
     use_days: bool,
@@ -91,19 +93,12 @@ pub(crate) fn format_reset(
 
 /// Render an absolute wall-clock time like `"7:00 PM PT"` (12h) or
 /// `"19:00 PT"` (24h).
-fn format_absolute_text(resets_at: DateTime<Utc>, cfg: &AbsoluteFormat) -> String {
-    let secs = resets_at.timestamp();
-    let nanos = i32::try_from(resets_at.timestamp_subsec_nanos()).unwrap_or(0);
-    let Ok(ts) = jiff::Timestamp::new(secs, nanos) else {
-        // `chrono::DateTime<Utc>` always fits jiff's range; this arm
-        // is defensive against future chrono-side range changes.
-        return String::new();
-    };
+fn format_absolute_text(resets_at: Timestamp, cfg: &AbsoluteFormat) -> String {
     let tz = match &cfg.timezone {
         Timezone::SystemLocal => jiff::tz::TimeZone::system(),
         Timezone::Iana(tz) => tz.clone(),
     };
-    let zdt = ts.to_zoned(tz);
+    let zdt = resets_at.to_zoned(tz);
     let pattern = match (cfg.hour, cfg.locale) {
         (HourFormat::Hour24, Locale::EnUs) => "%H:%M %Z",
         (HourFormat::Hour12, Locale::EnUs) => "%-I:%M %p %Z",
@@ -208,8 +203,8 @@ pub(crate) fn format_progress_bar(pct: f64, width: u16) -> String {
 /// Duration → text per spec §Config schema: `compact=true` collapses
 /// to `"4h37m"`, `compact=false` uses `"4hr 37m"`; `use_days=true`
 /// emits `"1d 3hr"` once the remainder is >= 1 day.
-fn format_duration_text(remaining: Duration, compact: bool, use_days: bool) -> String {
-    let total_minutes = remaining.num_minutes().max(0);
+fn format_duration_text(remaining: SignedDuration, compact: bool, use_days: bool) -> String {
+    let total_minutes = (remaining.as_secs() / 60).max(0);
     if total_minutes == 0 {
         // Per spec: never show "0m"; compact/non-compact both say "<1m".
         return "<1m".into();
@@ -280,10 +275,10 @@ fn format_two(
 
 /// Reset-progress as a percentage: how far the window has elapsed,
 /// computed as `1 - remaining / window_total`.
-fn reset_progress_pct(remaining: Duration, window: ResetWindow) -> f64 {
+fn reset_progress_pct(remaining: SignedDuration, window: ResetWindow) -> f64 {
     let total = window.total();
     let elapsed = total - remaining;
-    (elapsed.num_milliseconds() as f64 / total.num_milliseconds() as f64).clamp(0.0, 1.0) * 100.0
+    (elapsed.as_millis() as f64 / total.as_millis() as f64).clamp(0.0, 1.0) * 100.0
 }
 
 /// Compact token formatting matching the spec's JSONL-mode examples
@@ -479,7 +474,7 @@ mod tests {
     #[test]
     fn duration_text_sub_minute_renders_lt_1m() {
         assert_eq!(
-            format_duration_text(Duration::seconds(30), false, true),
+            format_duration_text(SignedDuration::from_secs(30), false, true),
             "<1m"
         );
     }
@@ -487,7 +482,7 @@ mod tests {
     #[test]
     fn duration_text_minutes_only() {
         assert_eq!(
-            format_duration_text(Duration::minutes(45), false, true),
+            format_duration_text(SignedDuration::from_mins(45), false, true),
             "45m"
         );
     }
@@ -495,7 +490,7 @@ mod tests {
     #[test]
     fn duration_text_hours_and_minutes_non_compact() {
         assert_eq!(
-            format_duration_text(Duration::minutes(4 * 60 + 37), false, true),
+            format_duration_text(SignedDuration::from_mins(4 * 60 + 37), false, true),
             "4hr 37m"
         );
     }
@@ -503,7 +498,7 @@ mod tests {
     #[test]
     fn duration_text_hours_and_minutes_compact() {
         assert_eq!(
-            format_duration_text(Duration::minutes(4 * 60 + 37), true, true),
+            format_duration_text(SignedDuration::from_mins(4 * 60 + 37), true, true),
             "4h37m"
         );
     }
@@ -511,7 +506,7 @@ mod tests {
     #[test]
     fn duration_text_uses_days_when_configured() {
         assert_eq!(
-            format_duration_text(Duration::minutes(27 * 60), false, true),
+            format_duration_text(SignedDuration::from_mins(27 * 60), false, true),
             "1d 3hr"
         );
     }
@@ -519,21 +514,24 @@ mod tests {
     #[test]
     fn duration_text_skips_days_when_use_days_false() {
         assert_eq!(
-            format_duration_text(Duration::minutes(27 * 60), false, false),
+            format_duration_text(SignedDuration::from_mins(27 * 60), false, false),
             "27hr"
         );
     }
 
     #[test]
     fn duration_text_clamps_days_to_four_digits() {
-        let huge = Duration::days(99_999);
+        let huge = SignedDuration::from_hours(99_999 * 24);
         let s = format_duration_text(huge, false, true);
         assert!(s.starts_with("9999d"), "{s}");
     }
 
     #[test]
     fn duration_text_round_hour_drops_minutes() {
-        assert_eq!(format_duration_text(Duration::hours(3), false, true), "3hr");
+        assert_eq!(
+            format_duration_text(SignedDuration::from_hours(3), false, true),
+            "3hr"
+        );
     }
 
     #[test]
@@ -657,10 +655,12 @@ mod tests {
 
     // --- absolute reset format ---
 
-    fn fixed_utc(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Utc> {
-        chrono::TimeZone::with_ymd_and_hms(&Utc, year, month, day, hour, minute, 0)
-            .single()
+    fn fixed_utc(year: i16, month: i8, day: i8, hour: i8, minute: i8) -> Timestamp {
+        civil::date(year, month, day)
+            .at(hour, minute, 0, 0)
+            .in_tz("UTC")
             .expect("valid utc")
+            .timestamp()
     }
 
     #[test]
@@ -728,7 +728,7 @@ mod tests {
         });
         let out = format_reset(
             resets_at,
-            Duration::hours(1),
+            SignedDuration::from_hours(1),
             &format,
             false,
             true,
@@ -757,7 +757,7 @@ mod tests {
         });
         let out = format_reset(
             resets_at,
-            Duration::hours(1),
+            SignedDuration::from_hours(1),
             &format,
             false,
             true,

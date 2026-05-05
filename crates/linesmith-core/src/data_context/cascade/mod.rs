@@ -16,7 +16,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use super::cache::{CacheError, CacheStore, CachedUsage, Lock, LockStore};
 use super::credentials::Credentials;
@@ -80,7 +80,7 @@ pub fn resolve_usage(
     transport: &dyn UsageTransport,
     credentials: &dyn Fn() -> Arc<Result<Credentials, CredentialError>>,
     jsonl: &dyn Fn() -> Result<JsonlAggregate, JsonlError>,
-    now: &dyn Fn() -> DateTime<Utc>,
+    now: &dyn Fn() -> Timestamp,
     config: &UsageCascadeConfig,
 ) -> Result<UsageData, UsageError> {
     let cache_entry = read_cache(cache);
@@ -97,7 +97,7 @@ pub fn resolve_usage(
 
     let lock_active = lock_entry
         .as_ref()
-        .is_some_and(|l| l.blocked_until > now_ts.timestamp());
+        .is_some_and(|l| l.blocked_until > now_ts.as_second());
     if lock_active {
         // Serve whatever we have without touching credentials: another
         // process is in backoff and we must honor it.
@@ -158,7 +158,7 @@ pub fn resolve_usage(
             write_lock(
                 lock,
                 Lock {
-                    blocked_until: add_secs(now_ts.timestamp(), config.cache_duration),
+                    blocked_until: add_secs(now_ts.as_second(), config.cache_duration),
                     error: None,
                 },
             );
@@ -202,7 +202,7 @@ pub fn resolve_usage(
 /// starts (clock skew) to a sane bound — see [`build_jsonl_usage`].
 fn jsonl_or(
     jsonl: &dyn Fn() -> Result<JsonlAggregate, JsonlError>,
-    now: DateTime<Utc>,
+    now: Timestamp,
     fallback: UsageError,
 ) -> Result<UsageData, UsageError> {
     match build_jsonl_usage(jsonl(), now) {
@@ -213,7 +213,7 @@ fn jsonl_or(
 
 fn build_jsonl_usage(
     result: Result<JsonlAggregate, JsonlError>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Option<JsonlUsage> {
     let agg = match result {
         Ok(agg) => agg,
@@ -389,12 +389,12 @@ fn is_transient_persist_race(_err: &CacheError) -> bool {
     false
 }
 
-fn write_failure_lock(lock: Option<&LockStore>, now_ts: DateTime<Utc>, err: &UsageError) {
+fn write_failure_lock(lock: Option<&LockStore>, now_ts: Timestamp, err: &UsageError) {
     let backoff = backoff_for_error(err);
     write_lock(
         lock,
         Lock {
-            blocked_until: add_secs(now_ts.timestamp(), backoff),
+            blocked_until: add_secs(now_ts.as_second(), backoff),
             error: Some(err.code().to_string()),
         },
     );
@@ -445,10 +445,10 @@ fn usage_error_from_code(code: &str) -> UsageError {
     }
 }
 
-fn is_fresh(entry: &CachedUsage, now: DateTime<Utc>, ttl: Duration) -> bool {
+fn is_fresh(entry: &CachedUsage, now: Timestamp, ttl: Duration) -> bool {
     // `cached_at > now` (clock skew) is filtered out by
     // `CacheStore::read`, so a normal `age < ttl` check is enough.
-    match now.signed_duration_since(entry.cached_at).to_std() {
+    match Duration::try_from(now.duration_since(entry.cached_at)) {
         Ok(elapsed) => elapsed < ttl,
         Err(_) => false,
     }

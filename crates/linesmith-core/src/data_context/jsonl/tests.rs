@@ -1,6 +1,14 @@
 use super::*;
-use chrono::TimeZone;
+
+use jiff::civil;
 use tempfile::TempDir;
+
+/// Floor a timestamp to the given second-grain so test fixtures
+/// produce stable, repeatable instants.
+fn floor_to_grain(ts: Timestamp, grain_secs: i64) -> Timestamp {
+    let s = ts.as_second();
+    Timestamp::from_second(s - s.rem_euclid(grain_secs)).expect("in range")
+}
 
 fn env_from(claude: Option<&Path>, xdg: Option<&Path>, home: Option<&Path>) -> DiscoveryEnv {
     DiscoveryEnv {
@@ -86,9 +94,9 @@ fn aggregate_returns_no_entries_when_roots_empty() {
 #[test]
 fn active_block_computed_from_recent_entries() {
     // Two entries within 5h of now.
-    let now = Utc::now();
+    let now = Timestamp::now();
     let e1 = UsageEntry {
-        timestamp: now - Duration::hours(1),
+        timestamp: now - SignedDuration::from_hours(1),
         message: MessageFields {
             usage: Some(UsageCounts {
                 input_tokens: 100,
@@ -108,9 +116,9 @@ fn active_block_computed_from_recent_entries() {
 
 #[test]
 fn no_active_block_when_last_entry_is_older_than_window() {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let e1 = UsageEntry {
-        timestamp: now - Duration::hours(10),
+        timestamp: now - SignedDuration::from_hours(10),
         message: MessageFields::default(),
         usage_limit_reset_time: None,
     };
@@ -121,9 +129,9 @@ fn no_active_block_when_last_entry_is_older_than_window() {
 fn new_block_starts_on_gap_exceeding_window() {
     // e1 at T-8h, e2 at T-1h. Gap is 7h > 5h, so a new block
     // starts at e2. Only the newer block is kept.
-    let now = Utc::now();
+    let now = Timestamp::now();
     let e1 = UsageEntry {
-        timestamp: now - Duration::hours(8),
+        timestamp: now - SignedDuration::from_hours(8),
         message: MessageFields {
             usage: Some(UsageCounts {
                 input_tokens: 999,
@@ -134,7 +142,7 @@ fn new_block_starts_on_gap_exceeding_window() {
         usage_limit_reset_time: None,
     };
     let e2 = UsageEntry {
-        timestamp: now - Duration::hours(1),
+        timestamp: now - SignedDuration::from_hours(1),
         message: MessageFields {
             usage: Some(UsageCounts {
                 input_tokens: 10,
@@ -151,16 +159,16 @@ fn new_block_starts_on_gap_exceeding_window() {
 
 #[test]
 fn usage_limit_reset_picks_most_recent() {
-    let now = Utc::now();
-    let earlier_reset = now + Duration::hours(1);
-    let later_reset = now + Duration::hours(2);
+    let now = Timestamp::now();
+    let earlier_reset = now + SignedDuration::from_hours(1);
+    let later_reset = now + SignedDuration::from_hours(2);
     let e1 = UsageEntry {
-        timestamp: now - Duration::minutes(90),
+        timestamp: now - SignedDuration::from_mins(90),
         message: MessageFields::default(),
         usage_limit_reset_time: Some(earlier_reset),
     };
     let e2 = UsageEntry {
-        timestamp: now - Duration::minutes(30),
+        timestamp: now - SignedDuration::from_mins(30),
         message: MessageFields::default(),
         usage_limit_reset_time: Some(later_reset),
     };
@@ -321,11 +329,8 @@ fn aggregate_dedupes_on_message_id() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();
     let projects = home.join(".claude").join("projects");
-    let now = Utc::now();
-    let ts = now
-        .duration_trunc(Duration::minutes(1))
-        .unwrap()
-        .to_rfc3339();
+    let now = Timestamp::now();
+    let ts = floor_to_grain(now, 60).to_string();
     let line = record(&ts, 100, 50, Some("dup-1"));
     write_jsonl(&projects, "-proj-a", "sess1.jsonl", &[&line]);
     write_jsonl(&projects, "-proj-a", "sess2.jsonl", &[&line]);
@@ -341,11 +346,8 @@ fn aggregate_keeps_missing_id_entries_individually() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();
     let projects = home.join(".claude").join("projects");
-    let now = Utc::now();
-    let ts = now
-        .duration_trunc(Duration::minutes(1))
-        .unwrap()
-        .to_rfc3339();
+    let now = Timestamp::now();
+    let ts = floor_to_grain(now, 60).to_string();
     let line = record(&ts, 100, 50, None);
     write_jsonl(&projects, "-proj-a", "sess1.jsonl", &[&line, &line]);
 
@@ -361,15 +363,9 @@ fn aggregate_happy_path_produces_active_block_and_7d_window() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();
     let projects = home.join(".claude").join("projects");
-    let now = Utc::now();
-    let recent_ts = now
-        .duration_trunc(Duration::minutes(1))
-        .unwrap()
-        .to_rfc3339();
-    let old_ts = (now - Duration::days(3))
-        .duration_trunc(Duration::minutes(1))
-        .unwrap()
-        .to_rfc3339();
+    let now = Timestamp::now();
+    let recent_ts = floor_to_grain(now, 60).to_string();
+    let old_ts = floor_to_grain(now - SignedDuration::from_hours(3 * 24), 60).to_string();
     let old_line = record(&old_ts, 500, 100, Some("old-1"));
     let recent_line = record(&recent_ts, 250, 50, Some("new-1"));
     write_jsonl(
@@ -394,10 +390,8 @@ fn aggregate_old_only_transcript_has_no_active_block() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();
     let projects = home.join(".claude").join("projects");
-    let old_ts = (Utc::now() - Duration::days(10))
-        .duration_trunc(Duration::minutes(1))
-        .unwrap()
-        .to_rfc3339();
+    let old_ts =
+        floor_to_grain(Timestamp::now() - SignedDuration::from_hours(10 * 24), 60).to_string();
     let line = record(&old_ts, 100, 50, Some("old-1"));
     write_jsonl(&projects, "-proj-a", "session.jsonl", &[&line]);
 
@@ -467,11 +461,19 @@ fn jsonl_error_code_taxonomy_is_unique() {
 
 #[test]
 fn floor_to_hour_truncates_subhour_components() {
-    let ts = Utc.with_ymd_and_hms(2026, 4, 20, 14, 37, 52).unwrap();
+    let ts = civil::date(2026, 4, 20)
+        .at(14, 37, 52, 0)
+        .in_tz("UTC")
+        .unwrap()
+        .timestamp();
     let floored = floor_to_hour(ts);
     assert_eq!(
         floored,
-        Utc.with_ymd_and_hms(2026, 4, 20, 14, 0, 0).unwrap()
+        civil::date(2026, 4, 20)
+            .at(14, 0, 0, 0)
+            .in_tz("UTC")
+            .unwrap()
+            .timestamp()
     );
 }
 
@@ -479,16 +481,16 @@ fn floor_to_hour_truncates_subhour_components() {
 
 #[test]
 fn five_hour_block_end_derives_from_start() {
-    let now = Utc::now();
+    let now = Timestamp::now();
     let e = UsageEntry {
-        timestamp: now - Duration::minutes(30),
+        timestamp: now - SignedDuration::from_mins(30),
         message: MessageFields::default(),
         usage_limit_reset_time: None,
     };
     let block = compute_active_block(&[e], now).expect("active");
     assert_eq!(
         block.end(),
-        block.start + Duration::hours(BLOCK_DURATION_HOURS)
+        block.start + SignedDuration::from_hours(BLOCK_DURATION_HOURS)
     );
 }
 
@@ -499,9 +501,9 @@ fn entries_exactly_5h_apart_stay_in_same_block() {
     // Spec: gap > 5h opens a new block. A gap of exactly 5h
     // (not strictly greater) must keep both entries in the
     // single rolling block. Guards against a `>=` refactor.
-    let now = Utc::now();
+    let now = Timestamp::now();
     let e1 = UsageEntry {
-        timestamp: now - Duration::hours(5),
+        timestamp: now - SignedDuration::from_hours(5),
         message: MessageFields {
             usage: Some(UsageCounts {
                 input_tokens: 100,
@@ -530,9 +532,9 @@ fn entries_exactly_5h_apart_stay_in_same_block() {
 #[test]
 fn gap_of_5h_plus_one_ns_opens_new_block() {
     // Strict `>` — one nanosecond past the boundary flips.
-    let now = Utc::now();
+    let now = Timestamp::now();
     let e1 = UsageEntry {
-        timestamp: now - Duration::hours(5) - Duration::nanoseconds(1),
+        timestamp: now - SignedDuration::from_hours(5) - SignedDuration::from_nanos(1),
         message: MessageFields {
             usage: Some(UsageCounts {
                 input_tokens: 999,
@@ -570,10 +572,11 @@ fn entry_at_exactly_7d_boundary_is_included() {
     // check (`e.timestamp >= window_start`) will include.
     // Use `now - 7d + 10s` so the spec's `>=` boundary is
     // pinned without depending on instant-perfect math.
-    let near_boundary = (Utc::now() - Duration::days(7) + Duration::seconds(10))
-        .duration_trunc(Duration::seconds(1))
-        .unwrap()
-        .to_rfc3339();
+    let near_boundary = floor_to_grain(
+        Timestamp::now() - SignedDuration::from_hours(7 * 24) + SignedDuration::from_secs(10),
+        1,
+    )
+    .to_string();
     let line = record(&near_boundary, 42, 0, Some("boundary"));
     write_jsonl(&projects, "-proj", "sess.jsonl", &[&line]);
     let env = env_from(None, None, Some(home));
@@ -587,10 +590,7 @@ fn entry_older_than_7d_excluded_from_window() {
     let home = tmp.path();
     let projects = home.join(".claude").join("projects");
     // `now - 8d` is definitively outside the window.
-    let old = (Utc::now() - Duration::days(8))
-        .duration_trunc(Duration::seconds(1))
-        .unwrap()
-        .to_rfc3339();
+    let old = floor_to_grain(Timestamp::now() - SignedDuration::from_hours(8 * 24), 1).to_string();
     let line = record(&old, 1000, 0, Some("way-old"));
     write_jsonl(&projects, "-proj", "sess.jsonl", &[&line]);
     let env = env_from(None, None, Some(home));
@@ -611,10 +611,7 @@ fn aggregate_dedupes_across_cascade_roots() {
     let home = tmp.path().join("home");
     let env_projects = env_dir.join("projects");
     let legacy_projects = home.join(".claude").join("projects");
-    let ts = Utc::now()
-        .duration_trunc(Duration::minutes(1))
-        .unwrap()
-        .to_rfc3339();
+    let ts = floor_to_grain(Timestamp::now(), 60).to_string();
     let line = record(&ts, 100, 50, Some("shared-msg"));
     write_jsonl(&env_projects, "-proj", "sess-env.jsonl", &[&line]);
     write_jsonl(&legacy_projects, "-proj", "sess-legacy.jsonl", &[&line]);
@@ -659,8 +656,8 @@ fn tailer_offset_monotonically_advances_on_repeat_reads() {
 
 #[test]
 fn block_models_dedupes_within_block() {
-    let now = Utc::now();
-    fn mk(ts: DateTime<Utc>, model: &str) -> UsageEntry {
+    let now = Timestamp::now();
+    fn mk(ts: Timestamp, model: &str) -> UsageEntry {
         UsageEntry {
             timestamp: ts,
             message: MessageFields {
@@ -671,9 +668,9 @@ fn block_models_dedupes_within_block() {
         }
     }
     let entries = [
-        mk(now - Duration::minutes(30), "claude-opus-4-7"),
-        mk(now - Duration::minutes(20), "claude-sonnet-4-6"),
-        mk(now - Duration::minutes(10), "claude-opus-4-7"),
+        mk(now - SignedDuration::from_mins(30), "claude-opus-4-7"),
+        mk(now - SignedDuration::from_mins(20), "claude-sonnet-4-6"),
+        mk(now - SignedDuration::from_mins(10), "claude-opus-4-7"),
     ];
     let block = compute_active_block(&entries, now).expect("active");
     assert_eq!(block.models.len(), 2);
@@ -708,10 +705,7 @@ fn project_roots_includes_xdg_when_home_unset() {
 fn aggregate_reads_xdg_projects_when_home_unset() {
     let tmp = TempDir::new().unwrap();
     let xdg = tmp.path().join("xdg");
-    let ts = Utc::now()
-        .duration_trunc(Duration::minutes(1))
-        .unwrap()
-        .to_rfc3339();
+    let ts = floor_to_grain(Timestamp::now(), 60).to_string();
     let line = record(&ts, 77, 33, Some("xdg-only"));
     write_jsonl(
         &xdg.join("claude").join("projects"),
@@ -734,15 +728,9 @@ fn seven_day_window_excludes_future_timestamps() {
     let tmp = TempDir::new().unwrap();
     let home = tmp.path();
     let projects = home.join(".claude").join("projects");
-    let future = (Utc::now() + Duration::hours(2))
-        .duration_trunc(Duration::seconds(1))
-        .unwrap()
-        .to_rfc3339();
+    let future = floor_to_grain(Timestamp::now() + SignedDuration::from_hours(2), 1).to_string();
     let future_line = record(&future, 500, 0, Some("future-1"));
-    let past = Utc::now()
-        .duration_trunc(Duration::seconds(1))
-        .unwrap()
-        .to_rfc3339();
+    let past = floor_to_grain(Timestamp::now(), 1).to_string();
     let past_line = record(&past, 10, 0, Some("past-1"));
     write_jsonl(
         &projects,
@@ -782,9 +770,9 @@ fn future_timestamp_inside_5h_block_is_counted_as_mild_skew() {
     // clocks shouldn't have their current session's tokens
     // disappear. Pathological far-future skew is a separate
     // hardening question, out of scope here.
-    let now = Utc::now();
+    let now = Timestamp::now();
     let future_entry = UsageEntry {
-        timestamp: now + Duration::minutes(10),
+        timestamp: now + SignedDuration::from_mins(10),
         message: MessageFields {
             usage: Some(UsageCounts {
                 input_tokens: 42,
@@ -803,15 +791,15 @@ fn usage_limit_reset_keeps_some_over_later_none() {
     // `extend_block` only overwrites when the incoming entry
     // carries `Some(_)`. A later entry with `None` must not
     // clear the earlier reset hint.
-    let now = Utc::now();
-    let reset = now + Duration::hours(1);
+    let now = Timestamp::now();
+    let reset = now + SignedDuration::from_hours(1);
     let e1 = UsageEntry {
-        timestamp: now - Duration::minutes(30),
+        timestamp: now - SignedDuration::from_mins(30),
         message: MessageFields::default(),
         usage_limit_reset_time: Some(reset),
     };
     let e2 = UsageEntry {
-        timestamp: now - Duration::minutes(10),
+        timestamp: now - SignedDuration::from_mins(10),
         message: MessageFields::default(),
         usage_limit_reset_time: None,
     };

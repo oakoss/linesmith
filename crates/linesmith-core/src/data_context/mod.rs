@@ -214,7 +214,7 @@ impl DataContext {
                 }
                 Err(_) => Err(JsonlError::NoEntries),
             },
-            &chrono::Utc::now,
+            &jiff::Timestamp::now,
             &config,
         )
     }
