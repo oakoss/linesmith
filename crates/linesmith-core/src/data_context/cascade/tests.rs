@@ -499,14 +499,88 @@ fn endpoint_401_does_not_serve_stale_cache() {
 }
 
 #[test]
+fn endpoint_401_clears_cache_so_peers_skip_fresh_short_circuit() {
+    // A 401 must remove the cache file so any subsequent invocation
+    // (this process or another) reads `None` and falls through to the
+    // lock-active 401 guard, rather than short-circuiting on a still-
+    // fresh `cached_at`. Without this, the `lock_from_401` guard is
+    // dead code for any peer whose cache hasn't expired yet.
+    let tmp = TempDir::new().unwrap();
+    let cache = CacheStore::new(tmp.path().to_path_buf());
+    cache
+        .write(&stale_cache_entry(ChronoDuration::from_mins(10)))
+        .unwrap();
+    let lock = LockStore::new(tmp.path().to_path_buf());
+    assert!(
+        cache.read().unwrap().is_some(),
+        "fixture wrote a cache entry"
+    );
+
+    let err = resolve_usage(
+        Some(&cache),
+        Some(&lock),
+        &FakeTransport::ok(401, "", None),
+        &ok_creds,
+        &jsonl_empty,
+        &now_fn(),
+        &config(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, UsageError::Unauthorized));
+    assert!(
+        cache.read().unwrap().is_none(),
+        "401 must clear the cache so peers fall through to the lock-active 401 guard",
+    );
+    let active_lock = lock.read().unwrap().expect("failure lock written");
+    assert_eq!(
+        active_lock.error.as_deref(),
+        Some("Unauthorized"),
+        "failure lock still records the 401 reason for the lock-active path",
+    );
+}
+
+#[test]
+fn endpoint_non_401_failure_preserves_cache_for_stale_serve() {
+    // Companion guard: only 401 clears the cache. A 429, timeout, or
+    // network error leaves the cache file intact so the stale-serve
+    // path inside the lock-active branch (and the cache-fall-through
+    // for non-Unauthorized lock errors) still has data to return.
+    let tmp = TempDir::new().unwrap();
+    let cache = CacheStore::new(tmp.path().to_path_buf());
+    cache
+        .write(&stale_cache_entry(ChronoDuration::from_mins(10)))
+        .unwrap();
+    let lock = LockStore::new(tmp.path().to_path_buf());
+
+    let data = resolve_usage(
+        Some(&cache),
+        Some(&lock),
+        &FakeTransport::ok(429, "", Some("60")),
+        &ok_creds,
+        &jsonl_empty,
+        &now_fn(),
+        &config(),
+    )
+    .expect("429 with stale cache serves the cached data");
+    assert!(
+        matches!(data, UsageData::Endpoint(_)),
+        "stale-serve path must return the cached endpoint data: got {data:?}",
+    );
+    assert!(
+        cache.read().unwrap().is_some(),
+        "429 must NOT clear the cache — the stale-serve path needs the data",
+    );
+}
+
+#[test]
 fn invocation_after_401_does_not_serve_stale_cache_via_lock_active() {
-    // A→B sequence: invocation A gets a 401 that wrote a failure-
-    // lock with error="Unauthorized". Invocation B within the
-    // lock TTL must NOT serve the pre-401 cached `data: Some(...)`
-    // through the lock-active branch — the `lock_from_401` guard
-    // catches it. Same "401 does not serve stale" contract as
-    // endpoint_401_does_not_serve_stale_cache, but via the A→B
-    // code path that test doesn't exercise.
+    // A→B sequence: invocation A gets a 401 that clears the cache
+    // and writes a failure-lock with error="Unauthorized". Invocation
+    // B within the lock TTL reads no cache (A cleared it) and the
+    // active Unauthorized lock, so the lock-active branch routes B
+    // to JSONL/Unauthorized rather than serving any stale data. The
+    // `lock_from_401` guard with a `Some(entry)` value is exercised
+    // separately by `active_unauthorized_lock_rejects_stale_cached_data`.
     let tmp = TempDir::new().unwrap();
     let cache = CacheStore::new(tmp.path().to_path_buf());
     cache

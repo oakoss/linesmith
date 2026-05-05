@@ -169,13 +169,37 @@ pub fn resolve_usage(
         // token, so reusing it would mislead the user. JSONL, however,
         // is independent of token validity — fall through to it before
         // surfacing the error so a user with a revoked token still
-        // sees their local transcript totals. The next invocation's
-        // lock-active branch refuses the stale data via the
-        // `lock_from_401` guard; we deliberately do NOT write an
-        // "Unauthorized" error into the cache here, because the
-        // cached error would then outlive the lock and mask a
+        // sees their local transcript totals. We deliberately do NOT
+        // write an "Unauthorized" error into the cache here, because
+        // the cached error would then outlive the lock and mask a
         // subsequent unrelated lock (e.g. a 429 after token refresh).
+        // Instead, clear the cache file so a peer invocation arriving
+        // after this one (and before the lock expires) reads no cache
+        // entry, can't short-circuit on the fresh-cache check, and
+        // falls through to the `lock_from_401` guard.
+        //
+        // This only changes behavior after an invocation has reached
+        // the endpoint and seen the 401. When a token is revoked
+        // while the cache is still fresh, every render returns at
+        // the top-of-cascade `is_fresh` short-circuit until the
+        // entry expires; that single-process first-invocation window
+        // is fundamental at this layer. Closing it would require
+        // out-of-band revalidation (background probe, credentials-
+        // file watch) and is tracked separately.
         Err(UsageError::Unauthorized) => {
+            if let Some(c) = cache {
+                if let Err(e) = c.clear() {
+                    // `lsm_error!` (bypasses `LINESMITH_LOG=off`)
+                    // matches the severity this module already uses
+                    // for cache-write failures: a clear failure
+                    // leaves peers serving revoked-token data
+                    // through the fresh-cache short-circuit until
+                    // the entry's TTL expires.
+                    crate::lsm_error!(
+                        "cascade: cache clear after 401 failed; peers may serve revoked-token data until TTL expires: {e}"
+                    );
+                }
+            }
             write_failure_lock(lock, now_ts, &UsageError::Unauthorized);
             jsonl_or(jsonl, now_ts, UsageError::Unauthorized)
         }

@@ -354,14 +354,22 @@ The data-fetching layer already enforces a 180s default TTL. Segments don't inde
 ## Change log
 
 - 2026-04-23 (v0.2.1): implementation landed — cascade returns
-  `Ok(UsageData::Jsonl(...))` on every endpoint-failure path (401,
-  timeout, network error, rate-limited, no credentials) when the
-  aggregator produces data. `NoCredentials` and `Unauthorized` now
-  fall through to JSONL instead of surfacing the error unconditionally
-  (previously blocked on `lsm-xhu`). `block.start` is clamped to
-  `floor_to_hour(now)` before surfacing so future-dated transcript
-  entries (mild clock skew) can't inflate `ends_at` beyond the
-  current window's nominal close.
+  `Ok(UsageData::Jsonl(...))` whenever a fetch is attempted and the
+  endpoint fails (401, timeout, network error, rate-limited, no
+  credentials) and the aggregator produces data. `NoCredentials` and
+  `Unauthorized` now fall through to JSONL instead of surfacing the
+  error unconditionally (previously blocked on `lsm-xhu`). The
+  fresh-cache short-circuit at the top of `resolve_usage` returns
+  cached endpoint data without attempting a fetch, so it does NOT
+  route through the JSONL fallback — that path serves whatever was
+  last cached until the entry goes stale. lsm-jes0 invalidates the
+  cache from the 401 arm so peer invocations after a 401 don't keep
+  serving stale-token data; the single-process first-invocation
+  latency window (token revoked while the cache is still fresh) is
+  fundamental at this layer and not addressed by that change.
+  `block.start` is clamped to `floor_to_grain(now, 3600)` before
+  surfacing so future-dated transcript entries (mild clock skew)
+  can't inflate `ends_at` beyond the current window's nominal close.
 - 2026-04-22 (v0.2): JSONL mode renders raw `TokenCounts` per
   [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md).
   `UsageData` is an enum (`Endpoint` / `Jsonl`); `UsageSource`

@@ -269,6 +269,20 @@ impl CacheStore {
     pub fn write(&self, entry: &CachedUsage) -> Result<(), CacheError> {
         atomic_write_json(&self.path(), entry)
     }
+
+    /// Remove the cache file. Idempotent — `Ok(())` on `NotFound` so
+    /// callers don't have to gate on existence first. Intended for
+    /// invalidating cached data that's tied to a no-longer-valid
+    /// token: a still-fresh cache otherwise short-circuits the
+    /// lock-active 401 guard for up to `cache_duration`.
+    pub fn clear(&self) -> Result<(), CacheError> {
+        let path = self.path();
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(cause) => Err(CacheError::Io { path, cause }),
+        }
+    }
 }
 
 // --- LockStore ----------------------------------------------------------
@@ -436,6 +450,34 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = CacheStore::new(tmp.path().to_path_buf());
         assert!(store.read().expect("read").is_none());
+    }
+
+    #[test]
+    fn cache_clear_is_idempotent_on_missing_file() {
+        // The cascade calls `clear()` unconditionally on the 401 arm
+        // — including the first 401 ever seen, when the cache file
+        // was never written. The `NotFound` arm must return `Ok(())`
+        // so the caller doesn't log a spurious error every time.
+        let tmp = TempDir::new().unwrap();
+        let store = CacheStore::new(tmp.path().to_path_buf());
+        store.clear().expect("clear on missing file is Ok");
+        // Repeat: still idempotent.
+        store.clear().expect("clear after clear is Ok");
+    }
+
+    #[test]
+    fn cache_clear_removes_existing_file() {
+        let tmp = TempDir::new().unwrap();
+        let store = CacheStore::new(tmp.path().to_path_buf());
+        store
+            .write(&CachedUsage::with_data(sample_response()))
+            .expect("write");
+        assert!(store.read().expect("read").is_some(), "fixture wrote");
+        store.clear().expect("clear");
+        assert!(
+            store.read().expect("read").is_none(),
+            "clear must remove the file",
+        );
     }
 
     #[test]
