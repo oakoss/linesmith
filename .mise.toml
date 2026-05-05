@@ -138,8 +138,8 @@ hyperfine \
 '''
 
 [tasks.check]
-description = "Run all checks (format + lint + Rust)"
-depends = ["fmt:check", "lint", "cargo:fmt:check", "cargo:clippy", "cargo:check"]
+description = "Run all checks (format + lint + Rust + schema)"
+depends = ["fmt:check", "lint", "cargo:fmt:check", "cargo:clippy", "cargo:check", "schema:check"]
 
 # CC's statusline spawns the mise shim (~/.cargo/bin/linesmith), so a
 # successful `install:*` task is live on the next prompt.

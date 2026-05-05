@@ -145,7 +145,7 @@
       "additionalProperties": true
     },
     "SegmentOverride": {
-      "description": "`[segments.<id>]` override block. Each typed field, when `Some`,\nreplaces the segment's built-in default. Any unrecognized keys land\nin [`extra`](Self::extra), which the segment builder forwards to\nplugin scripts as `ctx.config.<key>`. `style` is stored as a raw\nstring; `segments::builder::apply_override` parses it at build time\nso parse errors emit warnings through the same callback that\nhandles unknown-ID and inverted-bounds diagnostics.\n\n`Eq` isn't derived because [`toml::Value`] holds `f64` and so is\n`PartialEq` only — `extra` propagates that constraint.",
+      "description": "`[segments.<id>]` override block. Each typed field, when `Some`,\nreplaces the segment's built-in default. Any unrecognized keys land\nin [`extra`](Self::extra), which the segment builder forwards to\nplugin scripts as `ctx.config.<key>`. `style` is stored as a raw\nstring; the segment builder parses it at build time\nso parse errors emit warnings through the same callback that\nhandles unknown-ID and inverted-bounds diagnostics.\n\n`Eq` isn't derived because [`toml::Value`] holds `f64` and so is\n`PartialEq` only — `extra` propagates that constraint.",
       "type": "object",
       "properties": {
         "priority": {
