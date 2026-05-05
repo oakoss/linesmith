@@ -218,7 +218,7 @@ pub struct JsonlUsage {
 
 pub struct FiveHourWindow {
     pub(crate) tokens:  TokenCounts,   // four-category breakdown owned by aggregator; segments call `.total()`
-    pub(crate) ends_at: DateTime<Utc>, // invariant: ends_at == block.start + Duration::hours(5)
+    pub(crate) ends_at: Timestamp, // invariant: ends_at == block.start + SignedDuration::from_hours(5)
 }
 
 pub struct SevenDayWindow {

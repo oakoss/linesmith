@@ -443,8 +443,11 @@ mod tests {
         // Pin the on-disk RFC 3339 (`Z` suffix) timestamp shape so a
         // future datetime-library bump that changes the default serde
         // format fails loudly here, and existing cache files don't
-        // start silently failing to parse. Bump CACHE_SCHEMA_VERSION
-        // when the wire format intentionally changes.
+        // start silently failing to parse. Prefer pinning the wire
+        // format via a custom `Deserialize` adapter that accepts both
+        // shapes when the change is purely cosmetic; reserve a
+        // `CACHE_SCHEMA_VERSION` bump for genuinely semantic changes
+        // since the bump invalidates every existing cache file on disk.
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join(USAGE_FILE);
         let payload = r#"{

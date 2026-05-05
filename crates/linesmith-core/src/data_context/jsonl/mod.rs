@@ -626,13 +626,16 @@ fn extend_block(block: &mut FiveHourBlock, entry: &UsageEntry) {
 }
 
 /// Floor a timestamp to a whole multiple of `grain_secs` seconds (UTC).
-/// `as_second` / `from_second` round-trip cleanly because jiff's
-/// `Timestamp` is i64 seconds + i32 nanos internally; second-grained
-/// construction stays well inside the supported range.
+/// Falls back to the input on overflow: `rem_euclid` always returns a
+/// non-negative remainder, so subtracting it pushes a near-`MIN`
+/// timestamp out of jiff's range. A crafted JSONL line with a
+/// `-009999-01-02T01:59:59Z` timestamp (= `Timestamp::MIN`) round-trips
+/// through serde, so an unconditional `expect` would panic on the
+/// aggregator hot path.
 pub(super) fn floor_to_grain(ts: Timestamp, grain_secs: i64) -> Timestamp {
     let secs = ts.as_second();
     let floored = secs - secs.rem_euclid(grain_secs);
-    Timestamp::from_second(floored).expect("grained timestamp fits jiff range")
+    Timestamp::from_second(floored).unwrap_or(ts)
 }
 
 #[cfg(test)]

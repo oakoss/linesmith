@@ -72,11 +72,11 @@ pub struct JsonlAggregate {
 #[derive(Debug, Clone)]
 pub struct FiveHourBlock {
     /// UTC-floor-to-hour of the first entry in this block.
-    pub start: DateTime<Utc>,
+    pub start: Timestamp,
     /// `start + 5h` — the block's nominal close.
-    pub end: DateTime<Utc>,
+    pub end: Timestamp,
     /// Timestamp of the most recent entry observed in this block.
-    pub actual_last_activity: DateTime<Utc>,
+    pub actual_last_activity: Timestamp,
     pub token_counts: TokenCounts,
     /// Set of `message.model` strings seen in this block. Ordered
     /// by first-observation; no deduplication guarantees between
@@ -91,7 +91,7 @@ pub struct FiveHourBlock {
     /// the aggregator for future use once `lsm-ghpj` verifies the
     /// semantic; at that point [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md)
     /// may be revised to wire this field into the render path.
-    pub usage_limit_reset: Option<DateTime<Utc>>,
+    pub usage_limit_reset: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,7 +99,7 @@ pub struct SevenDayWindow {
     /// `now - 7d` at aggregation time. Consumers must not cache
     /// `JsonlAggregate` instances past the cache TTL enforced at
     /// the orchestrator layer.
-    pub window_start: DateTime<Utc>,
+    pub window_start: Timestamp,
     pub token_counts: TokenCounts,
 }
 
@@ -157,14 +157,14 @@ Records use `#[serde(default)]` + partial fields per [ADR-0009](../adrs/0009-jso
 ```rust
 #[derive(serde::Deserialize)]
 struct UsageEntry {
-    timestamp: DateTime<Utc>,
+    timestamp: Timestamp,
     message: MessageFields,
     #[serde(default, rename = "costUSD")]
     cost_usd: Option<f64>,
     /// Claude API usage-limit reset hint. Present on a subset of
     /// entries (exact conditions unconfirmed — see open questions).
     #[serde(default, rename = "usageLimitResetTime")]
-    usage_limit_reset_time: Option<DateTime<Utc>>,
+    usage_limit_reset_time: Option<Timestamp>,
     #[serde(default)]
     version: Option<String>,
 }
@@ -280,7 +280,7 @@ Gap-block semantics (ccusage's `isGap`) are computed but not exposed in v0.1 —
 ### 7-day window math
 
 ```text
-window_start = Utc::now() - Duration::days(7)
+window_start = Timestamp::now() - SignedDuration::from_hours(7 * 24)
 seven_day.token_counts = sum(e.message.usage) for e where
     e.timestamp >= window_start
 ```

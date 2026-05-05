@@ -470,6 +470,17 @@ fn floor_to_grain_hourly_truncates_subhour_components() {
     );
 }
 
+#[test]
+fn floor_to_grain_returns_input_when_floor_underflows_min() {
+    // `rem_euclid` always returns non-negative, so subtracting it from
+    // a `Timestamp::MIN` second-count pushes the result out of jiff's
+    // supported range. Pin the safe fallback so an adversarial JSONL
+    // line carrying `-009999-01-02T01:59:59Z` doesn't crash the
+    // aggregator hot path.
+    let result = floor_to_grain(Timestamp::MIN, 3600);
+    assert_eq!(result, Timestamp::MIN);
+}
+
 // --- FiveHourBlock::end derivation --------------------------------
 
 #[test]

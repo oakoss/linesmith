@@ -266,8 +266,8 @@ mod tests {
 
     fn data_with_reset_in(minutes: i64) -> UsageData {
         // 30s of slack so clock drift between setup and render doesn't
-        // round `num_minutes()` down a boundary (e.g. 277m → 276m), which
-        // would flip `"4hr 37m"` to `"4hr 36m"`.
+        // round the `as_secs() / 60` boundary down (e.g. 277m → 276m),
+        // which would flip `"4hr 37m"` to `"4hr 36m"`.
         let slack = if minutes > 0 {
             SignedDuration::from_secs(30)
         } else {
