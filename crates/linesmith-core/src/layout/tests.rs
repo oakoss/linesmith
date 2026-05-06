@@ -5,7 +5,7 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Stub `Segment` for layout tests that build `Item` literals
+/// Stub `Segment` for layout tests that build [`LayoutItem`] literals
 /// directly. The reflow loop's `shrink_to_fit` callback gets the
 /// default `None`, so layout tests focused on priority-drop /
 /// separators / truncatable behavior don't need to mint a fresh
@@ -46,19 +46,84 @@ fn empty_rc() -> RenderContext {
     RenderContext::new(80)
 }
 
-fn item(text: &str, priority: u8) -> Item<'static> {
-    Item {
+/// Build a [`LayoutItem::Segment`] for a stub render. Most layout
+/// tests use this; pair adjacent calls with [`space`], [`pl`], or
+/// [`lit`] to interleave separator items the way the production
+/// builder does.
+fn item(text: &str, priority: u8) -> LayoutItem<'static> {
+    LayoutItem::Segment(SegmentEntry {
         rendered: RenderedSegment::new(text),
         defaults: SegmentDefaults::with_priority(priority),
         segment: noop_segment(),
+    })
+}
+
+fn space() -> LayoutItem<'static> {
+    LayoutItem::Separator(Separator::Space)
+}
+
+fn pl() -> LayoutItem<'static> {
+    LayoutItem::Separator(Separator::powerline())
+}
+
+fn lit(s: &'static str) -> LayoutItem<'static> {
+    LayoutItem::Separator(Separator::Literal(Cow::Borrowed(s)))
+}
+
+fn none_sep() -> LayoutItem<'static> {
+    LayoutItem::Separator(Separator::None)
+}
+
+/// Build a `Vec<LayoutItem>` with [`Separator::Space`] interleaved
+/// between every adjacent `(text, priority)` pair.
+fn spaced(specs: &[(&str, u8)]) -> Vec<LayoutItem<'static>> {
+    interleaved(specs, space)
+}
+
+/// Build a `Vec<LayoutItem>` with [`Separator::powerline()`]
+/// interleaved between every adjacent `(text, priority)` pair.
+fn pl_spec(specs: &[(&str, u8)]) -> Vec<LayoutItem<'static>> {
+    interleaved(specs, pl)
+}
+
+fn interleaved(
+    specs: &[(&str, u8)],
+    mut sep: impl FnMut() -> LayoutItem<'static>,
+) -> Vec<LayoutItem<'static>> {
+    let mut out = Vec::with_capacity(specs.len().saturating_mul(2));
+    for (i, &(text, priority)) in specs.iter().enumerate() {
+        out.push(item(text, priority));
+        if i + 1 < specs.len() {
+            out.push(sep());
+        }
     }
+    out
+}
+
+/// Wrap `segments` as a [`LineItem`] sequence with `sep` interleaved
+/// between adjacent segments. For tests that drive the public render
+/// entry points (`render_with_warn`, `render_to_runs`).
+fn line_items_with(segments: Vec<Box<dyn Segment>>, sep: Separator) -> Vec<LineItem> {
+    let n = segments.len();
+    let mut out = Vec::with_capacity(n.saturating_mul(2));
+    for (i, seg) in segments.into_iter().enumerate() {
+        out.push(LineItem::Segment(seg));
+        if i + 1 < n {
+            out.push(LineItem::Separator(sep.clone()));
+        }
+    }
+    out
+}
+
+fn line_items_spaced(segments: Vec<Box<dyn Segment>>) -> Vec<LineItem> {
+    line_items_with(segments, Separator::Space)
 }
 
 /// Test helper: exercise `render_items` with the default theme and
 /// no color capability so output is plain text — the invariant most
 /// layout tests actually care about (priority-drop, separators,
 /// truncation behavior) is independent of theming.
-fn render_plain(items: Vec<Item<'_>>, terminal_width: u16) -> String {
+fn render_plain(items: Vec<LayoutItem<'_>>, terminal_width: u16) -> String {
     render_items(
         items,
         &empty_ctx(),
@@ -77,21 +142,15 @@ fn render_items_wraps_each_styled_segment_under_palette16() {
     // don't leak across separators.
     use crate::theme::Role;
     let items = vec![
-        Item {
-            rendered: RenderedSegment::new("a"),
-            defaults: SegmentDefaults::with_priority(10),
-            segment: noop_segment(),
-        },
-        Item {
+        item("a", 10),
+        space(),
+        LayoutItem::Segment(SegmentEntry {
             rendered: RenderedSegment::new("b").with_role(Role::Warning),
             defaults: SegmentDefaults::with_priority(10),
             segment: noop_segment(),
-        },
-        Item {
-            rendered: RenderedSegment::new("c"),
-            defaults: SegmentDefaults::with_priority(10),
-            segment: noop_segment(),
-        },
+        }),
+        space(),
+        item("c", 10),
     ];
     let out = render_items(
         items,
@@ -106,9 +165,9 @@ fn render_items_wraps_each_styled_segment_under_palette16() {
 }
 
 #[test]
-fn total_width_counts_inter_segment_separators_only() {
-    let items = vec![item("ab", 10), item("cd", 10), item("ef", 10)];
-    // widths 2+2+2 = 6, separators between: 2 * 1 = 2, total 8.
+fn total_width_sums_all_layout_items() {
+    let items = spaced(&[("ab", 10), ("cd", 10), ("ef", 10)]);
+    // widths 2+1+2+1+2 = 8.
     assert_eq!(total_width(&items), 8);
 }
 
@@ -125,17 +184,17 @@ fn total_width_single_segment_has_no_separator() {
 
 #[test]
 fn no_width_pressure_renders_all_with_separators() {
-    let items = vec![item("one", 10), item("two", 20), item("three", 30)];
+    let items = spaced(&[("one", 10), ("two", 20), ("three", 30)]);
     assert_eq!(render_plain(items, 100), "one two three");
 }
 
 #[test]
 fn drops_highest_priority_under_pressure() {
-    let items = vec![
-        item("aaaa", 10),
-        item("bbbb", 200), // highest priority → drops first
-        item("cccc", 50),
-    ];
+    let items = spaced(&[
+        ("aaaa", 10),
+        ("bbbb", 200), // highest priority → drops first
+        ("cccc", 50),
+    ]);
     // Full: 4+1+4+1+4 = 14. Budget 10 forces one drop.
     let out = render_plain(items, 10);
     assert!(!out.contains("bbbb"));
@@ -145,20 +204,20 @@ fn drops_highest_priority_under_pressure() {
 
 #[test]
 fn drops_in_descending_priority_order() {
-    let items = vec![
-        item("one", 10),
-        item("two", 200), // drops first
-        item("three", 20),
-        item("four", 150), // drops second
-        item("five", 30),
-    ];
+    let items = spaced(&[
+        ("one", 10),
+        ("two", 200), // drops first
+        ("three", 20),
+        ("four", 150), // drops second
+        ("five", 30),
+    ]);
     // Full: 3+1+3+1+5+1+4+1+4 = 23. Budget 15 forces two drops.
     assert_eq!(render_plain(items, 15), "one three five");
 }
 
 #[test]
 fn priority_zero_never_drops_even_over_budget() {
-    let items = vec![item("aaaa", 0), item("bbbb", 0)];
+    let items = spaced(&[("aaaa", 0), ("bbbb", 0)]);
     let out = render_plain(items, 3);
     assert_eq!(out, "aaaa bbbb");
 }
@@ -172,13 +231,7 @@ fn priority_drop_recomputes_budget_with_powerline_separators() {
     // and fits the budget without a second drop. A regression that
     // forgot to subtract a chevron's cells when its preceding
     // segment dropped would over-drop or mis-budget.
-    let item_pl = |text: &'static str, priority: u8| Item {
-        rendered: RenderedSegment::new(text),
-        defaults: SegmentDefaults::with_priority(priority)
-            .with_default_separator(Separator::powerline()),
-        segment: noop_segment(),
-    };
-    let items = vec![item_pl("aaaa", 0), item_pl("bbbb", 200), item_pl("cccc", 0)];
+    let items = pl_spec(&[("aaaa", 0), ("bbbb", 200), ("cccc", 0)]);
     // Full = 4 + 3 + 4 + 3 + 4 = 18; after drop = 4 + 3 + 4 = 11.
     let out = render_plain(items, 14);
     assert!(out.contains("aaaa"));
@@ -192,11 +245,7 @@ fn priority_drop_recomputes_budget_with_powerline_separators() {
 
 #[test]
 fn mix_drops_positives_keeps_zeros() {
-    let items = vec![
-        item("keep-me", 0),
-        item("droppable", 200),
-        item("sticky", 0),
-    ];
+    let items = spaced(&[("keep-me", 0), ("droppable", 200), ("sticky", 0)]);
     // Budget forces drop; only the priority-200 segment is eligible.
     let out = render_plain(items, 20);
     assert_eq!(out, "keep-me sticky");
@@ -204,7 +253,7 @@ fn mix_drops_positives_keeps_zeros() {
 
 #[test]
 fn no_trailing_separator() {
-    let items = vec![item("a", 10), item("b", 10)];
+    let items = spaced(&[("a", 10), ("b", 10)]);
     assert_eq!(render_plain(items, 100), "a b");
 }
 
@@ -214,41 +263,16 @@ fn empty_input_renders_empty_string() {
 }
 
 #[test]
-fn respects_custom_separator_from_defaults() {
-    let items = vec![
-        Item {
-            rendered: RenderedSegment::new("a"),
-            defaults: SegmentDefaults {
-                priority: 10,
-                width: None,
-                default_separator: Separator::Literal(Cow::Borrowed(" | ")),
-                truncatable: false,
-            },
-            segment: noop_segment(),
-        },
-        Item {
-            rendered: RenderedSegment::new("b"),
-            defaults: SegmentDefaults::with_priority(10),
-            segment: noop_segment(),
-        },
-    ];
+fn respects_inline_literal_separator() {
+    let items = vec![item("a", 10), lit(" | "), item("b", 10)];
     assert_eq!(render_plain(items, 100), "a | b");
 }
 
 #[test]
-fn render_override_separator_beats_default() {
-    let items = vec![
-        Item {
-            rendered: RenderedSegment::with_separator("a", Separator::None),
-            defaults: SegmentDefaults::with_priority(10),
-            segment: noop_segment(),
-        },
-        Item {
-            rendered: RenderedSegment::new("b"),
-            defaults: SegmentDefaults::with_priority(10),
-            segment: noop_segment(),
-        },
-    ];
+fn render_inline_none_separator_collapses_neighbors() {
+    // Inline `Separator::None` between two segments produces no run
+    // and no width — neighbors collapse against each other.
+    let items = vec![item("a", 10), none_sep(), item("b", 10)];
     assert_eq!(render_plain(items, 100), "ab");
 }
 
@@ -338,7 +362,7 @@ fn truncate_to_max_cells_one_emits_only_ellipsis() {
 
 #[test]
 fn priority_ties_drop_rightmost_first() {
-    let items = vec![item("left", 200), item("mid", 50), item("right", 200)];
+    let items = spaced(&[("left", 200), ("mid", 50), ("right", 200)]);
     // Full: 4+1+3+1+5 = 14. Budget 10 forces one drop; tied priorities
     // on "left" and "right" — right drops first.
     assert_eq!(render_plain(items, 10), "left mid");
@@ -346,57 +370,44 @@ fn priority_ties_drop_rightmost_first() {
 
 #[test]
 fn separator_none_not_charged_to_budget() {
-    // Three segments; middle one declares Separator::None on its right
-    // edge, collapsing against the next. Widths 1+1+1 = 3; separators
-    // are Space (1) between 0-1, None (0) between 1-2. Total = 4.
-    // Any budget ≥ 4 must keep everything and emit "a bc".
+    // Inline Separator::None between b and c collapses them against
+    // each other. Widths 1+1+1 = 3; separators: Space (1) between
+    // 0–1, None (0) between 1–2. Total = 4. Budget 4 must keep
+    // everything and emit "a bc".
     let items = vec![
-        Item {
-            rendered: RenderedSegment::new("a"),
-            defaults: SegmentDefaults::with_priority(200),
-            segment: noop_segment(),
-        },
-        Item {
-            rendered: RenderedSegment::with_separator("b", Separator::None),
-            defaults: SegmentDefaults::with_priority(200),
-            segment: noop_segment(),
-        },
-        Item {
-            rendered: RenderedSegment::new("c"),
-            defaults: SegmentDefaults::with_priority(200),
-            segment: noop_segment(),
-        },
+        item("a", 200),
+        space(),
+        item("b", 200),
+        none_sep(),
+        item("c", 200),
     ];
     assert_eq!(render_plain(items, 4), "a bc");
 }
 
 #[test]
 fn total_width_returns_u32_beyond_u16_range() {
-    // Three segments at u16::MAX each: sum = 3 * u16::MAX plus two
-    // separator cells. Must not wrap.
+    // Three segments at u16::MAX each plus two Space separators:
+    // sum = 3 * u16::MAX + 2. Must not wrap u32.
+    fn wide(text: String) -> LayoutItem<'static> {
+        LayoutItem::Segment(SegmentEntry {
+            rendered: RenderedSegment::new(text),
+            defaults: SegmentDefaults::with_priority(10),
+            segment: noop_segment(),
+        })
+    }
     let items = vec![
-        Item {
-            rendered: RenderedSegment::new("x".repeat(u16::MAX as usize)),
-            defaults: SegmentDefaults::with_priority(10),
-            segment: noop_segment(),
-        },
-        Item {
-            rendered: RenderedSegment::new("x".repeat(u16::MAX as usize)),
-            defaults: SegmentDefaults::with_priority(10),
-            segment: noop_segment(),
-        },
-        Item {
-            rendered: RenderedSegment::new("x".repeat(u16::MAX as usize)),
-            defaults: SegmentDefaults::with_priority(10),
-            segment: noop_segment(),
-        },
+        wide("x".repeat(u16::MAX as usize)),
+        space(),
+        wide("x".repeat(u16::MAX as usize)),
+        space(),
+        wide("x".repeat(u16::MAX as usize)),
     ];
     assert_eq!(total_width(&items), 3 * u32::from(u16::MAX) + 2);
 }
 
 #[test]
 fn all_priority_zero_keeps_every_segment_even_when_overfull() {
-    let items = vec![item("aaa", 0), item("bbb", 0), item("ccc", 0)];
+    let items = spaced(&[("aaa", 0), ("bbb", 0), ("ccc", 0)]);
     // Full 3+1+3+1+3 = 11. Budget 4 is nowhere near; all three stay.
     assert_eq!(render_plain(items, 4), "aaa bbb ccc");
 }
@@ -419,19 +430,22 @@ impl Segment for StubSegment {
 
 #[test]
 fn segment_error_is_logged_and_hides_segment() {
-    let segments: Vec<Box<dyn Segment>> = vec![
+    let line = line_items_spaced(vec![
         Box::new(StubSegment(Ok(Some(RenderedSegment::new("ok-before"))))),
         Box::new(StubSegment(Err(SegmentError::new("boom")))),
         Box::new(StubSegment(Ok(Some(RenderedSegment::new("ok-after"))))),
-    ];
+    ]);
     let mut warnings = Vec::new();
-    let items = collect_items_with(&segments, &empty_ctx(), &empty_rc(), &mut |msg| {
+    let items = collect_items_with(&line, &empty_ctx(), &empty_rc(), &mut |msg| {
         warnings.push(msg.to_string());
     });
-    // The Err segment vanishes from layout; neighbors survive.
-    assert_eq!(items.len(), 2);
-    assert_eq!(items[0].rendered.text, "ok-before");
-    assert_eq!(items[1].rendered.text, "ok-after");
+    // The Err segment vanishes; the separator that flanked it goes
+    // with it (both adjacency rules at once). Two surviving segments
+    // separated by one surviving Space = 3 LayoutItems.
+    assert_eq!(items.len(), 3);
+    assert_eq!(segment_text(&items[0]), "ok-before");
+    assert!(matches!(items[1], LayoutItem::Separator(_)));
+    assert_eq!(segment_text(&items[2]), "ok-after");
     // The error is surfaced to stderr exactly once.
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].contains("segment error"));
@@ -440,15 +454,17 @@ fn segment_error_is_logged_and_hides_segment() {
 
 #[test]
 fn ok_none_is_silently_hidden() {
-    let segments: Vec<Box<dyn Segment>> = vec![
+    let line = line_items_spaced(vec![
         Box::new(StubSegment(Ok(Some(RenderedSegment::new("visible"))))),
         Box::new(StubSegment(Ok(None))),
-    ];
+    ]);
     let mut warnings = Vec::new();
-    let items = collect_items_with(&segments, &empty_ctx(), &empty_rc(), &mut |msg| {
+    let items = collect_items_with(&line, &empty_ctx(), &empty_rc(), &mut |msg| {
         warnings.push(msg.to_string());
     });
+    // Hidden segment plus its trailing separator both prune away.
     assert_eq!(items.len(), 1);
+    assert_eq!(segment_text(&items[0]), "visible");
     assert!(warnings.is_empty());
 }
 
@@ -467,14 +483,14 @@ fn render_context_threads_terminal_width_into_segments() {
     // segment unmodified at the `collect_items_with` layer —
     // pinning runtime behavior, since type-signature compilation
     // alone doesn't prove the value moves.
-    let segments: Vec<Box<dyn Segment>> = vec![Box::new(WidthEcho)];
+    let line = line_items_spaced(vec![Box::new(WidthEcho)]);
     let mut warnings = Vec::new();
     let rc = RenderContext::new(42);
-    let items = collect_items_with(&segments, &empty_ctx(), &rc, &mut |msg| {
+    let items = collect_items_with(&line, &empty_ctx(), &rc, &mut |msg| {
         warnings.push(msg.to_string());
     });
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].rendered.text, "42");
+    assert_eq!(segment_text(&items[0]), "42");
 }
 
 #[test]
@@ -484,10 +500,10 @@ fn render_with_warn_constructs_render_context_from_terminal_width_arg() {
     // from its argument and pass it to segments. A regression that
     // hard-coded a default would slip past the
     // `collect_items_with`-only test above.
-    let segments: Vec<Box<dyn Segment>> = vec![Box::new(WidthEcho)];
+    let line = line_items_spaced(vec![Box::new(WidthEcho)]);
     let mut warnings = Vec::new();
-    let line = render_with_warn(
-        &segments,
+    let out = render_with_warn(
+        &line,
         &empty_ctx(),
         137,
         &mut |msg| warnings.push(msg.to_string()),
@@ -495,16 +511,27 @@ fn render_with_warn_constructs_render_context_from_terminal_width_arg() {
         theme::Capability::None,
         false,
     );
-    assert!(line.contains("137"), "got {line:?}");
+    assert!(out.contains("137"), "got {out:?}");
 }
 
 // --- truncate-before-drop (reflow) ---
 
-fn truncatable_item(text: &str, priority: u8) -> Item<'static> {
-    Item {
+fn truncatable_item(text: &str, priority: u8) -> LayoutItem<'static> {
+    LayoutItem::Segment(SegmentEntry {
         rendered: RenderedSegment::new(text),
         defaults: SegmentDefaults::with_priority(priority).with_truncatable(true),
         segment: noop_segment(),
+    })
+}
+
+/// Shorthand for the field-reach `out.rendered.text` pattern used in
+/// many `collect_items_with` assertions: matches the `Segment` variant
+/// and panics with a descriptive message when the slot is a separator.
+#[track_caller]
+fn segment_text<'a>(item: &'a LayoutItem<'_>) -> &'a str {
+    match item {
+        LayoutItem::Segment(seg) => &seg.rendered.text,
+        LayoutItem::Separator(_) => panic!("expected segment, got separator"),
     }
 }
 
@@ -515,6 +542,7 @@ fn reflow_truncates_highest_priority_before_dropping() {
     // with reflow it shrinks to fit so the user keeps orientation.
     let items = vec![
         truncatable_item("linesmith/very-long-feature-branch-name", 200),
+        space(),
         item("Sonnet", 0),
     ];
     // Total: 39 + 1 + 6 = 46. Budget 30 → overflow 16.
@@ -529,11 +557,25 @@ fn reflow_truncates_highest_priority_before_dropping() {
 fn reflow_drops_when_truncation_would_fall_below_floor() {
     // Budget so tight that truncating the workspace segment would
     // leave only the ellipsis (or less). Engine falls back to drop.
-    let items = vec![truncatable_item("workspace-name", 200), item("KEEP", 0)];
+    let items = vec![
+        truncatable_item("workspace-name", 200),
+        space(),
+        item("KEEP", 0),
+    ];
     // Total: 14 + 1 + 4 = 19. Budget 4 → overflow 15.
     // workspace target = 14 - 15 < 0 → reflow returns None → drop.
     let out = render_plain(items, 4);
     assert_eq!(out, "KEEP");
+}
+
+fn truncatable_with_bounds(text: &str, priority: u8, bounds: WidthBounds) -> LayoutItem<'static> {
+    LayoutItem::Segment(SegmentEntry {
+        rendered: RenderedSegment::new(text),
+        defaults: SegmentDefaults::with_priority(priority)
+            .with_truncatable(true)
+            .with_width(bounds),
+        segment: noop_segment(),
+    })
 }
 
 #[test]
@@ -541,9 +583,11 @@ fn reflow_respects_explicit_width_min_floor() {
     // Segment declares min=8; reflow must not shrink below that
     // even if a smaller truncation would fit the budget.
     let bounds = WidthBounds::new(8, u16::MAX).expect("valid");
-    let mut wide = truncatable_item("abcdefghijklmnop", 200); // width 16
-    wide.defaults.width = Some(bounds);
-    let items = vec![wide, item("X", 0)];
+    let items = vec![
+        truncatable_with_bounds("abcdefghijklmnop", 200, bounds), // width 16
+        space(),
+        item("X", 0),
+    ];
     // Total 16 + 1 + 1 = 18. Budget 10 → overflow 8 → target 8 ✓
     // (target equals floor; reflow proceeds).
     let out = render_plain(items, 10);
@@ -551,10 +595,11 @@ fn reflow_respects_explicit_width_min_floor() {
     assert!(out.ends_with(" X"), "got {out:?}");
 
     // Now budget 9 → overflow 9 → target 7 < floor 8 → drop.
-    let bounds = WidthBounds::new(8, u16::MAX).expect("valid");
-    let mut wide = truncatable_item("abcdefghijklmnop", 200);
-    wide.defaults.width = Some(bounds);
-    let items = vec![wide, item("X", 0)];
+    let items = vec![
+        truncatable_with_bounds("abcdefghijklmnop", 200, bounds),
+        space(),
+        item("X", 0),
+    ];
     let out = render_plain(items, 9);
     assert_eq!(out, "X");
 }
@@ -564,7 +609,7 @@ fn non_truncatable_drops_unchanged_under_pressure() {
     // Default `truncatable=false` keeps the legacy whole-segment
     // drop path so numeric segments don't suddenly start emitting
     // half-cut percentages or dollar figures.
-    let items = vec![item("45% · 200k", 200), item("Sonnet", 0)];
+    let items = spaced(&[("45% · 200k", 200), ("Sonnet", 0)]);
     // Total 10 + 1 + 6 = 17. Budget 10 → drop the wider one.
     let out = render_plain(items, 10);
     assert_eq!(out, "Sonnet");
@@ -577,7 +622,9 @@ fn reflow_iterates_when_first_truncation_insufficient() {
     // budget the loop comes back for the left one.
     let items = vec![
         truncatable_item("aaaaaaaaaa", 100),
+        space(),
         truncatable_item("bbbbbbbbbb", 100),
+        space(),
         item("KEEP", 0),
     ];
     // Total: 10 + 1 + 10 + 1 + 4 = 26. Budget 12 → overflow 14.
@@ -595,11 +642,12 @@ fn reflow_does_not_touch_priority_zero_even_when_truncatable() {
     // Priority 0 is "user said don't drop"; the reflow loop never
     // selects it (the existing droppable filter guards this).
     let items = vec![
-        Item {
+        LayoutItem::Segment(SegmentEntry {
             rendered: RenderedSegment::new("untouchable-long-name"),
             defaults: SegmentDefaults::with_priority(0).with_truncatable(true),
             segment: noop_segment(),
-        },
+        }),
+        space(),
         item("Sonnet", 0),
     ];
     let out = render_plain(items, 5);
@@ -654,16 +702,16 @@ fn shrink_to_fit_replaces_full_render_when_compact_form_fits() {
     // cells), compact = "longbranch" (10 cells). KEEP is
     // priority-0 so it can't be the drop target — only the
     // shrinkable segment is eligible.
-    let segments: Vec<Box<dyn Segment>> = vec![
+    let items = line_items_spaced(vec![
         Box::new(ShrinkableSegment {
             full: "longbranch * ↑2 ↓1",
             compact: "longbranch",
         }),
         Box::new(AnchorSegment("KEEP")),
-    ];
+    ]);
     let mut warnings = Vec::new();
     let line = render_with_warn(
-        &segments,
+        &items,
         &empty_ctx(),
         17,
         &mut |m| warnings.push(m.to_string()),
@@ -681,16 +729,16 @@ fn shrink_to_fit_replaces_full_render_when_compact_form_fits() {
 fn shrink_to_fit_falls_back_to_drop_when_compact_form_too_wide() {
     // Compact form is wider than target → engine rejects it,
     // falls through to drop (segment isn't truncatable).
-    let segments: Vec<Box<dyn Segment>> = vec![
+    let items = line_items_spaced(vec![
         Box::new(ShrinkableSegment {
             full: "longbranch",
             compact: "stilltoolongtruly",
         }),
         Box::new(AnchorSegment("X")),
-    ];
+    ]);
     let mut warnings = Vec::new();
     let line = render_with_warn(
-        &segments,
+        &items,
         &empty_ctx(),
         5,
         &mut |m| warnings.push(m.to_string()),
@@ -729,10 +777,9 @@ fn shrink_to_fit_honors_configured_width_min_floor() {
                 .with_width(WidthBounds::new(8, u16::MAX).expect("valid"))
         }
     }
-    let segments: Vec<Box<dyn Segment>> =
-        vec![Box::new(LowFloorShrink), Box::new(AnchorSegment("X"))];
+    let items = line_items_spaced(vec![Box::new(LowFloorShrink), Box::new(AnchorSegment("X"))]);
     let line = render_with_warn(
-        &segments,
+        &items,
         &empty_ctx(),
         7,
         &mut |_| {},
@@ -773,10 +820,12 @@ fn shrink_to_fit_rejects_too_wide_response_and_drops() {
             SegmentDefaults::with_priority(200)
         }
     }
-    let segments: Vec<Box<dyn Segment>> =
-        vec![Box::new(MisbehavingSegment), Box::new(AnchorSegment("X"))];
+    let items = line_items_spaced(vec![
+        Box::new(MisbehavingSegment),
+        Box::new(AnchorSegment("X")),
+    ]);
     let line = render_with_warn(
-        &segments,
+        &items,
         &empty_ctx(),
         5,
         &mut |_| {},
@@ -810,13 +859,13 @@ fn shrink_to_fit_runs_before_truncatable_end_ellipsis() {
             SegmentDefaults::with_priority(200).with_truncatable(true)
         }
     }
-    let segments: Vec<Box<dyn Segment>> = vec![
+    let items = line_items_spaced(vec![
         Box::new(DualSegment),
         Box::new(StubSegment(Ok(Some(RenderedSegment::new("X"))))),
-    ];
+    ]);
     let mut warnings = Vec::new();
     let line = render_with_warn(
-        &segments,
+        &items,
         &empty_ctx(),
         13,
         &mut |m| warnings.push(m.to_string()),
@@ -836,8 +885,8 @@ fn shrink_to_fit_runs_before_truncatable_end_ellipsis() {
 
 #[test]
 fn render_to_runs_empty_input_yields_no_runs() {
-    let segments: Vec<Box<dyn Segment>> = vec![];
-    let runs = render_to_runs(&segments, &empty_ctx(), 100, &mut |_| {});
+    let items: Vec<LineItem> = vec![];
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut |_| {});
     assert!(runs.is_empty());
 }
 
@@ -845,11 +894,11 @@ fn render_to_runs_empty_input_yields_no_runs() {
 fn render_to_runs_emits_segment_then_separator_then_segment() {
     // Neither segment requested a role, so all three emitted runs
     // carry Style::default().
-    let segments: Vec<Box<dyn Segment>> = vec![
+    let items = line_items_spaced(vec![
         Box::new(StubSegment(Ok(Some(RenderedSegment::new("a"))))),
         Box::new(StubSegment(Ok(Some(RenderedSegment::new("b"))))),
-    ];
-    let runs = render_to_runs(&segments, &empty_ctx(), 100, &mut |_| {});
+    ]);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut |_| {});
     assert_eq!(runs.len(), 3);
     assert_eq!(runs[0].text, "a");
     assert_eq!(runs[0].style, Style::default());
@@ -865,13 +914,13 @@ fn render_to_runs_preserves_segment_style() {
     // TUI consumer maps role → ratatui Color, so anything dropped
     // here would silently break themed preview.
     use crate::theme::Role;
-    let segments: Vec<Box<dyn Segment>> = vec![
+    let items = line_items_spaced(vec![
         Box::new(StubSegment(Ok(Some(RenderedSegment::new("plain"))))),
         Box::new(StubSegment(Ok(Some(
             RenderedSegment::new("warn").with_role(Role::Warning),
         )))),
-    ];
-    let runs = render_to_runs(&segments, &empty_ctx(), 100, &mut |_| {});
+    ]);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut |_| {});
     assert_eq!(runs.len(), 3);
     assert_eq!(runs[2].text, "warn");
     assert_eq!(runs[2].style.role, Some(Role::Warning));
@@ -881,14 +930,19 @@ fn render_to_runs_preserves_segment_style() {
 fn render_to_runs_skips_separator_none_between_segments() {
     // `Separator::None` is "no gap"; the runs view skips it
     // entirely so consumers don't have to filter empty-text runs.
-    let segments: Vec<Box<dyn Segment>> = vec![
-        Box::new(StubSegment(Ok(Some(RenderedSegment::with_separator(
-            "a",
-            Separator::None,
-        ))))),
-        Box::new(StubSegment(Ok(Some(RenderedSegment::new("b"))))),
-    ];
-    let runs = render_to_runs(&segments, &empty_ctx(), 100, &mut |_| {});
+    let items = line_items_with(
+        vec![
+            Box::new(StubSegment(Ok(Some(RenderedSegment::with_separator(
+                "a",
+                Separator::None,
+            ))))),
+            Box::new(StubSegment(Ok(Some(RenderedSegment::new("b"))))),
+        ],
+        Separator::Space,
+    );
+    // The plugin per-render override on segment "a" replaces the
+    // inline Space with Separator::None at that boundary.
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut |_| {});
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[0].text, "a");
     assert_eq!(runs[1].text, "b");
@@ -899,26 +953,26 @@ fn render_to_runs_drops_segments_under_width_pressure() {
     // The runs view reflects post-layout state: dropped segments
     // produce no run, and the separator that would have followed
     // a dropped segment also vanishes.
-    let segments: Vec<Box<dyn Segment>> = vec![
+    let items = line_items_spaced(vec![
         Box::new(StubSegment(Ok(Some(
             RenderedSegment::new("keep").with_role(crate::theme::Role::Primary),
         )))),
         Box::new(DroppableStub("droppable")),
         Box::new(StubSegment(Ok(Some(RenderedSegment::new("anchor"))))),
-    ];
+    ]);
     // Total: 4 + 1 + 9 + 1 + 6 = 21. Budget 12 forces the
     // priority-200 middle segment to drop.
-    let runs = render_to_runs(&segments, &empty_ctx(), 12, &mut |_| {});
+    let runs = render_to_runs(&items, &empty_ctx(), 12, &mut |_| {});
     let texts: Vec<&str> = runs.iter().map(|r| r.text.as_str()).collect();
     assert_eq!(texts, vec!["keep", " ", "anchor"]);
 }
 
-/// Build a styled multi-segment layout for round-trip tests:
-/// roled segments + a plain literal in the middle so both styled
-/// and unstyled run paths are exercised.
-fn round_trip_segments() -> Vec<Box<dyn Segment>> {
+/// Build a styled multi-segment line for round-trip tests: roled
+/// segments + a plain literal in the middle so both styled and
+/// unstyled run paths are exercised.
+fn round_trip_line() -> Vec<LineItem> {
     use crate::theme::Role;
-    vec![
+    line_items_spaced(vec![
         Box::new(StubSegment(Ok(Some(
             RenderedSegment::new("ctx").with_role(Role::Info),
         )))),
@@ -926,13 +980,13 @@ fn round_trip_segments() -> Vec<Box<dyn Segment>> {
         Box::new(StubSegment(Ok(Some(
             RenderedSegment::new("err").with_role(Role::Error),
         )))),
-    ]
+    ])
 }
 
 fn round_trip_assert(terminal_width: u16, capability: theme::Capability, hyperlinks: bool) {
-    let segments = round_trip_segments();
+    let items = round_trip_line();
     let direct = render_with_warn(
-        &segments,
+        &items,
         &empty_ctx(),
         terminal_width,
         &mut |_| {},
@@ -940,7 +994,7 @@ fn round_trip_assert(terminal_width: u16, capability: theme::Capability, hyperli
         capability,
         hyperlinks,
     );
-    let runs = render_to_runs(&segments, &empty_ctx(), terminal_width, &mut |_| {});
+    let runs = render_to_runs(&items, &empty_ctx(), terminal_width, &mut |_| {});
     let recomposed = runs_to_ansi(&runs, theme::default_theme(), capability, hyperlinks);
     assert_eq!(
         direct, recomposed,
@@ -987,16 +1041,18 @@ fn render_to_runs_round_trip_holds_with_hyperlinks_enabled() {
 
 #[test]
 fn render_to_runs_with_one_survivor_emits_no_trailing_separator() {
-    // Drop pressure leaves a single segment. The `i + 1 < items.len()`
-    // guard in `items_to_runs` must suppress the trailing separator;
-    // otherwise the runs view ends with a stray " " run.
-    let segments: Vec<Box<dyn Segment>> = vec![
+    // Drop pressure leaves a single segment. `pop_trailing_separator`
+    // (run when the priority-drop loop removes a segment whose
+    // right-edge separator was already adjacent) must remove the
+    // surviving separator so the runs view doesn't end with a stray
+    // " " run.
+    let items = line_items_spaced(vec![
         Box::new(StubSegment(Ok(Some(RenderedSegment::new("a"))))),
         Box::new(DroppableStub("droppable")),
-    ];
+    ]);
     // Total: 1 + 1 + 9 = 11. Budget 1 drops the priority-200
     // segment; "a" survives alone with no trailing separator.
-    let runs = render_to_runs(&segments, &empty_ctx(), 1, &mut |_| {});
+    let runs = render_to_runs(&items, &empty_ctx(), 1, &mut |_| {});
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].text, "a");
 }
@@ -1007,20 +1063,16 @@ fn render_to_runs_emits_powerline_chevron_with_muted_role() {
     // bg-transition restyle should land as an intentional update
     // to this assertion.
     use crate::theme::Role;
-    struct PowerlineSeg;
-    impl Segment for PowerlineSeg {
-        fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
-            Ok(Some(RenderedSegment::new("a").with_role(Role::Primary)))
-        }
-        fn defaults(&self) -> SegmentDefaults {
-            SegmentDefaults::with_priority(10).with_default_separator(Separator::powerline())
-        }
-    }
-    let segments: Vec<Box<dyn Segment>> = vec![
-        Box::new(PowerlineSeg),
-        Box::new(StubSegment(Ok(Some(RenderedSegment::new("b"))))),
-    ];
-    let runs = render_to_runs(&segments, &empty_ctx(), 100, &mut |_| {});
+    let items = line_items_with(
+        vec![
+            Box::new(StubSegment(Ok(Some(
+                RenderedSegment::new("a").with_role(Role::Primary),
+            )))),
+            Box::new(StubSegment(Ok(Some(RenderedSegment::new("b"))))),
+        ],
+        Separator::powerline(),
+    );
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut |_| {});
     assert_eq!(runs.len(), 3);
     assert_eq!(runs[1].text, " \u{E0B0} ");
     assert_eq!(runs[1].style.role, Some(Role::Muted));
@@ -1040,18 +1092,13 @@ fn powerline_separator_emits_padded_chevron_with_correct_width() {
 
 #[test]
 fn powerline_chevrons_are_charged_to_total_width_in_layout() {
-    // total_width counts inter-segment separators. Three priority-0
-    // segments at width 4 plus two powerline chevrons between them
-    // = 4 + chev + 4 + chev + 4. A regression that stopped counting
-    // Powerline width would silently push lines past budget.
-    // Computed (not hardcoded) so a future change to the chevron's
-    // padding-cell count fails this assertion at the right line.
-    let item = |text: &str| Item {
-        rendered: RenderedSegment::new(text),
-        defaults: SegmentDefaults::with_priority(0).with_default_separator(Separator::powerline()),
-        segment: noop_segment(),
-    };
-    let items = vec![item("aaaa"), item("bbbb"), item("cccc")];
+    // total_width sums every layout item. Three priority-0 segments
+    // at width 4 plus two powerline chevrons between them = 4 + chev
+    // + 4 + chev + 4. A regression that stopped counting Powerline
+    // width would silently push lines past budget. Computed (not
+    // hardcoded) so a future change to the chevron's padding-cell
+    // count fails this assertion at the right line.
+    let items = pl_spec(&[("aaaa", 0), ("bbbb", 0), ("cccc", 0)]);
     let chev = u32::from(Separator::powerline().width());
     assert_eq!(total_width(&items), 4 + chev + 4 + chev + 4);
 }
@@ -1066,21 +1113,24 @@ fn render_with_warn_emits_powerline_chevron_wrapped_in_muted_sgr() {
     // so this test adapts if the default theme's Muted color is
     // ever retuned. Decouples "chevron emits styled" from "the
     // exact ANSI code for Muted on theme X."
-    struct PowerlineSeg(&'static str, theme::Role);
-    impl Segment for PowerlineSeg {
+    struct RoledSeg(&'static str, theme::Role);
+    impl Segment for RoledSeg {
         fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
             Ok(Some(RenderedSegment::new(self.0).with_role(self.1)))
         }
         fn defaults(&self) -> SegmentDefaults {
-            SegmentDefaults::with_priority(10).with_default_separator(Separator::powerline())
+            SegmentDefaults::with_priority(10)
         }
     }
-    let segments: Vec<Box<dyn Segment>> = vec![
-        Box::new(PowerlineSeg("a", theme::Role::Primary)),
-        Box::new(PowerlineSeg("b", theme::Role::Info)),
-    ];
+    let items = line_items_with(
+        vec![
+            Box::new(RoledSeg("a", theme::Role::Primary)),
+            Box::new(RoledSeg("b", theme::Role::Info)),
+        ],
+        Separator::powerline(),
+    );
     let line = render_with_warn(
-        &segments,
+        &items,
         &empty_ctx(),
         100,
         &mut |_| {},
@@ -1102,26 +1152,20 @@ fn render_with_warn_emits_powerline_chevron_wrapped_in_muted_sgr() {
 
 #[test]
 fn render_to_runs_emits_literal_separator_with_default_style() {
-    // `Separator::Literal(" | ")` from the segment's defaults
-    // becomes a separator run with that exact text and
-    // Style::default() — separators don't inherit segment styling.
-    struct PipeSepSegment;
-    impl Segment for PipeSepSegment {
-        fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
-            Ok(Some(
+    // An inline `Separator::Literal(" | ")` becomes a separator run
+    // with that exact text and Style::default() — separators don't
+    // inherit segment styling, even when the flanking segment carries
+    // a role.
+    let items = line_items_with(
+        vec![
+            Box::new(StubSegment(Ok(Some(
                 RenderedSegment::new("a").with_role(crate::theme::Role::Warning),
-            ))
-        }
-        fn defaults(&self) -> SegmentDefaults {
-            SegmentDefaults::with_priority(10)
-                .with_default_separator(Separator::Literal(Cow::Borrowed(" | ")))
-        }
-    }
-    let segments: Vec<Box<dyn Segment>> = vec![
-        Box::new(PipeSepSegment),
-        Box::new(StubSegment(Ok(Some(RenderedSegment::new("b"))))),
-    ];
-    let runs = render_to_runs(&segments, &empty_ctx(), 100, &mut |_| {});
+            )))),
+            Box::new(StubSegment(Ok(Some(RenderedSegment::new("b"))))),
+        ],
+        Separator::Literal(Cow::Borrowed(" | ")),
+    );
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut |_| {});
     assert_eq!(runs.len(), 3);
     assert_eq!(runs[1].text, " | ");
     assert_eq!(runs[1].style, Style::default());

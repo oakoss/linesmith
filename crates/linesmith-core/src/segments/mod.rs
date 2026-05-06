@@ -278,12 +278,11 @@ impl WidthBounds {
 /// Under width pressure the engine drops segments in descending
 /// `priority` order: `255` drops first, `0` never drops. Default `128`.
 /// Ties break by position: the right-most segment drops first.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SegmentDefaults {
     pub priority: u8,
     pub width: Option<WidthBounds>,
-    pub default_separator: Separator,
     /// May the layout engine shrink this segment under width pressure
     /// before dropping it? Default `false` — only prose-like segments
     /// (workspace name, branch name) opt in. Numeric or structured
@@ -296,7 +295,7 @@ pub struct SegmentDefaults {
 impl SegmentDefaults {
     /// Constructor shorthand for the common case of "default layout
     /// intent with a specific priority." Chainable with
-    /// [`Self::with_width`] and [`Self::with_default_separator`].
+    /// [`Self::with_width`] and [`Self::with_truncatable`].
     #[must_use]
     pub fn with_priority(priority: u8) -> Self {
         Self {
@@ -309,13 +308,6 @@ impl SegmentDefaults {
     #[must_use]
     pub fn with_width(mut self, bounds: WidthBounds) -> Self {
         self.width = Some(bounds);
-        self
-    }
-
-    /// Chainable setter for the default right-separator.
-    #[must_use]
-    pub fn with_default_separator(mut self, separator: Separator) -> Self {
-        self.default_separator = separator;
         self
     }
 
@@ -332,7 +324,6 @@ impl Default for SegmentDefaults {
         Self {
             priority: 128,
             width: None,
-            default_separator: Separator::Space,
             truncatable: false,
         }
     }
@@ -485,8 +476,12 @@ pub trait Segment: Send {
         &[DataDep::Status]
     }
 
-    /// Layout defaults (priority, width bounds, separator preference).
+    /// Layout defaults (priority, width bounds, truncatable opt-in).
     /// User config may override each field via [`OverriddenSegment`].
+    /// Implementations must be O(1), do no I/O, and avoid allocation:
+    /// the layout engine snapshots this at collect time and the
+    /// [`LineItem::Debug`] impl reads it for `dbg!` / panic-backtrace
+    /// formatting.
     #[must_use]
     fn defaults(&self) -> SegmentDefaults {
         SegmentDefaults::default()
@@ -597,7 +592,6 @@ pub struct OverriddenSegment {
     inner: Box<dyn Segment>,
     priority: Option<u8>,
     width: Option<WidthBounds>,
-    default_separator: Option<Separator>,
     user_style: Option<Style>,
 }
 
@@ -608,7 +602,6 @@ impl OverriddenSegment {
             inner,
             priority: None,
             width: None,
-            default_separator: None,
             user_style: None,
         }
     }
@@ -625,12 +618,6 @@ impl OverriddenSegment {
         self
     }
 
-    #[must_use]
-    pub fn with_default_separator(mut self, separator: Separator) -> Self {
-        self.default_separator = Some(separator);
-        self
-    }
-
     /// Wholesale-replaces the inner segment's declared style at render
     /// time. See `docs/specs/theming.md` §Resolution precedence.
     #[must_use]
@@ -643,15 +630,12 @@ impl OverriddenSegment {
 impl Segment for OverriddenSegment {
     fn render(&self, ctx: &DataContext, rc: &RenderContext) -> RenderResult {
         let result = self.inner.render(ctx, rc)?;
-        Ok(result.map(|r| {
-            let r = apply_separator_override(r, self.default_separator.as_ref());
-            match &self.user_style {
-                Some(override_style) => {
-                    let merged = merge_user_override(r.style(), override_style);
-                    r.with_style(merged)
-                }
-                None => r,
+        Ok(result.map(|r| match &self.user_style {
+            Some(override_style) => {
+                let merged = merge_user_override(r.style(), override_style);
+                r.with_style(merged)
             }
+            None => r,
         }))
     }
 
@@ -662,7 +646,6 @@ impl Segment for OverriddenSegment {
         target: u16,
     ) -> Option<RenderedSegment> {
         let inner = self.inner.shrink_to_fit(ctx, rc, target)?;
-        let inner = apply_separator_override(inner, self.default_separator.as_ref());
         Some(match &self.user_style {
             Some(override_style) => {
                 let merged = merge_user_override(inner.style(), override_style);
@@ -684,39 +667,8 @@ impl Segment for OverriddenSegment {
         if let Some(w) = self.width {
             d.width = Some(w);
         }
-        if let Some(sep) = self.default_separator.clone() {
-            d.default_separator = sep;
-        }
         d
     }
-}
-
-/// Apply an `OverriddenSegment.default_separator` policy to a
-/// rendered segment's `right_separator`. The override replaces a
-/// per-render `Some(Space)` or `Some(Theme)` — those mean "I didn't
-/// pick anything intentional," so the layout-options separator wins.
-/// All other values pass through: `Some(Literal(..))`,
-/// `Some(Powerline { .. })`, and `Some(Separator::None)` are explicit
-/// segment choices, while a bare `None` (no per-render override)
-/// signals "use my overridden default," which `effective_separator`
-/// resolves downstream.
-fn apply_separator_override(
-    r: RenderedSegment,
-    sep_override: Option<&Separator>,
-) -> RenderedSegment {
-    let Some(override_sep) = sep_override else {
-        return r;
-    };
-    let should_replace = matches!(
-        r.right_separator.as_ref(),
-        Some(Separator::Space) | Some(Separator::Theme)
-    );
-    if !should_replace {
-        return r;
-    }
-    let mut r = r;
-    r.right_separator = Some(override_sep.clone());
-    r
 }
 
 /// Merge a user-config style override onto the inner segment's style.
@@ -734,6 +686,36 @@ fn merge_user_override(inner: &Style, override_style: &Style) -> Style {
         merged.hyperlink = inner.hyperlink.clone();
     }
     merged
+}
+
+/// One slot in a line layout: a configured segment or an inline
+/// separator between segments. The builder (`build_segments` /
+/// `build_lines`) interleaves separators between adjacent segments
+/// from `[layout_options].separator`; the renderer walks this list
+/// directly. See `docs/specs/segment-system.md` §Data model.
+///
+/// A plugin's per-render override ([`RenderedSegment::with_separator`])
+/// beats the inline `Separator` only when an inline-separator slot
+/// exists immediately to the segment's right. An override on the
+/// rightmost segment, or a segment whose right-neighbor separator
+/// has already been pruned, has no boundary to apply to and is
+/// silently discarded.
+#[non_exhaustive]
+pub enum LineItem {
+    Segment(Box<dyn Segment>),
+    Separator(Separator),
+}
+
+impl std::fmt::Debug for LineItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The trait has no `Debug` bound, so surface the layout
+            // intent (priority, width hints) — that's what's load-
+            // bearing in panic dumps and `dbg!` output anyway.
+            Self::Segment(seg) => f.debug_tuple("Segment").field(&seg.defaults()).finish(),
+            Self::Separator(sep) => f.debug_tuple("Separator").field(sep).finish(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -851,6 +833,30 @@ mod layout_type_tests {
     }
 
     #[test]
+    fn line_item_debug_renders_each_variant() {
+        // The hand-written `Debug` impl on `LineItem` exists because
+        // `Box<dyn Segment>` blocks `derive(Debug)`. Pin that both
+        // variants format without panicking and that the variant
+        // tag is visible in the output (so panic backtraces and
+        // `dbg!` calls actually identify the slot).
+        struct StubSeg;
+        impl Segment for StubSeg {
+            fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+                Ok(None)
+            }
+        }
+        let seg = LineItem::Segment(Box::new(StubSeg));
+        let sep = LineItem::Separator(Separator::powerline());
+        let seg_dbg = format!("{seg:?}");
+        let sep_dbg = format!("{sep:?}");
+        assert!(seg_dbg.starts_with("Segment("), "got {seg_dbg:?}");
+        assert!(sep_dbg.starts_with("Separator("), "got {sep_dbg:?}");
+        // The Segment-variant body surfaces the segment's defaults
+        // so panic dumps carry the priority/width context.
+        assert!(seg_dbg.contains("priority"), "got {seg_dbg:?}");
+    }
+
+    #[test]
     fn segment_defaults_default_priority_is_128() {
         assert_eq!(SegmentDefaults::default().priority, 128);
     }
@@ -860,7 +866,7 @@ mod layout_type_tests {
         let d = SegmentDefaults::with_priority(64);
         assert_eq!(d.priority, 64);
         assert_eq!(d.width, None);
-        assert_eq!(d.default_separator, Separator::Space);
+        assert!(!d.truncatable);
     }
 
     #[test]
@@ -868,13 +874,10 @@ mod layout_type_tests {
         let bounds = WidthBounds::new(4, 40).expect("valid bounds");
         let d = SegmentDefaults::with_priority(32)
             .with_width(bounds)
-            .with_default_separator(Separator::Literal(Cow::Borrowed(" | ")));
+            .with_truncatable(true);
         assert_eq!(d.priority, 32);
         assert_eq!(d.width, Some(bounds));
-        assert_eq!(
-            d.default_separator,
-            Separator::Literal(Cow::Borrowed(" | "))
-        );
+        assert!(d.truncatable);
     }
 
     #[test]
@@ -1014,13 +1017,6 @@ mod layout_type_tests {
         let bounds = WidthBounds::new(5, 40).expect("valid");
         let wrapped = OverriddenSegment::new(base).with_width(bounds);
         assert_eq!(wrapped.defaults().width, Some(bounds));
-    }
-
-    #[test]
-    fn overridden_segment_replaces_default_separator() {
-        let base = built_in_by_id("workspace", None, &mut |_| {}).expect("known id");
-        let wrapped = OverriddenSegment::new(base).with_default_separator(Separator::None);
-        assert_eq!(wrapped.defaults().default_separator, Separator::None);
     }
 
     #[test]
@@ -1200,91 +1196,6 @@ mod layout_type_tests {
         assert!(wrapped
             .shrink_to_fit(&stub_ctx(), &stub_rc(), 100)
             .is_none());
-    }
-
-    #[test]
-    fn shrink_to_fit_applies_separator_override_to_runtime_space() {
-        // Mirrors `layout_separator_powerline_overrides_runtime_right_separator`
-        // (in builder.rs) for the compact-render path. If the inner
-        // segment returns `right_separator: Some(Space)` from
-        // shrink_to_fit, the overridden default must replace it the
-        // same way it does on render — otherwise a width-pressured
-        // line would silently revert from powerline chevrons to
-        // spaces, producing inconsistent output across renders.
-        struct ShrinkableWithRuntimeSpace;
-        impl Segment for ShrinkableWithRuntimeSpace {
-            fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
-                Ok(Some(RenderedSegment::with_separator(
-                    "full",
-                    Separator::Space,
-                )))
-            }
-            fn shrink_to_fit(
-                &self,
-                _: &DataContext,
-                _: &RenderContext,
-                _target: u16,
-            ) -> Option<RenderedSegment> {
-                Some(RenderedSegment::with_separator("c", Separator::Space))
-            }
-        }
-        let wrapped = OverriddenSegment::new(Box::new(ShrinkableWithRuntimeSpace))
-            .with_default_separator(Separator::powerline());
-        let shrunk = wrapped
-            .shrink_to_fit(&stub_ctx(), &stub_rc(), 5)
-            .expect("inner returned compact form");
-        assert_eq!(shrunk.right_separator(), Some(&Separator::powerline()));
-    }
-
-    #[test]
-    fn apply_separator_override_replaces_runtime_theme() {
-        // The `Theme` arm of the should-replace match is otherwise
-        // uncovered. A plugin returning `Some(Theme)` (the implicit
-        // theme-padding default) must yield to layout-options.
-        let r = RenderedSegment::with_separator("x", Separator::Theme);
-        let out = apply_separator_override(r, Some(&Separator::powerline()));
-        assert_eq!(out.right_separator(), Some(&Separator::powerline()));
-    }
-
-    #[test]
-    fn apply_separator_override_passes_through_when_runtime_separator_is_none() {
-        // `right_separator: None` means "use my default" — the
-        // override travels via `default_separator` instead, so
-        // apply_separator_override leaves the per-render slot empty.
-        let r = RenderedSegment::new("x"); // no separator set
-        let out = apply_separator_override(r, Some(&Separator::powerline()));
-        assert_eq!(out.right_separator(), None);
-    }
-
-    #[test]
-    fn apply_separator_override_preserves_explicit_runtime_none() {
-        // `Some(Separator::None)` is the segment explicitly saying
-        // "no separator after me." Layout-options must not promote
-        // this to a chevron.
-        let r = RenderedSegment::with_separator("x", Separator::None);
-        let out = apply_separator_override(r, Some(&Separator::powerline()));
-        assert_eq!(out.right_separator(), Some(&Separator::None));
-    }
-
-    #[test]
-    fn apply_separator_override_passes_through_when_no_override() {
-        // `sep_override == None` is the no-layout-options case — the
-        // input must round-trip unchanged through every branch of
-        // the `right_separator` match.
-        for runtime_sep in [
-            None,
-            Some(Separator::Space),
-            Some(Separator::Theme),
-            Some(Separator::None),
-            Some(Separator::powerline()),
-        ] {
-            let r = match &runtime_sep {
-                None => RenderedSegment::new("x"),
-                Some(s) => RenderedSegment::with_separator("x", s.clone()),
-            };
-            let out = apply_separator_override(r, None);
-            assert_eq!(out.right_separator(), runtime_sep.as_ref());
-        }
     }
 
     fn stub_ctx() -> DataContext {

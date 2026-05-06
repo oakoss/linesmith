@@ -25,7 +25,7 @@ pub mod theme;
 
 pub use segments::builder::{build_default_segments, build_lines, build_segments};
 
-use crate::segments::Segment;
+use crate::segments::LineItem;
 use std::io::{self, Read, Write};
 
 /// Read a JSON payload from `reader`, render a status line, and write it
@@ -52,11 +52,11 @@ pub fn run_with_width(
     writer: impl Write,
     terminal_width: u16,
 ) -> io::Result<()> {
-    let segments = build_default_segments();
-    run_with_segments_and_width(reader, writer, &segments, terminal_width)
+    let items = build_default_segments();
+    run_with_segments_and_width(reader, writer, &items, terminal_width)
 }
 
-/// Full-control entry: pre-built segment list plus explicit width.
+/// Full-control entry: pre-built [`LineItem`] list plus explicit width.
 /// Parse failures render a `?` marker and log to the real process
 /// stderr; output is unstyled. For themed output or injected-stderr
 /// testability (used by `cli_main`), call [`run_with_context`] instead.
@@ -68,7 +68,7 @@ pub fn run_with_width(
 pub fn run_with_segments_and_width(
     reader: impl Read,
     writer: impl Write,
-    segments: &[Box<dyn Segment>],
+    items: &[LineItem],
     terminal_width: u16,
 ) -> io::Result<()> {
     // `cwd: None` — callers that want gix discovery go through
@@ -80,7 +80,7 @@ pub fn run_with_segments_and_width(
         None,
         false,
     );
-    run_with_context(reader, writer, &mut io::stderr().lock(), segments, &ctx)
+    run_with_context(reader, writer, &mut io::stderr().lock(), items, &ctx)
 }
 
 /// CLI run-state bundle: theme + capability + terminal width + cwd.
@@ -149,14 +149,14 @@ pub fn run_with_context(
     reader: impl Read,
     writer: impl Write,
     stderr: &mut dyn Write,
-    segments: &[Box<dyn Segment>],
+    items: &[LineItem],
     ctx: &RunContext<'_>,
 ) -> io::Result<()> {
     // The function predates multi-line and is part of the public API
     // surface (`pub use` in lib.rs), so removing it would be a SemVer
     // break. Delegate to the multi-line path with one line so single-
     // line callers don't need to allocate a `Vec<Vec<...>>` shim.
-    run_lines_with_context(reader, writer, stderr, std::slice::from_ref(&segments), ctx)
+    run_lines_with_context(reader, writer, stderr, std::slice::from_ref(&items), ctx)
 }
 
 /// Multi-line render entry. Each inner slice is one rendered line;
@@ -181,7 +181,7 @@ pub fn run_lines_with_context(
     mut reader: impl Read,
     mut writer: impl Write,
     stderr: &mut dyn Write,
-    lines: &[&[Box<dyn Segment>]],
+    lines: &[&[LineItem]],
     ctx: &RunContext<'_>,
 ) -> io::Result<()> {
     let mut buf = Vec::new();
@@ -196,9 +196,9 @@ pub fn run_lines_with_context(
     };
     let data_ctx = data_context::DataContext::with_cwd(status_ctx, ctx.cwd.clone());
 
-    for segments in lines {
+    for items in lines {
         let line = layout::render_with_warn(
-            segments,
+            items,
             &data_ctx,
             ctx.terminal_width,
             &mut |msg| {

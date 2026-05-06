@@ -5,22 +5,37 @@ use rhai::{Dynamic, Engine, Map};
 
 use linesmith_plugin::{CompiledPlugin, PluginRegistry};
 
-use super::super::{built_in_by_id, Segment, Separator, DEFAULT_SEGMENT_IDS};
-use super::layout::{
-    apply_layout_separator, resolve_layout_separator, single_line_ids, validated_numbered_lines,
-};
+use super::super::{built_in_by_id, LineItem, Segment, Separator, DEFAULT_SEGMENT_IDS};
+use super::layout::{resolve_layout_separator, single_line_ids, validated_numbered_lines};
 use super::plugins::{apply_override, bundle_plugins, toml_table_to_dynamic};
 use crate::config;
 use crate::plugins::RhaiSegment;
 
-/// Build the default segment list: every built-in in canonical order,
-/// no overrides applied.
+/// Build the default line: every built-in in canonical order with
+/// `Separator::Space` between each pair, no overrides applied.
 #[must_use]
-pub fn build_default_segments() -> Vec<Box<dyn Segment>> {
-    DEFAULT_SEGMENT_IDS
+pub fn build_default_segments() -> Vec<LineItem> {
+    let segs: Vec<Box<dyn Segment>> = DEFAULT_SEGMENT_IDS
         .iter()
         .filter_map(|id| built_in_by_id(id, None, &mut |_| {}))
-        .collect()
+        .collect();
+    interleave_separators(segs, &Separator::Space)
+}
+
+/// Walk a built segment list and interleave `sep` between adjacent
+/// segments, producing the [`LineItem`] sequence the renderer
+/// consumes. No leading or trailing separator.
+fn interleave_separators(segs: Vec<Box<dyn Segment>>, sep: &Separator) -> Vec<LineItem> {
+    let n = segs.len();
+    // n=0 saturates to 0; n>=1 gives 2n-1 slots (n segments + n-1 separators).
+    let mut items = Vec::with_capacity(n.saturating_mul(2).saturating_sub(1));
+    for (i, seg) in segs.into_iter().enumerate() {
+        items.push(LineItem::Segment(seg));
+        if i + 1 < n {
+            items.push(LineItem::Separator(sep.clone()));
+        }
+    }
+    items
 }
 
 /// Build a segment list from an optional [`Config`](config::Config).
@@ -50,7 +65,7 @@ pub fn build_segments(
     config: Option<&config::Config>,
     plugins: Option<(PluginRegistry, Arc<Engine>)>,
     mut warn: impl FnMut(&str),
-) -> Vec<Box<dyn Segment>> {
+) -> Vec<LineItem> {
     let configured_line = config.and_then(|c| c.line.as_ref());
     let layout_mode = config.map(|c| c.layout).unwrap_or_default();
 
@@ -133,7 +148,7 @@ pub fn build_lines(
     config: Option<&config::Config>,
     plugins: Option<(PluginRegistry, Arc<Engine>)>,
     mut warn: impl FnMut(&str),
-) -> Vec<Vec<Box<dyn Segment>>> {
+) -> Vec<Vec<LineItem>> {
     let mode = config.map(|c| c.layout).unwrap_or_default();
     let line_cfg = config.and_then(|c| c.line.as_ref());
 
@@ -212,9 +227,10 @@ fn build_one_line(
     consumed_plugins: &mut std::collections::HashSet<String>,
     layout_separator: &Separator,
     warn: &mut impl FnMut(&str),
-) -> Vec<Box<dyn Segment>> {
+) -> Vec<LineItem> {
     let mut seen = std::collections::HashSet::<String>::new();
-    ids.iter()
+    let segs: Vec<Box<dyn Segment>> = ids
+        .iter()
         .filter_map(|&id| {
             if !seen.insert(id.to_string()) {
                 warn(&format!(
@@ -255,8 +271,8 @@ fn build_one_line(
                 }
                 None
             })?;
-            let with_per_segment = apply_override(id, inner, cfg_override, warn);
-            Some(apply_layout_separator(with_per_segment, layout_separator))
+            Some(apply_override(id, inner, cfg_override, warn))
         })
-        .collect()
+        .collect();
+    interleave_separators(segs, layout_separator)
 }

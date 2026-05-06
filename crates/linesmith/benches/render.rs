@@ -97,13 +97,27 @@ fn fixture_repo() -> &'static std::path::Path {
 /// landing with an id pattern `all_no_usage_ids`'s name-coupled
 /// filter doesn't match (which would silently route the
 /// Keychain + JSONL + OAuth cascade into measurements).
-fn build_named_segments(ids: &[&str], name: &str, forbid_usage: bool) -> Vec<Box<dyn Segment>> {
+fn build_named_segments(
+    ids: &[&str],
+    name: &str,
+    forbid_usage: bool,
+) -> Vec<linesmith_core::segments::LineItem> {
+    use linesmith_core::segments::LineItem;
     let cfg = build_config(ids, name);
     let mut warnings: Vec<String> = Vec::new();
-    let segs = linesmith_core::build_segments(Some(&cfg), None, |w| warnings.push(w.to_string()));
+    let items = linesmith_core::build_segments(Some(&cfg), None, |w| warnings.push(w.to_string()));
     if !warnings.is_empty() {
         panic!("bench '{name}' build_segments emitted warnings: {warnings:?}");
     }
+    // `LineItem` is `#[non_exhaustive]`, so the wildcard covers both
+    // `Separator` and any future non-segment variant.
+    let segs: Vec<&dyn Segment> = items
+        .iter()
+        .filter_map(|i| match i {
+            LineItem::Segment(s) => Some(s.as_ref()),
+            _ => None,
+        })
+        .collect();
     if segs.len() != ids.len() {
         panic!(
             "bench '{name}' built {} segments but requested {}: ids={:?}",
@@ -122,7 +136,7 @@ fn build_named_segments(ids: &[&str], name: &str, forbid_usage: bool) -> Vec<Box
             }
         }
     }
-    segs
+    items
 }
 
 fn build_config(ids: &[&str], name: &str) -> linesmith_core::config::Config {
@@ -153,7 +167,7 @@ fn run_context(cwd: std::path::PathBuf) -> RunContext<'static> {
 /// which keeps the optimizer from eliminating any upstream
 /// `Write::write_all` calls.
 fn render_once(
-    segments: &[Box<dyn Segment>],
+    items: &[linesmith_core::segments::LineItem],
     payload: &[u8],
     ctx: &RunContext<'_>,
     sink: &mut Vec<u8>,
@@ -165,7 +179,7 @@ fn render_once(
         Cursor::new(payload),
         &mut *sink,
         &mut stderr_sink,
-        segments,
+        items,
         ctx,
     )
     .unwrap_or_else(|e| {

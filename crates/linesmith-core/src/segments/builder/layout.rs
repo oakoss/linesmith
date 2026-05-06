@@ -1,4 +1,4 @@
-use super::super::{OverriddenSegment, PowerlineWidth, Segment, Separator, DEFAULT_SEGMENT_IDS};
+use super::super::{PowerlineWidth, Separator, DEFAULT_SEGMENT_IDS};
 use crate::config;
 
 /// Resolve the single-line id list and warn on an explicitly empty
@@ -220,26 +220,5 @@ pub(super) fn validate_powerline_width(width: u16, warn: &mut impl FnMut(&str)) 
             ));
             PowerlineWidth::One
         }
-    }
-}
-
-/// Wrap the segment in [`OverriddenSegment`] so the configured
-/// separator replaces its `Space`/`Theme` default. No-op when `sep`
-/// is `Space` (the implicit default — nothing to override) or when
-/// the segment's default is anything else (`Literal`, `None`,
-/// `Powerline`) — that's an explicit segment-side choice we leave
-/// alone.
-pub(super) fn apply_layout_separator(
-    segment: Box<dyn Segment>,
-    sep: &Separator,
-) -> Box<dyn Segment> {
-    if matches!(sep, Separator::Space) {
-        return segment;
-    }
-    match segment.defaults().default_separator {
-        Separator::Space | Separator::Theme => {
-            Box::new(OverriddenSegment::new(segment).with_default_separator(sep.clone()))
-        }
-        _ => segment,
     }
 }

@@ -1,8 +1,8 @@
 # Segment System
 
 - Status: draft
-- Version: 0.6
-- Last updated: 2026-04-27
+- Version: 0.7
+- Last updated: 2026-05-05
 - Driving ADRs: [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0004](../adrs/0004-rhai-for-plugins.md), [ADR-0005](../adrs/0005-role-based-themes.md), [ADR-0008](../adrs/0008-canonical-type-refinements.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md)
 
 ## Overview
@@ -26,7 +26,8 @@ Segments know how to render themselves given a `DataContext` ([spec: data-fetchi
 - Segments render from a typed `DataContext` (which wraps `StatusContext` from [spec: input-schema](input-schema.md)) and produce styled text
 - Segments declare their data dependencies via `data_deps()` so the runtime only fetches sources that some enabled segment needs (see [spec: data-fetching](data-fetching.md))
 - Segments can return "no output" (`None`) to hide themselves (e.g. rate-limit segment hidden for API-tier users, worktree segment hidden outside a worktree)
-- Segments declare layout intent: priority (drop-order under pressure), width bounds, separator preference
+- Segments declare layout intent: priority (drop-order under pressure), width bounds, truncate-before-drop opt-in
+- Separators between segments are positional [`LineItem`](#line-items-and-separators) entries built by the layout pipeline from `[layout_options].separator`; segments don't own them
 - Segments declare a cache policy so expensive computations don't run every invocation
 - Segments can be composed: a "git group" segment may internally combine branch + dirty + ahead/behind
 - Plugin-authored segments (in rhai, per [ADR-0004](../adrs/0004-rhai-for-plugins.md)) use the same `Segment` trait as built-ins (see [`specs/plugin-api.md`](plugin-api.md) for the rhai binding details)
@@ -157,8 +158,10 @@ pub struct RenderedSegment {
     /// cluster aware, ignoring ANSI). Computed once at render time.
     pub width: u16,
 
-    /// The separator this segment prefers on its right edge. Overrides the
-    /// default separator from the theme for this boundary only.
+    /// Per-render override for the segment's right-edge separator.
+    /// Replaces the inline `LineItem::Separator` at that one boundary
+    /// when present. See §Line items and separators for the override
+    /// precedence.
     pub right_separator: Option<Separator>,
 }
 
@@ -195,10 +198,6 @@ pub struct SegmentDefaults {
     /// Width bounds, if any. Construction enforces `min <= max`.
     pub width: Option<WidthBounds>,
 
-    /// Default separator to the right of this segment. Theme or user
-    /// config can override.
-    pub default_separator: Separator,
-
     /// May this segment be truncated under width pressure before being
     /// dropped? Defaults to `false` — opt in for prose-like content
     /// (workspace name, branch name) where a partial value is more
@@ -229,12 +228,12 @@ impl Default for SegmentDefaults {
         Self {
             priority: 128,
             width: None,
-            default_separator: Separator::Space,
             truncatable: false,
         }
     }
 }
 
+#[non_exhaustive]
 pub enum Separator {
     /// Single space (default).
     Space,
@@ -243,12 +242,35 @@ pub enum Separator {
     /// Exact string. Built-in defaults can use `Cow::Borrowed` for zero-alloc;
     /// user config supplies runtime strings via `Cow::Owned`.
     Literal(Cow<'static, str>),
+    /// Powerline chevron (U+E0B0) flanked by single-space padding.
+    Powerline { width: PowerlineWidth },
     /// No separator; direct concatenation.
     None,
 }
 ```
 
 `Separator::Literal` takes `Cow<'static, str>` per [ADR-0008](../adrs/0008-canonical-type-refinements.md); built-ins stay zero-alloc (`Cow::Borrowed("…")`), user-provided config strings allocate once (`Cow::Owned`).
+
+### Line items and separators
+
+The layout pipeline takes a `Vec<LineItem>` rather than a flat segment list. A `LineItem` is either a configured segment or an inline separator between segments:
+
+```rust
+#[non_exhaustive]
+pub enum LineItem {
+    Segment(Box<dyn Segment>),
+    Separator(Separator),
+}
+```
+
+`build_segments` / `build_lines` resolve `[layout_options].separator` once and interleave it between every adjacent pair of segments. The renderer walks the list directly; there is no implicit "default separator between segments" — every gap is an explicit `LineItem::Separator` produced by the builder.
+
+**Adjacency invariants** (enforced by the layout engine — pruning happens during the collect pass; drop-with-adjacent-separator happens during the priority-drop loop):
+
+- A separator survives only when it sits between two surviving segments. Leading separators, trailing separators, and separators flanking a dropped segment are pruned.
+- When a segment drops under width pressure, the adjacent separator drops with it: the right-edge separator first, falling back to the left-edge when the dropped segment was the last in the line.
+
+**Override precedence.** `RenderedSegment::right_separator` is a plugin-facing per-render override (set via `RenderedSegment::with_separator`). When a segment's render returns it, the layout engine replaces the inline separator immediately to the segment's right with the override value. If the segment is the last in the line, or its right-edge separator has already been pruned for adjacency reasons, there is no boundary to apply to and the override is silently discarded. Built-in segments don't set runtime overrides; plugins use this slot to vary their right edge per render.
 
 ### Cache policy
 
@@ -352,27 +374,31 @@ stdin payload → StatusContext + config
 
 ### Layout algorithm
 
-Input: list of `Option<RenderedSegment>`, each with `SegmentDefaults`, terminal width `W`.
+Input: `Vec<LineItem>` (segments interleaved with inline separators, per [Line items and separators](#line-items-and-separators)), terminal width `W`.
 
 ```text
-1. Drop all `None` entries (visibility = hidden).
-2. For each remaining, resolve effective width:
-     - If render width < width.min: drop the segment entirely.
-     - If render width > width.max: truncate with a single-cell ellipsis marker
-       (theme-provided, default "…").
-3. Compute total width = sum(segment widths) + sum(separator widths).
-4. If total <= W: render as-is.
-5. Else: priority-based reflow loop:
-     a. Find the highest-priority (numerically largest) remaining segment.
+1. Collect pass: walk LineItems, render each segment, and emit a
+   LayoutItem sequence. Segments that return `Ok(None)` or `Err(..)`
+   drop, and so does the adjacent separator (per the adjacency
+   invariants). Width-bounds: if render width < width.min the segment
+   drops; if render width > width.max it's truncated with a single-cell
+   ellipsis marker (theme-provided, default "…"). Plugin per-render
+   `right_separator` overrides are applied here, replacing the inline
+   separator immediately to the segment's right.
+2. Compute total width = sum of every surviving LayoutItem's width.
+3. If total <= W: render as-is.
+4. Else: priority-based reflow loop:
+     a. Find the highest-priority (numerically largest) segment slot.
         If only priority-0 segments remain, stop.
      b. Compute `overflow = total - W` and `target = cur_width - overflow`.
      c. Call `segment.shrink_to_fit(ctx, rc, target)`. If it returns
         `Some(r)` where `r.width` lies in `[width.min, target]` (the
         configured `width.min` floor, default `0`, is honored the
-        same way `apply_width_bounds` honors it), replace the segment
-        with `r` and recompute total. Segment-side intelligence runs
-        first because the segment knows things the engine doesn't
-        (which decoration to shed, which prefix is signal-bearing).
+        same way `apply_width_bounds` honors it), replace the segment's
+        rendered output with `r` and recompute total. Segment-side
+        intelligence runs first because the segment knows things the
+        engine doesn't (which decoration to shed, which prefix is
+        signal-bearing).
      d. Else, if the chosen segment declares `truncatable = true`,
         attempt to shrink it to `target` cells via end-ellipsis
         truncation. The shrunk width must be at least `floor`, which
@@ -380,11 +406,14 @@ Input: list of `Option<RenderedSegment>`, each with `SegmentDefaults`, terminal 
         content cell plus the ellipsis); a declared `width.min` below
         `2` is clamped up. If feasible, replace and recompute total.
      e. Else (no compact form, no end-ellipsis, or end-ellipsis would
-        fall below `floor`) drop the segment outright.
+        fall below `floor`) drop the segment outright. Drop the
+        adjacent separator with it (right-edge first, left-edge
+        fallback when the segment was last in the line).
      f. Recompute total width.
      g. Repeat until total <= W or only priority-0 segments remain.
-6. Emit: for each remaining segment, write its runs, then its right-separator
-   (either segment-declared override or theme default), to stdout.
+5. Emit: walk the surviving LayoutItems and write each one's runs to
+   stdout. `Separator::None` (text == "") is filtered out so consumers
+   don't see empty-text runs.
 ```
 
 Priority-0 segments are never dropped or truncated by the reflow loop. If total width still exceeds `W` after all droppable segments are removed, render anyway (terminal wraps or truncates visually; worse UX than hiding, but priority-0 means "user said don't drop this").
@@ -506,7 +535,6 @@ Fixtures: lists of `(SegmentId, width, priority)` tuples.
 
 ## Open questions
 
-- **Separator ownership**: should segments declare `right_separator` or should the layout engine own all separators via theme config? Current design: segments can _prefer_, layout engine applies theme default otherwise. Revisit if this produces inconsistent visuals.
 - **Async segments in v0.1?** The matrix defers async prefetch to v0.2+. For v0.1 all renders are sync; any segment needing network I/O (rate-limit scraping) must cache aggressively to stay within budget.
 - **Cache key model**: per-segment cache keys vs. a shared invalidation store. Current design: per-file with invalidators declared in `CachePolicy`. Simpler; may not scale.
 - **Panic policy**: catch-and-continue vs. fail-loud in debug builds. Current design: always catch (statusline must never crash the user's terminal). Revisit if users report silent failures as confusing.
@@ -522,3 +550,4 @@ Fixtures: lists of `(SegmentId, width, priority)` tuples.
 - 2026-04-27: v0.4. Adds `SegmentDefaults.truncatable` opt-in (default `false`); under width pressure the layout engine shrinks `truncatable` segments to `(cur_width - overflow)` cells before dropping, with a floor of `max(width.min, 2)`. `workspace` opts in. Numeric segments stay opt-out so end-ellipsis truncation never produces a wrong number.
 - 2026-04-27: v0.5. Render signature gains `&RenderContext` as a second argument: `fn render(&self, ctx: &DataContext, rc: &RenderContext) -> RenderResult`. The new struct carries `terminal_width` today and is `#[non_exhaustive]` for additive growth (line index, capability, neighbor info). Segments that don't care about layout state ignore the argument; width-aware segments read `rc.terminal_width` to ladder their own output before the engine's reflow pass runs. Rendering pipeline diagram updated to show the per-render `RenderContext` build step.
 - 2026-04-27: v0.6. Adds `Segment::shrink_to_fit(&self, ctx, rc, target) -> Option<RenderedSegment>`. The reflow loop now calls it before falling back to `truncatable` end-ellipsis or drop, letting structured-tail segments (`git_branch`'s `* ↑2 ↓1`) shed decoration while keeping the signal-bearing prefix under layout pressure — not just under terminal narrowness. Default impl returns `None` (current behavior preserved); `git_branch` overrides to suppress its dirty + ahead/behind markers when `target` is below the full-assembly width.
+- 2026-05-05: v0.7. Separator-as-item refactor. Separators are now positional `LineItem::Separator` entries the builder produces from `[layout_options].separator`, not a `default_separator` field on `SegmentDefaults`. Strikes that field, the `with_default_separator` chainable, and the `apply_layout_separator` helper. The plugin per-render override path (`RenderedSegment::with_separator`) stays and beats the inline separator at that one boundary. Resolves the prior §Open questions "Separator ownership" item: the layout owns separators authoritatively. Drop logic now removes the adjacent separator with the segment (right-edge first, left-edge fallback when the segment was last in the line).

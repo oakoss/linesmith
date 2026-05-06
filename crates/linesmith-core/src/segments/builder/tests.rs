@@ -8,33 +8,95 @@ use std::str::FromStr;
 use linesmith_plugin::PluginRegistry;
 
 use crate::segments::{
-    self, built_in_by_id, PowerlineWidth, Segment, Separator, WidthBounds, BUILT_IN_SEGMENT_IDS,
-    DEFAULT_SEGMENT_IDS,
+    self, built_in_by_id, LineItem, PowerlineWidth, Segment, Separator, WidthBounds,
+    BUILT_IN_SEGMENT_IDS, DEFAULT_SEGMENT_IDS,
 };
 use crate::{config, input, theme};
 
-fn built(cfg: Option<&config::Config>) -> Vec<Box<dyn Segment>> {
+fn built(cfg: Option<&config::Config>) -> Vec<LineItem> {
     build_segments(cfg, None, |_| {})
 }
 
-fn built_with_warns(cfg: Option<&config::Config>) -> (Vec<Box<dyn Segment>>, Vec<String>) {
+fn built_with_warns(cfg: Option<&config::Config>) -> (Vec<LineItem>, Vec<String>) {
     let mut warns = Vec::new();
-    let segs = build_segments(cfg, None, |m| warns.push(m.to_string()));
-    (segs, warns)
+    let items = build_segments(cfg, None, |m| warns.push(m.to_string()));
+    (items, warns)
+}
+
+/// Number of `LineItem::Segment` slots. Tests that previously
+/// asserted on `built(...).len()` use this to ignore the inline
+/// separators the builder now interleaves.
+fn segment_count(items: &[LineItem]) -> usize {
+    items
+        .iter()
+        .filter(|i| matches!(i, LineItem::Segment(_)))
+        .count()
+}
+
+/// The Nth `LineItem::Segment` (skipping separators). Panics with
+/// a descriptive message when there are fewer than `n + 1` segments.
+#[track_caller]
+fn nth_segment(items: &[LineItem], n: usize) -> &dyn Segment {
+    items
+        .iter()
+        .filter_map(|i| match i {
+            LineItem::Segment(s) => Some(s.as_ref()),
+            LineItem::Separator(_) => None,
+        })
+        .nth(n)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected at least {} segments, got {}",
+                n + 1,
+                segment_count(items)
+            )
+        })
+}
+
+/// Resolved global separator the builder laid down between adjacent
+/// segments. Returns the first inline `LineItem::Separator`'s value;
+/// returns `None` for lines with fewer than two segments. All inline
+/// separators in a single-line build are equal (the resolved
+/// `[layout_options].separator`), so checking the first is sufficient.
+fn first_inline_separator(items: &[LineItem]) -> Option<&Separator> {
+    items.iter().find_map(|i| match i {
+        LineItem::Separator(s) => Some(s),
+        LineItem::Segment(_) => None,
+    })
+}
+
+/// Build a config with two segments and the supplied `[layout_options]
+/// .separator` value, then return the inline separator the builder
+/// laid down between them. Compresses the boilerplate of the
+/// `layout_separator_*` round-trip tests.
+fn resolve_inline_separator(separator_toml_value: &str) -> (Separator, Vec<String>) {
+    let cfg = config::Config::from_str(&format!(
+        r#"
+            [line]
+            segments = ["model", "workspace"]
+            [layout_options]
+            separator = {separator_toml_value}
+        "#,
+    ))
+    .expect("parse");
+    let (items, warns) = built_with_warns(Some(&cfg));
+    let sep = first_inline_separator(&items)
+        .expect("two-segment line must have one inline separator")
+        .clone();
+    (sep, warns)
 }
 
 #[test]
 fn build_segments_uses_default_order_when_config_missing() {
-    assert_eq!(built(None).len(), DEFAULT_SEGMENT_IDS.len());
+    assert_eq!(segment_count(&built(None)), DEFAULT_SEGMENT_IDS.len());
 }
 
 #[test]
-fn layout_separator_powerline_swaps_default_separator() {
-    // With `separator = "powerline"` configured, every segment
-    // whose built-in default is `Space` or `Theme` reports
-    // `Powerline` in `defaults().default_separator`. Pins the
-    // wholesale-swap behavior the layout engine relies on to
-    // emit chevrons between segments.
+fn layout_separator_powerline_lays_chevrons_between_segments() {
+    // With `separator = "powerline"` configured, the builder
+    // interleaves `LineItem::Separator(Powerline)` between every
+    // adjacent pair of segments — that's the only signal the
+    // layout engine needs to emit chevrons.
     let cfg = config::Config::from_str(
         r#"
             [line]
@@ -44,32 +106,20 @@ fn layout_separator_powerline_swaps_default_separator() {
         "#,
     )
     .expect("parse");
-    let segs = built(Some(&cfg));
-    for seg in &segs {
-        assert_eq!(
-            seg.defaults().default_separator,
-            Separator::powerline(),
-            "segment didn't pick up powerline separator"
-        );
-    }
+    let items = built(Some(&cfg));
+    assert_eq!(
+        first_inline_separator(&items),
+        Some(&Separator::powerline()),
+    );
 }
 
 #[test]
-fn layout_separator_space_is_passthrough() {
-    // Default `separator = "space"` (or absent) leaves segments
-    // unwrapped — no extra OverriddenSegment layer for the
-    // common case.
-    let cfg = config::Config::from_str(
-        r#"
-            [line]
-            segments = ["model"]
-            [layout_options]
-            separator = "space"
-        "#,
-    )
-    .expect("parse");
-    let segs = built(Some(&cfg));
-    assert_eq!(segs[0].defaults().default_separator, Separator::Space);
+fn layout_separator_space_is_default() {
+    // `separator = "space"` (or the implicit default when the key
+    // is absent) lays down `Separator::Space` between segments.
+    let (sep, warns) = resolve_inline_separator("\"space\"");
+    assert_eq!(sep, Separator::Space);
+    assert!(warns.is_empty());
 }
 
 #[test]
@@ -77,17 +127,8 @@ fn layout_separator_capsule_warns_and_falls_back_to_space() {
     // Capsule + flex are spec'd for v0.2+; a config file written
     // today must not error on them. Warn loudly and treat as
     // space until the v0.2 renderers land.
-    let cfg = config::Config::from_str(
-        r#"
-            [line]
-            segments = ["model"]
-            [layout_options]
-            separator = "capsule"
-        "#,
-    )
-    .expect("parse");
-    let (segs, warns) = built_with_warns(Some(&cfg));
-    assert_eq!(segs[0].defaults().default_separator, Separator::Space);
+    let (sep, warns) = resolve_inline_separator("\"capsule\"");
+    assert_eq!(sep, Separator::Space);
     assert!(
         warns
             .iter()
@@ -103,18 +144,9 @@ fn layout_separator_arbitrary_string_renders_as_literal() {
     // segments. Anything other than the reserved keywords falls
     // through to Separator::Literal preserving user input verbatim
     // (whitespace included).
-    let cfg = config::Config::from_str(
-        r#"
-            [line]
-            segments = ["model"]
-            [layout_options]
-            separator = " | "
-        "#,
-    )
-    .expect("parse");
-    let (segs, warns) = built_with_warns(Some(&cfg));
+    let (sep, warns) = resolve_inline_separator("\" | \"");
     assert_eq!(
-        segs[0].defaults().default_separator,
+        sep,
         Separator::Literal(std::borrow::Cow::Owned(" | ".to_string()))
     );
     assert!(warns.is_empty(), "no warnings on literal: {warns:?}");
@@ -125,17 +157,8 @@ fn layout_separator_empty_string_yields_none() {
     // Explicit `separator = ""` is the user saying "no separator";
     // emit nothing between segments. Distinct from absence of the
     // key (which falls through to the default Space).
-    let cfg = config::Config::from_str(
-        r#"
-            [line]
-            segments = ["model"]
-            [layout_options]
-            separator = ""
-        "#,
-    )
-    .expect("parse");
-    let (segs, warns) = built_with_warns(Some(&cfg));
-    assert_eq!(segs[0].defaults().default_separator, Separator::None);
+    let (sep, warns) = resolve_inline_separator("\"\"");
+    assert_eq!(sep, Separator::None);
     assert!(
         warns.is_empty(),
         "empty string is a valid choice: {warns:?}"
@@ -145,81 +168,7 @@ fn layout_separator_empty_string_yields_none() {
 #[test]
 fn build_segments_empty_config_falls_back_to_defaults() {
     let cfg = config::Config::default();
-    assert_eq!(built(Some(&cfg)).len(), DEFAULT_SEGMENT_IDS.len());
-}
-
-#[test]
-fn layout_separator_preserves_segment_literal_default() {
-    // Forward-compat pin: a segment whose built-in default is
-    // `Literal(...)` keeps its declared boundary even under
-    // `[layout_options].separator = "powerline"`. No segment uses
-    // Literal today; this protects the contract for ones that will.
-    struct PipeSeg;
-    impl segments::Segment for PipeSeg {
-        fn render(
-            &self,
-            _: &crate::data_context::DataContext,
-            _: &segments::RenderContext,
-        ) -> segments::RenderResult {
-            Ok(Some(segments::RenderedSegment::new("x")))
-        }
-        fn defaults(&self) -> segments::SegmentDefaults {
-            segments::SegmentDefaults::with_priority(0)
-                .with_default_separator(Separator::Literal(std::borrow::Cow::Borrowed(" | ")))
-        }
-    }
-    let wrapped = apply_layout_separator(Box::new(PipeSeg), &Separator::powerline());
-    assert_eq!(
-        wrapped.defaults().default_separator,
-        Separator::Literal(std::borrow::Cow::Borrowed(" | ")),
-    );
-}
-
-#[test]
-fn layout_separator_preserves_segment_none_default() {
-    // Same forward-compat pin for `Separator::None` — a segment
-    // that explicitly suppresses its right-edge separator must
-    // keep that suppression even when the user configures
-    // powerline.
-    struct NoSepSeg;
-    impl segments::Segment for NoSepSeg {
-        fn render(
-            &self,
-            _: &crate::data_context::DataContext,
-            _: &segments::RenderContext,
-        ) -> segments::RenderResult {
-            Ok(Some(segments::RenderedSegment::new("x")))
-        }
-        fn defaults(&self) -> segments::SegmentDefaults {
-            segments::SegmentDefaults::with_priority(0).with_default_separator(Separator::None)
-        }
-    }
-    let wrapped = apply_layout_separator(Box::new(NoSepSeg), &Separator::powerline());
-    assert_eq!(wrapped.defaults().default_separator, Separator::None);
-}
-
-#[test]
-fn layout_separator_does_not_double_wrap_when_default_already_powerline() {
-    // A segment whose built-in default is already `Powerline`
-    // falls through the `_` arm of the match — no wrap layer
-    // added. Pins the contract for any future segment that
-    // declares `Powerline` directly.
-    struct PowerlineSeg;
-    impl segments::Segment for PowerlineSeg {
-        fn render(
-            &self,
-            _: &crate::data_context::DataContext,
-            _: &segments::RenderContext,
-        ) -> segments::RenderResult {
-            Ok(Some(segments::RenderedSegment::new("x")))
-        }
-        fn defaults(&self) -> segments::SegmentDefaults {
-            segments::SegmentDefaults::with_priority(0)
-                .with_default_separator(Separator::powerline())
-        }
-    }
-    let wrapped = apply_layout_separator(Box::new(PowerlineSeg), &Separator::powerline());
-    assert_eq!(wrapped.defaults().default_separator, Separator::powerline());
+    assert_eq!(segment_count(&built(Some(&cfg))), DEFAULT_SEGMENT_IDS.len());
 }
 
 #[test]
@@ -287,53 +236,14 @@ fn layout_separator_typo_renders_as_literal_not_warn() {
 }
 
 #[test]
-fn layout_separator_powerline_overrides_runtime_right_separator() {
-    // `apply_layout_separator` only swaps `default_separator`, but
-    // `effective_separator()` prefers a per-render `right_separator`
-    // set via `RenderedSegment::with_separator`. Plugin segments
-    // that return `right_separator: Some(Space)` would otherwise
-    // bypass the global layout-options separator; `OverriddenSegment`
-    // therefore rewrites `right_separator` on render output too.
-    struct RuntimeSpaceSeg;
-    impl segments::Segment for RuntimeSpaceSeg {
-        fn render(
-            &self,
-            _: &crate::data_context::DataContext,
-            _: &segments::RenderContext,
-        ) -> segments::RenderResult {
-            Ok(Some(segments::RenderedSegment::with_separator(
-                "x",
-                Separator::Space,
-            )))
-        }
-        fn defaults(&self) -> segments::SegmentDefaults {
-            segments::SegmentDefaults::with_priority(0)
-        }
-    }
-    let layout_sep = parse_layout_separator("powerline", PowerlineWidth::One, &mut |_| {});
-    let wrapped = apply_layout_separator(Box::new(RuntimeSpaceSeg), &layout_sep);
-    let rendered = wrapped
-        .render(&stub_ctx(), &stub_rc())
-        .unwrap()
-        .expect("rendered");
-    assert_eq!(
-        rendered.right_separator(),
-        Some(&Separator::powerline()),
-        "layout-options separator must override runtime Space"
-    );
-}
-
-#[test]
-fn plugin_runtime_space_emits_chevron_through_render_with_warn() {
-    // End-to-end pin for the original Codex regression. The
-    // struct-level override test above proves the rendered struct
-    // carries the right separator; this test follows that through
-    // the full layout + emit pipeline. A future refactor that
-    // bypasses `OverriddenSegment::render` (e.g., a fast path
-    // pulling `defaults().default_separator` directly) would still
-    // pass the struct-level test but emit a Space here.
-    struct RuntimeSpaceSeg(&'static str);
-    impl segments::Segment for RuntimeSpaceSeg {
+fn plugin_runtime_separator_override_replaces_inline_separator() {
+    // End-to-end pin: with `[layout_options].separator = "powerline"`
+    // laying down chevrons, a segment that returns
+    // `RenderedSegment::with_separator(text, Separator::None)`
+    // suppresses the chevron at its right edge. The plugin per-
+    // render override beats the inline (config-time) separator.
+    struct OverrideNoneSeg(&'static str);
+    impl segments::Segment for OverrideNoneSeg {
         fn render(
             &self,
             _: &crate::data_context::DataContext,
@@ -341,20 +251,20 @@ fn plugin_runtime_space_emits_chevron_through_render_with_warn() {
         ) -> segments::RenderResult {
             Ok(Some(segments::RenderedSegment::with_separator(
                 self.0,
-                Separator::Space,
+                Separator::None,
             )))
         }
         fn defaults(&self) -> segments::SegmentDefaults {
             segments::SegmentDefaults::with_priority(0)
         }
     }
-    let layout_sep = parse_layout_separator("powerline", PowerlineWidth::One, &mut |_| {});
-    let segs: Vec<Box<dyn segments::Segment>> = vec![
-        apply_layout_separator(Box::new(RuntimeSpaceSeg("a")), &layout_sep),
-        apply_layout_separator(Box::new(RuntimeSpaceSeg("b")), &layout_sep),
+    let items: Vec<LineItem> = vec![
+        LineItem::Segment(Box::new(OverrideNoneSeg("a"))),
+        LineItem::Separator(Separator::powerline()),
+        LineItem::Segment(Box::new(OverrideNoneSeg("b"))),
     ];
     let line = crate::layout::render_with_warn(
-        &segs,
+        &items,
         &stub_ctx(),
         100,
         &mut |_| {},
@@ -362,28 +272,28 @@ fn plugin_runtime_space_emits_chevron_through_render_with_warn() {
         theme::Capability::None,
         false,
     );
-    assert!(line.contains(" \u{E0B0} "), "chevron in output: {line:?}");
-    assert!(
-        !line.contains("a b"),
-        "Space should not survive between a and b: {line:?}"
-    );
+    // Chevron suppressed by the runtime override; "ab" emits with
+    // no glyph between.
+    assert_eq!(line, "ab");
 }
 
 #[test]
-fn layout_separator_powerline_preserves_runtime_literal_right_separator() {
-    // Companion pin to the override test above: a per-render
-    // Literal `right_separator` is the segment saying "I picked
-    // this exactly" — layout-options separator must NOT clobber.
-    // Same Literal/None preservation as default_separator.
-    struct RuntimePipeSeg;
-    impl segments::Segment for RuntimePipeSeg {
+fn plugin_runtime_literal_override_replaces_inline_powerline() {
+    // Inverse-direction precedence pin (deleted v0.6 test
+    // `layout_separator_powerline_preserves_runtime_literal_right_separator`
+    // covered this against the legacy default-separator field; the
+    // new architecture must hold the same contract). A plugin
+    // returning `right_separator: Some(Literal(" | "))` replaces the
+    // inline Powerline with the literal at that one boundary.
+    struct OverrideLiteralSeg(&'static str);
+    impl segments::Segment for OverrideLiteralSeg {
         fn render(
             &self,
             _: &crate::data_context::DataContext,
             _: &segments::RenderContext,
         ) -> segments::RenderResult {
             Ok(Some(segments::RenderedSegment::with_separator(
-                "x",
+                self.0,
                 Separator::Literal(std::borrow::Cow::Borrowed(" | ")),
             )))
         }
@@ -391,16 +301,174 @@ fn layout_separator_powerline_preserves_runtime_literal_right_separator() {
             segments::SegmentDefaults::with_priority(0)
         }
     }
-    let layout_sep = parse_layout_separator("powerline", PowerlineWidth::One, &mut |_| {});
-    let wrapped = apply_layout_separator(Box::new(RuntimePipeSeg), &layout_sep);
-    let rendered = wrapped
-        .render(&stub_ctx(), &stub_rc())
-        .unwrap()
-        .expect("rendered");
-    assert_eq!(
-        rendered.right_separator(),
-        Some(&Separator::Literal(std::borrow::Cow::Borrowed(" | ")))
+    let items: Vec<LineItem> = vec![
+        LineItem::Segment(Box::new(OverrideLiteralSeg("a"))),
+        LineItem::Separator(Separator::powerline()),
+        LineItem::Segment(Box::new(OverrideLiteralSeg("b"))),
+    ];
+    let line = crate::layout::render_with_warn(
+        &items,
+        &stub_ctx(),
+        100,
+        &mut |_| {},
+        theme::default_theme(),
+        theme::Capability::None,
+        false,
     );
+    assert_eq!(line, "a | b");
+}
+
+#[test]
+fn plugin_runtime_override_on_last_segment_is_silently_discarded() {
+    // Spec contract: "An override on the rightmost segment ... has
+    // no boundary to apply to and is silently discarded." The line
+    // emits the segment with no trailing chevron / glyph, exactly
+    // as if no override had been set.
+    struct OverrideNoneSeg(&'static str);
+    impl segments::Segment for OverrideNoneSeg {
+        fn render(
+            &self,
+            _: &crate::data_context::DataContext,
+            _: &segments::RenderContext,
+        ) -> segments::RenderResult {
+            Ok(Some(segments::RenderedSegment::with_separator(
+                self.0,
+                Separator::powerline(),
+            )))
+        }
+        fn defaults(&self) -> segments::SegmentDefaults {
+            segments::SegmentDefaults::with_priority(0)
+        }
+    }
+    // Single-segment line — no inline-separator slot to the right.
+    let items: Vec<LineItem> = vec![LineItem::Segment(Box::new(OverrideNoneSeg("a")))];
+    let line = crate::layout::render_with_warn(
+        &items,
+        &stub_ctx(),
+        100,
+        &mut |_| {},
+        theme::default_theme(),
+        theme::Capability::None,
+        false,
+    );
+    assert_eq!(line, "a");
+}
+
+#[test]
+fn plugin_compact_form_separator_override_wins_over_pre_shrink_inline() {
+    // Codex-flagged regression: when `shrink_to_fit` returns a
+    // compact `RenderedSegment` whose `right_separator` differs
+    // from the full render, `apply_layout` must propagate the new
+    // override to the adjacent inline separator. Without the
+    // post-shrink re-application, the line would emit the stale
+    // pre-shrink value.
+    //
+    // Shape: full render carries `Some(Powerline)`; compact form
+    // carries `Some(None)` (suppress the chevron once compacted).
+    // Layout pressure forces shrink; the inline Powerline must
+    // become None.
+    struct ChevronUnlessCompactSeg;
+    impl segments::Segment for ChevronUnlessCompactSeg {
+        fn render(
+            &self,
+            _: &crate::data_context::DataContext,
+            _: &segments::RenderContext,
+        ) -> segments::RenderResult {
+            Ok(Some(segments::RenderedSegment::with_separator(
+                "longprefix-with-tail",
+                Separator::powerline(),
+            )))
+        }
+        fn shrink_to_fit(
+            &self,
+            _: &crate::data_context::DataContext,
+            _: &segments::RenderContext,
+            target: u16,
+        ) -> Option<segments::RenderedSegment> {
+            let r = segments::RenderedSegment::with_separator("compact", Separator::None);
+            (r.width() <= target).then_some(r)
+        }
+        fn defaults(&self) -> segments::SegmentDefaults {
+            segments::SegmentDefaults::with_priority(200)
+        }
+    }
+    struct AnchorSeg;
+    impl segments::Segment for AnchorSeg {
+        fn render(
+            &self,
+            _: &crate::data_context::DataContext,
+            _: &segments::RenderContext,
+        ) -> segments::RenderResult {
+            Ok(Some(segments::RenderedSegment::new("X")))
+        }
+        fn defaults(&self) -> segments::SegmentDefaults {
+            segments::SegmentDefaults::with_priority(0)
+        }
+    }
+    let items: Vec<LineItem> = vec![
+        LineItem::Segment(Box::new(ChevronUnlessCompactSeg)),
+        LineItem::Separator(Separator::powerline()),
+        LineItem::Segment(Box::new(AnchorSeg)),
+    ];
+    // Full assembly: 20 + 3 + 1 = 24 cells. Budget 11 forces shrink.
+    // Compact: 7 cells; with the override propagated, the
+    // separator goes to None: 7 + 0 + 1 = 8 cells.
+    let line = crate::layout::render_with_warn(
+        &items,
+        &stub_ctx(),
+        11,
+        &mut |_| {},
+        theme::default_theme(),
+        theme::Capability::None,
+        false,
+    );
+    // Pin: no chevron in the line (override suppressed it), and
+    // the compact text + anchor are concatenated with no gap.
+    assert!(
+        !line.contains('\u{E0B0}'),
+        "chevron must be suppressed: {line:?}"
+    );
+    assert_eq!(line, "compactX");
+}
+
+#[test]
+fn user_constructed_adjacent_separators_drop_second() {
+    // `LineItem` is `pub` + `#[non_exhaustive]`; external callers
+    // can build `Vec<LineItem>` by hand and produce shapes the
+    // builder never emits. Two consecutive `Separator` items with
+    // no segment between them is one such shape; the second drops
+    // because `collect_items_with` only pushes a separator when
+    // the previously-pushed item is a Segment.
+    struct RawSeg(&'static str);
+    impl segments::Segment for RawSeg {
+        fn render(
+            &self,
+            _: &crate::data_context::DataContext,
+            _: &segments::RenderContext,
+        ) -> segments::RenderResult {
+            Ok(Some(segments::RenderedSegment::new(self.0)))
+        }
+        fn defaults(&self) -> segments::SegmentDefaults {
+            segments::SegmentDefaults::with_priority(0)
+        }
+    }
+    let items: Vec<LineItem> = vec![
+        LineItem::Segment(Box::new(RawSeg("a"))),
+        LineItem::Separator(Separator::Literal(std::borrow::Cow::Borrowed(" | "))),
+        LineItem::Separator(Separator::Literal(std::borrow::Cow::Borrowed(" - "))),
+        LineItem::Segment(Box::new(RawSeg("b"))),
+    ];
+    let line = crate::layout::render_with_warn(
+        &items,
+        &stub_ctx(),
+        100,
+        &mut |_| {},
+        theme::default_theme(),
+        theme::Capability::None,
+        false,
+    );
+    // Only the first separator survives; the second is dropped.
+    assert_eq!(line, "a | b");
 }
 
 fn stub_ctx() -> crate::data_context::DataContext {
@@ -427,10 +495,6 @@ fn stub_ctx() -> crate::data_context::DataContext {
     })
 }
 
-fn stub_rc() -> segments::RenderContext {
-    segments::RenderContext::new(80)
-}
-
 #[test]
 fn layout_separator_pipe_literal_no_warning() {
     // Direct parser-level test for the `|` shorthand ccstatusline
@@ -452,9 +516,7 @@ fn layout_separator_single_space_renders_as_literal_not_keyword() {
     // user-visible distinction: the bypass at the top of the
     // parser short-circuits truly-empty inputs *before* trim, so
     // a single space falls into the literal arm. `Literal(" ")`
-    // and `Space` render identically but flow through different
-    // wrap policies in apply_layout_separator (Literal preserves
-    // segment-side defaults; Space is a no-op).
+    // and `Space` render identically.
     let mut warns = Vec::new();
     let mut warn = |m: &str| warns.push(m.to_string());
     assert_eq!(
@@ -468,53 +530,7 @@ fn layout_separator_single_space_renders_as_literal_not_keyword() {
 }
 
 #[test]
-fn apply_layout_separator_wraps_when_configured_literal_replaces_space_default() {
-    // Configured `Literal(" | ")` against a segment whose default
-    // is `Space` must wrap so the literal reaches the layout engine.
-    struct SpaceDefaultSeg;
-    impl segments::Segment for SpaceDefaultSeg {
-        fn render(
-            &self,
-            _: &crate::data_context::DataContext,
-            _: &segments::RenderContext,
-        ) -> segments::RenderResult {
-            Ok(Some(segments::RenderedSegment::new("x")))
-        }
-        fn defaults(&self) -> segments::SegmentDefaults {
-            segments::SegmentDefaults::with_priority(0)
-        }
-    }
-    let sep = Separator::Literal(std::borrow::Cow::Owned(" | ".to_string()));
-    let wrapped = apply_layout_separator(Box::new(SpaceDefaultSeg), &sep);
-    assert_eq!(wrapped.defaults().default_separator, sep);
-}
-
-#[test]
-fn apply_layout_separator_wraps_when_configured_none_replaces_space_default() {
-    // Configured `None` (user typed `separator = ""`) against a
-    // Space-default segment must wrap so the layout engine emits
-    // no separator. The `if matches!(sep, Space)` early-return
-    // guard at the top of apply_layout_separator must NOT
-    // accidentally include None.
-    struct SpaceDefaultSeg;
-    impl segments::Segment for SpaceDefaultSeg {
-        fn render(
-            &self,
-            _: &crate::data_context::DataContext,
-            _: &segments::RenderContext,
-        ) -> segments::RenderResult {
-            Ok(Some(segments::RenderedSegment::new("x")))
-        }
-        fn defaults(&self) -> segments::SegmentDefaults {
-            segments::SegmentDefaults::with_priority(0)
-        }
-    }
-    let wrapped = apply_layout_separator(Box::new(SpaceDefaultSeg), &Separator::None);
-    assert_eq!(wrapped.defaults().default_separator, Separator::None);
-}
-
-#[test]
-fn powerline_width_2_propagates_to_separator_variant() {
+fn powerline_width_2_propagates_to_inline_separator() {
     // Pin the Codex-flagged correctness path: users on
     // 2-cell-rendering Nerd Fonts set
     // `[layout_options].powerline_width = 2`, and that width
@@ -523,19 +539,19 @@ fn powerline_width_2_propagates_to_separator_variant() {
     let cfg = config::Config::from_str(
         r#"
             [line]
-            segments = ["model"]
+            segments = ["model", "workspace"]
             [layout_options]
             separator = "powerline"
             powerline_width = 2
         "#,
     )
     .expect("parse");
-    let segs = built(Some(&cfg));
+    let items = built(Some(&cfg));
     assert_eq!(
-        segs[0].defaults().default_separator,
-        Separator::Powerline {
+        first_inline_separator(&items),
+        Some(&Separator::Powerline {
             width: PowerlineWidth::Two,
-        }
+        }),
     );
 }
 
@@ -543,17 +559,8 @@ fn powerline_width_2_propagates_to_separator_variant() {
 fn powerline_width_default_is_1_when_unset() {
     // Absent `powerline_width` means 1 — the most-common Nerd Font
     // size + standard terminal combination.
-    let cfg = config::Config::from_str(
-        r#"
-            [line]
-            segments = ["model"]
-            [layout_options]
-            separator = "powerline"
-        "#,
-    )
-    .expect("parse");
-    let segs = built(Some(&cfg));
-    assert_eq!(segs[0].defaults().default_separator, Separator::powerline(),);
+    let (sep, _) = resolve_inline_separator("\"powerline\"");
+    assert_eq!(sep, Separator::powerline());
 }
 
 #[test]
@@ -564,15 +571,18 @@ fn powerline_width_invalid_warns_and_falls_back_to_1() {
     let cfg = config::Config::from_str(
         r#"
             [line]
-            segments = ["model"]
+            segments = ["model", "workspace"]
             [layout_options]
             separator = "powerline"
             powerline_width = 3
         "#,
     )
     .expect("parse");
-    let (segs, warns) = built_with_warns(Some(&cfg));
-    assert_eq!(segs[0].defaults().default_separator, Separator::powerline());
+    let (items, warns) = built_with_warns(Some(&cfg));
+    assert_eq!(
+        first_inline_separator(&items),
+        Some(&Separator::powerline())
+    );
     assert!(
         warns
             .iter()
@@ -624,12 +634,12 @@ fn layout_separator_absent_section_resolves_to_space() {
     let cfg = config::Config::from_str(
         r#"
             [line]
-            segments = ["model"]
+            segments = ["model", "workspace"]
         "#,
     )
     .expect("parse");
-    let segs = built(Some(&cfg));
-    assert_eq!(segs[0].defaults().default_separator, Separator::Space);
+    let items = built(Some(&cfg));
+    assert_eq!(first_inline_separator(&items), Some(&Separator::Space));
 }
 
 #[test]
@@ -644,9 +654,9 @@ fn build_segments_uses_configured_line_order() {
     let got = built(Some(&cfg));
     // Compare by default priority since we can't name-check dyn
     // Segments directly.
-    assert_eq!(got.len(), 2);
-    assert_eq!(got[0].defaults().priority, 16); // workspace
-    assert_eq!(got[1].defaults().priority, 64); // model
+    assert_eq!(segment_count(&got), 2);
+    assert_eq!(nth_segment(&got, 0).defaults().priority, 16); // workspace
+    assert_eq!(nth_segment(&got, 1).defaults().priority, 64); // model
 }
 
 #[test]
@@ -661,7 +671,7 @@ fn build_segments_applies_priority_override() {
     )
     .expect("parse");
     let got = built(Some(&cfg));
-    assert_eq!(got[0].defaults().priority, 0);
+    assert_eq!(nth_segment(&got, 0).defaults().priority, 0);
 }
 
 #[test]
@@ -677,7 +687,7 @@ fn build_segments_applies_width_override() {
     )
     .expect("parse");
     let got = built(Some(&cfg));
-    let bounds = got[0].defaults().width.expect("width set");
+    let bounds = nth_segment(&got, 0).defaults().width.expect("width set");
     assert_eq!(bounds.min(), 5);
     assert_eq!(bounds.max(), 30);
 }
@@ -693,7 +703,7 @@ fn build_segments_skips_unknown_ids_and_warns() {
     .expect("parse");
     let mut warnings = Vec::new();
     let got = build_segments(Some(&cfg), None, |msg| warnings.push(msg.to_string()));
-    assert_eq!(got.len(), 2);
+    assert_eq!(segment_count(&got), 2);
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].contains("does_not_exist"));
 }
@@ -709,7 +719,7 @@ fn build_segments_dedupes_duplicates_with_warning() {
     .expect("parse");
     let mut warnings = Vec::new();
     let got = build_segments(Some(&cfg), None, |msg| warnings.push(msg.to_string()));
-    assert_eq!(got.len(), 2); // one model, one workspace
+    assert_eq!(segment_count(&got), 2); // one model, one workspace
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].contains("model"));
     assert!(warnings[0].contains("more than once"));
@@ -745,8 +755,8 @@ fn build_segments_warns_on_inverted_width_bounds() {
     .expect("parse");
     let mut warnings = Vec::new();
     let got = build_segments(Some(&cfg), None, |msg| warnings.push(msg.to_string()));
-    assert_eq!(got.len(), 1);
-    assert_eq!(got[0].defaults().width, None);
+    assert_eq!(segment_count(&got), 1);
+    assert_eq!(nth_segment(&got, 0).defaults().width, None);
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].contains("min"));
     assert!(warnings[0].contains("max"));
@@ -854,7 +864,7 @@ fn style_override_replaces_segment_declared_style_at_render_time() {
     )
     .expect("parse");
     let built = build_segments(Some(&cfg), None, |_| {});
-    let rendered = built[0]
+    let rendered = nth_segment(&built, 0)
         .render(&model_ctx("Claude Sonnet 4.6"), &rc())
         .expect("render ok")
         .expect("visible");
@@ -879,7 +889,7 @@ fn style_override_with_explicit_fg_populates_fg_slot() {
     )
     .expect("parse");
     let built = build_segments(Some(&cfg), None, |_| {});
-    let rendered = built[0]
+    let rendered = nth_segment(&built, 0)
         .render(&model_ctx("Claude Sonnet 4.6"), &rc())
         .expect("render ok")
         .expect("visible");
@@ -904,7 +914,7 @@ fn invalid_style_string_warns_and_leaves_segment_style_unchanged() {
     .expect("parse");
     let mut warnings = Vec::new();
     let built = build_segments(Some(&cfg), None, |m| warnings.push(m.to_string()));
-    let rendered = built[0]
+    let rendered = nth_segment(&built, 0)
         .render(&model_ctx("Claude Sonnet 4.6"), &rc())
         .expect("render ok")
         .expect("visible");
@@ -928,7 +938,7 @@ fn empty_style_string_is_noop_and_preserves_segment_declared_style() {
     )
     .expect("parse");
     let built = build_segments(Some(&cfg), None, |_| {});
-    let rendered = built[0]
+    let rendered = nth_segment(&built, 0)
         .render(&model_ctx("Claude Sonnet 4.6"), &rc())
         .expect("render ok")
         .expect("visible");
@@ -948,7 +958,7 @@ fn whitespace_only_style_string_is_noop_and_preserves_segment_declared_style() {
     )
     .expect("parse");
     let built = build_segments(Some(&cfg), None, |_| {});
-    let rendered = built[0]
+    let rendered = nth_segment(&built, 0)
         .render(&model_ctx("Claude Sonnet 4.6"), &rc())
         .expect("render ok")
         .expect("visible");
@@ -995,16 +1005,16 @@ fn plugin_id_resolves_through_build_segments() {
     )
     .expect("parse");
     let built = build_segments(Some(&cfg), Some((registry, engine)), |_| {});
-    assert_eq!(built.len(), 2);
+    assert_eq!(segment_count(&built), 2);
     // Order matches `[line].segments`: built-in `model` first,
     // plugin `my_plugin` second. `model` defaults to priority 64;
     // a plugin with no override defaults to the trait's 128.
-    assert_eq!(built[0].defaults().priority, 64);
-    assert_eq!(built[1].defaults().priority, 128);
+    assert_eq!(nth_segment(&built, 0).defaults().priority, 64);
+    assert_eq!(nth_segment(&built, 1).defaults().priority, 128);
     // The plugin's render emits a known string — pin it so a
     // wiring regression that swaps slots fails loudly.
     let dc = model_ctx("Sonnet");
-    let plugin_render = built[1]
+    let plugin_render = nth_segment(&built, 1)
         .render(&dc, &rc())
         .expect("plugin render ok")
         .expect("visible");
@@ -1030,12 +1040,18 @@ fn build_segments_falls_back_to_first_line_for_multi_line_configs() {
     .expect("parse");
     let (segs, warns) = built_with_warns(Some(&cfg));
     assert_eq!(
-        segs.len(),
+        segment_count(&segs),
         2,
         "expected line 1's two segments, got {} segs",
-        segs.len()
+        segment_count(&segs),
     );
-    let actual: Vec<u8> = segs.iter().map(|s| s.defaults().priority).collect();
+    let actual: Vec<u8> = segs
+        .iter()
+        .filter_map(|i| match i {
+            LineItem::Segment(s) => Some(s.defaults().priority),
+            LineItem::Separator(_) => None,
+        })
+        .collect();
     assert_eq!(actual, priorities_for(&["model", "workspace"]));
     assert!(
         warns
@@ -1090,9 +1106,9 @@ fn build_lines_plugin_referenced_in_two_lines_warns_specifically_on_second() {
     // Line 1 has plugin + model; line 2 only workspace (plugin
     // reuse skipped).
     assert_eq!(lines.len(), 2);
-    assert_eq!(lines[0].len(), 2, "line 1 keeps plugin + model");
+    assert_eq!(segment_count(&lines[0]), 2, "line 1 keeps plugin + model");
     assert_eq!(
-        lines[1].len(),
+        segment_count(&lines[1]),
         1,
         "line 2 drops the reused plugin, keeps workspace"
     );
@@ -1180,9 +1196,9 @@ fn plugin_receives_extra_keys_from_segments_table_as_ctx_config() {
     )
     .expect("parse");
     let built = build_segments(Some(&cfg), Some((registry, engine)), |_| {});
-    assert_eq!(built.len(), 1);
+    assert_eq!(segment_count(&built), 1);
     let dc = model_ctx("Sonnet");
-    let rendered = built[0]
+    let rendered = nth_segment(&built, 0)
         .render(&dc, &rc())
         .expect("render ok")
         .expect("visible");
@@ -1222,8 +1238,8 @@ fn built_in_id_wins_over_plugin_with_same_id() {
     // text comparison wouldn't be stable across changes there.
     // Priority 64 belongs to the built-in; the plugin would have
     // the trait default of 128.
-    assert_eq!(built.len(), 1);
-    assert_eq!(built[0].defaults().priority, 64);
+    assert_eq!(segment_count(&built), 1);
+    assert_eq!(nth_segment(&built, 0).defaults().priority, 64);
 }
 
 #[test]
@@ -1240,19 +1256,32 @@ fn build_segments_forward_compat_keys_dont_break_parsing() {
         "#,
     )
     .expect("parse");
-    assert_eq!(built(Some(&cfg)).len(), 1);
+    assert_eq!(segment_count(&built(Some(&cfg))), 1);
 }
 
 // --- build_lines (multi-line layout) ---
 
-fn lines(cfg: Option<&config::Config>) -> Vec<Vec<Box<dyn Segment>>> {
+fn lines(cfg: Option<&config::Config>) -> Vec<Vec<LineItem>> {
     build_lines(cfg, None, |_| {})
 }
 
-fn lines_with_warns(cfg: Option<&config::Config>) -> (Vec<Vec<Box<dyn Segment>>>, Vec<String>) {
+fn lines_with_warns(cfg: Option<&config::Config>) -> (Vec<Vec<LineItem>>, Vec<String>) {
     let mut warns = Vec::new();
     let result = build_lines(cfg, None, |m| warns.push(m.to_string()));
     (result, warns)
+}
+
+/// Map each line's segment slots to the configured `[line.N]` ids
+/// by reading their priorities, using `priorities_for` (defined
+/// below) as the comparable canonical form.
+fn line_segment_priorities(items: &[LineItem]) -> Vec<u8> {
+    items
+        .iter()
+        .filter_map(|i| match i {
+            LineItem::Segment(s) => Some(s.defaults().priority),
+            LineItem::Separator(_) => None,
+        })
+        .collect()
 }
 
 /// Compare ids-per-line by mapping each id to its built-in's
@@ -1272,10 +1301,10 @@ fn priorities_for(ids: &[&str]) -> Vec<u8> {
         .collect()
 }
 
-fn priorities_per_line(built: &[Vec<Box<dyn Segment>>]) -> Vec<Vec<u8>> {
+fn priorities_per_line(built: &[Vec<LineItem>]) -> Vec<Vec<u8>> {
     built
         .iter()
-        .map(|line| line.iter().map(|s| s.defaults().priority).collect())
+        .map(|line| line_segment_priorities(line))
         .collect()
 }
 
@@ -1284,7 +1313,7 @@ fn build_lines_single_line_default_returns_one_line_with_default_segments() {
     // No config = implicit single-line with default segment list.
     let result = lines(None);
     assert_eq!(result.len(), 1);
-    assert_eq!(result[0].len(), DEFAULT_SEGMENT_IDS.len());
+    assert_eq!(segment_count(&result[0]), DEFAULT_SEGMENT_IDS.len());
 }
 
 #[test]
@@ -1563,10 +1592,14 @@ fn build_lines_consumed_plugins_threads_across_three_or_more_lines() {
     });
 
     assert_eq!(lines.len(), 3);
-    assert_eq!(lines[0].len(), 2, "line 1: plugin + model");
-    assert_eq!(lines[1].len(), 1, "line 2: plugin dropped, only workspace");
+    assert_eq!(segment_count(&lines[0]), 2, "line 1: plugin + model");
     assert_eq!(
-        lines[2].len(),
+        segment_count(&lines[1]),
+        1,
+        "line 2: plugin dropped, only workspace"
+    );
+    assert_eq!(
+        segment_count(&lines[2]),
         1,
         "line 3: plugin dropped, only context_window"
     );
@@ -1599,7 +1632,7 @@ fn build_segments_falls_back_to_line_one_even_when_top_segments_populated() {
     )
     .expect("parse");
     let (segs, _warns) = built_with_warns(Some(&cfg));
-    let actual: Vec<u8> = segs.iter().map(|s| s.defaults().priority).collect();
+    let actual = line_segment_priorities(&segs);
     assert_eq!(
         actual,
         priorities_for(&["model"]),

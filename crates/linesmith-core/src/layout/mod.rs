@@ -9,12 +9,13 @@
 
 use crate::data_context::DataContext;
 use crate::segments::{
-    text_width, RenderContext, RenderedSegment, Segment, SegmentDefaults, Separator, WidthBounds,
+    text_width, LineItem, RenderContext, RenderedSegment, Segment, SegmentDefaults, Separator,
+    WidthBounds,
 };
 use crate::theme::{self, Capability, Style, StyledRun, Theme};
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Render `segments` for `ctx` within `terminal_width` cells. Returns the
+/// Render `items` for `ctx` within `terminal_width` cells. Returns the
 /// final line without a trailing newline. Segment render errors go
 /// through [`crate::lsm_error!`] so a broken segment always surfaces,
 /// even under `LINESMITH_LOG=off` — a blank statusline with zero
@@ -22,10 +23,10 @@ use unicode_segmentation::UnicodeSegmentation;
 /// Output is unstyled (callers that want theming use
 /// [`render_with_warn`] with their own closure).
 #[must_use]
-pub fn render(segments: &[Box<dyn Segment>], ctx: &DataContext, terminal_width: u16) -> String {
+pub fn render(items: &[LineItem], ctx: &DataContext, terminal_width: u16) -> String {
     let mut warn = |msg: &str| crate::lsm_error!("{msg}");
     render_with_warn(
-        segments,
+        items,
         ctx,
         terminal_width,
         &mut warn,
@@ -52,7 +53,7 @@ pub fn render(segments: &[Box<dyn Segment>], ctx: &DataContext, terminal_width: 
 /// the TUI preview pane) call [`render_to_runs`] directly.
 #[must_use]
 pub fn render_with_warn(
-    segments: &[Box<dyn Segment>],
+    items: &[LineItem],
     ctx: &DataContext,
     terminal_width: u16,
     warn: &mut dyn FnMut(&str),
@@ -60,35 +61,35 @@ pub fn render_with_warn(
     capability: Capability,
     hyperlinks: bool,
 ) -> String {
-    let runs = render_to_runs(segments, ctx, terminal_width, warn);
+    let runs = render_to_runs(items, ctx, terminal_width, warn);
     runs_to_ansi(&runs, theme, capability, hyperlinks)
 }
 
-/// Render `segments` into a flat [`StyledRun`] sequence. One run per
-/// surviving segment, plus one run per non-empty inter-segment
-/// separator (in render order). Layout decisions — priority-drop,
+/// Render `items` into a flat [`StyledRun`] sequence. One run per
+/// surviving segment, plus one run per non-empty surviving separator
+/// (in render order). Layout decisions — priority-drop,
 /// `shrink_to_fit`, truncatable reflow, width-bound truncation —
 /// match [`render`] / [`render_with_warn`] exactly; only the emit
 /// form differs.
 ///
-/// `Separator::None` between segments contributes no run; it would
-/// be an empty-text run with no consumer use. Separator runs carry
-/// [`Style::default`]; separators inherit no styling from their
-/// flanking segments.
+/// `Separator::None` contributes no run; it would be an empty-text
+/// run with no consumer use. Separator runs carry [`Style::default`];
+/// separators inherit no styling from their flanking segments.
 ///
 /// Segment render errors and `Ok(None)` go through `warn` exactly as
 /// in the ANSI path; the run sequence reflects only segments that
-/// survived to the layout pass.
+/// survived to the layout pass, with separators surviving only
+/// between two surviving segments.
 #[must_use]
 pub fn render_to_runs(
-    segments: &[Box<dyn Segment>],
+    items: &[LineItem],
     ctx: &DataContext,
     terminal_width: u16,
     warn: &mut dyn FnMut(&str),
 ) -> Vec<StyledRun> {
     let rc = RenderContext::new(terminal_width);
-    let items = collect_items_with(segments, ctx, &rc, warn);
-    let laid_out = apply_layout(items, ctx, &rc, terminal_width);
+    let layout_items = collect_items_with(items, ctx, &rc, warn);
+    let laid_out = apply_layout(layout_items, ctx, &rc, terminal_width);
     items_to_runs(&laid_out)
 }
 
@@ -155,93 +156,207 @@ fn push_osc8_close(out: &mut String) {
     out.push_str("\x1b]8;;\x1b\\");
 }
 
-/// Rendered output paired with the defaults needed to place it (priority,
-/// separator, bounds) and a back-reference to the segment so the reflow
-/// loop can call `shrink_to_fit` without re-walking the input slice.
-/// Bundled here so drop/emit passes don't re-query the trait.
-struct Item<'a> {
+/// One slot in the post-collect layout list. `Segment` carries the
+/// rendered output, the defaults needed to place it (priority,
+/// bounds, truncatable), and a back-reference to the trait object so
+/// the reflow loop can call `shrink_to_fit` without re-walking the
+/// input slice. `Separator` carries a resolved [`Separator`] value
+/// ready for width math and emit; runtime overrides have already
+/// been merged in.
+enum LayoutItem<'a> {
+    Segment(SegmentEntry<'a>),
+    Separator(Separator),
+}
+
+struct SegmentEntry<'a> {
     rendered: RenderedSegment,
     defaults: SegmentDefaults,
     segment: &'a dyn Segment,
 }
 
+/// Walk the raw [`LineItem`] list, render each segment, and emit a
+/// [`LayoutItem`] sequence ready for the layout pass.
+///
+/// Adjacency rules baked in here so downstream passes don't need to
+/// know about them:
+///
+/// - A separator survives only when it sits between two surviving
+///   segments. Leading separators, trailing separators, and
+///   separators flanking a dropped segment are pruned.
+/// - A segment's per-render `right_separator` override (the plugin
+///   path) replaces the inline separator immediately to its right.
+///   The override is applied here so width math and drop decisions
+///   downstream see the post-override separator value.
 fn collect_items_with<'a>(
-    segments: &'a [Box<dyn Segment>],
+    items: &'a [LineItem],
     ctx: &DataContext,
     rc: &RenderContext,
     warn: &mut dyn FnMut(&str),
-) -> Vec<Item<'a>> {
-    segments
-        .iter()
-        .filter_map(|seg| {
-            let defaults = seg.defaults();
-            let rendered = match seg.render(ctx, rc) {
-                Ok(Some(r)) => r,
-                Ok(None) => return None,
-                Err(err) => {
-                    warn(&format!("segment error: {err}"));
-                    return None;
+) -> Vec<LayoutItem<'a>> {
+    let mut out: Vec<LayoutItem<'a>> = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            LineItem::Segment(seg) => {
+                let defaults = seg.defaults();
+                let rendered = match seg.render(ctx, rc) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => {
+                        pop_trailing_separator(&mut out);
+                        continue;
+                    }
+                    Err(err) => {
+                        warn(&format!("segment error: {err}"));
+                        pop_trailing_separator(&mut out);
+                        continue;
+                    }
+                };
+                let Some(rendered) = apply_width_bounds(rendered, defaults.width) else {
+                    pop_trailing_separator(&mut out);
+                    continue;
+                };
+                out.push(LayoutItem::Segment(SegmentEntry {
+                    rendered,
+                    defaults,
+                    segment: seg.as_ref(),
+                }));
+            }
+            LineItem::Separator(sep) => {
+                // Push only when directly preceded by a surviving
+                // segment, so leading/orphaned separators drop.
+                if matches!(out.last(), Some(LayoutItem::Segment(_))) {
+                    out.push(LayoutItem::Separator(sep.clone()));
                 }
-            };
-            apply_width_bounds(rendered, defaults.width).map(|r| Item {
-                rendered: r,
-                defaults,
-                segment: seg.as_ref(),
-            })
-        })
-        .collect()
+            }
+        }
+    }
+    pop_trailing_separator(&mut out);
+    for i in 0..out.len() {
+        apply_override_at(&mut out, i);
+    }
+    out
+}
+
+fn pop_trailing_separator(out: &mut Vec<LayoutItem<'_>>) {
+    if matches!(out.last(), Some(LayoutItem::Separator(_))) {
+        out.pop();
+    }
+}
+
+/// Apply the runtime `right_separator` override for the segment at
+/// `idx` to its right-edge inline separator (if any). Called from
+/// [`collect_items_with`] across the whole list, and again from
+/// [`apply_layout`] at a single index after `shrink_to_fit` / reflow
+/// rewrites a segment's render — both paths can produce a different
+/// `right_separator` than the pre-shrink value, and the inline slot
+/// must track it.
+///
+/// `Some` overrides the inline value; `None` is a no-op (the
+/// pre-existing inline value stays). The current implementation
+/// can't distinguish "segment never had an override" from "segment
+/// flipped from `Some` back to `None`" — the conservative behavior
+/// keeps the most recently applied `Some`. Plugins that flip in
+/// the latter direction are out of contract.
+fn apply_override_at(items: &mut [LayoutItem<'_>], idx: usize) {
+    let override_sep = match items.get(idx) {
+        Some(LayoutItem::Segment(seg)) => seg.rendered.right_separator.clone(),
+        _ => None,
+    };
+    if let Some(s) = override_sep {
+        if let Some(LayoutItem::Separator(slot)) = items.get_mut(idx + 1) {
+            *slot = s;
+        }
+    }
 }
 
 /// Pure layout pass — no styling, no emission. Runs the
 /// priority-drop / shrink / reflow loop and returns surviving items
-/// in render order.
+/// in render order. When a segment must be removed, the adjacent
+/// separator goes with it (see [`drop_segment_and_adjacent_separator`]).
+///
+/// Per iteration, for the highest-priority droppable segment:
+/// `shrink_to_fit` first, `truncatable` end-ellipsis reflow second,
+/// drop the whole segment last. Each compaction path may produce a
+/// `right_separator` different from the pre-shrink value, so the
+/// inline override slot gets re-propagated after a rewrite.
 fn apply_layout<'a>(
-    mut items: Vec<Item<'a>>,
+    mut items: Vec<LayoutItem<'a>>,
     ctx: &DataContext,
     rc: &RenderContext,
     terminal_width: u16,
-) -> Vec<Item<'a>> {
+) -> Vec<LayoutItem<'a>> {
     let budget = u32::from(terminal_width);
     loop {
         let total = total_width(&items);
         if total <= budget {
             break;
         }
-        let Some(drop_idx) = items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| item.defaults.priority > 0)
-            .max_by_key(|(_, item)| item.defaults.priority)
-            .map(|(i, _)| i)
-        else {
+        let Some(drop_idx) = highest_priority_droppable(&items) else {
             break;
         };
         let overflow = total - budget;
-        // Try segment-side compaction first; the segment knows things
-        // the engine doesn't (which decoration is signal-bearing,
-        // which prefix to keep). Falls through to generic end-ellipsis
-        // truncation only when shrink_to_fit declines.
-        if let Some(shrunk) = try_shrink(&items[drop_idx], ctx, rc, overflow) {
-            items[drop_idx].rendered = shrunk;
-            continue;
-        }
-        if items[drop_idx].defaults.truncatable {
-            if let Some(reflowed) = try_reflow(&items[drop_idx], overflow) {
-                items[drop_idx] = reflowed;
-                continue;
+        // `highest_priority_droppable` only returns segment indices, so
+        // this match always binds.
+        let LayoutItem::Segment(seg) = &items[drop_idx] else {
+            break;
+        };
+        if let Some(shrunk) = try_shrink(seg, ctx, rc, overflow) {
+            if let LayoutItem::Segment(s) = &mut items[drop_idx] {
+                s.rendered = shrunk;
             }
+            apply_override_at(&mut items, drop_idx);
+        } else if seg.defaults.truncatable {
+            if let Some(reflowed) = try_reflow(seg, overflow) {
+                items[drop_idx] = LayoutItem::Segment(reflowed);
+                apply_override_at(&mut items, drop_idx);
+            } else {
+                drop_segment_and_adjacent_separator(&mut items, drop_idx);
+            }
+        } else {
+            drop_segment_and_adjacent_separator(&mut items, drop_idx);
         }
-        items.remove(drop_idx);
     }
     items
 }
 
+/// Index of the highest-priority droppable segment, or `None` when
+/// every segment is priority-0 (pinned).
+fn highest_priority_droppable(items: &[LayoutItem<'_>]) -> Option<usize> {
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, item)| match item {
+            LayoutItem::Segment(seg) if seg.defaults.priority > 0 => {
+                Some((i, seg.defaults.priority))
+            }
+            _ => None,
+        })
+        .max_by_key(|(_, pri)| *pri)
+        .map(|(i, _)| i)
+}
+
+/// Drop the segment at `idx` along with one adjacent separator: the
+/// right-edge separator first, falling back to the left-edge when
+/// the segment was the last in the line.
+fn drop_segment_and_adjacent_separator(items: &mut Vec<LayoutItem<'_>>, idx: usize) {
+    let next_is_sep = matches!(items.get(idx + 1), Some(LayoutItem::Separator(_)));
+    let prev_is_sep = idx > 0 && matches!(items.get(idx - 1), Some(LayoutItem::Separator(_)));
+    if next_is_sep {
+        items.remove(idx);
+        items.remove(idx);
+    } else if prev_is_sep {
+        items.remove(idx);
+        items.remove(idx - 1);
+    } else {
+        items.remove(idx);
+    }
+}
+
 /// Test-only helper that mirrors `render_with_warn`'s compose order.
-/// Lets unit tests build `Item` literals directly without restating
-/// the layout-then-emit dance per case.
+/// Lets unit tests build [`LayoutItem`] literals directly without
+/// restating the layout-then-emit dance per case.
 #[cfg(test)]
 fn render_items(
-    items: Vec<Item<'_>>,
+    items: Vec<LayoutItem<'_>>,
     ctx: &DataContext,
     rc: &RenderContext,
     terminal_width: u16,
@@ -255,27 +370,29 @@ fn render_items(
 
 /// Flatten step for [`render_to_runs`]: see that function for the
 /// emit contract. Separator runs carry [`Style::default`];
-/// `Separator::None` is filtered here so consumers don't see
-/// empty-text runs.
-fn items_to_runs(items: &[Item<'_>]) -> Vec<StyledRun> {
-    let mut runs = Vec::with_capacity(items.len().saturating_mul(2));
-    for (i, item) in items.iter().enumerate() {
-        runs.push(StyledRun {
-            text: item.rendered.text.clone(),
-            style: item.rendered.style.clone(),
-        });
-        if i + 1 < items.len() {
-            let sep = effective_separator(item);
-            let sep_text = sep.text();
-            if !sep_text.is_empty() {
-                runs.push(StyledRun {
-                    text: sep_text.to_string(),
-                    style: separator_style(sep),
-                });
+/// `Separator::None` (text == "") is filtered here so consumers
+/// don't see empty-text runs.
+fn items_to_runs(items: &[LayoutItem<'_>]) -> Vec<StyledRun> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            LayoutItem::Segment(seg) => Some(StyledRun {
+                text: seg.rendered.text.clone(),
+                style: seg.rendered.style.clone(),
+            }),
+            LayoutItem::Separator(sep) => {
+                let text = sep.text();
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(StyledRun {
+                        text: text.to_string(),
+                        style: separator_style(sep),
+                    })
+                }
             }
-        }
-    }
-    runs
+        })
+        .collect()
 }
 
 /// Style for an inter-segment separator run. Plain separators carry
@@ -290,27 +407,16 @@ fn separator_style(sep: &Separator) -> Style {
     }
 }
 
-/// Sum of segment widths plus the separators that sit *between* segments
-/// (no trailing separator). `u32` prevents `u16` overflow on many wide
-/// segments.
-fn total_width(items: &[Item<'_>]) -> u32 {
-    if items.is_empty() {
-        return 0;
-    }
-    let seg_sum: u32 = items.iter().map(|i| u32::from(i.rendered.width)).sum();
-    let sep_sum: u32 = items
+/// Sum of every layout item's width — segments and separators alike.
+/// `u32` prevents `u16` overflow on many wide segments.
+fn total_width(items: &[LayoutItem<'_>]) -> u32 {
+    items
         .iter()
-        .take(items.len() - 1)
-        .map(|item| u32::from(effective_separator(item).width()))
-        .sum();
-    seg_sum + sep_sum
-}
-
-fn effective_separator<'i>(item: &'i Item<'_>) -> &'i Separator {
-    item.rendered
-        .right_separator
-        .as_ref()
-        .unwrap_or(&item.defaults.default_separator)
+        .map(|item| match item {
+            LayoutItem::Segment(seg) => u32::from(seg.rendered.width),
+            LayoutItem::Separator(sep) => u32::from(sep.width()),
+        })
+        .sum()
 }
 
 /// Applies `bounds`: under-min drops the segment, over-max truncates with
@@ -341,7 +447,7 @@ fn apply_width_bounds(
 /// the reflow loop exits on its next check; a wide grapheme straddling
 /// the boundary may yield a slightly narrower result, which still
 /// meets the `overflow` requirement.
-fn try_reflow<'a>(item: &Item<'a>, overflow: u32) -> Option<Item<'a>> {
+fn try_reflow<'a>(item: &SegmentEntry<'a>, overflow: u32) -> Option<SegmentEntry<'a>> {
     let floor = item.defaults.width.map_or(2, |b| b.min().max(2));
     let cur = item.rendered.width;
     let target = u32::from(cur).checked_sub(overflow)?;
@@ -353,9 +459,9 @@ fn try_reflow<'a>(item: &Item<'a>, overflow: u32) -> Option<Item<'a>> {
     if truncated.width < floor {
         return None;
     }
-    Some(Item {
+    Some(SegmentEntry {
         rendered: truncated,
-        defaults: item.defaults.clone(),
+        defaults: item.defaults,
         segment: item.segment,
     })
 }
@@ -370,7 +476,7 @@ fn try_reflow<'a>(item: &Item<'a>, overflow: u32) -> Option<Item<'a>> {
 /// author. The caller falls through to `truncatable` end-ellipsis or
 /// drop on any of these outcomes.
 fn try_shrink(
-    item: &Item<'_>,
+    item: &SegmentEntry<'_>,
     ctx: &DataContext,
     rc: &RenderContext,
     overflow: u32,

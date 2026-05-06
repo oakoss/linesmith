@@ -863,10 +863,9 @@ fn run_cli(
     let lines = build_lines(cfg.as_ref(), plugins, |msg| {
         let _ = writeln!(stderr, "linesmith: {msg}");
     });
-    // `run_lines_with_context` takes `&[&[Box<dyn Segment>]]`; map
-    // each owned `Vec` to a borrowed slice once.
-    let line_refs: Vec<&[Box<dyn crate::segments::Segment>]> =
-        lines.iter().map(Vec::as_slice).collect();
+    // `run_lines_with_context` takes `&[&[LineItem]]`; map each owned
+    // `Vec<LineItem>` to a borrowed slice once.
+    let line_refs: Vec<&[crate::segments::LineItem]> = lines.iter().map(Vec::as_slice).collect();
 
     let raw_width = env.terminal_width.unwrap_or_else(detect_terminal_width);
     let padding = layout_options(cfg.as_ref()).map_or(0, |l| l.claude_padding);
