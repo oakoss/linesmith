@@ -62,6 +62,11 @@ supports-color = "3"
 # probing approach. Returns a single bool; we don't need the
 # `supports_hyperlinks::on_cached` variant.
 supports-hyperlinks = "3"
+# TUI substrate for `linesmith config` per ADR-0015. Pinned to the
+# `0.30` minor; bump deliberately rather than via `cargo update`. Pulled
+# in via the optional `config-ui` feature on the linesmith CLI crate so
+# `--no-default-features` builds drop it from the dep graph.
+ratatui = "0.30"
 tempfile = "3"
 terminal_size = "0.4"
 # ureq 3.x is the current major line — post-rewrite, sync HTTP client

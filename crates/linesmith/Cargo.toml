@@ -47,6 +47,18 @@ ureq.workspace = true
 toml.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
+# TUI runtime for `linesmith config`. Optional + gated by `config-ui`
+# per ADR-0015 so `--no-default-features` cleanly drops the substrate
+# from the dep graph for binary-size-sensitive distributors. The
+# render path never imports this module.
+ratatui = { workspace = true, optional = true }
+
+[features]
+default = ["config-ui"]
+# Enables the `linesmith config` interactive TUI editor. Default-on
+# for v0.1; opt out with `cargo build --no-default-features` for a
+# render-only binary.
+config-ui = ["dep:ratatui"]
 
 [dev-dependencies]
 criterion.workspace = true

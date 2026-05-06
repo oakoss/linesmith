@@ -17,6 +17,8 @@
 pub mod cli;
 pub mod doctor;
 pub(crate) mod driver;
+#[cfg(feature = "config-ui")]
+pub(crate) mod tui;
 
 // Crate-internal re-exports of the linesmith-core surface so
 // driver / doctor / cli modules can keep the short

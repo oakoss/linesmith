@@ -56,6 +56,13 @@ pub enum Action {
         plain: bool,
         config: Option<PathBuf>,
     },
+    /// Boot the interactive `linesmith config` TUI editor (per
+    /// ADR-0015 / ADR-0016). Loads the config at `config` if set,
+    /// else the resolved default path; if no file exists, starts
+    /// against an in-memory `Config::default()`.
+    Config {
+        config: Option<PathBuf>,
+    },
 }
 
 /// Help text. Kept short; full docs live at
@@ -67,6 +74,7 @@ USAGE:
     linesmith [OPTIONS]
     linesmith init [--no-doctor]
     linesmith doctor [--plain]
+    linesmith config
     linesmith themes list
     linesmith presets list
     linesmith presets apply <NAME> [--force]
@@ -90,6 +98,8 @@ SUBCOMMANDS:
     doctor                 Run setup diagnostics (env, config, Claude Code
                            integration, credentials, cache, plugins, git);
                            exits 1 on any FAIL
+    config                 Boot the interactive TUI editor for `config.toml`.
+                           Requires the `config-ui` feature (default-on)
     themes list            List available themes (built-in + user)
     presets list           List available config presets
     presets apply <NAME>   Write a preset's config.toml to the resolved path
@@ -223,6 +233,15 @@ fn dispatch_subcommand(
                 });
             }
             Ok(Some(Action::Doctor { plain, config }))
+        }
+        "config" => {
+            if positional.len() > 1 {
+                return Err(lexopt::Error::UnexpectedValue {
+                    option: "config".to_string(),
+                    value: positional[1].to_string_lossy().to_string().into(),
+                });
+            }
+            Ok(Some(Action::Config { config }))
         }
         "themes" => {
             let sub = positional.get(1).map(|s| s.to_string_lossy().into_owned());
@@ -755,6 +774,41 @@ mod tests {
                 "args {args:?} should reject --plain, got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn config_subcommand_parses_with_no_flags() {
+        assert_eq!(
+            parse_args(&["config"]).expect("ok"),
+            Action::Config { config: None }
+        );
+    }
+
+    #[test]
+    fn config_subcommand_threads_config_flag_into_action() {
+        // `linesmith --config /tmp/alt.toml config` uses the supplied
+        // path as the file the TUI loads / writes back to. Pin both
+        // orderings so a parser regression that drops one trips here.
+        let got = parse_args(&["--config", "/tmp/alt.toml", "config"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::Config {
+                config: Some(PathBuf::from("/tmp/alt.toml")),
+            }
+        );
+        let got = parse_args(&["config", "--config", "/tmp/alt.toml"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::Config {
+                config: Some(PathBuf::from("/tmp/alt.toml")),
+            }
+        );
+    }
+
+    #[test]
+    fn config_subcommand_with_extra_positional_errors() {
+        let err = parse_args(&["config", "extra"]).unwrap_err();
+        assert!(matches!(err, lexopt::Error::UnexpectedValue { .. }));
     }
 
     #[test]

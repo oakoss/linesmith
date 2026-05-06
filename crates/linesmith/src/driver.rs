@@ -177,8 +177,33 @@ where
             init_action(config, no_doctor, stdin, stdout, stderr, env)
         }
         cli::Action::Doctor { plain, config } => doctor_action(plain, config, stdout, stderr),
+        cli::Action::Config { config } => config_action(config, stderr, env),
         cli::Action::Run(args) => run_cli(args, stdin, stdout, stderr, env),
     }
+}
+
+/// Dispatch the `linesmith config` interactive TUI editor. With the
+/// `config-ui` feature off (`--no-default-features` builds), prints an
+/// actionable error and exits 2; the daily render path stays clear of
+/// the TUI substrate either way.
+#[cfg(feature = "config-ui")]
+fn config_action(config_override: Option<PathBuf>, stderr: &mut dyn Write, env: &CliEnv) -> u8 {
+    let resolved = config::resolve_config_path(
+        config_override,
+        env.linesmith_config.as_deref(),
+        env.xdg_config_home.as_deref(),
+        env.home.as_deref(),
+    );
+    crate::tui::run(resolved.as_ref().map(|c| c.path.as_path()), stderr)
+}
+
+#[cfg(not(feature = "config-ui"))]
+fn config_action(_config_override: Option<PathBuf>, stderr: &mut dyn Write, _env: &CliEnv) -> u8 {
+    let _ = writeln!(
+        stderr,
+        "linesmith: this build was compiled without the `config-ui` feature; rebuild with `cargo install linesmith` (defaults on) or `cargo build --features config-ui` to enable it.",
+    );
+    2
 }
 
 /// Build a doctor report, render it, and return the report's exit
