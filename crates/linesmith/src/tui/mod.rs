@@ -6,9 +6,9 @@
 //! state before the default panic handler runs (so a crash mid-screen
 //! doesn't leave the user's shell in a broken state), polls
 //! crossterm events, and dispatches them through the pure
-//! `(Model, Event) -> Model` update function in [`app`]. The actual
-//! screens (Main Menu, Items Editor, etc.) live in their own modules
-//! and are wired in as their respective beads land.
+//! `(Model, Event) -> Model` update function in [`app`]. Screens
+//! (`main_menu`, `placeholder`, …) live in their own modules and
+//! are dispatched through [`app::update`] / [`app::view`].
 //!
 //! This module is feature-gated behind `config-ui` (default-on per
 //! ADR-0015); the daily render path never imports it.
@@ -16,6 +16,7 @@
 mod app;
 mod list_screen;
 mod main_menu;
+mod placeholder;
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -127,8 +128,7 @@ fn poll_event() -> io::Result<Option<Event>> {
     match cevent::read()? {
         CtEvent::Key(key) => Ok(Some(Event::Key(key))),
         CtEvent::Resize(_, _) => Ok(Some(Event::Resize)),
-        // Mouse / FocusGained/Lost / Paste — ignored for v0.1. Mouse
-        // + paste land with their respective screens.
+        // Mouse / FocusGained/Lost / Paste — ignored for v0.1.
         _ => Ok(None),
     }
 }

@@ -12,19 +12,26 @@ use ratatui::Frame;
 use crate::config;
 
 use super::main_menu::{self, MainMenuState};
+use super::placeholder::{self, PlaceholderState};
 
 /// Top-level UI state. Each variant carries its own state struct.
 /// Add a screen by adding a variant + its state struct + a `match`
 /// arm in [`view`] / [`update`].
 #[non_exhaustive]
+#[derive(Debug)]
 pub(super) enum AppScreen {
     MainMenu(MainMenuState),
+    Placeholder(PlaceholderState),
 }
 
 /// Top-level model. Carries the current screen, the parsed config,
 /// and the quit flag.
 pub(super) struct Model {
     pub(super) screen: AppScreen,
+    // Held on `Model` so screens that need it can read it
+    // directly; current screens (`MainMenu`, `Placeholder`) don't,
+    // hence the dead-code allow.
+    #[allow(dead_code)]
     pub(super) config: config::Config,
     pub(super) quit: bool,
 }
@@ -46,8 +53,7 @@ impl Model {
 /// Engine event dispatched into [`update`]. `Resize` carries no
 /// payload — it only signals "the layout should redraw"; the
 /// `view` path re-queries terminal size on each draw, so update
-/// itself doesn't need the new dimensions. Mouse / paste land
-/// with screens that need them.
+/// itself doesn't need the new dimensions.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Event {
@@ -55,10 +61,28 @@ pub(super) enum Event {
     Resize,
 }
 
-/// Pure state transition. Global key handling (quit) runs first; if
-/// the event isn't claimed it falls through to the current screen's
-/// own update arm. Adding a screen means adding the `match
-/// model.screen` arm and routing per-screen events to it.
+/// Per-screen dispatch signal. Screens return one of these from
+/// their `update` so `app::update` can apply the transition without
+/// the screen code touching `Model` directly. Adding a new screen
+/// means adding an `AppScreen` variant + a screen module that
+/// returns the same outcome shape.
+#[non_exhaustive]
+#[derive(Debug)]
+pub(super) enum ScreenOutcome {
+    /// Screen handled the event internally (or didn't claim it);
+    /// `Model` stays as-is.
+    Stay,
+    /// Replace `model.screen` with the supplied `AppScreen`. Used
+    /// for menu activation and back-navigation.
+    NavigateTo(AppScreen),
+    /// Signal the event loop to leave the TUI.
+    Quit,
+}
+
+/// Pure state transition. Unconditional-quit keys (`q`, Ctrl+C)
+/// fire regardless of which screen is active; everything else
+/// routes to the screen's own `update`, whose [`ScreenOutcome`] the
+/// caller applies to `Model`.
 ///
 /// `Event::Resize` is a no-op at the model layer; routing it
 /// through [`update`] still triggers the post-update draw in the
@@ -69,27 +93,32 @@ pub(super) fn update(mut model: Model, event: Event) -> Model {
         Event::Key(key) => key,
         Event::Resize => return model,
     };
-    if is_global_quit(&key) {
+    if is_unconditional_quit(&key) {
         model.quit = true;
         return model;
     }
-    match &mut model.screen {
+    let outcome = match &mut model.screen {
         AppScreen::MainMenu(state) => main_menu::update(state, key),
+        AppScreen::Placeholder(state) => placeholder::update(state, key),
+    };
+    match outcome {
+        ScreenOutcome::Stay => {}
+        ScreenOutcome::NavigateTo(screen) => model.screen = screen,
+        ScreenOutcome::Quit => model.quit = true,
     }
     model
 }
 
-/// Match the keys that always quit, regardless of which screen is
-/// active: Esc, `q`, and Ctrl+C. Future screens that need to
-/// override (e.g. text-input modes that consume `q`) will gate this
-/// behind their own state check before [`update`] sees the event.
+/// Match the keys that quit regardless of which screen is active:
+/// `q` and Ctrl+C. Esc is intentionally screen-specific — sub-
+/// screens use it for back-navigation; only the top-level menu
+/// treats Esc as quit.
 ///
 /// The Ctrl+C arm uses `contains(CONTROL)` rather than exact-match
 /// because some terminals deliver Ctrl+Shift+C as `Char('C')` with
 /// `CONTROL | SHIFT` set, and we want both shapes to quit.
-fn is_global_quit(key: &KeyEvent) -> bool {
+fn is_unconditional_quit(key: &KeyEvent) -> bool {
     match (key.code, key.modifiers) {
-        (KeyCode::Esc, _) => true,
         (KeyCode::Char('q'), KeyModifiers::NONE) => true,
         (KeyCode::Char('c' | 'C'), m) if m.contains(KeyModifiers::CONTROL) => true,
         _ => false,
@@ -98,10 +127,11 @@ fn is_global_quit(key: &KeyEvent) -> bool {
 
 /// Render the current screen. Each screen owns its own draw routine;
 /// this function is a thin dispatcher. Screens read top-level state
-/// (config, future preview runs) directly off `model`.
+/// (e.g. `model.config`) directly off `model`.
 pub(super) fn view(model: &Model, frame: &mut Frame) {
     match &model.screen {
-        AppScreen::MainMenu(state) => main_menu::view(state, model, frame),
+        AppScreen::MainMenu(state) => main_menu::view(state, frame),
+        AppScreen::Placeholder(state) => placeholder::view(state, frame),
     }
 }
 
@@ -118,7 +148,12 @@ mod tests {
     }
 
     #[test]
-    fn esc_sets_quit() {
+    fn esc_on_main_menu_quits() {
+        // Esc is no longer in `is_unconditional_quit`; the quit
+        // path now flows through the screen's `update`. Pin the
+        // observable outcome (model.quit set) so the routing
+        // change doesn't silently regress the Esc-quits-from-main
+        // user contract.
         let m = update(model(), key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(m.quit);
     }
@@ -164,14 +199,10 @@ mod tests {
 
     #[test]
     fn non_quit_key_routes_to_screen_without_quitting() {
-        // The screen-dispatch arm in `update` (the `match model.screen`
-        // block) is otherwise covered only by the global-quit short-
-        // circuit, which returns before reaching it. A refactor that
-        // flipped the dispatch arm to always-quit or to a no-op
-        // would still pass the quit tests above; this pin catches
-        // that. F12 is used (rather than a `Char` like `j`) because
-        // it's guaranteed never to become a documented binding once
-        // real screens land.
+        // The screen-dispatch arm in `update` is otherwise covered
+        // only by quit short-circuits, which return before reaching
+        // it. F12 is used (rather than a `Char` like `j`) because
+        // it's guaranteed never to become a documented binding.
         let m = update(model(), key(KeyCode::F(12), KeyModifiers::NONE));
         assert!(!m.quit, "non-quit key must not set quit");
         assert!(
@@ -187,6 +218,44 @@ mod tests {
         // event loop's post-update draw fires for free without any
         // screen-level routing.
         let m = update(model(), Event::Resize);
+        assert!(!m.quit);
+        assert!(matches!(m.screen, AppScreen::MainMenu(_)));
+    }
+
+    #[test]
+    fn enter_on_main_menu_navigates_to_placeholder() {
+        // Pin the dispatch chain: top-level update → screen
+        // update → NavigateTo application. A regression in any
+        // link breaks Enter-to-open across every menu row.
+        let m = update(model(), key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!m.quit);
+        assert!(
+            matches!(m.screen, AppScreen::Placeholder(_)),
+            "screen should transition to Placeholder",
+        );
+    }
+
+    #[test]
+    fn q_on_placeholder_quits() {
+        // Pin that the unconditional-quit predicate runs *before*
+        // screen dispatch, so `q` quits even from a sub-screen.
+        // The placeholder's `update` only handles Esc; without
+        // upstream filtering, `q` would no-op on the placeholder.
+        let m = update(model(), key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(m.screen, AppScreen::Placeholder(_)));
+        let m = update(m, key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(m.quit);
+    }
+
+    #[test]
+    fn esc_on_placeholder_returns_to_main_menu() {
+        // Activate from MainMenu to land on Placeholder, then Esc
+        // navigates back. Pins both the screen restoration and the
+        // top-level Esc handling (Esc must reach the screen's
+        // update — `is_unconditional_quit` rejects it).
+        let m = update(model(), key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(m.screen, AppScreen::Placeholder(_)));
+        let m = update(m, key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!m.quit);
         assert!(matches!(m.screen, AppScreen::MainMenu(_)));
     }
