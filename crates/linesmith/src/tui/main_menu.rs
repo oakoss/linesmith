@@ -221,6 +221,9 @@ mod tests {
         use super::super::app::{update as app_update, AppScreen, Event};
         let mut model = super::super::app::Model::new(
             crate::config::Config::default(),
+            toml_edit::DocumentMut::new(),
+            String::new(),
+            None,
             crate::theme::default_theme().clone(),
             crate::theme::Capability::None,
             None,

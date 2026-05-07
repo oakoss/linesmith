@@ -20,7 +20,7 @@ mod placeholder;
 mod preview;
 
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +30,7 @@ use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::Terminal;
+use toml_edit::DocumentMut;
 
 use crate::config;
 use crate::logging::{CapturedSink, SinkGuard};
@@ -47,7 +48,7 @@ use app::{update, Event, Model};
 /// reaches `driver::config_action`; allow the redundancy lint here.
 #[allow(clippy::redundant_pub_crate)]
 pub(super) fn run(config_path: Option<&Path>, stderr: &mut dyn Write) -> u8 {
-    let (config, parse_warning) = match load_config(config_path) {
+    let load = match load_config(config_path) {
         Ok(out) => out,
         Err(err) => {
             let _ = writeln!(stderr, "linesmith config: load: {err}");
@@ -59,7 +60,7 @@ pub(super) fn run(config_path: Option<&Path>, stderr: &mut dyn Write) -> u8 {
     // swallows stderr — otherwise the editor opens against a default
     // config and a future write-back silently shadows the user's
     // real broken TOML.
-    if let Some(warning) = parse_warning {
+    if let Some(warning) = &load.warning {
         let _ = writeln!(stderr, "linesmith config: {warning}");
     }
 
@@ -76,8 +77,8 @@ pub(super) fn run(config_path: Option<&Path>, stderr: &mut dyn Write) -> u8 {
         crate::runtime::themes::build_theme_registry(user_themes_dir.as_deref(), |msg| {
             let _ = writeln!(stderr, "linesmith config: {msg}");
         });
-    let theme = resolve_theme(config.theme.as_deref(), &theme_registry, stderr).clone();
-    let capability = resolve_capability(&config);
+    let theme = resolve_theme(load.config.theme.as_deref(), &theme_registry, stderr).clone();
+    let capability = resolve_capability(&load.config);
 
     // Install the captured-log sink *before* enter_terminal so any
     // macro emission that fires between sink install and the first
@@ -91,7 +92,15 @@ pub(super) fn run(config_path: Option<&Path>, stderr: &mut dyn Write) -> u8 {
     let captured_sink = Arc::new(CapturedSink::default());
     let _sink_guard = SinkGuard::install(captured_sink.clone());
 
-    let model = Model::new(config, theme, capability, Some(Arc::clone(&captured_sink)));
+    let model = Model::new(
+        load.config,
+        load.document,
+        load.original_text,
+        load.save_target,
+        theme,
+        capability,
+        Some(Arc::clone(&captured_sink)),
+    );
 
     // Install the panic hook *before* enter_terminal so a panic
     // during `Terminal::new` or the first draw still routes through
@@ -132,6 +141,56 @@ pub(super) fn run(config_path: Option<&Path>, stderr: &mut dyn Write) -> u8 {
             1
         }
     }
+}
+
+/// Atomically replace `path` with `contents`. Writes to a temp
+/// file in the same directory, fsyncs, then renames over the
+/// destination — so a crash mid-write leaves the original file
+/// intact (and the temp file orphaned but harmless), and the
+/// rename itself is atomic on both Unix (`rename(2)`) and Windows
+/// (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`, which `tempfile`
+/// invokes via `persist`). Parent directory is created if missing
+/// — covers the "user pointed `--config` at a path under
+/// `~/.config/linesmith/` before that directory existed" case so
+/// the first save isn't a `NotFound` failure.
+// Same `redundant_pub_crate` / `unreachable_pub` clash as `run`
+// above; same resolution.
+#[allow(clippy::redundant_pub_crate)]
+pub(super) fn atomic_write(path: &Path, contents: &str) -> io::Result<()> {
+    // Resolve to absolute up front so the temp directory choice
+    // can't drift if cwd changes between save attempts (a TUI host
+    // process that chdirs after spawn would otherwise land the
+    // temp on a different filesystem and lose `persist`'s atomic
+    // contract via cross-device rename).
+    let absolute: PathBuf = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let parent = absolute.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic_write: path has no parent directory",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(contents.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(&absolute).map_err(|e| {
+        // Log the orphaned temp path so a user investigating
+        // "why did save fail" doesn't also have to wonder where
+        // the leftover `.tmpXXXXXX` next to their config came
+        // from. The `Drop` on `e.file` cleans up if it can, but a
+        // partial-persist on Windows ("destination open by another
+        // process") can leave the temp behind.
+        linesmith_core::lsm_warn!(
+            "atomic_write: persist failed; orphaned temp at {} may be removed manually",
+            e.file.path().display(),
+        );
+        e.error
+    })?;
+    Ok(())
 }
 
 /// Drain any entries the captured sink picked up during boot and
@@ -320,52 +379,122 @@ fn resolve_theme<'a>(
     }
 }
 
-/// Load the config for the boot path. Returns the parsed config plus
-/// an optional human-readable warning the caller surfaces *before*
-/// taking over the screen.
+/// Result of [`load_config`]. Bundles the typed [`config::Config`]
+/// the render pipeline needs with the round-trip-preserving
+/// [`DocumentMut`] the editor mutates and saves, plus enough state
+/// to drive the save-allowed / save-refused decision.
+// Same `redundant_pub_crate` / `unreachable_pub` clash as `run`
+// above; same resolution.
+#[allow(clippy::redundant_pub_crate)]
+#[derive(Debug)]
+pub(super) struct LoadOutcome {
+    pub(super) config: config::Config,
+    pub(super) document: DocumentMut,
+    /// The exact bytes read from disk (or `String::new()` for the
+    /// no-file / parse-error paths). Used by the dirty-check: a
+    /// stringify of `document` that equals this means no edits.
+    pub(super) original_text: String,
+    /// Where Ctrl+S should write. `Some` when save is allowed —
+    /// either the file existed and parsed cleanly, or the file
+    /// didn't exist but the user supplied a path so save creates
+    /// it. `None` when save is refused: no path provided, or the
+    /// file existed but parse-failed (overwriting it would clobber
+    /// the user's broken-but-present config with defaults).
+    pub(super) save_target: Option<PathBuf>,
+    /// Optional human-readable warning the caller surfaces on
+    /// stderr *before* the alt-screen takes over. Carries unknown-
+    /// key diagnostics on a clean parse, or the parse-error
+    /// message on a malformed file.
+    pub(super) warning: Option<String>,
+}
+
+/// Load the config for the boot path.
 ///
 /// Outcomes:
 ///
-/// - `path == None` or file absent → `(Config::default(), None)`.
-///   The user is operating without a config file; defaults are the
-///   correct starting point with no warning.
-/// - File present and parses cleanly → `(parsed, None)`.
-/// - File present and parses with unknown-key warnings (typo'd
-///   section header, forward-compat key) → `(parsed, Some(joined))`.
-///   Surfaces the same warnings the render path emits on stderr so
-///   the user knows about stale or typo'd keys before opening the
-///   editor. Goes through `Config::from_str_validated` rather than
-///   the plain `FromStr` impl because the latter explicitly drops
-///   unknown-key diagnostics.
-/// - File present but malformed → `(Config::default(), Some(msg))`.
-///   The editor opens against defaults so the user can fix the
-///   broken file interactively. Without the warning the user
-///   wouldn't notice their real config is being shadowed.
+/// - `path == None` → empty document, `save_target = None`. No
+///   target to save to; Ctrl+S will surface a "save not available"
+///   message when triggered.
+/// - File absent (path provided, `NotFound`) → empty document,
+///   `save_target = Some(path)`. Save creates the file.
+/// - File present and parses cleanly → loaded document,
+///   `save_target = Some(path)`, optional unknown-key warning.
+/// - File present but malformed → empty document,
+///   `save_target = None`, parse-error warning. Save is refused
+///   because the user's broken-but-present file would otherwise
+///   get clobbered with defaults on the first Ctrl+S.
 ///
 /// I/O errors other than `NotFound` propagate so the boot path
 /// surfaces them as a load failure exit, not as a silent fallback.
-fn load_config(path: Option<&Path>) -> io::Result<(config::Config, Option<String>)> {
+fn load_config(path: Option<&Path>) -> io::Result<LoadOutcome> {
     let Some(path) = path else {
-        return Ok((config::Config::default(), None));
+        return Ok(LoadOutcome {
+            config: config::Config::default(),
+            document: DocumentMut::new(),
+            original_text: String::new(),
+            save_target: None,
+            warning: None,
+        });
     };
     match std::fs::read_to_string(path) {
         Ok(text) => {
             let mut warnings: Vec<String> = Vec::new();
             match config::Config::from_str_validated(&text, |w| warnings.push(w.to_string())) {
                 Ok(cfg) => {
-                    let warning = (!warnings.is_empty()).then(|| warnings.join("\n"));
-                    Ok((cfg, warning))
+                    // toml + toml_edit share a parser at the same
+                    // major version, so a disagreement here means
+                    // the two crates have skewed (most likely a
+                    // future Cargo update bumped one but not the
+                    // other). Don't panic — that crashes the TUI
+                    // mid-edit. Don't fall back to an empty
+                    // document either — that would hand the user
+                    // an editor that round-trips defaults and
+                    // silently drops their existing keys on
+                    // Ctrl+S. Treat as save-disabled (same posture
+                    // as a malformed file) so the user can browse
+                    // through the parsed Config but can't clobber.
+                    match text.parse::<DocumentMut>() {
+                        Ok(document) => {
+                            let warning = (!warnings.is_empty()).then(|| warnings.join("\n"));
+                            Ok(LoadOutcome {
+                                config: cfg,
+                                document,
+                                original_text: text,
+                                save_target: Some(path.to_path_buf()),
+                                warning,
+                            })
+                        }
+                        Err(err) => Ok(LoadOutcome {
+                            config: cfg,
+                            document: DocumentMut::new(),
+                            original_text: String::new(),
+                            save_target: None,
+                            warning: Some(format!(
+                                "TOML parser skew in {}: {err} — editor opened read-only (save disabled)",
+                                path.display()
+                            )),
+                        }),
+                    }
                 }
-                Err(err) => Ok((
-                    config::Config::default(),
-                    Some(format!(
-                        "parse error in {}: {err} — opening with defaults",
+                Err(err) => Ok(LoadOutcome {
+                    config: config::Config::default(),
+                    document: DocumentMut::new(),
+                    original_text: String::new(),
+                    save_target: None,
+                    warning: Some(format!(
+                        "parse error in {}: {err} — opening with defaults (save disabled)",
                         path.display()
                     )),
-                )),
+                }),
             }
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok((config::Config::default(), None)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(LoadOutcome {
+            config: config::Config::default(),
+            document: DocumentMut::new(),
+            original_text: String::new(),
+            save_target: Some(path.to_path_buf()),
+            warning: None,
+        }),
         Err(err) => Err(err),
     }
 }
@@ -384,6 +513,62 @@ mod tests {
             kind,
             KeyEventState::NONE,
         )
+    }
+
+    #[test]
+    fn atomic_write_creates_new_file_with_contents() {
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        atomic_write(&path, "[line]\nsegments = []\n").expect("write");
+        let read = fs::read_to_string(&path).expect("read");
+        assert_eq!(read, "[line]\nsegments = []\n");
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file_atomically() {
+        // Pin the round-trip: writing fresh contents over an
+        // existing file leaves the destination with the new
+        // bytes, not concatenated. Failure mode would be a
+        // non-atomic write that appends or partially overwrites.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        fs::write(&path, "old contents that should disappear").expect("seed");
+        atomic_write(&path, "new bytes").expect("write");
+        assert_eq!(fs::read_to_string(&path).expect("read"), "new bytes");
+    }
+
+    #[test]
+    fn atomic_write_creates_missing_parent_directory() {
+        // Pin: pointing --config at a path under a directory
+        // that doesn't exist (e.g., `~/.config/linesmith/` when
+        // the user has never run linesmith) creates the parent
+        // before writing. Without this, the first save would
+        // NotFound and the user wouldn't understand why.
+        let tmp = TempDir::new().expect("tempdir");
+        let nested = tmp.path().join("nested/subdir/config.toml");
+        atomic_write(&nested, "x").expect("write");
+        assert_eq!(fs::read_to_string(&nested).expect("read"), "x");
+    }
+
+    #[test]
+    fn atomic_write_does_not_leave_temp_file_on_success() {
+        // The tempfile crate's persist() consumes the temp; pin
+        // that no `*.tmp` siblings linger after a successful
+        // write. Without this, a future refactor that drops the
+        // persist() call would silently leave temps around.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        atomic_write(&path, "x").expect("write");
+        let entries: Vec<_> = fs::read_dir(tmp.path())
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected only the destination file, got {entries:?}",
+        );
     }
 
     #[test]
@@ -463,22 +648,30 @@ mod tests {
     }
 
     #[test]
-    fn load_config_none_path_returns_default_no_warning() {
-        let (cfg, warning) = load_config(None).expect("ok");
-        assert!(warning.is_none());
-        assert_eq!(cfg, config::Config::default());
+    fn load_config_none_path_refuses_save() {
+        // No --config / no XDG fallback → no save target at all.
+        // Ctrl+S surfaces "save not available"; the editor is
+        // effectively read-only.
+        let out = load_config(None).expect("ok");
+        assert!(out.warning.is_none());
+        assert_eq!(out.config, config::Config::default());
+        assert!(out.save_target.is_none(), "no path → no save target");
+        assert!(out.original_text.is_empty());
     }
 
     #[test]
-    fn load_config_missing_file_returns_default_no_warning() {
-        // The user is operating without a config file. Boot picks up
-        // defaults silently — the editor is the right place to start
-        // a config from scratch.
+    fn load_config_missing_file_allows_save_to_path() {
+        // Path provided, file absent → defaults loaded, but save
+        // target is the user-supplied path so Ctrl+S creates it.
+        // Distinguishes "no path at all" (refuse save) from "path
+        // provided but file doesn't exist yet" (create on save).
         let tmp = TempDir::new().expect("tempdir");
         let missing = tmp.path().join("does_not_exist.toml");
-        let (cfg, warning) = load_config(Some(&missing)).expect("ok");
-        assert!(warning.is_none());
-        assert_eq!(cfg, config::Config::default());
+        let out = load_config(Some(&missing)).expect("ok");
+        assert!(out.warning.is_none());
+        assert_eq!(out.config, config::Config::default());
+        assert_eq!(out.save_target.as_deref(), Some(missing.as_path()));
+        assert!(out.original_text.is_empty());
     }
 
     #[test]
@@ -501,53 +694,76 @@ mod tests {
             "bogus_top_level_key = 42\n[line]\nsegments = [\"model\"]\n",
         )
         .expect("write");
-        let (cfg, warning) = load_config(Some(&path)).expect("ok");
+        let out = load_config(Some(&path)).expect("ok");
         // Parse still succeeds — the editor opens against the user's
-        // real config, not defaults.
-        let segments = cfg
+        // real config, not defaults. Save remains allowed: forward-
+        // compat unknown keys aren't a reason to refuse round-trip.
+        let segments = out
+            .config
             .line
             .as_ref()
             .map(|l| l.segments.clone())
             .unwrap_or_default();
         assert_eq!(segments, vec!["model".to_string()]);
-        // Warning surfaces the unknown key.
-        let msg = warning.expect("unknown-key warning present");
+        let msg = out.warning.expect("unknown-key warning present");
         assert!(msg.contains("bogus_top_level_key"), "got {msg:?}");
+        assert_eq!(out.save_target.as_deref(), Some(path.as_path()));
     }
 
     #[test]
-    fn load_config_valid_toml_returns_parsed_no_warning() {
+    fn load_config_valid_toml_carries_document_and_original_text() {
+        // Pin the round-trip foundation: a clean parse populates
+        // both `original_text` (the exact bytes we read) and
+        // `document` (the toml_edit DocumentMut). Without these,
+        // dirty-detection has nothing to compare against and save
+        // has nothing to write.
         let tmp = TempDir::new().expect("tempdir");
         let path = tmp.path().join("config.toml");
-        fs::write(&path, "[line]\nsegments = [\"model\"]\n").expect("write");
-        let (cfg, warning) = load_config(Some(&path)).expect("ok");
-        assert!(warning.is_none(), "valid TOML emits no warning");
-        let segments = cfg
+        let raw = "# header comment kept\n[line]\nsegments = [\"model\"]\n";
+        fs::write(&path, raw).expect("write");
+        let out = load_config(Some(&path)).expect("ok");
+        assert!(out.warning.is_none(), "valid TOML emits no warning");
+        let segments = out
+            .config
             .line
             .as_ref()
             .map(|l| l.segments.clone())
             .unwrap_or_default();
         assert_eq!(segments, vec!["model".to_string()]);
+        assert_eq!(out.original_text, raw);
+        // toml_edit round-trips byte-for-byte on a clean parse —
+        // pin that the loaded document is initially identical to
+        // the source so dirty-check starts at False.
+        assert_eq!(out.document.to_string(), raw);
+        assert_eq!(out.save_target.as_deref(), Some(path.as_path()));
     }
 
     #[test]
-    fn load_config_malformed_toml_returns_default_with_warning() {
+    fn load_config_malformed_toml_disables_save_with_warning() {
         // Pin the v0.1 contract: parse error → default config + a
         // warning string the boot path emits to stderr before the
-        // alt-screen takes over. Without the warning the user
-        // wouldn't notice their real config is being shadowed.
+        // alt-screen takes over. Save is REFUSED — overwriting a
+        // broken-but-present file with defaults on the first
+        // Ctrl+S would silently destroy whatever the user was
+        // mid-edit on.
         let tmp = TempDir::new().expect("tempdir");
         let path = tmp.path().join("broken.toml");
         fs::write(&path, "this = is not = valid TOML\n").expect("write");
-        let (cfg, warning) = load_config(Some(&path)).expect("ok");
-        assert_eq!(cfg, config::Config::default());
-        let msg = warning.expect("warning present");
+        let out = load_config(Some(&path)).expect("ok");
+        assert_eq!(out.config, config::Config::default());
+        let msg = out.warning.expect("warning present");
         assert!(msg.contains("parse error"), "got {msg:?}");
         assert!(
             msg.contains("broken.toml"),
             "warning names the path: {msg:?}"
         );
         assert!(msg.contains("opening with defaults"), "got {msg:?}");
+        assert!(msg.contains("save disabled"), "got {msg:?}");
+        assert!(
+            out.save_target.is_none(),
+            "parse error must refuse save target",
+        );
+        assert!(out.original_text.is_empty());
     }
 
     #[cfg(unix)]

@@ -45,6 +45,10 @@ tempfile.workspace = true
 terminal_size.workspace = true
 ureq.workspace = true
 toml.workspace = true
+# Mutable TOML document for the `linesmith config` write-back
+# path. Lives in the cli crate (not core) — only the editor needs
+# it; the daily render path stays on the read-only `toml` crate.
+toml_edit.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
 # TUI runtime for `linesmith config`. Optional + gated by `config-ui`

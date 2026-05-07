@@ -80,6 +80,14 @@ ureq = "3"
 # through the cargo harness.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 toml = "1"
+# Round-trip-preserving TOML editor used by `linesmith config`'s
+# write-back path. `toml` 1.x doesn't re-export a public mutable
+# document type; `toml_edit` is the maintained crate the canonical
+# `toml` crate itself depends on, and it's the only way to mutate
+# specific keys without losing user comments / blank lines / key
+# order on save. Held as a workspace dep so the version pin moves
+# in lockstep across crates.
+toml_edit = "0.23"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 
