@@ -42,9 +42,9 @@ impl Segment for ContextWindowSegment {
 }
 
 fn format_size(size: u32) -> String {
-    if size >= 1_000_000 && size % 1_000_000 == 0 {
+    if size >= 1_000_000 && size.is_multiple_of(1_000_000) {
         format!("{}M", size / 1_000_000)
-    } else if size >= 1_000 && size % 1_000 == 0 {
+    } else if size >= 1_000 && size.is_multiple_of(1_000) {
         format!("{}k", size / 1_000)
     } else {
         size.to_string()
