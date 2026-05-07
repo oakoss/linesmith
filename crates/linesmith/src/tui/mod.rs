@@ -22,7 +22,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
 
-use ratatui::crossterm::event::{self as cevent, Event as CtEvent};
+use ratatui::crossterm::event::{self as cevent, Event as CtEvent, KeyEventKind};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -125,11 +125,25 @@ fn poll_event() -> io::Result<Option<Event>> {
     if !cevent::poll(POLL_INTERVAL)? {
         return Ok(None);
     }
-    match cevent::read()? {
-        CtEvent::Key(key) => Ok(Some(Event::Key(key))),
-        CtEvent::Resize(_, _) => Ok(Some(Event::Resize)),
+    Ok(classify_event(cevent::read()?))
+}
+
+/// Map a raw crossterm event to our internal [`Event`] enum.
+///
+/// `KeyEventKind::Press` is the only key kind we forward — Windows
+/// crossterm reports both Press and Release for every physical
+/// keystroke (macOS/Linux only emit Press by default), so accepting
+/// every kind would double-fire `Action` verbs and double-toggle
+/// move-mode on Enter under Windows. OS-level autorepeat already
+/// produces a stream of Press events, so filtering Repeat doesn't
+/// break held-key navigation.
+fn classify_event(event: CtEvent) -> Option<Event> {
+    match event {
+        CtEvent::Key(key) if key.kind == KeyEventKind::Press => Some(Event::Key(key)),
+        CtEvent::Resize(_, _) => Some(Event::Resize),
         // Mouse / FocusGained/Lost / Paste — ignored for v0.1.
-        _ => Ok(None),
+        // Non-Press key kinds (Release, Repeat) — filtered above.
+        _ => None,
     }
 }
 
@@ -243,8 +257,63 @@ fn load_config(path: Option<&Path>) -> io::Result<(config::Config, Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventState, KeyModifiers};
     use std::fs;
     use tempfile::TempDir;
+
+    fn key_event(kind: KeyEventKind) -> KeyEvent {
+        KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            kind,
+            KeyEventState::NONE,
+        )
+    }
+
+    #[test]
+    fn classify_press_key_routes_to_event_key() {
+        let outcome = classify_event(CtEvent::Key(key_event(KeyEventKind::Press)));
+        assert!(matches!(outcome, Some(Event::Key(_))));
+    }
+
+    #[test]
+    fn classify_release_key_is_filtered() {
+        // Crossterm on Windows emits both Press AND Release for
+        // every keystroke; macOS/Linux only emit Press by default.
+        // Without this filter, Windows users would double-fire
+        // every `Action` verb and double-toggle move-mode on
+        // Enter. Pin the filter so a future "match all key kinds"
+        // refactor regresses noisily instead of just on Windows.
+        let outcome = classify_event(CtEvent::Key(key_event(KeyEventKind::Release)));
+        assert!(outcome.is_none());
+    }
+
+    #[test]
+    fn classify_repeat_key_is_filtered() {
+        // OS-level autorepeat already produces a stream of Press
+        // events for held keys, so we don't need to handle Repeat
+        // separately. Filtering it out keeps held-key behavior
+        // identical across platforms — autorepeat cadence comes
+        // from the OS, not from us.
+        let outcome = classify_event(CtEvent::Key(key_event(KeyEventKind::Repeat)));
+        assert!(outcome.is_none());
+    }
+
+    #[test]
+    fn classify_resize_routes_to_event_resize() {
+        let outcome = classify_event(CtEvent::Resize(80, 24));
+        assert!(matches!(outcome, Some(Event::Resize)));
+    }
+
+    #[test]
+    fn classify_focus_and_paste_are_filtered() {
+        // Mouse / FocusGained / FocusLost / Paste land with the
+        // screens that need them; today none do, so they fall
+        // through to the catchall and produce no event.
+        assert!(classify_event(CtEvent::FocusGained).is_none());
+        assert!(classify_event(CtEvent::FocusLost).is_none());
+        assert!(classify_event(CtEvent::Paste("ignored".to_string())).is_none());
+    }
 
     #[test]
     fn load_config_none_path_returns_default_no_warning() {
