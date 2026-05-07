@@ -36,7 +36,7 @@ impl Model {
     /// before the alt-screen takes over.
     pub(super) fn new(config: config::Config) -> Self {
         Self {
-            screen: AppScreen::MainMenu(MainMenuState),
+            screen: AppScreen::MainMenu(MainMenuState::default()),
             config,
             quit: false,
         }

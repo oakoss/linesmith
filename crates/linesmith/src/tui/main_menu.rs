@@ -1,80 +1,73 @@
 //! Main Menu screen — boot-time placeholder.
 //!
-//! Renders a centered title + quit hint + one-line config summary so
-//! the boot path proves out end-to-end. The real menu (per ADR-0016
-//! §Architecture: Items Editor, Theme Picker, Line Picker, Global
-//! Overrides, Powerline Setup, Terminal Options, Install to Claude
-//! Code, Quit) replaces this view once the `ListScreen` widget lands.
+//! Renders the reusable [`super::list_screen`] widget against a
+//! single-row stub list so the boot path proves the widget out
+//! end-to-end. The target menu is in ADR-0016 §Architecture.
+
+use std::borrow::Cow;
 
 use ratatui::crossterm::event::KeyEvent;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout};
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use super::app::Model;
+use super::list_screen::{
+    self, ListOutcome, ListRowData, ListScreenState, ListScreenView, VerbHint,
+};
 
 #[derive(Debug, Default)]
-pub(super) struct MainMenuState;
-
-/// No-op for the placeholder; the cursor + verb dispatch arrive
-/// with the `ListScreen` widget.
-pub(super) fn update(_state: &mut MainMenuState, _key: KeyEvent) {}
-
-/// Render a centered title, a quit hint, and a one-line config
-/// summary so the placeholder confirms both boot and config-load
-/// worked.
-pub(super) fn view(_state: &MainMenuState, model: &Model, frame: &mut Frame) {
-    let area = frame.area();
-    let block = Block::default().borders(Borders::ALL).title(Span::styled(
-        " linesmith config ",
-        Style::default().add_modifier(Modifier::BOLD),
-    ));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    // Vertical layout: top spacer (40%), title (1 row), hint (1 row),
-    // summary (1 row), bottom spacer. Centers the title cluster
-    // without computing pixel offsets so the layout adapts to
-    // whatever terminal size the user has.
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(40),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-        ])
-        .split(inner);
-
-    let title = Paragraph::new(Line::from(Span::styled(
-        "Main Menu",
-        Style::default().add_modifier(Modifier::BOLD),
-    )))
-    .alignment(Alignment::Center);
-    frame.render_widget(title, rows[1]);
-
-    let hint = Paragraph::new(Line::from(vec![
-        Span::raw("press "),
-        Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" or "),
-        Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" to quit"),
-    ]))
-    .alignment(Alignment::Center);
-    frame.render_widget(hint, rows[2]);
-
-    let summary =
-        Paragraph::new(Line::from(Span::raw(config_summary(model)))).alignment(Alignment::Center);
-    frame.render_widget(summary, rows[3]);
+pub(super) struct MainMenuState {
+    list: ListScreenState,
 }
 
-/// One-line summary of what the boot loaded: segment count from the
-/// resolved config, or "no config file — defaults loaded" when the
-/// path didn't exist. Lives here (not on `Model`) because it's
-/// purely a placeholder-rendering concern.
+/// Drive the placeholder list through the shared widget.
+///
+/// The placeholder configures `verbs = &[]` and
+/// `move_mode_supported = false`, so the legitimate outcomes are
+/// `Consumed`, `Unhandled`, and `Activate` (Enter on the single
+/// row). `Activate` is a no-op until the navigation deliverable
+/// wires real menu targets. `Action(_)` and `MoveSwap` are
+/// unreachable given that config; if either fires, the placeholder
+/// has been mis-configured (e.g. a stray verb registered, or the
+/// move-mode flag flipped) and the `debug_assert!` turns the
+/// silent no-op into a CI failure.
+pub(super) fn update(state: &mut MainMenuState, key: KeyEvent) {
+    let rows = placeholder_rows();
+    match list_screen::handle_key(&mut state.list, key, rows.len(), &[], false) {
+        ListOutcome::Consumed | ListOutcome::Unhandled | ListOutcome::Activate => {}
+        outcome @ (ListOutcome::Action(_) | ListOutcome::MoveSwap { .. }) => {
+            debug_assert!(
+                false,
+                "main menu placeholder: unexpected outcome {outcome:?}",
+            );
+        }
+    }
+}
+
+pub(super) fn view(state: &MainMenuState, model: &Model, frame: &mut Frame) {
+    let rows = placeholder_rows();
+    let summary = config_summary(model);
+    let label = rows.first().copied().unwrap_or("");
+    let row_data = [ListRowData {
+        label: Cow::Borrowed(label),
+        description: Cow::Owned(summary),
+    }];
+    let verbs: [VerbHint<'_>; 0] = [];
+    let view = ListScreenView {
+        title: " linesmith config (placeholder) ",
+        rows: &row_data,
+        verbs: &verbs,
+        move_mode_supported: false,
+    };
+    list_screen::render(&state.list, &view, frame.area(), frame);
+}
+
+fn placeholder_rows() -> &'static [&'static str] {
+    &["Press q or Esc to quit"]
+}
+
+/// One-line summary of what the boot loaded: either a segment
+/// count or a "no segments configured" hint when the resolved
+/// config has no `[line]` table.
 fn config_summary(model: &Model) -> String {
     let line = model.config.line.as_ref();
     let segments = line.map(|l| l.segments.len()).unwrap_or(0);
@@ -99,6 +92,22 @@ mod tests {
         assert_eq!(
             config_summary(&model),
             "no segments configured (defaults will render)",
+        );
+    }
+
+    #[test]
+    fn enter_on_placeholder_does_not_panic_in_debug() {
+        // Regression pin: the placeholder has one row and
+        // `move_mode_supported = false`, so Enter returns
+        // `ListOutcome::Activate`. An earlier draft sent that
+        // outcome to `debug_assert!(false, ...)`, which panicked
+        // on every Enter keypress in debug builds. Activate must
+        // be in the no-op arm.
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut state = MainMenuState::default();
+        update(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
     }
 
