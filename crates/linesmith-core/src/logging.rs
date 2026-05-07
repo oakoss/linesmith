@@ -18,14 +18,20 @@
 //! broken statusline needs a stderr line the user can grep. Scripts
 //! that want absolute silence can `2>/dev/null`.
 //!
-//! Output format: `linesmith [<level>]: <message>`. A future doctor
-//! command can buffer and reformat the same emissions.
+//! Output format on stderr: `linesmith [<level>]: <message>`. The
+//! TUI installs a [`CapturedSink`] in place of [`StderrSink`] for
+//! the duration of the alt-screen so macro emissions don't paint
+//! over the rendered frame; captured entries use the compact
+//! `[<level>] <message>` form (no `linesmith` prefix, no colon)
+//! since the surrounding UI provides context.
 //!
-//! Not a general-purpose logger: no filtering by target, no structured
-//! fields, no sink swap. Add those when a call site needs them.
+//! Not a general-purpose logger: no filtering by target, no
+//! structured fields. Add those when a call site needs them.
 
 use std::io::{self, Write};
+use std::mem;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Logger severity. Variants are ordered `Off < Warn < Debug` so a
 /// call fires when its own level is `<=` the configured level.
@@ -128,20 +134,208 @@ pub fn is_enabled(at_least: Level) -> bool {
     level() >= at_least
 }
 
-/// Emit `msg` at `lvl` when the configured level allows. A broken
-/// stderr (closed pipe, full disk) drops the write silently — the
-/// statusline has no recovery path and panicking would nuke an
-/// otherwise-good render.
+/// Pluggable destination for diagnostic emissions. The default
+/// [`StderrSink`] preserves the `linesmith [<level>]: <msg>` format
+/// external scripts grep for; the TUI swaps in a [`CapturedSink`]
+/// for the duration of the alt-screen so macro emissions land in
+/// the warnings panel instead of corrupting the painted frame.
+///
+/// `&self` (not `&mut self`) so a sink instance can be shared via
+/// `Arc<dyn LogSink>`. The `Send + Sync` bound is what `Arc<dyn _>`
+/// requires; today only the render thread emits, but the bound
+/// keeps the door open for future background plugin emitters
+/// without breaking the public surface. Concurrent emit/swap is
+/// not yet supported — a swap that races with an in-flight
+/// `current_sink()` clone can land an emission on the just-
+/// orphaned sink. See `lsm-wyph` follow-ups for the work to close
+/// that.
+pub trait LogSink: Send + Sync {
+    /// Emit a level-gated diagnostic. The caller has already
+    /// confirmed the level is enabled — the sink writes
+    /// unconditionally. Implementations defensively no-op on
+    /// `Level::Off` rather than relying on the caller; the macros
+    /// never pass `Off`, but `emit()` is `pub`.
+    fn emit(&self, lvl: Level, msg: &str);
+
+    /// Emit a structural-failure diagnostic. Always fires regardless
+    /// of the configured level — `LINESMITH_LOG=off` users still
+    /// see "the statusline broke" because there's no other channel.
+    fn emit_error(&self, msg: &str);
+}
+
+/// Default sink. Writes `linesmith [<tag>]: <msg>` lines to
+/// `io::stderr().lock()` and drops the write on a closed pipe /
+/// full disk: the statusline has no recovery path, and panicking
+/// here would nuke an otherwise-good render.
+#[derive(Debug, Default)]
+pub struct StderrSink;
+
+impl LogSink for StderrSink {
+    fn emit(&self, lvl: Level, msg: &str) {
+        let tag = match lvl {
+            Level::Off => return,
+            Level::Warn => "warn",
+            Level::Debug => "debug",
+        };
+        let _ = writeln!(io::stderr().lock(), "linesmith [{tag}]: {msg}");
+    }
+
+    fn emit_error(&self, msg: &str) {
+        let _ = writeln!(io::stderr().lock(), "linesmith [error]: {msg}");
+    }
+}
+
+/// Buffering sink that accumulates formatted entries for an
+/// interactive consumer to drain. The TUI installs one for the
+/// alt-screen lifetime so `lsm_warn!` / `lsm_error!` / `lsm_debug!`
+/// surface in the live-preview warnings panel instead of painting
+/// over the rendered frame.
+///
+/// Captured format is `[<tag>] <msg>` — the surrounding UI prefixes
+/// each line with its own marker (e.g. `⚠`), so the `linesmith`
+/// prefix and colon would be redundant noise.
+#[derive(Debug, Default)]
+pub struct CapturedSink {
+    entries: Mutex<Vec<String>>,
+}
+
+impl CapturedSink {
+    /// Take all currently-buffered entries, leaving the sink empty.
+    /// The TUI calls this between draws so each frame's warnings
+    /// reflect that frame's render only.
+    #[must_use]
+    pub fn drain(&self) -> Vec<String> {
+        let mut g = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        mem::take(&mut *g)
+    }
+
+    /// Test helper: assert against the buffer without consuming it.
+    #[cfg(test)]
+    fn snapshot(&self) -> Vec<String> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+}
+
+impl LogSink for CapturedSink {
+    fn emit(&self, lvl: Level, msg: &str) {
+        let tag = match lvl {
+            Level::Off => return,
+            Level::Warn => "warn",
+            Level::Debug => "debug",
+        };
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(format!("[{tag}] {msg}"));
+    }
+
+    fn emit_error(&self, msg: &str) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(format!("[error] {msg}"));
+    }
+}
+
+/// Process-wide active sink. `OnceLock` because `Arc::new(...)`
+/// allocates and `Arc::new` is not const-stable, so the slot can't
+/// be a plain `static`. Init fires on first emission or first sink
+/// swap, whichever comes first.
+static SINK: OnceLock<Mutex<Arc<dyn LogSink>>> = OnceLock::new();
+
+/// Test-only serialization helper. Tests that install a custom
+/// sink (or mutate `LEVEL`) must take this lock first — without
+/// it, a parallel test installing its own sink can race the
+/// active-sink slot and steal each other's emissions.
+///
+/// `#[doc(hidden)]` because this isn't part of the supported
+/// public API. Cross-crate tests in this workspace use it; future
+/// removal isn't a SemVer-breaking change. The leading underscore
+/// signals "not for production code".
+#[doc(hidden)]
+pub fn _test_serial_lock() -> std::sync::MutexGuard<'static, ()> {
+    static M: OnceLock<Mutex<()>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+fn sink_slot() -> &'static Mutex<Arc<dyn LogSink>> {
+    SINK.get_or_init(|| Mutex::new(Arc::new(StderrSink)))
+}
+
+fn current_sink() -> Arc<dyn LogSink> {
+    sink_slot()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// Replace the active sink and return the prior one. Use
+/// [`SinkGuard`] for scoped install/restore; this raw function is
+/// `pub(crate)` because the only documented in-tree caller is
+/// `SinkGuard::install` itself. If a real out-of-crate embedder
+/// shows up, promote it back to `pub` then.
+pub(crate) fn install_sink(new_sink: Arc<dyn LogSink>) -> Arc<dyn LogSink> {
+    let mut g = sink_slot().lock().unwrap_or_else(|p| p.into_inner());
+    mem::replace(&mut *g, new_sink)
+}
+
+/// RAII handle that installs a custom sink and restores the prior
+/// one on drop. The TUI uses this so stderr emission resumes after
+/// the alt-screen exits in the normal-return path. Note: the
+/// workspace's release profile sets `panic = "abort"`, so on a
+/// release-build panic this `Drop` does **not** run — the panic
+/// hook (in [`super::tui`]) is what restores the terminal under
+/// abort, and stderr is owned by the alt-screen until then. Under
+/// the default unwind profile (dev/test), stack unwinding drops
+/// the guard normally.
+///
+/// Nested guards in nested scopes restore in reverse construction
+/// order so long as Rust's normal stack-LIFO drop applies (no
+/// explicit `mem::take` of the field, no moves into a heap-owned
+/// container that delays drop). Don't move the guard into
+/// `Box`/`Arc`/`Vec` and expect LIFO.
+#[must_use = "binding to `_` drops the guard immediately, which restores the prior sink right away; bind to `_g` (or any real name) to hold it for the scope"]
+pub struct SinkGuard {
+    /// `Option` only so `Drop` can `take()` the prior out of
+    /// `&mut self`. Invariant: always `Some` outside `Drop`. If a
+    /// future `defuse(self) -> Arc<dyn LogSink>` method is added,
+    /// it must consume `self` via `mem::forget` rather than
+    /// `take()`-ing this field, or restore semantics silently
+    /// regress.
+    prior: Option<Arc<dyn LogSink>>,
+}
+
+impl SinkGuard {
+    /// Install `new_sink` as the active sink, capturing the prior
+    /// one for restoration on drop.
+    pub fn install(new_sink: Arc<dyn LogSink>) -> Self {
+        Self {
+            prior: Some(install_sink(new_sink)),
+        }
+    }
+}
+
+impl Drop for SinkGuard {
+    fn drop(&mut self) {
+        if let Some(prior) = self.prior.take() {
+            install_sink(prior);
+        }
+    }
+}
+
+/// Emit `msg` at `lvl` when the configured level allows. Routed
+/// through the active [`LogSink`]; the default sink writes to
+/// stderr, the TUI's [`CapturedSink`] buffers for in-frame display.
 pub fn emit(lvl: Level, msg: &str) {
     if !is_enabled(lvl) {
         return;
     }
-    let tag = match lvl {
-        Level::Off => return,
-        Level::Warn => "warn",
-        Level::Debug => "debug",
-    };
-    let _ = writeln!(io::stderr().lock(), "linesmith [{tag}]: {msg}");
+    current_sink().emit(lvl, msg);
 }
 
 /// Emit a structural-failure diagnostic. Bypasses the level gate:
@@ -149,14 +343,7 @@ pub fn emit(lvl: Level, msg: &str) {
 /// things that reach this function are render failures a user has no
 /// other way of seeing.
 pub fn emit_error(msg: &str) {
-    emit_error_to(msg, &mut io::stderr().lock());
-}
-
-/// Same as [`emit_error`] but to a caller-supplied sink. Separate
-/// from `emit_error` so unit tests can assert the message without
-/// capturing process stderr.
-pub(crate) fn emit_error_to(msg: &str, sink: &mut dyn Write) {
-    let _ = writeln!(sink, "linesmith [error]: {msg}");
+    current_sink().emit_error(msg);
 }
 
 impl Level {
@@ -210,14 +397,13 @@ macro_rules! lsm_error {
 mod tests {
     use super::*;
 
-    // Tests that mutate LEVEL run serially — parallel cargo-test would
-    // otherwise flake when two tests disagree on the expected level.
+    // Tests that mutate LEVEL or the active sink run serially —
+    // parallel cargo-test would otherwise flake when two tests
+    // disagree on the expected state. Wraps the same mutex
+    // cross-crate tests use via `_test_serial_lock` so logging
+    // tests and consumer tests (e.g. `tui::preview`) coordinate.
     fn lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static M: OnceLock<Mutex<()>> = OnceLock::new();
-        M.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        super::_test_serial_lock()
     }
 
     #[test]
@@ -378,28 +564,154 @@ mod tests {
     }
 
     #[test]
-    fn emit_error_bypasses_off_level() {
+    fn captured_sink_records_warn_emit_with_compact_format() {
+        // Pin the captured-sink shape: `[<tag>] <msg>` with no
+        // `linesmith` prefix and no colon. The TUI warnings panel
+        // already wraps each line with `⚠`, so the prefix is noise.
+        let _g = lock();
+        set_level(Level::Warn);
+        let captured = Arc::new(CapturedSink::default());
+        let _restore = SinkGuard::install(captured.clone());
+        emit(Level::Warn, "hello");
+        assert_eq!(captured.snapshot(), vec!["[warn] hello".to_string()]);
+        set_level(DEFAULT_LEVEL);
+    }
+
+    #[test]
+    fn captured_sink_records_error_bypassing_off_level() {
+        // emit_error always fires — including when the level gate
+        // would otherwise suppress every emission. Pin both the
+        // bypass and the `[error] msg` capture format.
         let _g = lock();
         set_level(Level::Off);
-        let mut sink = Vec::<u8>::new();
-        emit_error_to("render panic", &mut sink);
-        let written = String::from_utf8(sink).expect("utf8");
-        assert_eq!(written, "linesmith [error]: render panic\n");
+        let captured = Arc::new(CapturedSink::default());
+        let _restore = SinkGuard::install(captured.clone());
+        emit_error("render panic");
+        assert_eq!(
+            captured.snapshot(),
+            vec!["[error] render panic".to_string()]
+        );
+        set_level(DEFAULT_LEVEL);
+    }
+
+    #[test]
+    fn captured_sink_skips_debug_emit_when_level_warn() {
+        // The level gate runs in `emit()` *before* dispatching to
+        // the sink. Pin that a Debug emission with the level set to
+        // Warn never reaches the sink — otherwise `LINESMITH_LOG`
+        // would silently stop gating once the TUI installed a
+        // capture sink.
+        let _g = lock();
+        set_level(Level::Warn);
+        let captured = Arc::new(CapturedSink::default());
+        let _restore = SinkGuard::install(captured.clone());
+        emit(Level::Debug, "verbose");
+        assert!(captured.snapshot().is_empty());
         set_level(DEFAULT_LEVEL);
     }
 
     #[test]
     fn emit_error_fires_at_every_level() {
+        // emit_error bypasses the level gate at every setting, not
+        // just Off. Pin Off + Warn + Debug so a future "optimize
+        // emit_error to share the emit() short-circuit" refactor
+        // breaks the Warn/Debug arms here, not just at Off.
         let _g = lock();
         for l in [Level::Off, Level::Warn, Level::Debug] {
             set_level(l);
-            let mut sink = Vec::<u8>::new();
-            emit_error_to("x", &mut sink);
-            assert!(
-                !sink.is_empty(),
-                "emit_error must fire at level {l:?}, got empty sink"
+            let captured = Arc::new(CapturedSink::default());
+            let _restore = SinkGuard::install(captured.clone());
+            emit_error("structural failure");
+            assert_eq!(
+                captured.snapshot(),
+                vec!["[error] structural failure".to_string()],
+                "emit_error must fire at level {l:?}",
             );
         }
         set_level(DEFAULT_LEVEL);
+    }
+
+    #[test]
+    fn captured_sink_drain_returns_entries_and_empties_buffer() {
+        let _g = lock();
+        set_level(Level::Warn);
+        let captured = Arc::new(CapturedSink::default());
+        let _restore = SinkGuard::install(captured.clone());
+        emit(Level::Warn, "first");
+        emit(Level::Warn, "second");
+        let drained = captured.drain();
+        assert_eq!(
+            drained,
+            vec!["[warn] first".to_string(), "[warn] second".to_string()]
+        );
+        // Drain consumes — second drain is empty.
+        assert!(captured.drain().is_empty());
+        set_level(DEFAULT_LEVEL);
+    }
+
+    #[test]
+    fn sink_guard_restores_prior_sink_on_drop_lifo_three_deep() {
+        // The TUI relies on RAII restore for stderr emissions to
+        // resume after the alt-screen exits. A three-level nest
+        // catches a regression where Drop accidentally restores the
+        // first-installed sink (or any non-immediate prior) — a
+        // two-level nest would let that bug pass.
+        let _g = lock();
+        set_level(Level::Warn);
+        let outer = Arc::new(CapturedSink::default());
+        let _outer_g = SinkGuard::install(outer.clone());
+        {
+            let middle = Arc::new(CapturedSink::default());
+            let _middle_g = SinkGuard::install(middle.clone());
+            {
+                let inner = Arc::new(CapturedSink::default());
+                let _inner_g = SinkGuard::install(inner.clone());
+                emit(Level::Warn, "inner");
+                assert_eq!(inner.snapshot(), vec!["[warn] inner".to_string()]);
+                assert!(middle.snapshot().is_empty());
+                assert!(outer.snapshot().is_empty());
+            }
+            // _inner_g dropped → middle is active again.
+            emit(Level::Warn, "middle");
+            assert_eq!(middle.snapshot(), vec!["[warn] middle".to_string()]);
+            assert!(outer.snapshot().is_empty());
+        }
+        // _middle_g dropped → outer is active again.
+        emit(Level::Warn, "outer");
+        assert_eq!(outer.snapshot(), vec!["[warn] outer".to_string()]);
+        set_level(DEFAULT_LEVEL);
+    }
+
+    #[test]
+    fn install_sink_returns_prior_for_manual_restore() {
+        // The raw `install_sink` is `pub(crate)`; this pins the
+        // round-trip contract `SinkGuard::install` itself depends
+        // on. Force the level explicitly: the test runs serially,
+        // but a future test that leaves `Off` would otherwise
+        // silently suppress the emit and break the assertion.
+        let _g = lock();
+        set_level(Level::Warn);
+        let captured = Arc::new(CapturedSink::default());
+        let prior = install_sink(captured.clone());
+        emit(Level::Warn, "captured");
+        assert_eq!(captured.snapshot(), vec!["[warn] captured".to_string()]);
+        let _ = install_sink(prior);
+    }
+
+    #[test]
+    fn concrete_sink_types_remain_thread_safe() {
+        // `Arc<dyn LogSink>` requires Send+Sync via the trait
+        // bound, so the trait-object case is enforced at compile
+        // time without a runtime assertion. The concrete-type pins
+        // here catch a future field addition (e.g. `Cell`,
+        // `RefCell`) that would auto-derive a non-Sync `StderrSink`
+        // or `CapturedSink` — at which point neither could be
+        // wrapped in `Arc<dyn LogSink>` and the trait-object
+        // bound's compile error would name the trait, not the
+        // field. Naming the concrete types here makes the failure
+        // point at the right line.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<StderrSink>();
+        assert_send_sync::<CapturedSink>();
     }
 }

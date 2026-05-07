@@ -6,6 +6,8 @@
 //! `#[non_exhaustive]` so new screen variants don't churn match arms
 //! in code that didn't need to change.
 
+use std::sync::Arc;
+
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
@@ -14,6 +16,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::config;
+use crate::logging::CapturedSink;
 use crate::theme::{Capability, Theme};
 
 use super::main_menu::{self, MainMenuState};
@@ -31,10 +34,11 @@ pub(super) enum AppScreen {
 }
 
 /// Top-level model. Carries the current screen, the parsed config,
-/// the resolved theme, the detected color capability, and the
-/// quit flag. Theme + capability are snapshot at boot so the
-/// preview honors `config.theme` and `NO_COLOR` the same way the
-/// production driver does.
+/// the resolved theme, the detected color capability, the captured
+/// log sink (when running under the alt-screen), and the quit flag.
+/// Theme + capability are snapshot at boot so the preview honors
+/// `config.theme` and `NO_COLOR` the same way the production driver
+/// does.
 pub(super) struct Model {
     pub(super) screen: AppScreen,
     // Held on `Model` so screens that need it can read it
@@ -44,6 +48,12 @@ pub(super) struct Model {
     pub(super) config: config::Config,
     pub(super) theme: Theme,
     pub(super) capability: Capability,
+    /// Process-wide log sink the boot path swapped in. The view
+    /// passes a borrow to `preview::render_lines`, which drains
+    /// macro emissions into the warnings vec so they paint into
+    /// the warnings panel instead of corrupting the alt-screen.
+    /// `None` for unit tests that bypass the boot path.
+    pub(super) sink: Option<Arc<CapturedSink>>,
     pub(super) quit: bool,
 }
 
@@ -54,12 +64,23 @@ impl Model {
     /// emission so it can write to stderr before the alt-screen
     /// takes over, plus theme registry construction and color
     /// capability detection.
-    pub(super) fn new(config: config::Config, theme: Theme, capability: Capability) -> Self {
+    ///
+    /// `sink` is the captured-log sink installed for the alt-screen
+    /// lifetime — pass the same `Arc` the boot path handed to
+    /// [`logging::SinkGuard::install`] so the view can drain
+    /// macro emissions on each draw. `None` for unit tests.
+    pub(super) fn new(
+        config: config::Config,
+        theme: Theme,
+        capability: Capability,
+        sink: Option<Arc<CapturedSink>>,
+    ) -> Self {
         Self {
             screen: AppScreen::MainMenu(MainMenuState::default()),
             config,
             theme,
             capability,
+            sink,
             quit: false,
         }
     }
@@ -154,8 +175,13 @@ pub(super) fn view(model: &Model, frame: &mut Frame) {
     // shrink/drop against the surface that actually displays
     // them, not the outer frame width.
     let inner_width = area.width.saturating_sub(2);
-    let (preview_lines, warnings) =
-        preview::render_lines(&model.config, &model.theme, model.capability, inner_width);
+    let (preview_lines, warnings) = preview::render_lines(
+        &model.config,
+        &model.theme,
+        model.capability,
+        inner_width,
+        model.sink.as_deref(),
+    );
 
     // Height: 2 border rows + at least 1 content row + 1 row per
     // warning (capped). Capped at 16 total so a pathological
@@ -243,6 +269,7 @@ mod tests {
             config::Config::default(),
             crate::theme::default_theme().clone(),
             Capability::None,
+            None,
         )
     }
 

@@ -223,6 +223,7 @@ mod tests {
             crate::config::Config::default(),
             crate::theme::default_theme().clone(),
             crate::theme::Capability::None,
+            None,
         );
         // Down twice → cursor on row 2 (Powerline Setup).
         model = app_update(model, Event::Key(key(KeyCode::Down)));

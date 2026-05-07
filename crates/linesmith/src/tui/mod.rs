@@ -21,6 +21,7 @@ mod preview;
 
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use ratatui::crossterm::event::{self as cevent, Event as CtEvent, KeyEventKind};
@@ -31,6 +32,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::Terminal;
 
 use crate::config;
+use crate::logging::{CapturedSink, SinkGuard};
 
 use app::{update, Event, Model};
 
@@ -77,7 +79,19 @@ pub(super) fn run(config_path: Option<&Path>, stderr: &mut dyn Write) -> u8 {
     let theme = resolve_theme(config.theme.as_deref(), &theme_registry, stderr).clone();
     let capability = resolve_capability(&config);
 
-    let model = Model::new(config, theme, capability);
+    // Install the captured-log sink *before* enter_terminal so any
+    // macro emission that fires between sink install and the first
+    // draw lands in the buffer (where the first frame's drain will
+    // surface it) rather than on stderr (where the alt-screen would
+    // paint over it). The `SinkGuard` restores `StderrSink` on drop
+    // for the normal-return path; under the workspace's release
+    // `panic = "abort"`, the panic hook (not Drop) is what restores
+    // terminal state and stderr is owned by the alt-screen until
+    // process exit.
+    let captured_sink = Arc::new(CapturedSink::default());
+    let _sink_guard = SinkGuard::install(captured_sink.clone());
+
+    let model = Model::new(config, theme, capability, Some(Arc::clone(&captured_sink)));
 
     // Install the panic hook *before* enter_terminal so a panic
     // during `Terminal::new` or the first draw still routes through
@@ -86,6 +100,14 @@ pub(super) fn run(config_path: Option<&Path>, stderr: &mut dyn Write) -> u8 {
     // safety net.
     install_panic_hook();
     if let Err(err) = enter_terminal() {
+        // Drain anything the sink captured between install and
+        // failure (theme registry warnings, capability detection,
+        // anything Model::new transitively emits) onto stderr —
+        // the alt-screen never opened, so there's no warnings
+        // panel to surface them in, and silently dropping
+        // diagnostics from the boot-failure path is the worst
+        // possible UX for "why didn't my TUI start".
+        flush_captured_to_stderr(&captured_sink, stderr);
         let _ = writeln!(stderr, "linesmith config: terminal setup: {err}");
         return 1;
     }
@@ -101,9 +123,31 @@ pub(super) fn run(config_path: Option<&Path>, stderr: &mut dyn Write) -> u8 {
     match outcome {
         Ok(()) => 0,
         Err(err) => {
+            // The event loop failed; surface anything macros emitted
+            // between the last successful frame drain and the failure
+            // point so the user sees the underlying diagnostic, not
+            // just the I/O error code.
+            flush_captured_to_stderr(&captured_sink, stderr);
             let _ = writeln!(stderr, "linesmith config: event loop: {err}");
             1
         }
+    }
+}
+
+/// Drain any entries the captured sink picked up during boot and
+/// write them to `stderr`. Used by the early-return arm when
+/// `enter_terminal` fails: the alt-screen never opened, so the
+/// warnings panel never gets a chance to surface them, and silently
+/// dropping diagnostics from the boot-failure path is the worst
+/// possible UX for "why didn't my TUI start".
+///
+/// Lines come out prefixed with `linesmith config:` to match the
+/// other boot-path stderr writes (parse warnings, terminal setup
+/// errors). The captured `[<level>] <msg>` body is preserved as-is
+/// so the level tag is visible to the user.
+fn flush_captured_to_stderr(captured: &CapturedSink, stderr: &mut dyn Write) {
+    for entry in captured.drain() {
+        let _ = writeln!(stderr, "linesmith config: {entry}");
     }
 }
 
@@ -340,6 +384,37 @@ mod tests {
             kind,
             KeyEventState::NONE,
         )
+    }
+
+    #[test]
+    fn flush_captured_to_stderr_drains_with_boot_path_prefix() {
+        // Pin the boot-failure drain format: each entry comes out
+        // prefixed with `linesmith config: ` to match the other
+        // boot-path stderr writes (parse warnings, terminal-setup
+        // errors), and the captured `[<level>] <msg>` body stays
+        // intact so the user sees the level tag. Drain is
+        // consume-once: a second call returns nothing.
+        use crate::logging::{Level, LogSink};
+
+        let _serial = crate::logging::_test_serial_lock();
+        let captured = CapturedSink::default();
+        captured.emit(Level::Warn, "first");
+        captured.emit_error("oops");
+        let mut stderr = Vec::<u8>::new();
+        flush_captured_to_stderr(&captured, &mut stderr);
+        let written = String::from_utf8(stderr).expect("utf8");
+        assert!(
+            written.contains("linesmith config: [warn] first"),
+            "missing warn prefix in {written:?}",
+        );
+        assert!(
+            written.contains("linesmith config: [error] oops"),
+            "missing error prefix in {written:?}",
+        );
+        // Drain consumed both entries; second flush is a no-op.
+        let mut second = Vec::<u8>::new();
+        flush_captured_to_stderr(&captured, &mut second);
+        assert!(second.is_empty(), "second flush leaked: {second:?}");
     }
 
     #[test]

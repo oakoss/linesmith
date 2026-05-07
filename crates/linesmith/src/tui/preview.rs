@@ -25,6 +25,7 @@ use crate::config::Config;
 use crate::data_context::error::UsageError;
 use crate::data_context::DataContext;
 use crate::layout::render_to_runs;
+use crate::logging::CapturedSink;
 use crate::segments::builder::build_lines;
 use crate::segments::LineItem;
 use crate::theme::{AnsiColor, Capability, Color, StyledRun, Theme};
@@ -59,6 +60,17 @@ const PREVIEW_STDIN_JSON: &[u8] = br#"{
 /// layout-mode mismatches, render errors); the caller chooses how
 /// to display them.
 ///
+/// `sink` is the [`CapturedSink`] the TUI installs for the alt-
+/// screen lifetime so `lsm_warn!` / `lsm_error!` / `lsm_debug!`
+/// emissions from inside `build_lines` and `render_to_runs` (layout
+/// contract violations, schema-drift warns inside the input parser,
+/// segment render errors) land in the warnings panel instead of
+/// painting over the frame. Drained at the end of this call so the
+/// returned warnings vec carries the full per-frame diagnostic
+/// stream — explicit-callback channel + macro channel — in one
+/// list. Pass `None` from non-TUI callers (the unit tests below)
+/// where the macros are free to write to stderr.
+///
 /// Plugin segments don't render: the preview path passes
 /// `plugins = None` to keep the editor independent of the rhai
 /// runtime. Plugin-authored segments hide silently and the warn
@@ -68,6 +80,7 @@ pub(super) fn render_lines(
     theme: &Theme,
     capability: Capability,
     terminal_width: u16,
+    sink: Option<&CapturedSink>,
 ) -> (Vec<Line<'static>>, Vec<String>) {
     let mut warnings: Vec<String> = Vec::new();
     let lines = build_lines(Some(config), None, |msg| warnings.push(msg.to_string()));
@@ -84,6 +97,15 @@ pub(super) fn render_lines(
                 warnings.push(msg.to_string());
             },
         ));
+    }
+    // Drain after every macro emission has fired so the returned
+    // vec captures both channels. Order: explicit-callback
+    // warnings first (in segment-iteration order), then macro
+    // emissions appended. Macros that fire between draws (none
+    // today; possible once v0.2 background plugins land) surface
+    // on the next frame's render, not the one they fired during.
+    if let Some(sink) = sink {
+        warnings.extend(sink.drain());
     }
     (rendered, warnings)
 }
@@ -241,7 +263,16 @@ mod tests {
     }
 
     fn render(config: &Config, width: u16) -> (Vec<Line<'static>>, Vec<String>) {
-        render_lines(config, theme::default_theme(), Capability::TrueColor, width)
+        // `sink = None` keeps these tests independent of the
+        // process-wide log sink; they assert the explicit-callback
+        // channel only.
+        render_lines(
+            config,
+            theme::default_theme(),
+            Capability::TrueColor,
+            width,
+            None,
+        )
     }
 
     #[test]
@@ -436,6 +467,102 @@ mod tests {
         );
         assert_eq!(ansi_to_ratatui(AnsiColor::BrightCyan), RColor::LightCyan);
         assert_eq!(ansi_to_ratatui(AnsiColor::BrightWhite), RColor::White);
+    }
+
+    #[test]
+    fn render_lines_drains_captured_sink_into_warnings() {
+        // Pin the macro-channel pickup: `lsm_warn!` emissions that
+        // fire during `render_lines` (whether from build_lines,
+        // render_to_runs, or any internal helper that bypasses the
+        // explicit `warn` callbacks) end up in the returned
+        // warnings vec via the captured sink. Without this drain,
+        // those emissions would either paint over the alt-screen
+        // (if sink is StderrSink) or get silently swallowed.
+        use crate::logging::{self, Level};
+        use std::sync::Arc;
+
+        // Serialize against any other test in the process that
+        // installs a sink or mutates the level — without this, two
+        // tests racing each other's `SinkGuard::install` would
+        // steal each other's emissions.
+        let _serial = logging::_test_serial_lock();
+        let cfg = Config::default();
+        let captured = Arc::new(CapturedSink::default());
+        let _restore = logging::SinkGuard::install(captured.clone());
+        // Pre-seed an emission so the drain path has something to
+        // pick up regardless of whether any built-in segment in the
+        // default config decides to warn this frame.
+        logging::set_level(Level::Warn);
+        linesmith_core::lsm_warn!("preview-drain-pin: synthetic warn");
+
+        let (_lines, warnings) = render_lines(
+            &cfg,
+            theme::default_theme(),
+            Capability::TrueColor,
+            200,
+            Some(captured.as_ref()),
+        );
+        // Strict count + format pin: the drained entry must appear
+        // exactly once and carry the `[warn]` prefix. A weaker
+        // `.any(contains)` would pass under future refactors that
+        // duplicate or strip the captured-sink prefix; both would
+        // be silent regressions of the documented format.
+        let matches: Vec<&String> = warnings
+            .iter()
+            .filter(|w| w.contains("preview-drain-pin"))
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one synthetic-warn entry, got {warnings:?}",
+        );
+        assert!(
+            matches[0].starts_with("[warn] "),
+            "drained entry must carry the `[warn]` prefix, got {:?}",
+            matches[0],
+        );
+        // Sink consumed by drain — second call must be empty.
+        assert!(
+            captured.drain().is_empty(),
+            "render_lines must consume the captured sink",
+        );
+    }
+
+    #[test]
+    fn render_lines_with_sink_none_does_not_drain_global_sink() {
+        // Pin the contract: `sink = None` means render_lines does
+        // NOT touch the process-wide sink. A refactor that
+        // silently substitutes a default sink (e.g.
+        // `sink.unwrap_or(&CapturedSink::default()).drain()`) would
+        // both swallow real macro emissions in non-TUI callers and
+        // bypass the production stderr destination — the test
+        // catches that by installing a captured sink globally,
+        // emitting, then asserting the entry is STILL there after
+        // a `None` render.
+        use crate::logging::{self, Level};
+        use std::sync::Arc;
+
+        let _serial = logging::_test_serial_lock();
+        let cfg = Config::default();
+        let captured = Arc::new(CapturedSink::default());
+        let _restore = logging::SinkGuard::install(captured.clone());
+        logging::set_level(Level::Warn);
+        linesmith_core::lsm_warn!("none-bypass-pin: stays in sink");
+
+        let (_lines, _warnings) = render_lines(
+            &cfg,
+            theme::default_theme(),
+            Capability::TrueColor,
+            200,
+            None,
+        );
+        // The render_lines call did not drain — the entry must
+        // still be sitting in the captured sink.
+        let leftovers = captured.drain();
+        assert!(
+            leftovers.iter().any(|w| w.contains("none-bypass-pin")),
+            "sink=None must leave global sink contents alone, got {leftovers:?}",
+        );
     }
 
     #[test]
