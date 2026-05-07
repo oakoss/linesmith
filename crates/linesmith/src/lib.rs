@@ -29,8 +29,8 @@ pub(crate) mod tui;
 // used internally are aliased; new internal callers add the
 // short alias here as needed.
 pub(crate) use linesmith_core::{
-    config, data_context, detect_terminal_width, logging, presets, run_lines_with_context, runtime,
-    segments, theme, RunContext,
+    config, data_context, detect_terminal_width, input, layout, logging, presets,
+    run_lines_with_context, runtime, segments, theme, RunContext,
 };
 
 pub use driver::{cli_main, CliEnv};

@@ -17,6 +17,7 @@ mod app;
 mod list_screen;
 mod main_menu;
 mod placeholder;
+mod preview;
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -59,7 +60,24 @@ pub(super) fn run(config_path: Option<&Path>, stderr: &mut dyn Write) -> u8 {
     if let Some(warning) = parse_warning {
         let _ = writeln!(stderr, "linesmith config: {warning}");
     }
-    let model = Model::new(config);
+
+    // Resolve theme + color capability so the preview tracks the
+    // user's configured rendering. Theme registry is built from
+    // XDG-derived dirs; capability honors `[layout_options].color`
+    // and falls through to `Capability::detect` (which checks
+    // `NO_COLOR` and probes the terminal). `FORCE_COLOR` and the
+    // production driver's CLI flags aren't honored here — full
+    // parity with the driver's resolve chain is a separate task.
+    let xdg = crate::data_context::xdg::XdgEnv::from_process_env();
+    let user_themes_dir = crate::runtime::themes::user_themes_dir(&xdg);
+    let theme_registry =
+        crate::runtime::themes::build_theme_registry(user_themes_dir.as_deref(), |msg| {
+            let _ = writeln!(stderr, "linesmith config: {msg}");
+        });
+    let theme = resolve_theme(config.theme.as_deref(), &theme_registry, stderr).clone();
+    let capability = resolve_capability(&config);
+
+    let model = Model::new(config, theme, capability);
 
     // Install the panic hook *before* enter_terminal so a panic
     // during `Terminal::new` or the first draw still routes through
@@ -202,6 +220,60 @@ fn install_panic_hook() {
         let _ = leave_terminal();
         prev(info);
     }));
+}
+
+/// Resolve the color capability for the preview from
+/// `[layout_options].color`: Never → strip color, Always →
+/// richest the terminal supports (with TrueColor rescue when not
+/// a TTY), Auto → `Capability::detect` (which checks `NO_COLOR`
+/// and probes the terminal). `FORCE_COLOR` and the CLI's
+/// `--force-color` / `--no-color` flags aren't honored here; the
+/// editor doesn't take args.
+fn resolve_capability(config: &config::Config) -> crate::theme::Capability {
+    use crate::theme::Capability;
+    match config.layout_options.as_ref().map(|l| l.color) {
+        Some(config::ColorPolicy::Never) => Capability::None,
+        Some(config::ColorPolicy::Always) => {
+            // `from_terminal` strips `NO_COLOR` and runs the
+            // supports-color probe; if the probe says "no TTY"
+            // we still want color (the user asked for it).
+            let probed = Capability::from_terminal();
+            if probed == Capability::None {
+                Capability::TrueColor
+            } else {
+                probed
+            }
+        }
+        _ => Capability::detect(),
+    }
+}
+
+/// Resolve the user's configured theme name against the registry.
+/// Empty / unset name → `default`. Unknown name → `default` with a
+/// stderr warning emitted before the alt-screen takes over so the
+/// user sees the typo without hunting in scrollback.
+fn resolve_theme<'a>(
+    name: Option<&str>,
+    registry: &'a crate::theme::ThemeRegistry,
+    stderr: &mut dyn Write,
+) -> &'a crate::theme::Theme {
+    let Some(name) = name.filter(|n| !n.is_empty()) else {
+        return registry
+            .lookup("default")
+            .expect("default theme is always in the registry");
+    };
+    match registry.lookup(name) {
+        Some(t) => t,
+        None => {
+            let _ = writeln!(
+                stderr,
+                "linesmith config: unknown theme '{name}'; using 'default'",
+            );
+            registry
+                .lookup("default")
+                .expect("default theme is always in the registry")
+        }
+    }
 }
 
 /// Load the config for the boot path. Returns the parsed config plus

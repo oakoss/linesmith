@@ -7,12 +7,18 @@
 //! in code that didn't need to change.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::config;
+use crate::theme::{Capability, Theme};
 
 use super::main_menu::{self, MainMenuState};
 use super::placeholder::{self, PlaceholderState};
+use super::preview;
 
 /// Top-level UI state. Each variant carries its own state struct.
 /// Add a screen by adding a variant + its state struct + a `match`
@@ -25,7 +31,10 @@ pub(super) enum AppScreen {
 }
 
 /// Top-level model. Carries the current screen, the parsed config,
-/// and the quit flag.
+/// the resolved theme, the detected color capability, and the
+/// quit flag. Theme + capability are snapshot at boot so the
+/// preview honors `config.theme` and `NO_COLOR` the same way the
+/// production driver does.
 pub(super) struct Model {
     pub(super) screen: AppScreen,
     // Held on `Model` so screens that need it can read it
@@ -33,18 +42,24 @@ pub(super) struct Model {
     // hence the dead-code allow.
     #[allow(dead_code)]
     pub(super) config: config::Config,
+    pub(super) theme: Theme,
+    pub(super) capability: Capability,
     pub(super) quit: bool,
 }
 
 impl Model {
-    /// Construct a fresh `Model` against `config`, opening on the
-    /// `MainMenu` screen. The caller (`super::run`) handles config
-    /// loading + parse-warning emission so it can write to stderr
-    /// before the alt-screen takes over.
-    pub(super) fn new(config: config::Config) -> Self {
+    /// Construct a fresh `Model` against `config`, theme, and
+    /// capability, opening on the `MainMenu` screen. The caller
+    /// (`super::run`) handles config loading + parse-warning
+    /// emission so it can write to stderr before the alt-screen
+    /// takes over, plus theme registry construction and color
+    /// capability detection.
+    pub(super) fn new(config: config::Config, theme: Theme, capability: Capability) -> Self {
         Self {
             screen: AppScreen::MainMenu(MainMenuState::default()),
             config,
+            theme,
+            capability,
             quit: false,
         }
     }
@@ -125,13 +140,93 @@ fn is_unconditional_quit(key: &KeyEvent) -> bool {
     }
 }
 
-/// Render the current screen. Each screen owns its own draw routine;
-/// this function is a thin dispatcher. Screens read top-level state
-/// (e.g. `model.config`) directly off `model`.
+/// Render the live-preview header above the active screen. The
+/// preview lives at the top of every frame per ADR-0016. Height =
+/// 2 border rows + max(1, line count) + one row per emitted
+/// warning, with the total clamped to 16 rows so a many-line
+/// config or noisy diagnostic stream can't crowd out the screen
+/// below.
 pub(super) fn view(model: &Model, frame: &mut Frame) {
+    let area = frame.area();
+
+    // The bordered preview block costs 2 columns horizontally;
+    // the layout engine needs the *content* width so segments
+    // shrink/drop against the surface that actually displays
+    // them, not the outer frame width.
+    let inner_width = area.width.saturating_sub(2);
+    let (preview_lines, warnings) =
+        preview::render_lines(&model.config, &model.theme, model.capability, inner_width);
+
+    // Height: 2 border rows + at least 1 content row + 1 row per
+    // warning (capped). Capped at 16 total so a pathological
+    // multi-line config can't crowd out the screen below.
+    let line_rows = u16::try_from(preview_lines.len().max(1)).unwrap_or(u16::MAX);
+    let warn_rows = u16::try_from(warnings.len()).unwrap_or(u16::MAX);
+    let preview_height = line_rows
+        .saturating_add(warn_rows)
+        .saturating_add(2)
+        .min(16);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(preview_height), Constraint::Min(1)])
+        .split(area);
+
+    render_preview(&preview_lines, &warnings, chunks[0], frame);
+
     match &model.screen {
-        AppScreen::MainMenu(state) => main_menu::view(state, frame),
-        AppScreen::Placeholder(state) => placeholder::view(state, frame),
+        AppScreen::MainMenu(state) => main_menu::view(state, frame, chunks[1]),
+        AppScreen::Placeholder(state) => placeholder::view(state, frame, chunks[1]),
+    }
+}
+
+fn render_preview(
+    lines: &[Line<'static>],
+    warnings: &[String],
+    area: ratatui::layout::Rect,
+    frame: &mut Frame,
+) {
+    let block = Block::default().borders(Borders::ALL).title(Span::styled(
+        " preview ",
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 {
+        return;
+    }
+
+    // Vertical layout: lines fill the top, warnings (if any)
+    // occupy the bottom rows in a dim italic style so they read
+    // as advisory rather than primary content.
+    let line_rows = u16::try_from(lines.len().max(1)).unwrap_or(u16::MAX);
+    let warn_rows = u16::try_from(warnings.len()).unwrap_or(u16::MAX);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(line_rows), Constraint::Length(warn_rows)])
+        .split(inner);
+
+    if lines.is_empty() {
+        let body = Paragraph::new(Line::from(
+            "(no preview — `[line].segments` resolved to empty; check warnings below)",
+        ));
+        frame.render_widget(body, chunks[0]);
+    } else {
+        let body = Paragraph::new(lines.to_vec());
+        frame.render_widget(body, chunks[0]);
+    }
+
+    if !warnings.is_empty() {
+        let style = Style::default()
+            .add_modifier(Modifier::DIM)
+            .add_modifier(Modifier::ITALIC);
+        let warn_lines: Vec<Line<'static>> = warnings
+            .iter()
+            .map(|w| Line::styled(format!("⚠ {w}"), style))
+            .collect();
+        let body = Paragraph::new(warn_lines);
+        frame.render_widget(body, chunks[1]);
     }
 }
 
@@ -144,7 +239,11 @@ mod tests {
     }
 
     fn model() -> Model {
-        Model::new(config::Config::default())
+        Model::new(
+            config::Config::default(),
+            crate::theme::default_theme().clone(),
+            Capability::None,
+        )
     }
 
     #[test]

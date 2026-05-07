@@ -12,6 +12,7 @@ use std::borrow::Cow;
 use std::mem;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::Rect;
 use ratatui::Frame;
 
 use super::app::{AppScreen, ScreenOutcome};
@@ -127,7 +128,7 @@ fn activate(state: &mut MainMenuState) -> ScreenOutcome {
     )))
 }
 
-pub(super) fn view(state: &MainMenuState, frame: &mut Frame) {
+pub(super) fn view(state: &MainMenuState, frame: &mut Frame, area: Rect) {
     let row_data: Vec<ListRowData<'static>> = MENU_ITEMS
         .iter()
         .map(|item| ListRowData {
@@ -142,7 +143,7 @@ pub(super) fn view(state: &MainMenuState, frame: &mut Frame) {
         verbs: &verbs,
         move_mode_supported: false,
     };
-    list_screen::render(&state.list, &view, frame.area(), frame);
+    list_screen::render(&state.list, &view, area, frame);
 }
 
 #[cfg(test)]
@@ -218,7 +219,11 @@ mod tests {
         // with a fresh `MainMenuState::default()` somewhere along
         // the back-nav path.
         use super::super::app::{update as app_update, AppScreen, Event};
-        let mut model = super::super::app::Model::new(crate::config::Config::default());
+        let mut model = super::super::app::Model::new(
+            crate::config::Config::default(),
+            crate::theme::default_theme().clone(),
+            crate::theme::Capability::None,
+        );
         // Down twice → cursor on row 2 (Powerline Setup).
         model = app_update(model, Event::Key(key(KeyCode::Down)));
         model = app_update(model, Event::Key(key(KeyCode::Down)));

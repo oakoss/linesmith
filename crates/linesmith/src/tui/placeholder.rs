@@ -7,7 +7,7 @@
 use std::mem;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -55,8 +55,7 @@ pub(super) fn update(state: &mut PlaceholderState, key: KeyEvent) -> ScreenOutco
 /// center, separated by a blank row. The `Min(0)` floor absorbs
 /// the remaining height so the layout adapts to any terminal size
 /// that fits the borders.
-pub(super) fn view(state: &PlaceholderState, frame: &mut Frame) {
-    let area = frame.area();
+pub(super) fn view(state: &PlaceholderState, frame: &mut Frame, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title(Span::styled(
         format!(" {} ", state.name),
         Style::default().add_modifier(Modifier::BOLD),
