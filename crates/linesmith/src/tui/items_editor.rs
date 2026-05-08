@@ -28,15 +28,27 @@ use super::list_screen::{
     self, ListOutcome, ListRowData, ListScreenState, ListScreenView, VerbHint,
 };
 use super::main_menu::MainMenuState;
+use super::type_picker::TypePickerState;
 
-/// Verbs the editor dispatches in normal mode. Letters must match
-/// the help-row labels in `VERBS`; `list_screen::handle_key` only
-/// surfaces `Action(c)` when `c` is in this slice.
+/// Verbs the editor dispatches through `list_screen::handle_key`.
+/// `a`/`i` are NOT listed here — they're handled at the screen
+/// level alongside ←/→ so they remain reachable when the segment
+/// list is empty (ListScreen gates `Action(c)` on `num_rows > 0`,
+/// which would make add/insert inert during the live "clear →
+/// rebuild" flow).
 const VERB_LETTERS: &[char] = &['d', 'c', 'k'];
 
 /// Help-row hints rendered alongside the move-mode toggle. Order
 /// here drives the visible order in the help row.
 const VERBS: &[VerbHint<'static>] = &[
+    VerbHint {
+        letter: 'a',
+        label: "add",
+    },
+    VerbHint {
+        letter: 'i',
+        label: "insert",
+    },
     VerbHint {
         letter: 'd',
         label: "delete",
@@ -55,8 +67,9 @@ const VERBS: &[VerbHint<'static>] = &[
 /// addresses `[line].segments`; `Numbered(N)` addresses
 /// `[line.N].segments`. `NonZeroU32` makes the spec's "lines start
 /// at 1" rule a compile-time guarantee.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LineKey {
+    #[default]
     Single,
     /// Helpers walk `[line.N].segments`; only `Single` is
     /// constructed from the UI today.
@@ -64,11 +77,28 @@ pub(super) enum LineKey {
     Numbered(NonZeroU32),
 }
 
+/// Where in the segments array a picked entry should land. Carried
+/// from the items editor through `TypePicker` so the picker can
+/// stay UI-only and the data mutation lives in this module.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum InsertTarget {
+    /// Insert at `idx` (shifts the entry at `idx` and after to
+    /// the right by one). The new entry takes index `idx`.
+    Before(usize),
+    /// Insert immediately after `idx`. The new entry takes index
+    /// `idx + 1`.
+    After(usize),
+}
+
 /// Items editor state. The list-widget cursor lives in `list`; the
 /// `prev` MainMenuState round-trips through Esc back-nav so the
 /// user lands back on the menu row they came from. `prev` stays
 /// `pub(super)` to mirror `PlaceholderState`'s back-nav idiom.
-#[derive(Debug)]
+///
+/// `Default` is derived so `mem::take` in the type-picker entry
+/// path leaves a placeholder `ItemsEditorState` behind (the screen
+/// transition replaces it before any render observes the placeholder).
+#[derive(Debug, Default)]
 pub(super) struct ItemsEditorState {
     line: LineKey,
     list: ListScreenState,
@@ -90,22 +120,57 @@ impl ItemsEditorState {
     pub(super) fn line(&self) -> LineKey {
         self.line
     }
+
+    /// Mutator for the list-widget cursor; production sites in
+    /// this module reach `state.list` directly.
+    #[allow(dead_code)]
+    pub(super) fn set_cursor(&mut self, idx: usize, num_rows: usize) {
+        self.list.set_cursor(idx, num_rows);
+    }
+
+    /// Read-only accessor for the cursor.
+    #[allow(dead_code)]
+    pub(super) fn cursor(&self) -> usize {
+        self.list.cursor()
+    }
 }
 
 /// Drive the items editor through one keypress. Esc back-navigates
-/// to MainMenu (preserving its cursor); other keys route through
-/// the shared list widget with `move_mode_supported = true`. The
-/// caller acks cursor changes per ADR-0022 after every mutation
-/// and reparses config so the preview reflects the new state.
+/// to MainMenu (preserving its cursor); ←/→ + the `a`/`i` verbs
+/// open the type picker for insert/add. Other keys route through
+/// the shared list widget. The caller acks cursor changes per
+/// ADR-0022 after every mutation and reparses config so the
+/// preview reflects the new state.
 pub(super) fn update(
     state: &mut ItemsEditorState,
     document: &mut DocumentMut,
     config: &mut config::Config,
     key: KeyEvent,
 ) -> ScreenOutcome {
+    // Esc back-nav fires regardless of move-mode (ListScreen exits
+    // move-mode on Esc; we never see Esc here while in move-mode).
     if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Esc {
         let prev = mem::take(&mut state.prev);
         return ScreenOutcome::NavigateTo(AppScreen::MainMenu(prev));
+    }
+    // Screen-level keybindings for picker entry: `a`/`i` verbs and
+    // ←/→ accelerators. Handled here (not via ListScreen's verb
+    // dispatch) so they remain reachable when `segment_count == 0`
+    // — the live "clear → rebuild" flow. Gated to normal mode so a
+    // chord-typed letter or arrow during move-mode doesn't yank
+    // the user out of their reorder.
+    if key.modifiers == KeyModifiers::NONE && !state.list.move_mode() {
+        match key.code {
+            KeyCode::Left | KeyCode::Char('i') => {
+                let cursor = state.list.cursor();
+                return open_type_picker(state, InsertTarget::Before(cursor));
+            }
+            KeyCode::Right | KeyCode::Char('a') => {
+                let cursor = state.list.cursor();
+                return open_type_picker(state, InsertTarget::After(cursor));
+            }
+            _ => {}
+        }
     }
     let line = state.line;
     let row_count = segment_count(document, line);
@@ -144,6 +209,49 @@ pub(super) fn update(
         | ListOutcome::Unhandled => {}
     }
     ScreenOutcome::Stay
+}
+
+/// Hand the editor state off to a fresh `TypePicker`. `mem::take`
+/// leaves a default `ItemsEditorState` behind; the screen
+/// transition immediately overwrites it via the returned
+/// `NavigateTo`, so no render observes the placeholder.
+fn open_type_picker(state: &mut ItemsEditorState, target: InsertTarget) -> ScreenOutcome {
+    let prev = mem::take(state);
+    ScreenOutcome::NavigateTo(AppScreen::TypePicker(TypePickerState::new(target, prev)))
+}
+
+/// Apply a picker selection to the document and navigate back to
+/// the items editor. Takes ownership of `prev` and returns it
+/// inside the `NavigateTo` so the picker's mem::take handoff is
+/// the single ownership transfer for the round trip.
+///
+/// Called from `type_picker::update` on Enter. On insertion
+/// failure (e.g., a numbered line without an explicit array)
+/// surfaces a warning and navigates back without mutating —
+/// matches `refresh_config`'s precedent of keeping the user
+/// informed when a UI action would otherwise dismiss silently.
+pub(super) fn apply_insert(
+    mut prev: ItemsEditorState,
+    document: &mut DocumentMut,
+    config: &mut config::Config,
+    target: InsertTarget,
+    segment_id: &str,
+) -> ScreenOutcome {
+    let line = prev.line;
+    if !insert_segment(document, line, target, segment_id) {
+        linesmith_core::lsm_warn!(
+            "items editor: insert failed for segment {segment_id:?} (line={line:?}); editor unchanged",
+        );
+        return ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(prev));
+    }
+    refresh_config(document, config);
+    let inserted_at = match target {
+        InsertTarget::Before(idx) => idx,
+        InsertTarget::After(idx) => idx + 1,
+    };
+    let new_count = segment_count(document, line);
+    prev.list.set_cursor(inserted_at, new_count);
+    ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(prev))
 }
 
 /// Render the segment list. Description slot is intentionally
@@ -300,6 +408,28 @@ fn clear_segments(document: &mut DocumentMut, line: LineKey) -> bool {
         return false;
     };
     arr.clear();
+    true
+}
+
+/// Insert `segment_id` at the position described by `target`.
+/// Returns `false` only when `ensure_segments_array_mut` rejects
+/// (numbered line without an explicit array). The target index
+/// is clamped to `arr.len()` so an out-of-range index appends
+/// rather than panics.
+fn insert_segment(
+    document: &mut DocumentMut,
+    line: LineKey,
+    target: InsertTarget,
+    segment_id: &str,
+) -> bool {
+    let Some(arr) = ensure_segments_array_mut(document, line) else {
+        return false;
+    };
+    let idx = match target {
+        InsertTarget::Before(i) => i.min(arr.len()),
+        InsertTarget::After(i) => i.saturating_add(1).min(arr.len()),
+    };
+    arr.insert(idx, segment_id);
     true
 }
 
@@ -932,6 +1062,252 @@ segments = ["a", 42, "b"]
         assert_eq!(arr.len(), 4);
         assert_eq!(arr.get(1).and_then(|v| v.as_str()), None);
         assert_eq!(arr.get(2).and_then(|v| v.as_str()), None);
+    }
+
+    #[test]
+    fn add_verb_navigates_to_type_picker_with_after_target() {
+        let mut s = state();
+        let mut doc = document(
+            r#"[line]
+segments = ["a", "b"]
+"#,
+        );
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Down));
+        let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('a')));
+        assert!(matches!(
+            outcome,
+            ScreenOutcome::NavigateTo(AppScreen::TypePicker(_))
+        ));
+    }
+
+    #[test]
+    fn insert_verb_navigates_to_type_picker_with_before_target() {
+        let mut s = state();
+        let mut doc = document(
+            r#"[line]
+segments = ["a", "b"]
+"#,
+        );
+        let mut cfg = config_default();
+        let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('i')));
+        assert!(matches!(
+            outcome,
+            ScreenOutcome::NavigateTo(AppScreen::TypePicker(_))
+        ));
+    }
+
+    #[test]
+    fn right_arrow_opens_picker_in_normal_mode() {
+        let mut s = state();
+        let mut doc = document(
+            r#"[line]
+segments = ["a"]
+"#,
+        );
+        let mut cfg = config_default();
+        let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Right));
+        assert!(matches!(
+            outcome,
+            ScreenOutcome::NavigateTo(AppScreen::TypePicker(_))
+        ));
+    }
+
+    #[test]
+    fn left_arrow_opens_picker_in_normal_mode() {
+        let mut s = state();
+        let mut doc = document(
+            r#"[line]
+segments = ["a"]
+"#,
+        );
+        let mut cfg = config_default();
+        let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Left));
+        assert!(matches!(
+            outcome,
+            ScreenOutcome::NavigateTo(AppScreen::TypePicker(_))
+        ));
+    }
+
+    #[test]
+    fn add_verb_works_on_empty_segment_array() {
+        // ListScreen gates `Action(c)` on `num_rows > 0`, so
+        // dispatching a/i through the verb table would leave them
+        // inert after a `c` clear. Handling them at the screen
+        // level keeps add/insert reachable in the live "clear →
+        // rebuild" flow.
+        let mut s = state();
+        let mut doc = document("[line]\nsegments = []\n");
+        let mut cfg = config_default();
+        let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('a')));
+        assert!(matches!(
+            outcome,
+            ScreenOutcome::NavigateTo(AppScreen::TypePicker(_))
+        ));
+    }
+
+    #[test]
+    fn insert_verb_works_on_empty_segment_array() {
+        let mut s = state();
+        let mut doc = document("[line]\nsegments = []\n");
+        let mut cfg = config_default();
+        let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('i')));
+        assert!(matches!(
+            outcome,
+            ScreenOutcome::NavigateTo(AppScreen::TypePicker(_))
+        ));
+    }
+
+    #[test]
+    fn picker_keybindings_in_move_mode_are_inert() {
+        // The screen-level picker entry keybindings (←/→ + a/i)
+        // must stay inside the editor during move-mode reorder.
+        // The normal-mode gate keeps them from yanking the user
+        // out of their reorder. Pin so a refactor that drops the
+        // gate doesn't silently change the reorder UX.
+        let raw = "[line]\nsegments = [\"a\", \"b\"]\n";
+        let mut s = state();
+        let mut doc = document(raw);
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Enter));
+        assert!(s.list.move_mode());
+        for code in [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Char('a'),
+            KeyCode::Char('i'),
+        ] {
+            let outcome = update(&mut s, &mut doc, &mut cfg, key(code));
+            assert!(
+                matches!(outcome, ScreenOutcome::Stay),
+                "{code:?} in move-mode should be Stay, got {outcome:?}",
+            );
+        }
+        assert_eq!(doc.to_string(), raw);
+    }
+
+    #[test]
+    fn apply_insert_at_last_index_appends_and_advances_cursor() {
+        // Edge: After(last) lands at arr.len(). Pins both the
+        // saturating clamp in `insert_segment` AND the cursor
+        // arithmetic in `apply_insert` (inserted_at = idx + 1).
+        let mut doc = document(
+            r#"[line]
+segments = ["a", "b"]
+"#,
+        );
+        let mut cfg = config_default();
+        let outcome = apply_insert(
+            ItemsEditorState::default(),
+            &mut doc,
+            &mut cfg,
+            InsertTarget::After(1),
+            "model",
+        );
+        let restored = match outcome {
+            ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(s)) => s,
+            other => panic!("expected NavigateTo(ItemsEditor), got {other:?}"),
+        };
+        assert_eq!(
+            segment_labels(&doc, LineKey::Single),
+            vec!["a", "b", "model"],
+        );
+        assert_eq!(restored.cursor(), 2);
+    }
+
+    #[test]
+    fn apply_insert_into_empty_explicit_array_lands_at_index_zero() {
+        // The user's "clear → add" flow: explicit `segments = []`
+        // becomes `segments = ["model"]` after one insert. Pins
+        // both `Before(0)` and `After(0)` against an empty array
+        // (insert_segment's clamp dominates the saturating math).
+        for target in [InsertTarget::Before(0), InsertTarget::After(0)] {
+            let mut doc = document("[line]\nsegments = []\n");
+            let mut cfg = config_default();
+            let outcome = apply_insert(
+                ItemsEditorState::default(),
+                &mut doc,
+                &mut cfg,
+                target,
+                "model",
+            );
+            let restored = match outcome {
+                ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(s)) => s,
+                other => panic!("expected NavigateTo(ItemsEditor), got {other:?}"),
+            };
+            assert_eq!(
+                segment_labels(&doc, LineKey::Single),
+                vec!["model"],
+                "target={target:?}",
+            );
+            assert_eq!(restored.cursor(), 0, "target={target:?}");
+        }
+    }
+
+    #[test]
+    fn apply_insert_emits_warning_on_failure() {
+        // Pin the warn precedent: when `insert_segment` returns
+        // false (numbered line without an explicit array), the
+        // user gets a warning rather than a silent picker
+        // dismissal. Once LinePicker lands, this branch becomes
+        // user-reachable; today it pins the contract.
+        use crate::logging::{self, Level};
+
+        let _serial = logging::_test_serial_lock();
+        let captured = std::sync::Arc::new(crate::logging::CapturedSink::default());
+        let _restore = logging::SinkGuard::install(captured.clone());
+        logging::set_level(Level::Warn);
+
+        let prev = ItemsEditorState::new(
+            LineKey::Numbered(NonZeroU32::new(1).expect("nonzero")),
+            MainMenuState::default(),
+        );
+        let mut doc = document(
+            r#"layout = "multi-line"
+[line]
+"#,
+        );
+        let mut cfg = config_default();
+        let _ = apply_insert(prev, &mut doc, &mut cfg, InsertTarget::After(0), "model");
+
+        let entries = captured.drain();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.starts_with("[warn]") && e.contains("insert failed")),
+            "expected insert-failed warn in {entries:?}",
+        );
+    }
+
+    #[test]
+    fn apply_insert_lands_segment_at_target_and_advances_cursor() {
+        // Drives `apply_insert` directly (the picker's Enter
+        // handler delegates to it). Pins both the insert position
+        // AND the post-mutation cursor, since both are caller-
+        // owned per ADR-0022.
+        let mut doc = document(
+            r#"[line]
+segments = ["a", "b"]
+"#,
+        );
+        let mut cfg = config_default();
+        let outcome = apply_insert(
+            ItemsEditorState::default(),
+            &mut doc,
+            &mut cfg,
+            InsertTarget::After(0),
+            "model",
+        );
+        let restored = match outcome {
+            ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(s)) => s,
+            other => panic!("expected NavigateTo(ItemsEditor), got {other:?}"),
+        };
+        assert_eq!(
+            segment_labels(&doc, LineKey::Single),
+            vec!["a", "model", "b"]
+        );
+        // After(0) → inserted_at = 1.
+        assert_eq!(restored.cursor(), 1);
     }
 
     #[test]

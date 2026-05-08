@@ -26,6 +26,7 @@ use super::items_editor::{self, ItemsEditorState};
 use super::main_menu::{self, MainMenuState};
 use super::placeholder::{self, PlaceholderState};
 use super::preview;
+use super::type_picker::{self, TypePickerState};
 
 /// Top-level UI state. Each variant carries its own state struct.
 /// Add a screen by adding a variant + its state struct + a `match`
@@ -37,6 +38,7 @@ pub(super) enum AppScreen {
     Placeholder(PlaceholderState),
     ConfirmQuit(ConfirmQuitState),
     ItemsEditor(ItemsEditorState),
+    TypePicker(TypePickerState),
 }
 
 /// State for the modal "you have unsaved changes" prompt that
@@ -271,6 +273,9 @@ pub(super) fn update(mut model: Model, event: Event) -> Model {
         AppScreen::ItemsEditor(state) => {
             items_editor::update(state, &mut model.document, &mut model.config, key)
         }
+        AppScreen::TypePicker(state) => {
+            type_picker::update(state, &mut model.document, &mut model.config, key)
+        }
     };
     match outcome {
         ScreenOutcome::Stay => {}
@@ -426,6 +431,7 @@ pub(super) fn view(model: &Model, frame: &mut Frame) {
         AppScreen::ItemsEditor(state) => {
             items_editor::view(state, &model.document, frame, chunks[1])
         }
+        AppScreen::TypePicker(state) => type_picker::view(state, frame, chunks[1]),
     }
 }
 
@@ -1163,6 +1169,34 @@ mod tests {
             written.contains("\"b\"") && written.contains("\"a\""),
             "document should retain both segments: {written}",
         );
+    }
+
+    #[test]
+    fn add_verb_through_app_dispatch_opens_picker_and_inserts_on_enter() {
+        // End-to-end pin for the new `AppScreen::TypePicker` arm:
+        // top-level update → items_editor::update → TypePicker
+        // → type_picker::update → items_editor::apply_insert →
+        // ItemsEditor (with new entry). A regression that omits
+        // either dispatch arm (update or view) only fails at
+        // runtime; this catches the chain.
+        let raw = "[line]\nsegments = [\"a\"]\n";
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        let m = model_with_loaded_text(raw, path);
+        // Activate EditLines → ItemsEditor.
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(m.screen, AppScreen::ItemsEditor(_)));
+        // 'a' opens the picker.
+        let m = update(m, key(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(matches!(m.screen, AppScreen::TypePicker(_)));
+        // Enter selects the first candidate ("model" by default
+        // ordering of `DEFAULT_SEGMENT_IDS`).
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(m.screen, AppScreen::ItemsEditor(_)));
+        let line = m.config.line.clone().expect("line reparsed");
+        // After(0) inserts at index 1 → ["a", picked].
+        assert_eq!(line.segments.len(), 2);
+        assert_eq!(line.segments[0], "a");
     }
 
     #[test]

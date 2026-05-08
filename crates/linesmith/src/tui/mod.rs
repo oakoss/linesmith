@@ -19,6 +19,7 @@ mod list_screen;
 mod main_menu;
 mod placeholder;
 mod preview;
+mod type_picker;
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
