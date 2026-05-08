@@ -29,6 +29,28 @@ use super::list_screen::{
 };
 use super::main_menu::MainMenuState;
 
+/// Verbs the editor dispatches in normal mode. Letters must match
+/// the help-row labels in `VERBS`; `list_screen::handle_key` only
+/// surfaces `Action(c)` when `c` is in this slice.
+const VERB_LETTERS: &[char] = &['d', 'c', 'k'];
+
+/// Help-row hints rendered alongside the move-mode toggle. Order
+/// here drives the visible order in the help row.
+const VERBS: &[VerbHint<'static>] = &[
+    VerbHint {
+        letter: 'd',
+        label: "delete",
+    },
+    VerbHint {
+        letter: 'c',
+        label: "clear",
+    },
+    VerbHint {
+        letter: 'k',
+        label: "clone",
+    },
+];
+
 /// Which line in the config the editor is mutating. `Single`
 /// addresses `[line].segments`; `Numbered(N)` addresses
 /// `[line.N].segments`. `NonZeroU32` makes the spec's "lines start
@@ -72,9 +94,9 @@ impl ItemsEditorState {
 
 /// Drive the items editor through one keypress. Esc back-navigates
 /// to MainMenu (preserving its cursor); other keys route through
-/// the shared list widget with `move_mode_supported = true`. On
-/// `MoveSwap`, mutate the document, ack cursor per ADR-0022, and
-/// reparse config so the preview reflects the new order.
+/// the shared list widget with `move_mode_supported = true`. The
+/// caller acks cursor changes per ADR-0022 after every mutation
+/// and reparses config so the preview reflects the new state.
 pub(super) fn update(
     state: &mut ItemsEditorState,
     document: &mut DocumentMut,
@@ -87,25 +109,46 @@ pub(super) fn update(
     }
     let line = state.line;
     let row_count = segment_count(document, line);
-    match list_screen::handle_key(&mut state.list, key, row_count, &[], true) {
+    let cursor = state.list.cursor();
+    match list_screen::handle_key(&mut state.list, key, row_count, VERB_LETTERS, true) {
         ListOutcome::MoveSwap { from, to } => {
             if swap_segments(document, line, from, to) {
                 let new_count = segment_count(document, line);
                 state.list.set_cursor(to, new_count);
                 refresh_config(document, config);
             }
-            ScreenOutcome::Stay
+        }
+        ListOutcome::Action('d') => {
+            if delete_segment_at(document, line, cursor) {
+                let new_count = segment_count(document, line);
+                state.list.set_cursor(cursor, new_count);
+                refresh_config(document, config);
+            }
+        }
+        ListOutcome::Action('c') => {
+            if clear_segments(document, line) {
+                state.list.set_cursor(0, 0);
+                refresh_config(document, config);
+            }
+        }
+        ListOutcome::Action('k') => {
+            if clone_segment_at(document, line, cursor) {
+                let new_count = segment_count(document, line);
+                state.list.set_cursor(cursor + 1, new_count);
+                refresh_config(document, config);
+            }
         }
         ListOutcome::Activate
         | ListOutcome::Action(_)
         | ListOutcome::Consumed
-        | ListOutcome::Unhandled => ScreenOutcome::Stay,
+        | ListOutcome::Unhandled => {}
     }
+    ScreenOutcome::Stay
 }
 
 /// Render the segment list. Description slot is intentionally
 /// empty: rows are plain segment IDs. `move_mode_supported = true`
-/// so Enter toggles reorder.
+/// so Enter toggles reorder; `VERBS` populate the help-row hints.
 pub(super) fn view(
     state: &ItemsEditorState,
     document: &DocumentMut,
@@ -120,11 +163,10 @@ pub(super) fn view(
             description: Cow::Borrowed(""),
         })
         .collect();
-    let verbs: [VerbHint<'_>; 0] = [];
     let view = ListScreenView {
         title: " edit lines ",
         rows: &row_data,
-        verbs: &verbs,
+        verbs: VERBS,
         move_mode_supported: true,
     };
     list_screen::render(&state.list, &view, area, frame);
@@ -201,24 +243,32 @@ fn segment_labels(document: &DocumentMut, line: LineKey) -> Vec<String> {
     }
 }
 
-/// Swap two positions in the segments array. Returns `false` when
-/// an index is out of range. Single-line configs that are silent
-/// on `[line].segments` materialize the runtime defaults into the
-/// document before swapping, so the user's first edit commits the
-/// view they were already seeing. Numbered lines never materialize
-/// — multi-line configs must be authored explicitly.
-fn swap_segments(document: &mut DocumentMut, line: LineKey, from: usize, to: usize) -> bool {
-    // Existence check via the immutable path. `segments_array_mut`
-    // walks the same chain via `Item::get_mut`, which can have
-    // mutating side effects (e.g., implicit-table insertion) that
-    // we don't want firing when the swap is a no-op.
+/// Get a mutable reference to the segments array, materializing
+/// the runtime defaults first when single-line is silent on
+/// `[line].segments`. Numbered lines never materialize — multi-
+/// line configs must be authored explicitly. Returns `None` when
+/// the path can't be resolved or materialized.
+///
+/// The immutable check is load-bearing: `Item::get_mut` can fire
+/// implicit-table insertions on no-op mutations, so we only walk
+/// the mutable chain after confirming the path resolves.
+fn ensure_segments_array_mut(
+    document: &mut DocumentMut,
+    line: LineKey,
+) -> Option<&mut toml_edit::Array> {
     if segments_array(document, line).is_none() {
         if !matches!(line, LineKey::Single) {
-            return false;
+            return None;
         }
         materialize_default_single_line_segments(document);
     }
-    let Some(arr) = segments_array_mut(document, line) else {
+    segments_array_mut(document, line)
+}
+
+/// Swap two positions in the segments array. Returns `false` when
+/// the array can't be resolved or an index is out of range.
+fn swap_segments(document: &mut DocumentMut, line: LineKey, from: usize, to: usize) -> bool {
+    let Some(arr) = ensure_segments_array_mut(document, line) else {
         return false;
     };
     if from >= arr.len() || to >= arr.len() {
@@ -226,6 +276,44 @@ fn swap_segments(document: &mut DocumentMut, line: LineKey, from: usize, to: usi
     }
     let item = arr.remove(from);
     arr.insert(to, item);
+    true
+}
+
+/// Remove the entry at `idx`. The cursor ack happens in the caller
+/// (`update`); `set_cursor` clamps to the new (smaller) length.
+fn delete_segment_at(document: &mut DocumentMut, line: LineKey, idx: usize) -> bool {
+    let Some(arr) = ensure_segments_array_mut(document, line) else {
+        return false;
+    };
+    if idx >= arr.len() {
+        return false;
+    }
+    arr.remove(idx);
+    true
+}
+
+/// Empty the segments array (preserves the explicit `segments = []`
+/// authored intent — does NOT remove the array entirely so the
+/// next render doesn't fall back to runtime defaults).
+fn clear_segments(document: &mut DocumentMut, line: LineKey) -> bool {
+    let Some(arr) = ensure_segments_array_mut(document, line) else {
+        return false;
+    };
+    arr.clear();
+    true
+}
+
+/// Insert a copy of the entry at `idx` immediately after itself.
+/// The caller advances the cursor to `idx + 1` so the user lands
+/// on the fresh copy.
+fn clone_segment_at(document: &mut DocumentMut, line: LineKey, idx: usize) -> bool {
+    let Some(arr) = ensure_segments_array_mut(document, line) else {
+        return false;
+    };
+    let Some(value) = arr.get(idx).cloned() else {
+        return false;
+    };
+    arr.insert(idx + 1, value);
     true
 }
 
@@ -550,6 +638,56 @@ segments = ["cwd", "git"]
     }
 
     #[test]
+    fn verb_helpers_on_numbered_with_present_array_mutate_only_targeted_line() {
+        // `update`'s verb arms are exercised against `Single` only
+        // (LinePicker isn't wired yet), so this drops a level
+        // lower and pins the helper contract directly: when a
+        // `[line.N].segments` array exists, delete/clear/clone all
+        // mutate JUST that line and never touch siblings.
+        let initial = r#"layout = "multi-line"
+[line]
+
+[line.1]
+segments = ["a", "b", "c"]
+
+[line.2]
+segments = ["x", "y", "z"]
+"#;
+        let one = NonZeroU32::new(1).expect("nonzero");
+        let two = NonZeroU32::new(2).expect("nonzero");
+
+        // Delete on line 1 leaves line 2 untouched.
+        let mut doc = document(initial);
+        assert!(delete_segment_at(&mut doc, LineKey::Numbered(one), 1));
+        assert_eq!(segment_labels(&doc, LineKey::Numbered(one)), vec!["a", "c"]);
+        assert_eq!(
+            segment_labels(&doc, LineKey::Numbered(two)),
+            vec!["x", "y", "z"]
+        );
+
+        // Clear on line 2 leaves line 1 untouched.
+        let mut doc = document(initial);
+        assert!(clear_segments(&mut doc, LineKey::Numbered(two)));
+        assert_eq!(segment_count(&doc, LineKey::Numbered(two)), 0);
+        assert_eq!(
+            segment_labels(&doc, LineKey::Numbered(one)),
+            vec!["a", "b", "c"]
+        );
+
+        // Clone on line 1 leaves line 2 untouched.
+        let mut doc = document(initial);
+        assert!(clone_segment_at(&mut doc, LineKey::Numbered(one), 0));
+        assert_eq!(
+            segment_labels(&doc, LineKey::Numbered(one)),
+            vec!["a", "a", "b", "c"]
+        );
+        assert_eq!(
+            segment_labels(&doc, LineKey::Numbered(two)),
+            vec!["x", "y", "z"]
+        );
+    }
+
+    #[test]
     fn swap_segments_returns_false_for_numbered_with_missing_array() {
         // Multi-line authoring is explicit; numbered lines never
         // materialize defaults. The single-line equivalent
@@ -630,6 +768,188 @@ segments = ["a", "b"]
         let mut cfg = config_default();
         update(&mut s, &mut doc, &mut cfg, key(KeyCode::Enter));
         update(&mut s, &mut doc, &mut cfg, key(KeyCode::Down));
+        assert_eq!(doc.to_string(), raw);
+    }
+
+    #[test]
+    fn delete_verb_removes_cursor_segment_and_keeps_cursor_in_range() {
+        let mut s = state();
+        let mut doc = document(
+            r#"[line]
+segments = ["a", "b", "c"]
+"#,
+        );
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Down));
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('d')));
+        assert_eq!(segment_labels(&doc, LineKey::Single), vec!["a", "c"]);
+        assert_eq!(
+            s.list.cursor(),
+            1,
+            "cursor stays at 1, now pointing at \"c\""
+        );
+        let line = cfg.line.expect("line config reparsed");
+        assert_eq!(line.segments, vec!["a".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn delete_verb_at_last_row_clamps_cursor_back_one() {
+        // Deleting the last row leaves cursor at len-1 of the new
+        // (smaller) array. ListScreen's set_cursor clamps; the
+        // editor explicitly calls it after the mutation so the
+        // next render doesn't show a stale highlight.
+        let mut s = state();
+        let mut doc = document(
+            r#"[line]
+segments = ["a", "b", "c"]
+"#,
+        );
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Down));
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Down));
+        assert_eq!(s.list.cursor(), 2);
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('d')));
+        assert_eq!(segment_labels(&doc, LineKey::Single), vec!["a", "b"]);
+        assert_eq!(s.list.cursor(), 1);
+    }
+
+    #[test]
+    fn delete_verb_against_silent_document_materializes_then_deletes() {
+        // The user opens the editor on a fresh config, sees the
+        // runtime defaults, presses 'd' on row 0. The defaults
+        // commit to the document AND the first one is removed in
+        // the same edit — same materialization-on-first-edit
+        // contract as the swap path.
+        let mut s = state();
+        let mut doc = document("");
+        let mut cfg = config_default();
+        let defaults = linesmith_core::segments::DEFAULT_SEGMENT_IDS;
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('d')));
+        let labels = segment_labels(&doc, LineKey::Single);
+        assert_eq!(labels.len(), defaults.len() - 1);
+        assert_eq!(labels[0], defaults[1]);
+    }
+
+    #[test]
+    fn clear_verb_empties_segments_to_explicit_empty_array() {
+        // After clear, segment_count is 0 (the explicit empty
+        // array, not the missing-array fallback that would surface
+        // defaults). User authored an empty list. Also pin the
+        // config refresh: a regression that drops `refresh_config`
+        // would leave `cfg.line.segments` at the pre-clear value
+        // and the preview would show the old segments forever.
+        let mut s = state();
+        let mut doc = document(
+            r#"[line]
+segments = ["a", "b", "c"]
+"#,
+        );
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('c')));
+        assert_eq!(segment_count(&doc, LineKey::Single), 0);
+        assert_eq!(s.list.cursor(), 0);
+        let arr = segments_array(&doc, LineKey::Single).expect("explicit empty array");
+        assert_eq!(arr.len(), 0);
+        assert!(cfg.line.expect("line reparsed").segments.is_empty());
+    }
+
+    #[test]
+    fn clear_verb_on_already_empty_array_is_idempotent() {
+        // Re-pressing `c` on an explicit empty array stays at
+        // segments = []; no re-materialization, no re-fall-back.
+        let mut s = state();
+        let mut doc = document("[line]\nsegments = []\n");
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('c')));
+        assert_eq!(segment_count(&doc, LineKey::Single), 0);
+        let arr = segments_array(&doc, LineKey::Single).expect("explicit empty preserved");
+        assert_eq!(arr.len(), 0);
+    }
+
+    #[test]
+    fn clone_verb_inserts_copy_after_cursor_and_advances_cursor() {
+        let mut s = state();
+        let mut doc = document(
+            r#"[line]
+segments = ["a", "b", "c"]
+"#,
+        );
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Down));
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('k')));
+        assert_eq!(
+            segment_labels(&doc, LineKey::Single),
+            vec!["a", "b", "b", "c"],
+        );
+        assert_eq!(s.list.cursor(), 2, "cursor lands on the fresh clone");
+        // Pin the config refresh: a regression that drops
+        // `refresh_config` from the clone arm would leave
+        // `cfg.line.segments` at the pre-clone shape, freezing
+        // the preview at three segments while the document has
+        // four.
+        let segments = cfg.line.expect("line reparsed").segments;
+        assert_eq!(segments.len(), 4);
+    }
+
+    #[test]
+    fn clone_verb_at_last_index_inserts_at_end_and_advances_cursor() {
+        // Edge case: cursor at last row → clone inserts at
+        // arr.len() (not arr.len() - 1 + 1 = arr.len(); same value
+        // but worth pinning). `Array::insert(arr.len(), value)` is
+        // valid; the cursor advances past the previously-final
+        // index to the new last entry.
+        let mut s = state();
+        let mut doc = document(
+            r#"[line]
+segments = ["a", "b"]
+"#,
+        );
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Down));
+        assert_eq!(s.list.cursor(), 1);
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('k')));
+        assert_eq!(segment_labels(&doc, LineKey::Single), vec!["a", "b", "b"]);
+        assert_eq!(s.list.cursor(), 2);
+    }
+
+    #[test]
+    fn clone_verb_on_non_string_entry_clones_through_placeholder() {
+        // `<non-string>` is a display detail; the underlying value
+        // clones as-is (not stringified to "<non-string>"). Pin
+        // that cloning a malformed entry produces another malformed
+        // entry rather than coercing the placeholder string into
+        // the array.
+        let mut s = state();
+        let mut doc = document(
+            r#"[line]
+segments = ["a", 42, "b"]
+"#,
+        );
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Down));
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('k')));
+        let arr = segments_array(&doc, LineKey::Single).expect("array");
+        assert_eq!(arr.len(), 4);
+        assert_eq!(arr.get(1).and_then(|v| v.as_str()), None);
+        assert_eq!(arr.get(2).and_then(|v| v.as_str()), None);
+    }
+
+    #[test]
+    fn verb_letters_in_move_mode_are_inert() {
+        // Pressing 'd' / 'c' / 'k' while reordering must not
+        // mutate the document. ListScreen gates `Action(c)` to
+        // normal mode; this test locks that gate so a future
+        // refactor can't silently let a chord-typed verb destroy
+        // data while the user is mid-reorder.
+        let raw = "[line]\nsegments = [\"a\", \"b\"]\n";
+        let mut s = state();
+        let mut doc = document(raw);
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Enter));
+        assert!(s.list.move_mode());
+        for verb in ['d', 'c', 'k'] {
+            update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char(verb)));
+        }
         assert_eq!(doc.to_string(), raw);
     }
 }
