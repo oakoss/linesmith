@@ -22,6 +22,7 @@ use crate::config;
 use crate::logging::CapturedSink;
 use crate::theme::{Capability, Theme};
 
+use super::items_editor::{self, ItemsEditorState};
 use super::main_menu::{self, MainMenuState};
 use super::placeholder::{self, PlaceholderState};
 use super::preview;
@@ -35,6 +36,7 @@ pub(super) enum AppScreen {
     MainMenu(MainMenuState),
     Placeholder(PlaceholderState),
     ConfirmQuit(ConfirmQuitState),
+    ItemsEditor(ItemsEditorState),
 }
 
 /// State for the modal "you have unsaved changes" prompt that
@@ -263,9 +265,12 @@ pub(super) fn update(mut model: Model, event: Event) -> Model {
         return apply_quit(model);
     }
     let outcome = match &mut model.screen {
-        AppScreen::MainMenu(state) => main_menu::update(state, key),
+        AppScreen::MainMenu(state) => main_menu::update(state, &model.config, key),
         AppScreen::Placeholder(state) => placeholder::update(state, key),
         AppScreen::ConfirmQuit(state) => confirm_quit_update(state, key),
+        AppScreen::ItemsEditor(state) => {
+            items_editor::update(state, &mut model.document, &mut model.config, key)
+        }
     };
     match outcome {
         ScreenOutcome::Stay => {}
@@ -418,6 +423,9 @@ pub(super) fn view(model: &Model, frame: &mut Frame) {
         AppScreen::MainMenu(state) => main_menu::view(state, frame, chunks[1]),
         AppScreen::Placeholder(state) => placeholder::view(state, frame, chunks[1]),
         AppScreen::ConfirmQuit(_) => render_confirm_quit(frame, chunks[1]),
+        AppScreen::ItemsEditor(state) => {
+            items_editor::view(state, &model.document, frame, chunks[1])
+        }
     }
 }
 
@@ -1103,9 +1111,13 @@ mod tests {
     #[test]
     fn enter_on_main_menu_navigates_to_placeholder() {
         // Pin the dispatch chain: top-level update → screen
-        // update → NavigateTo application. A regression in any
-        // link breaks Enter-to-open across every menu row.
-        let m = update(model(), key(KeyCode::Enter, KeyModifiers::NONE));
+        // update → NavigateTo application. Walks past EditLines
+        // (now routed to ItemsEditor) to a row that still uses
+        // Placeholder, so this test stays focused on the dispatch
+        // chain rather than which screen variant a specific row
+        // happens to open.
+        let m = update(model(), key(KeyCode::Down, KeyModifiers::NONE));
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!m.quit);
         assert!(
             matches!(m.screen, AppScreen::Placeholder(_)),
@@ -1119,10 +1131,62 @@ mod tests {
         // screen dispatch, so `q` quits even from a sub-screen.
         // The placeholder's `update` only handles Esc; without
         // upstream filtering, `q` would no-op on the placeholder.
-        let m = update(model(), key(KeyCode::Enter, KeyModifiers::NONE));
+        let m = update(model(), key(KeyCode::Down, KeyModifiers::NONE));
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(m.screen, AppScreen::Placeholder(_)));
         let m = update(m, key(KeyCode::Char('q'), KeyModifiers::NONE));
         assert!(m.quit);
+    }
+
+    #[test]
+    fn items_editor_swap_through_app_dispatch_mutates_document_and_config() {
+        // Pins the full dispatch chain for the ItemsEditor variant:
+        // top-level `update` → `items_editor::update` → document
+        // mutation → `refresh_config`. A regression that omits the
+        // new match arm or wires it to the wrong state would only
+        // fail items_editor's in-module tests (which call its
+        // `update` directly); this catches the chain.
+        let raw = "[line]\nsegments = [\"a\", \"b\"]\n";
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        let m = model_with_loaded_text(raw, path);
+        // Default cursor=0 = EditLines → ItemsEditor.
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(m.screen, AppScreen::ItemsEditor(_)));
+        // Enter toggles move-mode; ↓ requests the swap.
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
+        let m = update(m, key(KeyCode::Down, KeyModifiers::NONE));
+        let line = m.config.line.clone().expect("line config reparsed");
+        assert_eq!(line.segments, vec!["b".to_string(), "a".to_string()]);
+        let written = m.document.to_string();
+        assert!(
+            written.contains("\"b\"") && written.contains("\"a\""),
+            "document should retain both segments: {written}",
+        );
+    }
+
+    #[test]
+    fn ctrl_s_from_items_editor_persists_swap_to_disk() {
+        // The global Ctrl+S handler in `update` runs before screen
+        // dispatch, so it should work from any screen. ItemsEditor
+        // is the first screen that actually mutates `document`, so
+        // the edit→save→clear pipeline is load-bearing here in a
+        // way it isn't from MainMenu.
+        let raw = "[line]\nsegments = [\"a\", \"b\"]\n";
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        let m = model_with_loaded_text(raw, path.clone());
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
+        let m = update(m, key(KeyCode::Down, KeyModifiers::NONE));
+        assert!(m.is_dirty(), "swap should flip dirty true");
+        let m = update(m, key(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(!m.is_dirty(), "Ctrl+S from items editor should clear dirty");
+        let written = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            written.contains("\"b\", \"a\"") || written.contains("\"b\",\"a\""),
+            "saved file should reflect swap: {written:?}",
+        );
     }
 
     #[test]
@@ -1131,7 +1195,8 @@ mod tests {
         // navigates back. Pins both the screen restoration and the
         // top-level Esc handling (Esc must reach the screen's
         // update — `is_unconditional_quit` rejects it).
-        let m = update(model(), key(KeyCode::Enter, KeyModifiers::NONE));
+        let m = update(model(), key(KeyCode::Down, KeyModifiers::NONE));
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(m.screen, AppScreen::Placeholder(_)));
         let m = update(m, key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!m.quit);

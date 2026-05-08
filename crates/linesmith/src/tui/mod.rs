@@ -14,6 +14,7 @@
 //! ADR-0015); the daily render path never imports it.
 
 mod app;
+mod items_editor;
 mod list_screen;
 mod main_menu;
 mod placeholder;

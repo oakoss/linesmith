@@ -15,7 +15,10 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
+use crate::config::{Config, LayoutMode};
+
 use super::app::{AppScreen, ScreenOutcome};
+use super::items_editor::{ItemsEditorState, LineKey};
 use super::list_screen::{
     self, ListOutcome, ListRowData, ListScreenState, ListScreenView, VerbHint,
 };
@@ -83,12 +86,12 @@ const MENU_ITEMS: &[MainMenuItem] = &[
 /// configuration (`verbs = &[]`, `move_mode_supported = false`);
 /// they fall through to `unreachable!` so a misconfiguration that
 /// would silently swallow keypresses fails loudly instead.
-pub(super) fn update(state: &mut MainMenuState, key: KeyEvent) -> ScreenOutcome {
+pub(super) fn update(state: &mut MainMenuState, config: &Config, key: KeyEvent) -> ScreenOutcome {
     if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Esc {
         return ScreenOutcome::Quit;
     }
     match list_screen::handle_key(&mut state.list, key, MENU_ITEMS.len(), &[], false) {
-        ListOutcome::Activate => activate(state),
+        ListOutcome::Activate => activate(state, config),
         ListOutcome::Consumed | ListOutcome::Unhandled => ScreenOutcome::Stay,
         outcome @ (ListOutcome::Action(_) | ListOutcome::MoveSwap { .. }) => {
             unreachable!(
@@ -107,7 +110,7 @@ pub(super) fn update(state: &mut MainMenuState, key: KeyEvent) -> ScreenOutcome 
 ///
 /// The cursor is always in range here: `handle_key` clamps it
 /// before returning `Activate`.
-fn activate(state: &mut MainMenuState) -> ScreenOutcome {
+fn activate(state: &mut MainMenuState, config: &Config) -> ScreenOutcome {
     debug_assert!(
         state.list.cursor() < MENU_ITEMS.len(),
         "list_screen::handle_key must clamp the cursor before Activate",
@@ -122,10 +125,26 @@ fn activate(state: &mut MainMenuState) -> ScreenOutcome {
     // outcome synchronously before the event loop yields back to
     // `view`, so no render path can see it.
     let prev = mem::take(state);
-    ScreenOutcome::NavigateTo(AppScreen::Placeholder(PlaceholderState::new(
-        item.label(),
-        prev,
-    )))
+    match item {
+        // Multi-line layouts route to the placeholder until a line
+        // picker exists: multi-line rendering reads `[line.N]`, so
+        // editing `[line].segments` would silently miss the active
+        // layout. `_` covers `MultiLine` plus any future
+        // `#[non_exhaustive]` variant.
+        MainMenuItem::EditLines => match config.layout {
+            LayoutMode::SingleLine => ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(
+                ItemsEditorState::new(LineKey::Single, prev),
+            )),
+            _ => ScreenOutcome::NavigateTo(AppScreen::Placeholder(PlaceholderState::new(
+                MainMenuItem::EditLines.label(),
+                prev,
+            ))),
+        },
+        other => ScreenOutcome::NavigateTo(AppScreen::Placeholder(PlaceholderState::new(
+            other.label(),
+            prev,
+        ))),
+    }
 }
 
 pub(super) fn view(state: &MainMenuState, frame: &mut Frame, area: Rect) {
@@ -161,7 +180,7 @@ mod tests {
     #[test]
     fn esc_quits() {
         let mut state = MainMenuState::default();
-        let outcome = update(&mut state, key(KeyCode::Esc));
+        let outcome = update(&mut state, &Config::default(), key(KeyCode::Esc));
         assert!(matches!(outcome, ScreenOutcome::Quit));
     }
 
@@ -178,7 +197,7 @@ mod tests {
         // mid-fall-through still fails.
         for mods in [KeyModifiers::SHIFT, KeyModifiers::CONTROL] {
             let mut state = MainMenuState::default();
-            let outcome = update(&mut state, key_mod(KeyCode::Esc, mods));
+            let outcome = update(&mut state, &Config::default(), key_mod(KeyCode::Esc, mods));
             assert!(
                 matches!(outcome, ScreenOutcome::Stay),
                 "mods={mods:?} should fall through to Stay, got {outcome:?}",
@@ -266,18 +285,53 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_default_cursor_navigates_to_edit_lines_placeholder() {
-        // Default cursor is row 0 = "Edit Lines". Pin both the
-        // outcome shape and the placeholder name so a row reorder
-        // becomes a deliberate edit, not a silent navigation
-        // change.
+    fn edit_lines_on_multi_line_layout_falls_back_to_placeholder() {
+        // Multi-line layouts render `[line.N]`, not `[line]`, so
+        // opening the items editor on `LineKey::Single` would let
+        // edits silently miss the active layout — fall through to
+        // the placeholder until a line picker exists. Pin the
+        // screen variant, the label, AND that prev round-trips
+        // through `mem::take` (so Esc back-nav restores the
+        // EditLines row).
         let mut state = MainMenuState::default();
-        let outcome = update(&mut state, key(KeyCode::Enter));
+        let cfg = Config {
+            layout: LayoutMode::MultiLine,
+            ..Config::default()
+        };
+        let outcome = update(&mut state, &cfg, key(KeyCode::Enter));
         match outcome {
             ScreenOutcome::NavigateTo(AppScreen::Placeholder(p)) => {
                 assert_eq!(p.name, "Edit Lines");
+                assert_eq!(
+                    p.prev.list.cursor(),
+                    0,
+                    "prev MainMenu cursor must round-trip for Esc back-nav",
+                );
             }
             other => panic!("expected Placeholder(Edit Lines), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_on_default_cursor_navigates_to_items_editor() {
+        // Default cursor is row 0 = "Edit Lines", which routes to
+        // the items editor on a single-line layout. Constructing
+        // the config explicitly (rather than relying on
+        // `Config::default()`'s `LayoutMode::default()`) defends
+        // against a future `#[default]` flip silently shifting the
+        // test's meaning to "default-config routes to ItemsEditor"
+        // instead of "single-line routes to ItemsEditor".
+        let mut state = MainMenuState::default();
+        let cfg = Config {
+            layout: LayoutMode::SingleLine,
+            ..Config::default()
+        };
+        let outcome = update(&mut state, &cfg, key(KeyCode::Enter));
+        match outcome {
+            ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(s)) => {
+                assert_eq!(s.line(), super::super::items_editor::LineKey::Single);
+            }
+            other => panic!("expected ItemsEditor(Single), got {other:?}"),
         }
     }
 
@@ -287,40 +341,39 @@ mod tests {
         // pressing Enter must emit `Quit`, not navigate.
         let mut state = MainMenuState::default();
         for _ in 0..(MENU_ITEMS.len() - 1) {
-            let outcome = update(&mut state, key(KeyCode::Down));
+            let outcome = update(&mut state, &Config::default(), key(KeyCode::Down));
             assert!(matches!(outcome, ScreenOutcome::Stay));
         }
         assert_eq!(MENU_ITEMS[state.list.cursor()], MainMenuItem::Exit);
-        let outcome = update(&mut state, key(KeyCode::Enter));
+        let outcome = update(&mut state, &Config::default(), key(KeyCode::Enter));
         assert!(matches!(outcome, ScreenOutcome::Quit));
     }
 
     #[test]
-    fn enter_on_each_non_exit_row_carries_correct_placeholder_name() {
+    fn enter_on_each_non_exit_row_routes_to_correct_screen() {
         // Walks the menu and asserts every non-Exit row routes to
-        // a placeholder named after the item's label. Catches a
-        // copy-paste bug in `activate` where the wrong item label
-        // could end up in `PlaceholderState::name`.
+        // its expected destination — `EditLines` opens the items
+        // editor; every other row still opens a placeholder named
+        // after the item's label. Catches a copy-paste bug in
+        // `activate` where the wrong item label / variant could
+        // ship.
         for (idx, item) in MENU_ITEMS.iter().enumerate() {
             if matches!(item, MainMenuItem::Exit) {
                 continue;
             }
             let mut state = MainMenuState::default();
             for _ in 0..idx {
-                update(&mut state, key(KeyCode::Down));
+                update(&mut state, &Config::default(), key(KeyCode::Down));
             }
-            // Pin that the cursor walked to row `idx` before
-            // pressing Enter. Without this, a regression in Down
-            // navigation would surface as "wrong placeholder name"
-            // instead of "cursor didn't move", which misleads
-            // debugging.
             assert_eq!(state.list.cursor(), idx);
-            let outcome = update(&mut state, key(KeyCode::Enter));
-            match outcome {
-                ScreenOutcome::NavigateTo(AppScreen::Placeholder(p)) => {
-                    assert_eq!(p.name, item.label(), "row {idx}");
+            let outcome = update(&mut state, &Config::default(), key(KeyCode::Enter));
+            match (item, outcome) {
+                (MainMenuItem::EditLines, ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(_))) => {
                 }
-                other => panic!("row {idx}: expected Placeholder, got {other:?}"),
+                (other_item, ScreenOutcome::NavigateTo(AppScreen::Placeholder(p))) => {
+                    assert_eq!(p.name, other_item.label(), "row {idx}");
+                }
+                (item, outcome) => panic!("row {idx} ({item:?}): unexpected outcome {outcome:?}",),
             }
         }
     }
@@ -332,12 +385,12 @@ mod tests {
         // it. Pin that the cursor index is preserved across the
         // transition.
         let mut state = MainMenuState::default();
-        update(&mut state, key(KeyCode::Down));
-        update(&mut state, key(KeyCode::Down));
+        update(&mut state, &Config::default(), key(KeyCode::Down));
+        update(&mut state, &Config::default(), key(KeyCode::Down));
         // Cursor now on row 2 (Powerline Setup). Activating it
         // should pack a MainMenuState with cursor=2 into the
         // Placeholder.
-        let outcome = update(&mut state, key(KeyCode::Enter));
+        let outcome = update(&mut state, &Config::default(), key(KeyCode::Enter));
         match outcome {
             ScreenOutcome::NavigateTo(AppScreen::Placeholder(p)) => {
                 assert_eq!(p.name, "Powerline Setup");
@@ -350,14 +403,14 @@ mod tests {
     #[test]
     fn down_advances_cursor() {
         let mut state = MainMenuState::default();
-        update(&mut state, key(KeyCode::Down));
+        update(&mut state, &Config::default(), key(KeyCode::Down));
         assert_eq!(state.list.cursor(), 1);
     }
 
     #[test]
     fn up_at_top_wraps_to_last() {
         let mut state = MainMenuState::default();
-        update(&mut state, key(KeyCode::Up));
+        update(&mut state, &Config::default(), key(KeyCode::Up));
         assert_eq!(state.list.cursor(), MENU_ITEMS.len() - 1);
     }
 }
