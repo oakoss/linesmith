@@ -28,6 +28,7 @@ use super::list_screen::{
     self, ListOutcome, ListRowData, ListScreenState, ListScreenView, VerbHint,
 };
 use super::main_menu::MainMenuState;
+use super::raw_value_editor::RawValueEditorState;
 use super::type_picker::TypePickerState;
 
 /// Verbs the editor dispatches through `list_screen::handle_key`.
@@ -35,8 +36,9 @@ use super::type_picker::TypePickerState;
 /// level alongside ←/→ so they remain reachable when the segment
 /// list is empty (ListScreen gates `Action(c)` on `num_rows > 0`,
 /// which would make add/insert inert during the live "clear →
-/// rebuild" flow).
-const VERB_LETTERS: &[char] = &['d', 'c', 'k'];
+/// rebuild" flow). `r` (raw) requires a cursor segment to edit,
+/// so the gate is correct for it.
+const VERB_LETTERS: &[char] = &['d', 'c', 'k', 'r'];
 
 /// Help-row hints rendered alongside the move-mode toggle. Order
 /// here drives the visible order in the help row.
@@ -48,6 +50,10 @@ const VERBS: &[VerbHint<'static>] = &[
     VerbHint {
         letter: 'i',
         label: "insert",
+    },
+    VerbHint {
+        letter: 'r',
+        label: "raw",
     },
     VerbHint {
         letter: 'd',
@@ -183,6 +189,9 @@ pub(super) fn update(
                 refresh_config(document, config);
             }
         }
+        ListOutcome::Action('r') => {
+            return open_raw_value_editor(state, document, cursor);
+        }
         ListOutcome::Action('d') => {
             if delete_segment_at(document, line, cursor) {
                 let new_count = segment_count(document, line);
@@ -218,6 +227,89 @@ pub(super) fn update(
 fn open_type_picker(state: &mut ItemsEditorState, target: InsertTarget) -> ScreenOutcome {
     let prev = mem::take(state);
     ScreenOutcome::NavigateTo(AppScreen::TypePicker(TypePickerState::new(target, prev)))
+}
+
+/// Hand the editor state off to a fresh `RawValueEditor` seeded
+/// with the cursor segment's current label. Same `mem::take`
+/// safety as `open_type_picker`.
+///
+/// The seed is read from the underlying TOML value, not the
+/// rendered label. This distinguishes a real string ID equal to
+/// `"<non-string>"` (a valid TOML string) from the synthetic
+/// placeholder that `segment_labels` emits for non-string TOML
+/// entries — the literal must round-trip; the placeholder must
+/// not invite a commit of itself.
+///
+/// `target_idx` is captured here and consumed in `apply_replace`
+/// when the user commits. Valid for the lifetime of the editor:
+/// the items editor is suspended while the raw editor runs (no
+/// other dispatch path mutates the document), so the index can
+/// only become stale via an external file edit, which falls into
+/// the `replace_segment` bounds check.
+fn open_raw_value_editor(
+    state: &mut ItemsEditorState,
+    document: &DocumentMut,
+    target_idx: usize,
+) -> ScreenOutcome {
+    let line = state.line;
+    let initial = if let Some(arr) = segments_array(document, line) {
+        arr.get(target_idx)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_default()
+    } else if matches!(line, LineKey::Single) {
+        // No explicit [line].segments — seed from the default the
+        // renderer is showing.
+        linesmith_core::segments::DEFAULT_SEGMENT_IDS
+            .get(target_idx)
+            .map(|s| (*s).to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let prev = mem::take(state);
+    ScreenOutcome::NavigateTo(AppScreen::RawValueEditor(RawValueEditorState::new(
+        initial, target_idx, prev,
+    )))
+}
+
+/// Apply a raw-value commit to the document and navigate back to
+/// the items editor. Mirrors `apply_insert`'s ownership transfer.
+/// Empty strings are accepted at this layer — the segment IDs
+/// the user types pass through to the load-layer warning channel
+/// when they don't match any built-in or plugin.
+pub(super) fn apply_replace(
+    mut prev: ItemsEditorState,
+    document: &mut DocumentMut,
+    config: &mut config::Config,
+    target_idx: usize,
+    new_value: &str,
+) -> ScreenOutcome {
+    let line = prev.line;
+    if !replace_segment(document, line, target_idx, new_value) {
+        linesmith_core::lsm_warn!(
+            "items editor: replace failed at index {target_idx} (line={line:?}); editor unchanged",
+        );
+        return ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(prev));
+    }
+    refresh_config(document, config);
+    let new_count = segment_count(document, line);
+    prev.list.set_cursor(target_idx, new_count);
+    ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(prev))
+}
+
+/// Replace the entry at `idx` with `new_value`. Returns `false`
+/// when `ensure_segments_array_mut` rejects (numbered line
+/// without explicit array) or the index is out of range.
+fn replace_segment(document: &mut DocumentMut, line: LineKey, idx: usize, new_value: &str) -> bool {
+    let Some(arr) = ensure_segments_array_mut(document, line) else {
+        return false;
+    };
+    if idx >= arr.len() {
+        return false;
+    }
+    arr.replace(idx, new_value);
+    true
 }
 
 /// Apply a picker selection to the document and navigate back to
@@ -1127,6 +1219,115 @@ segments = ["a"]
             outcome,
             ScreenOutcome::NavigateTo(AppScreen::TypePicker(_))
         ));
+    }
+
+    #[test]
+    fn raw_verb_opens_editor_seeded_with_cursor_segment_label() {
+        let mut s = state();
+        let mut doc = document(
+            r#"[line]
+segments = ["alpha", "beta"]
+"#,
+        );
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Down));
+        let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('r')));
+        assert!(matches!(
+            outcome,
+            ScreenOutcome::NavigateTo(AppScreen::RawValueEditor(_))
+        ));
+    }
+
+    #[test]
+    fn raw_verb_inert_on_empty_array() {
+        // ListScreen gates `Action('r')` on `num_rows > 0`. Pin
+        // the contract: 'r' on an empty array is a no-op (no
+        // cursor segment to edit).
+        let mut s = state();
+        let mut doc = document("[line]\nsegments = []\n");
+        let mut cfg = config_default();
+        let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('r')));
+        assert!(matches!(outcome, ScreenOutcome::Stay));
+    }
+
+    #[test]
+    fn apply_replace_emits_warning_on_failure() {
+        // Mirror of `apply_insert_emits_warning_on_failure`: when
+        // the underlying replace can't land (numbered line without
+        // an explicit array), the user gets a warning rather than
+        // a silent no-op. Pin the contract so it survives a
+        // future relax of the precondition.
+        use crate::logging::{self, Level};
+
+        let _serial = logging::_test_serial_lock();
+        let captured = std::sync::Arc::new(crate::logging::CapturedSink::default());
+        let _restore = logging::SinkGuard::install(captured.clone());
+        logging::set_level(Level::Warn);
+
+        let prev = ItemsEditorState::new(
+            LineKey::Numbered(NonZeroU32::new(1).expect("nonzero")),
+            MainMenuState::default(),
+        );
+        let mut doc = document(
+            r#"layout = "multi-line"
+[line]
+"#,
+        );
+        let mut cfg = config_default();
+        let _ = apply_replace(prev, &mut doc, &mut cfg, 0, "model");
+
+        let entries = captured.drain();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.starts_with("[warn]") && e.contains("replace failed")),
+            "expected replace-failed warn in {entries:?}",
+        );
+    }
+
+    #[test]
+    fn apply_replace_accepts_empty_string_at_target() {
+        // The doc claims empty strings are accepted at this layer
+        // (load-layer warns on unknown ids). Pin the no-rejection
+        // contract so a future "validate non-empty" guard becomes
+        // a deliberate edit.
+        let mut doc = document(
+            r#"[line]
+segments = ["alpha", "beta"]
+"#,
+        );
+        let mut cfg = config_default();
+        let outcome = apply_replace(ItemsEditorState::default(), &mut doc, &mut cfg, 0, "");
+        assert!(matches!(
+            outcome,
+            ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(_))
+        ));
+        let labels = segment_labels(&doc, LineKey::Single);
+        assert_eq!(labels, vec!["", "beta"]);
+    }
+
+    #[test]
+    fn apply_replace_swaps_value_at_index_and_advances_cursor() {
+        let mut doc = document(
+            r#"[line]
+segments = ["alpha", "beta", "gamma"]
+"#,
+        );
+        let mut cfg = config_default();
+        let outcome = apply_replace(
+            ItemsEditorState::default(),
+            &mut doc,
+            &mut cfg,
+            1,
+            "BETA-renamed",
+        );
+        let restored = match outcome {
+            ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(s)) => s,
+            other => panic!("expected NavigateTo(ItemsEditor), got {other:?}"),
+        };
+        let labels = segment_labels(&doc, LineKey::Single);
+        assert_eq!(labels, vec!["alpha", "BETA-renamed", "gamma"]);
+        assert_eq!(restored.cursor(), 1);
     }
 
     #[test]

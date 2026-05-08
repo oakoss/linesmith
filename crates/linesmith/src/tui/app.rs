@@ -26,6 +26,7 @@ use super::items_editor::{self, ItemsEditorState};
 use super::main_menu::{self, MainMenuState};
 use super::placeholder::{self, PlaceholderState};
 use super::preview;
+use super::raw_value_editor::{self, RawValueEditorState};
 use super::type_picker::{self, TypePickerState};
 
 /// Top-level UI state. Each variant carries its own state struct.
@@ -39,6 +40,26 @@ pub(super) enum AppScreen {
     ConfirmQuit(ConfirmQuitState),
     ItemsEditor(ItemsEditorState),
     TypePicker(TypePickerState),
+    RawValueEditor(RawValueEditorState),
+}
+
+impl AppScreen {
+    /// Whether the active screen is consuming text input. Two
+    /// global shortcuts are suppressed on these screens:
+    ///
+    /// - bare `q` quit — the user must be able to type a `q`
+    ///   into the buffer without quitting the TUI.
+    /// - Ctrl+S save — pending edits live in the screen's own
+    ///   buffer, not yet in `model.document`; saving here would
+    ///   write the pre-edit state and silently drop the visible
+    ///   change. Suppression surfaces a warn telling the user to
+    ///   commit (Enter) first.
+    ///
+    /// Ctrl+C still force-quits unconditionally — it's the
+    /// universal escape hatch.
+    fn captures_text_input(&self) -> bool {
+        matches!(self, AppScreen::RawValueEditor(_))
+    }
 }
 
 /// State for the modal "you have unsaved changes" prompt that
@@ -252,7 +273,17 @@ pub(super) fn update(mut model: Model, event: Event) -> Model {
     // Ctrl+S is global: any screen, including the ConfirmQuit
     // modal. Save-from-modal lets the user dismiss the prompt
     // afterward via 'n' since the dirty flag is now false.
+    //
+    // Suppressed on text-entry screens: those keep pending edits
+    // in their own buffer (not yet committed to `model.document`),
+    // so a save here would write the pre-edit document and
+    // silently drop the user's visible work. Warn so the warnings
+    // panel surfaces what happened.
     if is_save_key(&key) {
+        if model.screen.captures_text_input() {
+            linesmith_core::lsm_warn!("press Enter to commit your edit before saving",);
+            return model;
+        }
         apply_save(&mut model);
         return model;
     }
@@ -263,7 +294,11 @@ pub(super) fn update(mut model: Model, event: Event) -> Model {
         model.quit = true;
         return model;
     }
-    if is_quit_attempt(&key) {
+    // Suppress the bare-`q` quit shortcut on text-entry screens so
+    // the user can type a literal `q` into the buffer. Ctrl+C is
+    // unaffected (handled by `is_force_quit` above) and remains
+    // the universal escape hatch.
+    if !model.screen.captures_text_input() && is_quit_attempt(&key) {
         return apply_quit(model);
     }
     let outcome = match &mut model.screen {
@@ -275,6 +310,9 @@ pub(super) fn update(mut model: Model, event: Event) -> Model {
         }
         AppScreen::TypePicker(state) => {
             type_picker::update(state, &mut model.document, &mut model.config, key)
+        }
+        AppScreen::RawValueEditor(state) => {
+            raw_value_editor::update(state, &mut model.document, &mut model.config, key)
         }
     };
     match outcome {
@@ -432,6 +470,7 @@ pub(super) fn view(model: &Model, frame: &mut Frame) {
             items_editor::view(state, &model.document, frame, chunks[1])
         }
         AppScreen::TypePicker(state) => type_picker::view(state, frame, chunks[1]),
+        AppScreen::RawValueEditor(state) => raw_value_editor::view(state, frame, chunks[1]),
     }
 }
 
@@ -1168,6 +1207,152 @@ mod tests {
         assert!(
             written.contains("\"b\"") && written.contains("\"a\""),
             "document should retain both segments: {written}",
+        );
+    }
+
+    #[test]
+    fn q_keypress_on_raw_value_editor_inserts_text_does_not_quit() {
+        // The bare-`q` quit shortcut must be suppressed on text-
+        // entry screens so the user can type `q` into the buffer.
+        // Pin: open raw editor via 'r', press 'q', observe no
+        // quit and the buffer mutated.
+        let raw = "[line]\nsegments = [\"alpha\"]\n";
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        let m = model_with_loaded_text(raw, path);
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
+        let m = update(m, key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(matches!(m.screen, AppScreen::RawValueEditor(_)));
+        let m = update(m, key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!m.quit, "q on text-entry screen must not quit");
+        assert!(matches!(m.screen, AppScreen::RawValueEditor(_)));
+        // Commit and assert the buffer landed in the document.
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
+        let line = m.config.line.clone().expect("line reparsed");
+        assert_eq!(line.segments, vec!["alphaq".to_string()]);
+    }
+
+    #[test]
+    fn ctrl_s_on_raw_value_editor_suppresses_save_and_warns() {
+        // Real data-loss bug if not suppressed: the raw editor
+        // keeps pending edits in its own buffer until Enter, so
+        // `model.save()` would write the pre-edit document and
+        // silently drop the user's visible change. Pin: Ctrl+S on
+        // the editor leaves the document untouched, the editor
+        // active, and surfaces a warn telling the user to commit
+        // first.
+        use crate::logging::{self, Level};
+        let _serial = logging::_test_serial_lock();
+        let captured = std::sync::Arc::new(crate::logging::CapturedSink::default());
+        let _restore = logging::SinkGuard::install(captured.clone());
+        logging::set_level(Level::Warn);
+
+        let raw = "[line]\nsegments = [\"alpha\"]\n";
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        let m = model_with_loaded_text(raw, path.clone());
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
+        let m = update(m, key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(matches!(m.screen, AppScreen::RawValueEditor(_)));
+        let m = update(m, key(KeyCode::Char('x'), KeyModifiers::NONE));
+        let pre_save_doc = m.document.to_string();
+        let m = update(m, key(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        // Editor still active; document unchanged; no file written.
+        assert!(
+            matches!(m.screen, AppScreen::RawValueEditor(_)),
+            "Ctrl+S must not navigate away from the text-entry screen",
+        );
+        assert_eq!(
+            m.document.to_string(),
+            pre_save_doc,
+            "document must not change — buffer hasn't been committed",
+        );
+        assert!(
+            !path.exists(),
+            "Ctrl+S on a text-entry screen must not write to disk",
+        );
+        let entries = captured.drain();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.starts_with("[warn]") && e.contains("commit")),
+            "expected commit-warning in {entries:?}",
+        );
+    }
+
+    #[test]
+    fn raw_verb_on_default_segment_seeds_with_runtime_default() {
+        // When `[line].segments` is absent, segment_count falls
+        // back to DEFAULT_SEGMENT_IDS so the user sees the runtime
+        // defaults. The raw editor must seed from the matching
+        // default — pressing `r` on row 0 of a fresh config seeds
+        // with "model" (the first default), and Enter-without-
+        // typing preserves it after the materialize-on-first-edit
+        // path commits the explicit array. A regression that drops
+        // the runtime-defaults fallback in `open_raw_value_editor`
+        // would silently surface as an empty seed and erase the
+        // default on commit.
+        let raw = "";
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        let m = model_with_loaded_text(raw, path);
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
+        let m = update(m, key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(matches!(m.screen, AppScreen::RawValueEditor(_)));
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
+        let line = m.config.line.clone().expect("line reparsed");
+        assert_eq!(
+            line.segments[0], "model",
+            "first runtime default must round-trip through r → Enter",
+        );
+        assert_eq!(line.segments.len(), 6);
+    }
+
+    #[test]
+    fn raw_verb_preserves_literal_non_string_string_id() {
+        // A real segment ID literally equal to "<non-string>" is
+        // valid TOML and must round-trip through the raw editor
+        // — the synthetic placeholder check has to inspect the
+        // TOML value's type, not the rendered label, or this
+        // string gets erased on Enter-without-typing.
+        let raw = "[line]\nsegments = [\"<non-string>\"]\n";
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        let m = model_with_loaded_text(raw, path);
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
+        let m = update(m, key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(matches!(m.screen, AppScreen::RawValueEditor(_)));
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
+        let line = m.config.line.clone().expect("line reparsed");
+        assert_eq!(
+            line.segments,
+            vec!["<non-string>".to_string()],
+            "literal '<non-string>' must round-trip; placeholder check must inspect TOML type",
+        );
+    }
+
+    #[test]
+    fn raw_verb_on_non_string_entry_seeds_empty_buffer_through_dispatch() {
+        // Pin the empty-seed contract end-to-end: a non-string
+        // segment renders as `<non-string>` in segment_labels but
+        // the raw editor must NOT inherit that placeholder as the
+        // seed — otherwise pressing Enter without typing would
+        // commit the literal "<non-string>" as a segment ID.
+        // Verifies via Enter-without-typing → commit lands empty.
+        let raw = "[line]\nsegments = [\"a\", 42]\n";
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().join("config.toml");
+        let m = model_with_loaded_text(raw, path);
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
+        let m = update(m, key(KeyCode::Down, KeyModifiers::NONE));
+        let m = update(m, key(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(matches!(m.screen, AppScreen::RawValueEditor(_)));
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
+        let line = m.config.line.clone().expect("line reparsed");
+        assert_eq!(
+            line.segments,
+            vec!["a".to_string(), String::new()],
+            "non-string entry replaced with empty seed",
         );
     }
 

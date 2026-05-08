@@ -19,6 +19,7 @@ mod list_screen;
 mod main_menu;
 mod placeholder;
 mod preview;
+mod raw_value_editor;
 mod type_picker;
 
 use std::io::{self, Write};
