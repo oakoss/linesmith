@@ -82,8 +82,13 @@ pub(super) enum ListOutcome {
     /// A registered verb-letter was pressed in normal mode. Caller
     /// looks up the letter in its own action table.
     Action(char),
-    /// In move-mode: caller must swap rows `from` and `to`. The
-    /// widget has already advanced `state.cursor` to `to`.
+    /// In move-mode: caller must (1) swap rows `from` and `to` in
+    /// their data and (2) call `state.set_cursor(to, num_rows)` to
+    /// track the moved row. Failing to do BOTH leaves the user's
+    /// data and cursor out of sync. The widget intentionally does
+    /// NOT mutate the cursor here — a missed acknowledgement leaves
+    /// the cursor frozen, which is visually obvious instead of
+    /// silently desynced. See ADR-0022.
     MoveSwap { from: usize, to: usize },
     /// Widget did not claim the key; caller can apply its own
     /// fallback (e.g. screen-specific keys) or let it bubble up.
@@ -149,9 +154,15 @@ pub(super) fn handle_key(
     // `move_mode_supported = true` (entering move-mode) and then
     // flips support back off. Without this clamp the dispatch
     // would still route through `handle_move_mode` even though the
-    // help row no longer claims to support it.
+    // help row no longer claims to support it. If we were in
+    // move-mode, drop the trigger key — reinterpreting a swap-intent
+    // press as navigation would surprise the user (ADR-0022).
     if !move_mode_supported {
+        let was_in_move_mode = state.move_mode;
         state.move_mode = false;
+        if was_in_move_mode {
+            return ListOutcome::Unhandled;
+        }
     }
 
     if state.move_mode {
@@ -175,13 +186,11 @@ fn handle_move_mode(state: &mut ListScreenState, key: KeyEvent, num_rows: usize)
         KeyCode::Up if num_rows >= 2 && state.cursor > 0 => {
             let from = state.cursor;
             let to = from - 1;
-            state.cursor = to;
             ListOutcome::MoveSwap { from, to }
         }
         KeyCode::Down if num_rows >= 2 && state.cursor + 1 < num_rows => {
             let from = state.cursor;
             let to = from + 1;
-            state.cursor = to;
             ListOutcome::MoveSwap { from, to }
         }
         KeyCode::Up | KeyCode::Down => ListOutcome::Consumed,
@@ -490,24 +499,65 @@ mod tests {
     }
 
     #[test]
-    fn move_mode_down_swaps_with_neighbor() {
+    fn move_mode_down_requests_swap_without_moving_cursor() {
+        // A regression that re-adds the cursor mutation here would
+        // silently advance the highlight even when the caller forgot
+        // to swap the underlying rows (ADR-0022).
         let mut s = ListScreenState::new();
         s.move_mode = true;
         s.set_cursor(0, 3);
         let out = handle_key(&mut s, key(KeyCode::Down), 3, &[], true);
         assert_eq!(out, ListOutcome::MoveSwap { from: 0, to: 1 });
-        assert_eq!(s.cursor(), 1);
+        assert_eq!(s.cursor(), 0);
         assert!(s.move_mode());
     }
 
     #[test]
-    fn move_mode_up_swaps_with_neighbor() {
+    fn move_mode_up_requests_swap_without_moving_cursor() {
+        // Mirror of the down-direction test; same ADR-0022 invariant.
         let mut s = ListScreenState::new();
         s.move_mode = true;
         s.set_cursor(2, 3);
         let out = handle_key(&mut s, key(KeyCode::Up), 3, &[], true);
         assert_eq!(out, ListOutcome::MoveSwap { from: 2, to: 1 });
-        assert_eq!(s.cursor(), 1);
+        assert_eq!(s.cursor(), 2);
+        assert!(s.move_mode());
+    }
+
+    #[test]
+    fn caller_ack_between_swaps_advances_to_next_neighbor() {
+        // Round-trip pin for ADR-0022. The caller's responsibility is
+        // (a) swap rows[from] / rows[to] and (b) call
+        // set_cursor(to, num_rows). Driving two ↓s with the
+        // acknowledgement between catches a future refactor that
+        // re-adds widget cursor mutation alongside an existing
+        // caller — the second emission would skip a row to
+        // MoveSwap { from: 2, to: 3 } (panic on rows.swap) instead
+        // of the expected { from: 1, to: 2 }.
+        let mut s = ListScreenState::new();
+        s.move_mode = true;
+        s.set_cursor(0, 3);
+        let first = handle_key(&mut s, key(KeyCode::Down), 3, &[], true);
+        assert_eq!(first, ListOutcome::MoveSwap { from: 0, to: 1 });
+        s.set_cursor(1, 3);
+        let second = handle_key(&mut s, key(KeyCode::Down), 3, &[], true);
+        assert_eq!(second, ListOutcome::MoveSwap { from: 1, to: 2 });
+    }
+
+    #[test]
+    fn move_mode_down_with_stale_cursor_clamps_before_swap_check() {
+        // The top-of-handle_key clamp runs before the move-mode
+        // bottom-guard, so a stale cursor (e.g. caller's data
+        // shrank without a matching set_cursor) can't emit a
+        // MoveSwap with `to` past num_rows-1. ADR-0022 makes the
+        // caller responsible for cursor sync; this pins the
+        // widget's defensive clamp in move-mode specifically.
+        let mut s = ListScreenState::new();
+        s.move_mode = true;
+        s.cursor = 99;
+        let out = handle_key(&mut s, key(KeyCode::Down), 3, &[], true);
+        assert_eq!(out, ListOutcome::Consumed);
+        assert_eq!(s.cursor(), 2);
         assert!(s.move_mode());
     }
 
@@ -623,20 +673,20 @@ mod tests {
     }
 
     #[test]
-    fn move_mode_supported_false_clears_stale_state_move_mode() {
-        // A screen that previously rendered with move-mode support
-        // (entering move-mode) and then flips support back off
-        // shouldn't keep dispatching through `handle_move_mode` —
-        // the help row already stopped advertising move-mode, so
-        // keeping the dispatch live is a split-brain bug.
+    fn move_mode_supported_flipping_off_drops_trigger_key() {
+        // Per ADR-0022: a screen that previously rendered with
+        // move-mode support (entering move-mode) and then flips
+        // support back off drops the trigger keypress. The user's
+        // ↓ meant "swap with the row below" — silently reinterpreting
+        // it as "navigate down" would surprise them. Move-mode is
+        // cleared and the cursor stays put; the caller's next
+        // keypress lands in normal-mode cleanly.
         let mut s = ListScreenState::new();
         s.move_mode = true;
         let out = handle_key(&mut s, key(KeyCode::Down), 3, &[], false);
         assert!(!s.move_mode());
-        // Subsequent dispatch ran through normal-mode → ↓ wraps
-        // from cursor 0 to cursor 1 instead of swapping rows.
-        assert_eq!(out, ListOutcome::Consumed);
-        assert_eq!(s.cursor(), 1);
+        assert_eq!(out, ListOutcome::Unhandled);
+        assert_eq!(s.cursor(), 0);
     }
 
     #[test]
@@ -688,9 +738,11 @@ mod tests {
     }
 
     #[test]
-    fn handle_key_clamps_cursor_and_move_mode_in_one_call() {
+    fn handle_key_clamps_cursor_and_drops_move_mode_trigger_in_one_call() {
         // Combined stale state: cursor past end, move_mode flag
-        // stale, and `move_mode_supported = false`. Pin the
+        // stale, and `move_mode_supported = false`. The cursor
+        // clamp still runs (99 → 2) but the trigger keypress is
+        // dropped per ADR-0022 — no normal-mode wrap. Pin the
         // post-clamp outcome so a refactor that consolidates the
         // two clamps into a helper but forgets to call one of
         // them still trips this test.
@@ -699,10 +751,8 @@ mod tests {
         s.move_mode = true;
         let out = handle_key(&mut s, key(KeyCode::Down), 3, &[], false);
         assert!(!s.move_mode(), "move_mode should clear");
-        // Cursor was clamped from 99 → 2 (last row); ↓ in normal
-        // mode wraps from 2 → 0.
-        assert_eq!(out, ListOutcome::Consumed);
-        assert_eq!(s.cursor(), 0);
+        assert_eq!(out, ListOutcome::Unhandled);
+        assert_eq!(s.cursor(), 2, "cursor clamped 99→2 and stays there");
     }
 
     #[test]
