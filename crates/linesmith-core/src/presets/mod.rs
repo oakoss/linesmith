@@ -70,6 +70,7 @@ mod tests {
             .expect("preset has [line]")
             .segments
             .into_iter()
+            .filter_map(|e| e.segment_id().map(str::to_string))
             .collect()
     }
 

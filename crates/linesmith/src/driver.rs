@@ -2427,10 +2427,15 @@ mod tests {
         assert!(expected.exists(), "config.toml not written");
         let written = std::fs::read_to_string(&expected).unwrap();
         let cfg = config::Config::from_str(&written).expect("round-trips");
-        assert_eq!(
-            cfg.line.expect("has [line]").segments,
-            vec!["model".to_string(), "context_window".to_string()]
-        );
+        let ids: Vec<&str> = cfg
+            .line
+            .as_ref()
+            .expect("has [line]")
+            .segments
+            .iter()
+            .filter_map(config::LineEntry::segment_id)
+            .collect();
+        assert_eq!(ids, vec!["model", "context_window"]);
         assert!(stdout.contains("wrote preset 'minimal'"));
     }
 
@@ -2702,10 +2707,15 @@ mod tests {
         let written = std::fs::read_to_string(&path).expect("file exists");
         let cfg = config::Config::from_str(&written).expect("round-trips");
         assert_eq!(cfg.theme.as_deref(), Some("catppuccin-mocha"));
-        assert_eq!(
-            cfg.line.expect("has [line]").segments,
-            vec!["model".to_string(), "context_window".to_string()]
-        );
+        let ids: Vec<&str> = cfg
+            .line
+            .as_ref()
+            .expect("has [line]")
+            .segments
+            .iter()
+            .filter_map(config::LineEntry::segment_id)
+            .collect();
+        assert_eq!(ids, vec!["model", "context_window"]);
         assert!(stdout.contains("wrote config.toml to"));
     }
 

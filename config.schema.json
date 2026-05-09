@@ -135,11 +135,55 @@
       "type": "object",
       "properties": {
         "segments": {
+          "description": "Custom deserializer routes each entry through `try_into` per-\nitem so a single malformed inline-table (e.g.\n`{ type = 42 }`) doesn't abort the whole `Config::from_str`\n— it surfaces as a kindless [`LineEntry::Item`] that the\nbuilder warns and drops. Mirrors the per-item warn-and-drop\nbehavior the numbered-line path already had via\n[`crate::segments::builder`]'s `extract_line_segments`. Without\nthis, single-line configs with one bad boundary override\nfail to load entirely while multi-line configs degrade\ngracefully — an asymmetry users hit when porting between\nlayouts.",
           "type": "array",
-          "default": [],
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/LineEntry"
           }
+        }
+      },
+      "additionalProperties": true
+    },
+    "LineEntry": {
+      "description": "One entry in `[line].segments`. Per ADR-0024, the array is a\nmixed shape: bare strings (`\"model\"`) round-trip as\n[`LineEntry::Id`] for backward compatibility with the v0.x string-\nonly schema; inline tables (`{ type = \"separator\", character = \" | \" }`)\nround-trip as [`LineEntry::Item`] and carry per-boundary settings.\n\nUntagged because the strict-tagged form would reject the bare-string\nshorthand at parse time. Typo'd keys inside an inline table (e.g.\n`{ tpye = \"separator\" }`) land in [`LineEntryItem::extra`]\nrather than failing parse, preserving the spec's \"unknown keys\nwarn, never fail\" contract. The runtime builder warns when a\nkindless inline table reaches it; per-key typo diagnostics\ninside `[line].segments` array entries are not yet surfaced\nat config-load time (the existing `validate_keys` pass walks\nonly top-level / `[layout_options]` / `[segments.<id>]` shapes).",
+      "anyOf": [
+        {
+          "description": "Bare string: `\"model\"` is equivalent to `{ type = \"model\" }`.",
+          "type": "string"
+        },
+        {
+          "description": "Inline table: `{ type = \"...\", ... }`. Carries the kind tag\nplus optional per-entry knobs (separator glyph, merge flag,\nfuture ccstatusline-parity fields under [`LineEntryItem::extra`]).",
+          "$ref": "#/$defs/LineEntryItem"
+        }
+      ]
+    },
+    "LineEntryItem": {
+      "description": "Inline-table form of [`LineEntry`]. Typed fields cover today's\nknown knobs; everything else lands in [`extra`](Self::extra) so\nfuture fields parse without a schema bump.",
+      "type": "object",
+      "properties": {
+        "character": {
+          "description": "Separator glyph for `type = \"separator\"` entries. Ignored\n(with warning) on non-separator entries. When `None` on a\nseparator entry, the builder falls back to\n`[layout_options].separator`.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "merge": {
+          "description": "When `true` on a segment entry, the boundary to its right\nrenders without a separator (suppresses the implicit\ninterleave AND any explicit [`LineEntry::Item`] separator at\nthat boundary). Ignored (with warning) on separator entries.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "type": {
+          "description": "`\"separator\"` or a segment id (`\"model\"`, `\"git_branch\"`, ...).\nWhen absent, the builder warns and drops the entry.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         }
       },
       "additionalProperties": true

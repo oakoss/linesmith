@@ -18,7 +18,8 @@ use ratatui::Frame;
 use crate::config::{Config, LayoutMode};
 
 use super::app::{AppScreen, ScreenOutcome};
-use super::items_editor::{ItemsEditorState, LineKey};
+use super::items_editor::{ItemsEditorPrev, ItemsEditorState, LineKey};
+use super::line_picker::LinePickerState;
 use super::list_screen::{
     self, ListOutcome, ListRowData, ListScreenState, ListScreenView, VerbHint,
 };
@@ -126,15 +127,37 @@ fn activate(state: &mut MainMenuState, config: &Config) -> ScreenOutcome {
     // `view`, so no render path can see it.
     let prev = mem::take(state);
     match item {
-        // Multi-line layouts route to the placeholder until a line
-        // picker exists: multi-line rendering reads `[line.N]`, so
-        // editing `[line].segments` would silently miss the active
-        // layout. `_` covers `MultiLine` plus any future
-        // `#[non_exhaustive]` variant.
+        // Single-line configs go straight to the items editor with
+        // `LineKey::Single`. Multi-line configs route through the
+        // line picker so the user picks which `[line.N]` to edit.
+        // `_` covers any future `#[non_exhaustive]` variant.
         MainMenuItem::EditLines => match config.layout {
+            // Mirror `build_lines`'s auto-promotion: when the user
+            // has `[line.N]` sub-tables but no `[line].segments`
+            // array (and no explicit `layout = "multi-line"`), the
+            // runtime renders the numbered lines. Editing the
+            // empty `[line].segments` here would let the user
+            // change a line set the renderer doesn't read; route
+            // to the picker instead so the editor and renderer
+            // stay in sync.
+            LayoutMode::SingleLine if multi_line_auto_promotes(config) => {
+                // Surface the layout mismatch so a user who
+                // explicitly typed `segments = []` to test single-
+                // line behavior knows the editor sided with the
+                // numbered tables (and matches what `build_lines`
+                // renders). Without this, the screen swap is silent
+                // and looks like an editor bug.
+                linesmith_core::lsm_debug!(
+                    "main menu: auto-promoted to multi-line picker — `[line].segments` is empty and `[line.N]` sub-tables are present",
+                );
+                ScreenOutcome::NavigateTo(AppScreen::LinePicker(LinePickerState::new(prev)))
+            }
             LayoutMode::SingleLine => ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(
-                ItemsEditorState::new(LineKey::Single, prev),
+                ItemsEditorState::new(LineKey::Single, ItemsEditorPrev::MainMenu(prev)),
             )),
+            LayoutMode::MultiLine => {
+                ScreenOutcome::NavigateTo(AppScreen::LinePicker(LinePickerState::new(prev)))
+            }
             _ => ScreenOutcome::NavigateTo(AppScreen::Placeholder(PlaceholderState::new(
                 MainMenuItem::EditLines.label(),
                 prev,
@@ -145,6 +168,20 @@ fn activate(state: &mut MainMenuState, config: &Config) -> ScreenOutcome {
             prev,
         ))),
     }
+}
+
+/// Mirrors the auto-promotion rule in
+/// `linesmith_core::segments::builder::build_lines`: when a config
+/// has `[line.N]` sub-tables but no `[line].segments` array, the
+/// runtime renders the numbered lines even without an explicit
+/// `layout = "multi-line"` declaration. The editor must follow the
+/// same rule so EditLines opens the screen that maps to what's
+/// actually being rendered.
+fn multi_line_auto_promotes(config: &Config) -> bool {
+    config
+        .line
+        .as_ref()
+        .is_some_and(|l| l.segments.is_empty() && !l.numbered.is_empty())
 }
 
 pub(super) fn view(state: &MainMenuState, frame: &mut Frame, area: Rect) {
@@ -285,14 +322,12 @@ mod tests {
     }
 
     #[test]
-    fn edit_lines_on_multi_line_layout_falls_back_to_placeholder() {
-        // Multi-line layouts render `[line.N]`, not `[line]`, so
-        // opening the items editor on `LineKey::Single` would let
-        // edits silently miss the active layout — fall through to
-        // the placeholder until a line picker exists. Pin the
-        // screen variant, the label, AND that prev round-trips
-        // through `mem::take` (so Esc back-nav restores the
-        // EditLines row).
+    fn edit_lines_on_multi_line_layout_routes_to_line_picker() {
+        // Multi-line layouts render `[line.N]`, not `[line]`, so the
+        // user picks which line to edit before the items editor
+        // opens. Pin the screen variant AND that the previous menu
+        // state round-trips through `mem::take` so Esc back-nav
+        // restores the EditLines row.
         let mut state = MainMenuState::default();
         let cfg = Config {
             layout: LayoutMode::MultiLine,
@@ -300,15 +335,14 @@ mod tests {
         };
         let outcome = update(&mut state, &cfg, key(KeyCode::Enter));
         match outcome {
-            ScreenOutcome::NavigateTo(AppScreen::Placeholder(p)) => {
-                assert_eq!(p.name, "Edit Lines");
+            ScreenOutcome::NavigateTo(AppScreen::LinePicker(p)) => {
                 assert_eq!(
                     p.prev.list.cursor(),
                     0,
                     "prev MainMenu cursor must round-trip for Esc back-nav",
                 );
             }
-            other => panic!("expected Placeholder(Edit Lines), got {other:?}"),
+            other => panic!("expected LinePicker(Edit Lines), got {other:?}"),
         }
     }
 
@@ -332,6 +366,75 @@ mod tests {
                 assert_eq!(s.line(), super::super::items_editor::LineKey::Single);
             }
             other => panic!("expected ItemsEditor(Single), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edit_lines_auto_promotes_to_line_picker_when_numbered_tables_present() {
+        // A config with `[line.1]` sub-tables but no explicit
+        // `layout = "multi-line"` is auto-promoted to multi-line by
+        // `build_lines`. Editing through the single-line items
+        // editor would let the user mutate the empty `[line].segments`
+        // array — a different surface than what the renderer reads.
+        // Pin that EditLines opens the picker in this case so editor
+        // and renderer stay in sync.
+        use crate::config::{LineConfig, LineEntry};
+        use std::collections::BTreeMap;
+        let mut numbered = BTreeMap::new();
+        let mut line_one = toml::value::Table::new();
+        line_one.insert("segments".to_string(), toml::Value::Array(vec![]));
+        numbered.insert("1".to_string(), toml::Value::Table(line_one));
+        let cfg = Config {
+            layout: LayoutMode::SingleLine,
+            line: Some(LineConfig {
+                segments: Vec::<LineEntry>::new(),
+                numbered,
+            }),
+            ..Config::default()
+        };
+        let mut state = MainMenuState::default();
+        let outcome = update(&mut state, &cfg, key(KeyCode::Enter));
+        match outcome {
+            ScreenOutcome::NavigateTo(AppScreen::LinePicker(_)) => {}
+            other => {
+                panic!("expected LinePicker for auto-promoted multi-line config, got {other:?}",)
+            }
+        }
+    }
+
+    #[test]
+    fn edit_lines_does_not_auto_promote_when_segments_array_is_populated() {
+        // Counter-pin to `edit_lines_auto_promotes_…`: when BOTH
+        // `[line].segments` is non-empty AND `[line.N]` sub-tables
+        // exist, `build_lines` resolves to single-line + warn; the
+        // editor must follow that resolution rather than silently
+        // promoting on every numbered-tables-present case. A
+        // regression that auto-promotes "whenever numbered is non-
+        // empty" would silently re-route the user's deliberate
+        // single-line edits to the picker.
+        use crate::config::{LineConfig, LineEntry};
+        use std::collections::BTreeMap;
+        let mut numbered = BTreeMap::new();
+        let mut line_one = toml::value::Table::new();
+        line_one.insert("segments".to_string(), toml::Value::Array(vec![]));
+        numbered.insert("1".to_string(), toml::Value::Table(line_one));
+        let cfg = Config {
+            layout: LayoutMode::SingleLine,
+            line: Some(LineConfig {
+                segments: vec![LineEntry::Id("model".to_string())],
+                numbered,
+            }),
+            ..Config::default()
+        };
+        let mut state = MainMenuState::default();
+        let outcome = update(&mut state, &cfg, key(KeyCode::Enter));
+        match outcome {
+            ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(s)) => {
+                assert_eq!(s.line(), super::super::items_editor::LineKey::Single);
+            }
+            other => panic!(
+                "expected ItemsEditor(Single) when both segments AND numbered are populated, got {other:?}",
+            ),
         }
     }
 

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -6,7 +7,7 @@ use rhai::{Dynamic, Engine, Map};
 use linesmith_plugin::{CompiledPlugin, PluginRegistry};
 
 use super::super::{built_in_by_id, LineItem, Segment, Separator, DEFAULT_SEGMENT_IDS};
-use super::layout::{resolve_layout_separator, single_line_ids, validated_numbered_lines};
+use super::layout::{resolve_layout_separator, single_line_entries, validated_numbered_lines};
 use super::plugins::{apply_override, bundle_plugins, toml_table_to_dynamic};
 use crate::config;
 use crate::plugins::RhaiSegment;
@@ -79,11 +80,10 @@ pub fn build_segments(
         {
             warn("layout = \"multi-line\" passed to build_segments (the single-line API); rendering line 1 only. Call build_lines to render every [line.N] sub-table.");
             let layout_separator = resolve_layout_separator(config, &mut warn);
-            let ids: Vec<&str> = first.iter().map(String::as_str).collect();
             let mut plugin_bundle = bundle_plugins(plugins);
             let mut consumed = std::collections::HashSet::new();
             return build_one_line(
-                &ids,
+                &first,
                 config,
                 &mut plugin_bundle,
                 &mut consumed,
@@ -103,15 +103,18 @@ pub fn build_segments(
 
     let layout_separator = resolve_layout_separator(config, &mut warn);
 
-    let ids: Vec<&str> = match configured_line {
-        Some(l) => l.segments.iter().map(String::as_str).collect(),
-        None => DEFAULT_SEGMENT_IDS.to_vec(),
+    let entries: Vec<config::LineEntry> = match configured_line {
+        Some(l) => l.segments.clone(),
+        None => DEFAULT_SEGMENT_IDS
+            .iter()
+            .map(|&s| config::LineEntry::Id(s.to_string()))
+            .collect(),
     };
 
     let mut plugin_bundle = bundle_plugins(plugins);
     let mut consumed = std::collections::HashSet::new();
     build_one_line(
-        &ids,
+        &entries,
         config,
         &mut plugin_bundle,
         &mut consumed,
@@ -152,7 +155,7 @@ pub fn build_lines(
     let mode = config.map(|c| c.layout).unwrap_or_default();
     let line_cfg = config.and_then(|c| c.line.as_ref());
 
-    let line_id_lists: Vec<Vec<String>> = match mode {
+    let line_entry_lists: Vec<Vec<config::LineEntry>> = match mode {
         config::LayoutMode::SingleLine => {
             // Two single-line + numbered combinations: if `segments`
             // is populated, the user picked single-line on purpose
@@ -169,20 +172,20 @@ pub fn build_lines(
                     promoted
                 } else {
                     warn("[line.N] sub-tables present but none are usable, and [line].segments is empty; nothing will render");
-                    single_line_ids(line_cfg, &mut warn)
+                    single_line_entries(line_cfg, &mut warn)
                 }
             } else {
                 if has_numbered {
                     warn("layout is single-line but [line.N] sub-tables are present; ignoring numbered tables and rendering [line].segments");
                 }
-                single_line_ids(line_cfg, &mut warn)
+                single_line_entries(line_cfg, &mut warn)
             }
         }
         config::LayoutMode::MultiLine => match validated_numbered_lines(line_cfg, &mut warn) {
             Some(lines) => lines,
             None => {
                 warn("layout = \"multi-line\" but no usable [line.N] sub-tables; falling back to single-line using [line].segments");
-                single_line_ids(line_cfg, &mut warn)
+                single_line_entries(line_cfg, &mut warn)
             }
         },
     };
@@ -191,12 +194,11 @@ pub fn build_lines(
     let mut plugin_bundle = bundle_plugins(plugins);
     let mut consumed_plugins = std::collections::HashSet::<String>::new();
 
-    line_id_lists
+    line_entry_lists
         .into_iter()
-        .map(|owned_ids| {
-            let ids: Vec<&str> = owned_ids.iter().map(String::as_str).collect();
+        .map(|entries| {
             build_one_line(
-                &ids,
+                &entries,
                 config,
                 &mut plugin_bundle,
                 &mut consumed_plugins,
@@ -207,11 +209,27 @@ pub fn build_lines(
         .collect()
 }
 /// Inner segment-building loop, shared by single-line `build_segments`
-/// and per-line `build_lines`. Dedupes within a single call (so
-/// duplicates within one line warn) but not across calls — multi-line
-/// configs that list the same built-in id in two different lines
-/// produce two independent segment instances, which is the right
-/// behavior for stateless built-ins.
+/// and per-line `build_lines`. Walks `entries` and emits a
+/// [`LineItem`] sequence per ADR-0024:
+///
+/// - Bare-string / `type = "<segment-id>"` entries materialize as
+///   [`LineItem::Segment`].
+/// - `type = "separator"` entries materialize as [`LineItem::Separator`]
+///   using the entry's `character` override or the global
+///   `[layout_options].separator` fallback.
+/// - Adjacent segments with no explicit separator between them get
+///   the global `layout_separator` interleaved (preserves pre-ADR
+///   behavior for string-only configs).
+/// - A segment with `merge = true` suppresses the boundary at its
+///   right edge: the implicit interleave is skipped AND any
+///   immediately-following explicit separator is dropped silently.
+///
+/// Dedupes segment ids within a single call (so duplicates within
+/// one line warn) but not across calls — multi-line configs that
+/// list the same built-in id in two different lines produce two
+/// independent segment instances, which is the right behavior for
+/// stateless built-ins. Separator entries are NOT deduped (each
+/// separator entry is positionally distinct).
 ///
 /// `consumed_plugins` tracks plugin ids removed from the shared
 /// lookup by earlier `build_one_line` calls. The lookup itself can't
@@ -221,7 +239,7 @@ pub fn build_lines(
 /// line" warning; otherwise the generic "unknown segment id"
 /// diagnostic fires.
 fn build_one_line(
-    ids: &[&str],
+    entries: &[config::LineEntry],
     config: Option<&config::Config>,
     plugin_bundle: &mut Option<(HashMap<String, CompiledPlugin>, Arc<Engine>)>,
     consumed_plugins: &mut std::collections::HashSet<String>,
@@ -229,50 +247,106 @@ fn build_one_line(
     warn: &mut impl FnMut(&str),
 ) -> Vec<LineItem> {
     let mut seen = std::collections::HashSet::<String>::new();
-    let segs: Vec<Box<dyn Segment>> = ids
-        .iter()
-        .filter_map(|&id| {
-            if !seen.insert(id.to_string()) {
-                warn(&format!(
-                    "segment '{id}' listed more than once; keeping first occurrence"
-                ));
-                return None;
+    let mut items: Vec<LineItem> = Vec::with_capacity(entries.len() * 2);
+    // True when the most-recently-pushed segment had `merge = true`.
+    // Cleared when the next segment lands; persists across an
+    // explicit separator entry (so `seg(merge), |, seg` drops the
+    // explicit separator AND the implicit interleave).
+    let mut merge_pending = false;
+
+    for entry in entries {
+        if matches!(entry, config::LineEntry::Item(item) if item.kind.as_deref() == Some("separator") && item.merge.is_some())
+        {
+            warn("[line].segments separator entry has `merge = ...`; ignoring (merge is for segment entries)");
+        }
+        if matches!(entry, config::LineEntry::Item(item) if item.kind.as_deref() != Some("separator") && item.character.is_some())
+        {
+            warn("[line].segments segment entry has `character = ...`; ignoring (character is for separator entries)");
+        }
+
+        match entry.kind() {
+            None => {
+                warn("[line].segments inline-table entry is missing `type`; skipping");
+                continue;
             }
-            let cfg_override = config.and_then(|c| c.segments.get(id));
-            let extras = cfg_override.map(|ov| &ov.extra);
-            let inner = if let Some(b) = built_in_by_id(id, extras, warn) {
-                Some(b)
-            } else if let Some((lookup, engine)) = plugin_bundle.as_mut() {
-                lookup.remove(id).map(|plugin| {
-                    consumed_plugins.insert(id.to_string());
-                    // Always pass a Map (possibly empty) rather than
-                    // `()` so plugins can probe `ctx.config.foo`
-                    // without first checking the parent for unit.
-                    let plugin_config = cfg_override.map_or_else(
-                        || Dynamic::from_map(Map::new()),
-                        |ov| toml_table_to_dynamic(&ov.extra),
-                    );
-                    Box::new(RhaiSegment::from_compiled(
-                        plugin,
-                        engine.clone(),
-                        plugin_config,
-                    )) as Box<dyn Segment>
-                })
-            } else {
-                None
-            };
-            let inner = inner.or_else(|| {
-                if consumed_plugins.contains(id) {
-                    warn(&format!(
-                        "plugin '{id}' was rendered on an earlier line; v0.1 supports each plugin on at most one line per render — skipping"
-                    ));
-                } else {
-                    warn(&format!("unknown segment id '{id}' — skipping"));
+            Some("separator") => {
+                if merge_pending {
+                    // Suppress: the preceding segment opted into
+                    // merge with its right neighbor. The merge flag
+                    // stays armed until the next segment lands.
+                    continue;
                 }
-                None
-            })?;
-            Some(apply_override(id, inner, cfg_override, warn))
-        })
-        .collect();
-    interleave_separators(segs, layout_separator)
+                match items.last() {
+                    Some(LineItem::Segment(_)) => {} // proceed below
+                    Some(LineItem::Separator(_)) => {
+                        warn(
+                            "[line].segments has consecutive separator entries; keeping the first",
+                        );
+                        continue;
+                    }
+                    None => {
+                        warn("[line].segments leads with a separator entry; skipping");
+                        continue;
+                    }
+                }
+                let sep = entry.separator_character().map_or_else(
+                    || layout_separator.clone(),
+                    |c| Separator::Literal(Cow::Owned(c.to_string())),
+                );
+                items.push(LineItem::Separator(sep));
+            }
+            Some(id) => {
+                if !seen.insert(id.to_string()) {
+                    warn(&format!(
+                        "segment '{id}' listed more than once; keeping first occurrence"
+                    ));
+                    continue;
+                }
+                let cfg_override = config.and_then(|c| c.segments.get(id));
+                let extras = cfg_override.map(|ov| &ov.extra);
+                let inner = if let Some(b) = built_in_by_id(id, extras, warn) {
+                    Some(b)
+                } else if let Some((lookup, engine)) = plugin_bundle.as_mut() {
+                    lookup.remove(id).map(|plugin| {
+                        consumed_plugins.insert(id.to_string());
+                        let plugin_config = cfg_override.map_or_else(
+                            || Dynamic::from_map(Map::new()),
+                            |ov| toml_table_to_dynamic(&ov.extra),
+                        );
+                        Box::new(RhaiSegment::from_compiled(
+                            plugin,
+                            engine.clone(),
+                            plugin_config,
+                        )) as Box<dyn Segment>
+                    })
+                } else {
+                    None
+                };
+                let Some(inner) = inner else {
+                    if consumed_plugins.contains(id) {
+                        warn(&format!(
+                            "plugin '{id}' was rendered on an earlier line; v0.1 supports each plugin on at most one line per render — skipping"
+                        ));
+                    } else {
+                        warn(&format!("unknown segment id '{id}' — skipping"));
+                    }
+                    continue;
+                };
+                let seg = apply_override(id, inner, cfg_override, warn);
+
+                // Implicit interleave: when the previous item is a
+                // segment (no explicit separator between them) and
+                // the previous segment didn't request merge, insert
+                // the global default separator. When the previous
+                // item is already a Separator (explicit), don't
+                // double-up.
+                if matches!(items.last(), Some(LineItem::Segment(_))) && !merge_pending {
+                    items.push(LineItem::Separator(layout_separator.clone()));
+                }
+                items.push(LineItem::Segment(seg));
+                merge_pending = entry.merge();
+            }
+        }
+    }
+    items
 }

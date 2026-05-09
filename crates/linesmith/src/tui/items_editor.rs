@@ -1,11 +1,24 @@
 //! Items editor screen per ADR-0023.
 //!
 //! Edits `[line].segments` (and `[line.N].segments`) by mutating
-//! `model.document` via toml_edit. The view renders only segment
-//! IDs today; separator-as-item rendering is an editor-scope
-//! deferral, not a missing data model — the runtime LineItem enum
-//! and the `[layout_options].separator` global already exist (see
-//! `docs/specs/segment-system.md` §Line items and separators).
+//! `model.document` via toml_edit. Per ADR-0024, the array is a
+//! mixed shape: bare strings (`"model"`) for plain segment ids,
+//! inline tables (`{ type = "separator", character = " | " }`)
+//! for per-boundary separators, and inline tables with `merge =
+//! true` for segments that suppress their right-edge boundary.
+//! Display rows distinguish segments from separators (with the
+//! glyph in the description column) and surface the `merge` flag.
+//!
+//! Verbs:
+//! - `a`/`i` open the type picker for add/insert (segments).
+//! - `Space` inserts `{ type = "separator" }` after the cursor.
+//! - `r` opens the raw editor; on a separator it edits the
+//!   `character` field, on a segment it renames the id (preserving
+//!   inline-table fields like `merge`).
+//! - `m` toggles merge on the cursor segment (string ↔ inline
+//!   table; demotes back to bare string when only `type` remains).
+//! - `d`/`c`/`k` delete / clear / clone the cursor entry.
+//! - `Enter` toggles move-mode reorder.
 //!
 //! Per ADR-0022, this screen owns cursor sync on `MoveSwap`: after
 //! swapping the underlying segment array, the caller calls
@@ -19,26 +32,29 @@ use std::num::NonZeroU32;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::Frame;
-use toml_edit::DocumentMut;
+use toml_edit::{DocumentMut, InlineTable, Value};
 
 use crate::config;
 
 use super::app::{AppScreen, ScreenOutcome};
+use super::line_picker::LinePickerState;
 use super::list_screen::{
     self, ListOutcome, ListRowData, ListScreenState, ListScreenView, VerbHint,
 };
 use super::main_menu::MainMenuState;
-use super::raw_value_editor::RawValueEditorState;
+use super::raw_value_editor::{RawTarget, RawValueEditorState};
 use super::type_picker::TypePickerState;
 
 /// Verbs the editor dispatches through `list_screen::handle_key`.
-/// `a`/`i` are NOT listed here — they're handled at the screen
-/// level alongside ←/→ so they remain reachable when the segment
-/// list is empty (ListScreen gates `Action(c)` on `num_rows > 0`,
-/// which would make add/insert inert during the live "clear →
-/// rebuild" flow). `r` (raw) requires a cursor segment to edit,
-/// so the gate is correct for it.
-const VERB_LETTERS: &[char] = &['d', 'c', 'k', 'r'];
+/// `a`/`i`/`Space` are NOT listed here — they're handled at the
+/// screen level so they remain reachable when the segment list is
+/// empty (ListScreen gates `Action(c)` on `num_rows > 0`, which
+/// would make add/insert/separator-insert inert during the live
+/// "clear → rebuild" flow). `r`/`d`/`k`/`m` need a cursor entry to
+/// act on; `c` clears the whole array but only fires when there's
+/// something to clear. The `num_rows > 0` gate is correct for all
+/// five.
+const VERB_LETTERS: &[char] = &['d', 'c', 'k', 'r', 'm'];
 
 /// Help-row hints rendered alongside the move-mode toggle. Order
 /// here drives the visible order in the help row.
@@ -52,8 +68,16 @@ const VERBS: &[VerbHint<'static>] = &[
         label: "insert",
     },
     VerbHint {
+        letter: ' ',
+        label: "Space sep",
+    },
+    VerbHint {
         letter: 'r',
         label: "raw",
+    },
+    VerbHint {
+        letter: 'm',
+        label: "merge",
     },
     VerbHint {
         letter: 'd',
@@ -96,10 +120,29 @@ pub(super) enum InsertTarget {
     After(usize),
 }
 
+/// Where Esc back-navigates to from the items editor. Single-line
+/// configs reach the editor straight from MainMenu, so Esc returns
+/// to the menu row the user activated from. Multi-line configs go
+/// through the line picker, so Esc returns to the picker row the
+/// user activated from. Without this discriminator, multi-line Esc
+/// jumps two screens up to MainMenu and forces the user to re-pick
+/// the line they were just editing.
+#[derive(Debug)]
+pub(super) enum ItemsEditorPrev {
+    MainMenu(MainMenuState),
+    LinePicker(LinePickerState),
+}
+
+impl Default for ItemsEditorPrev {
+    fn default() -> Self {
+        Self::MainMenu(MainMenuState::default())
+    }
+}
+
 /// Items editor state. The list-widget cursor lives in `list`; the
-/// `prev` MainMenuState round-trips through Esc back-nav so the
-/// user lands back on the menu row they came from. `prev` stays
-/// `pub(super)` to mirror `PlaceholderState`'s back-nav idiom.
+/// `prev` round-trips the back-nav target through Esc so the user
+/// lands on the row they activated from (MainMenu for single-line
+/// configs, LinePicker for multi-line).
 ///
 /// `Default` is derived so `mem::take` in the type-picker entry
 /// path leaves a placeholder `ItemsEditorState` behind (the screen
@@ -108,11 +151,11 @@ pub(super) enum InsertTarget {
 pub(super) struct ItemsEditorState {
     line: LineKey,
     list: ListScreenState,
-    pub(super) prev: MainMenuState,
+    pub(super) prev: ItemsEditorPrev,
 }
 
 impl ItemsEditorState {
-    pub(super) fn new(line: LineKey, prev: MainMenuState) -> Self {
+    pub(super) fn new(line: LineKey, prev: ItemsEditorPrev) -> Self {
         Self {
             line,
             list: ListScreenState::default(),
@@ -156,15 +199,14 @@ pub(super) fn update(
     // Esc back-nav fires regardless of move-mode (ListScreen exits
     // move-mode on Esc; we never see Esc here while in move-mode).
     if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Esc {
-        let prev = mem::take(&mut state.prev);
-        return ScreenOutcome::NavigateTo(AppScreen::MainMenu(prev));
+        return back_nav_to_prev(&mut state.prev);
     }
-    // Screen-level keybindings for picker entry: `a`/`i` verbs and
-    // ←/→ accelerators. Handled here (not via ListScreen's verb
-    // dispatch) so they remain reachable when `segment_count == 0`
-    // — the live "clear → rebuild" flow. Gated to normal mode so a
-    // chord-typed letter or arrow during move-mode doesn't yank
-    // the user out of their reorder.
+    // Screen-level keybindings for picker entry: `a`/`i` verbs,
+    // Space (insert separator), and ←/→ accelerators. Handled here
+    // (not via ListScreen's verb dispatch) so they remain reachable
+    // when `segment_count == 0` — the live "clear → rebuild" flow.
+    // Gated to normal mode so a chord-typed letter or arrow during
+    // move-mode doesn't yank the user out of their reorder.
     if key.modifiers == KeyModifiers::NONE && !state.list.move_mode() {
         match key.code {
             KeyCode::Left | KeyCode::Char('i') => {
@@ -174,6 +216,29 @@ pub(super) fn update(
             KeyCode::Right | KeyCode::Char('a') => {
                 let cursor = state.list.cursor();
                 return open_type_picker(state, InsertTarget::After(cursor));
+            }
+            KeyCode::Char(' ') => {
+                let cursor = state.list.cursor();
+                let line = state.line;
+                let target = if segment_count(document, line) == 0 {
+                    InsertTarget::Before(0)
+                } else {
+                    InsertTarget::After(cursor)
+                };
+                if insert_separator(document, line, target) {
+                    refresh_config(document, config);
+                    let new_count = segment_count(document, line);
+                    let new_cursor = match target {
+                        InsertTarget::Before(idx) => idx,
+                        InsertTarget::After(idx) => idx + 1,
+                    };
+                    state.list.set_cursor(new_cursor, new_count);
+                } else {
+                    linesmith_core::lsm_warn!(
+                        "items editor: insert separator failed (line={line:?}); editor unchanged",
+                    );
+                }
+                return ScreenOutcome::Stay;
             }
             _ => {}
         }
@@ -192,12 +257,28 @@ pub(super) fn update(
         ListOutcome::Action('r') => {
             return open_raw_value_editor(state, document, cursor);
         }
+        ListOutcome::Action('m') => {
+            if toggle_merge_at(document, line, cursor) {
+                let new_count = segment_count(document, line);
+                state.list.set_cursor(cursor, new_count);
+                refresh_config(document, config);
+            } else {
+                linesmith_core::lsm_warn!(
+                    "items editor: merge toggle inert at index {cursor} (line={line:?}); merge applies to segment entries only",
+                );
+            }
+        }
         ListOutcome::Action('d') => {
             if delete_segment_at(document, line, cursor) {
                 let new_count = segment_count(document, line);
                 state.list.set_cursor(cursor, new_count);
                 refresh_config(document, config);
             }
+            // No warn arm: ListScreen gates `Action(c)` on
+            // `num_rows > 0` and `delete_segment_at` materializes
+            // the single-line defaults on demand, so the false
+            // branch is unreachable through the UI. Per AGENTS.md,
+            // don't add validation for scenarios that can't happen.
         }
         ListOutcome::Action('c') => {
             if clear_segments(document, line) {
@@ -220,6 +301,19 @@ pub(super) fn update(
     ScreenOutcome::Stay
 }
 
+/// Resolve the Esc back-nav target. `mem::take` swaps the prev
+/// for the `Default` variant (`MainMenu(MainMenuState::default())`)
+/// — the screen transition overwrites the editor's state
+/// immediately so the placeholder is never observed by `view`.
+fn back_nav_to_prev(prev: &mut ItemsEditorPrev) -> ScreenOutcome {
+    match mem::take(prev) {
+        ItemsEditorPrev::MainMenu(state) => ScreenOutcome::NavigateTo(AppScreen::MainMenu(state)),
+        ItemsEditorPrev::LinePicker(state) => {
+            ScreenOutcome::NavigateTo(AppScreen::LinePicker(state))
+        }
+    }
+}
+
 /// Hand the editor state off to a fresh `TypePicker`. `mem::take`
 /// leaves a default `ItemsEditorState` behind; the screen
 /// transition immediately overwrites it via the returned
@@ -230,15 +324,17 @@ fn open_type_picker(state: &mut ItemsEditorState, target: InsertTarget) -> Scree
 }
 
 /// Hand the editor state off to a fresh `RawValueEditor` seeded
-/// with the cursor segment's current label. Same `mem::take`
-/// safety as `open_type_picker`.
+/// with the cursor entry's current value. Dispatches by entry
+/// kind: a separator inline table opens the editor for the
+/// `character` field; everything else opens for the segment id.
+/// Same `mem::take` safety as `open_type_picker`.
 ///
 /// The seed is read from the underlying TOML value, not the
 /// rendered label. This distinguishes a real string ID equal to
 /// `"<non-string>"` (a valid TOML string) from the synthetic
-/// placeholder that `segment_labels` emits for non-string TOML
-/// entries — the literal must round-trip; the placeholder must
-/// not invite a commit of itself.
+/// placeholder the display path (`value_to_row`) emits for non-
+/// string non-table TOML entries — the literal must round-trip;
+/// the placeholder must not invite a commit of itself.
 ///
 /// `target_idx` is captured here and consumed in `apply_replace`
 /// when the user commits. Valid for the lifetime of the editor:
@@ -252,41 +348,80 @@ fn open_raw_value_editor(
     target_idx: usize,
 ) -> ScreenOutcome {
     let line = state.line;
-    let initial = if let Some(arr) = segments_array(document, line) {
-        arr.get(target_idx)
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .unwrap_or_default()
-    } else if matches!(line, LineKey::Single) {
-        // No explicit [line].segments — seed from the default the
-        // renderer is showing.
-        linesmith_core::segments::DEFAULT_SEGMENT_IDS
-            .get(target_idx)
-            .map(|s| (*s).to_string())
-            .unwrap_or_default()
-    } else {
-        String::new()
+    let (initial, target) = match classify_entry(document, line, target_idx) {
+        EntryKind::Separator => {
+            let initial = segments_array(document, line)
+                .and_then(|arr| arr.get(target_idx).and_then(|v| v.as_inline_table()))
+                .and_then(|t| t.get("character").and_then(|v| v.as_str()))
+                .map(str::to_string)
+                .unwrap_or_default();
+            (initial, RawTarget::SeparatorCharacter)
+        }
+        EntryKind::Segment | EntryKind::Malformed => {
+            let initial = if let Some(arr) = segments_array(document, line) {
+                arr.get(target_idx)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| inline_segment_id(arr.get(target_idx)))
+            } else if matches!(line, LineKey::Single) {
+                linesmith_core::segments::DEFAULT_SEGMENT_IDS
+                    .get(target_idx)
+                    .map(|s| (*s).to_string())
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            (initial, RawTarget::SegmentId)
+        }
     };
     let prev = mem::take(state);
     ScreenOutcome::NavigateTo(AppScreen::RawValueEditor(RawValueEditorState::new(
-        initial, target_idx, prev,
+        initial, target_idx, target, prev,
     )))
 }
 
+/// Extract the `type` field from a non-separator inline table so
+/// `r` on a `{ type = "model", merge = true }` entry seeds the
+/// editor with `"model"` rather than an empty buffer. Returns an
+/// empty string when the value isn't an inline table or has no
+/// `type` field.
+fn inline_segment_id(value: Option<&Value>) -> String {
+    value
+        .and_then(toml_edit::Value::as_inline_table)
+        .and_then(|t| t.get("type").and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .unwrap_or_default()
+}
+
 /// Apply a raw-value commit to the document and navigate back to
-/// the items editor. Mirrors `apply_insert`'s ownership transfer.
-/// Empty strings are accepted at this layer — the segment IDs
-/// the user types pass through to the load-layer warning channel
-/// when they don't match any built-in or plugin.
+/// the items editor. Dispatches by `target` so a separator-
+/// character edit mutates the inline table's `character` field
+/// while a segment-id edit replaces the array entry with a string.
+/// Mirrors `apply_insert`'s ownership transfer.
+///
+/// Empty strings are accepted at this layer:
+/// - For `SegmentId`, the empty string passes through to the
+///   load-layer warning channel when it doesn't match any built-
+///   in or plugin id.
+/// - For `SeparatorCharacter`, an empty string clears the
+///   override so the boundary uses the global
+///   `[layout_options].separator` default.
 pub(super) fn apply_replace(
     mut prev: ItemsEditorState,
     document: &mut DocumentMut,
     config: &mut config::Config,
     target_idx: usize,
+    target: RawTarget,
     new_value: &str,
 ) -> ScreenOutcome {
     let line = prev.line;
-    if !replace_segment(document, line, target_idx, new_value) {
+    let success = match target {
+        RawTarget::SegmentId => replace_segment(document, line, target_idx, new_value),
+        RawTarget::SeparatorCharacter => {
+            replace_separator_character(document, line, target_idx, new_value)
+        }
+    };
+    if !success {
         linesmith_core::lsm_warn!(
             "items editor: replace failed at index {target_idx} (line={line:?}); editor unchanged",
         );
@@ -298,18 +433,206 @@ pub(super) fn apply_replace(
     ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(prev))
 }
 
-/// Replace the entry at `idx` with `new_value`. Returns `false`
-/// when `ensure_segments_array_mut` rejects (numbered line
-/// without explicit array) or the index is out of range.
+/// Replace the segment-id at `idx` with `new_value`, preserving
+/// any inline-table fields (`merge`, future per-entry knobs) when
+/// the existing entry is an inline table. Bare-string entries stay
+/// bare strings; inline-table entries have only their `type` field
+/// updated. Returns `false` when `ensure_segments_array_mut`
+/// rejects (numbered line without explicit array) or the index is
+/// out of range.
+///
+/// The inline-table path is load-bearing for the `m`+`r` workflow:
+/// `m` promotes a bare string to `{ type = "model", merge = true }`,
+/// then `r` to rename the segment must keep `merge` intact rather
+/// than rewrite the array entry as a bare string and silently drop
+/// the flag.
 fn replace_segment(document: &mut DocumentMut, line: LineKey, idx: usize, new_value: &str) -> bool {
     let Some(arr) = ensure_segments_array_mut(document, line) else {
         return false;
     };
-    if idx >= arr.len() {
+    let Some(entry) = arr.get_mut(idx) else {
+        return false;
+    };
+    // Single match avoids the TOCTOU shape where a separate
+    // `is_inline_table` check + later `as_inline_table_mut` could
+    // disagree and silently elide the mutation. Either we land on
+    // an inline-table arm and update its `type`, or we fall through
+    // and replace with a bare string. A separator inline table at
+    // this index means kind-drift since `open_raw_value_editor`
+    // dispatched on the entry's classification — refuse the rename
+    // so a "rename segment" verb doesn't silently corrupt a
+    // separator boundary.
+    match entry {
+        Value::InlineTable(table) => {
+            if table.get("type").and_then(|v| v.as_str()) == Some("separator") {
+                return false;
+            }
+            table.insert("type", Value::from(new_value));
+            true
+        }
+        _ => {
+            arr.replace(idx, new_value);
+            true
+        }
+    }
+}
+
+/// Update the `character` field of the inline-table separator at
+/// `idx` to `new_value` verbatim, including the empty string. Per
+/// ADR-0024 the two states `character = ""` (explicit no-separator
+/// at this boundary) and `character` absent (fall back to
+/// `[layout_options].separator`) are distinct render outcomes; the
+/// raw editor commits one consistent meaning — "set the character
+/// to what's in the buffer" — so a round-trip through `r` never
+/// changes which mode the entry is in. Users who want the absent-
+/// field "use global default" state use `Space` to insert a fresh
+/// defaulted separator (and don't subsequently `r` it). Returns
+/// `false` when the entry isn't a separator inline table or the
+/// index is out of range.
+fn replace_separator_character(
+    document: &mut DocumentMut,
+    line: LineKey,
+    idx: usize,
+    new_value: &str,
+) -> bool {
+    let Some(arr) = ensure_segments_array_mut(document, line) else {
+        return false;
+    };
+    let Some(value) = arr.get_mut(idx) else {
+        return false;
+    };
+    let Some(table) = value.as_inline_table_mut() else {
+        return false;
+    };
+    if table.get("type").and_then(|v| v.as_str()) != Some("separator") {
         return false;
     }
-    arr.replace(idx, new_value);
+    table.insert("character", Value::from(new_value));
     true
+}
+
+/// Toggle the `merge` flag on the cursor segment. A bare-string
+/// entry (`"model"`) is promoted to `{ type = "model", merge = true }`;
+/// an inline-table entry already at `merge = true` has the field
+/// removed (and demotes back to a bare string when no other typed
+/// fields remain). Returns `false` for separator entries (merge
+/// is a segment-only flag), kindless inline tables (no `type` —
+/// the builder drops these as malformed; toggling `merge` on them
+/// would just write more invalid TOML), missing arrays, or out-
+/// of-range indices.
+fn toggle_merge_at(document: &mut DocumentMut, line: LineKey, idx: usize) -> bool {
+    let Some(arr) = ensure_segments_array_mut(document, line) else {
+        return false;
+    };
+    let Some(value) = arr.get(idx).cloned() else {
+        return false;
+    };
+    match value {
+        Value::String(s) => {
+            // Promote: `"model"` → `{ type = "model", merge = true }`.
+            let mut table = InlineTable::new();
+            table.insert("type", Value::from(s.value().as_str()));
+            table.insert("merge", Value::from(true));
+            arr.replace(idx, Value::InlineTable(table));
+            true
+        }
+        Value::InlineTable(t) => {
+            let type_field = t.get("type").and_then(|v| v.as_str());
+            if type_field == Some("separator") {
+                return false;
+            }
+            // Reject kindless entries: the builder drops them with
+            // a "missing `type`" warn, so adding `merge = true` only
+            // ships invalid TOML. The user must add `type` first
+            // (via `r`) before merge is meaningful.
+            let Some(_) = type_field else {
+                return false;
+            };
+            let kind = t.get("type").and_then(|v| v.as_str()).map(str::to_string);
+            let currently_merging = t.get("merge").and_then(|v| v.as_bool()).unwrap_or(false);
+            if currently_merging {
+                // Demote: clear merge. If the only remaining field
+                // is `type`, collapse back to a bare string for
+                // round-trip cleanliness.
+                let mut new_table = t.clone();
+                new_table.remove("merge");
+                let only_type_left = new_table.iter().count() == 1
+                    && new_table.get("type").and_then(|v| v.as_str()).is_some();
+                if only_type_left {
+                    if let Some(id) = kind {
+                        arr.replace(idx, Value::from(id.as_str()));
+                        return true;
+                    }
+                }
+                arr.replace(idx, Value::InlineTable(new_table));
+            } else {
+                let mut new_table = t.clone();
+                new_table.insert("merge", Value::from(true));
+                arr.replace(idx, Value::InlineTable(new_table));
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Insert `{ type = "separator" }` at the position described by
+/// `target`. The new separator uses the global
+/// `[layout_options].separator` default; the user customizes the
+/// glyph by navigating to the row and pressing `r` (raw). Returns
+/// `false` only when `ensure_segments_array_mut` rejects.
+fn insert_separator(document: &mut DocumentMut, line: LineKey, target: InsertTarget) -> bool {
+    let Some(arr) = ensure_segments_array_mut(document, line) else {
+        return false;
+    };
+    let idx = match target {
+        InsertTarget::Before(i) => i.min(arr.len()),
+        InsertTarget::After(i) => i.saturating_add(1).min(arr.len()),
+    };
+    let mut table = InlineTable::new();
+    table.insert("type", Value::from("separator"));
+    arr.insert(idx, Value::InlineTable(table));
+    true
+}
+
+/// Classification of an entry in the segments array. Drives the
+/// view's row rendering AND the `r`/`m` verb dispatch (separators
+/// reach a different RawTarget; merge is a segment-only flag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    /// Bare-string id or inline-table with `type` ≠ `"separator"`.
+    Segment,
+    /// Inline-table with `type = "separator"`.
+    Separator,
+    /// Out of range, non-string, or kindless inline table.
+    Malformed,
+}
+
+fn classify_entry(document: &DocumentMut, line: LineKey, idx: usize) -> EntryKind {
+    let Some(arr) = segments_array(document, line) else {
+        // Default-fallback path (Single + missing array) renders
+        // bare segment ids; classify as Segment so `r` opens the
+        // segment-id editor.
+        return if matches!(line, LineKey::Single) {
+            EntryKind::Segment
+        } else {
+            EntryKind::Malformed
+        };
+    };
+    let Some(v) = arr.get(idx) else {
+        return EntryKind::Malformed;
+    };
+    if v.as_str().is_some() {
+        return EntryKind::Segment;
+    }
+    if let Some(t) = v.as_inline_table() {
+        return match t.get("type").and_then(|tv| tv.as_str()) {
+            Some("separator") => EntryKind::Separator,
+            Some(_) => EntryKind::Segment,
+            None => EntryKind::Malformed,
+        };
+    }
+    EntryKind::Malformed
 }
 
 /// Apply a picker selection to the document and navigate back to
@@ -346,23 +669,23 @@ pub(super) fn apply_insert(
     ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(prev))
 }
 
-/// Render the segment list. Description slot is intentionally
-/// empty: rows are plain segment IDs. `move_mode_supported = true`
-/// so Enter toggles reorder; `VERBS` populate the help-row hints.
+/// Render the segment list. Separators render distinctly with the
+/// `character` value shown in the description column, or
+/// `(default)` when the boundary inherits
+/// `[layout_options].separator`, or `(empty)` for an explicit
+/// `character = ""` (the no-separator-at-this-boundary state per
+/// ADR-0024 — distinct from "use global default"). Segments with
+/// `merge = true` carry a `merge →` description so the per-
+/// boundary suppression is visible without opening the saved
+/// file. `move_mode_supported = true` so Enter toggles reorder;
+/// `VERBS` populate the help-row hints.
 pub(super) fn view(
     state: &ItemsEditorState,
     document: &DocumentMut,
     frame: &mut Frame,
     area: Rect,
 ) {
-    let labels = segment_labels(document, state.line);
-    let row_data: Vec<ListRowData<'_>> = labels
-        .into_iter()
-        .map(|label| ListRowData {
-            label: Cow::Owned(label),
-            description: Cow::Borrowed(""),
-        })
-        .collect();
+    let row_data = display_rows(document, state.line);
     let view = ListScreenView {
         title: " edit lines ",
         rows: &row_data,
@@ -370,6 +693,55 @@ pub(super) fn view(
         move_mode_supported: true,
     };
     list_screen::render(&state.list, &view, area, frame);
+}
+
+fn display_rows(document: &DocumentMut, line: LineKey) -> Vec<ListRowData<'static>> {
+    if let Some(arr) = segments_array(document, line) {
+        return arr.iter().map(value_to_row).collect();
+    }
+    if matches!(line, LineKey::Single) {
+        return linesmith_core::segments::DEFAULT_SEGMENT_IDS
+            .iter()
+            .map(|s| ListRowData {
+                label: Cow::Owned((*s).to_string()),
+                description: Cow::Borrowed(""),
+            })
+            .collect();
+    }
+    Vec::new()
+}
+
+fn value_to_row(value: &Value) -> ListRowData<'static> {
+    if let Some(s) = value.as_str() {
+        return ListRowData {
+            label: Cow::Owned(s.to_string()),
+            description: Cow::Borrowed(""),
+        };
+    }
+    if let Some(t) = value.as_inline_table() {
+        let kind = t.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if kind == "separator" {
+            let glyph = t.get("character").and_then(|v| v.as_str());
+            return ListRowData {
+                label: Cow::Borrowed("· separator"),
+                description: Cow::Owned(match glyph {
+                    Some("") => "(empty)".to_string(),
+                    Some(g) => format!("'{g}'"),
+                    None => "(default)".to_string(),
+                }),
+            };
+        }
+        let label = if kind.is_empty() { "<no type>" } else { kind };
+        let merge = t.get("merge").and_then(|v| v.as_bool()).unwrap_or(false);
+        return ListRowData {
+            label: Cow::Owned(label.to_string()),
+            description: Cow::Borrowed(if merge { "merge →" } else { "" }),
+        };
+    }
+    ListRowData {
+        label: Cow::Borrowed("<non-string>"),
+        description: Cow::Borrowed(""),
+    }
 }
 
 fn segment_count(document: &DocumentMut, line: LineKey) -> usize {
@@ -387,14 +759,28 @@ fn segment_count(document: &DocumentMut, line: LineKey) -> usize {
     }
 }
 
+/// Resolve the document key for a numbered line. Walks the
+/// `[line]` table and returns the first child whose key parses as
+/// the same `u32` as `n`. This handles zero-padded keys like
+/// `[line.01]` — the runtime builder treats `01` and `1` as the
+/// same line index, so the editor must look the entry back up by
+/// its parsed numeric value rather than `n.to_string()` (which
+/// would always produce `"1"` and miss `"01"` entirely).
+pub(super) fn numbered_line_key(document: &DocumentMut, n: std::num::NonZeroU32) -> Option<String> {
+    let table = document.get("line")?.as_table()?;
+    table
+        .iter()
+        .find(|(k, v)| v.is_table() && k.parse::<u32>().ok() == Some(n.get()))
+        .map(|(k, _)| k.to_string())
+}
+
 fn segments_array(document: &DocumentMut, line: LineKey) -> Option<&toml_edit::Array> {
     match line {
         LineKey::Single => document.get("line")?.get("segments")?.as_array(),
-        LineKey::Numbered(n) => document
-            .get("line")?
-            .get(n.to_string())?
-            .get("segments")?
-            .as_array(),
+        LineKey::Numbered(n) => {
+            let key = numbered_line_key(document, n)?;
+            document.get("line")?.get(&key)?.get("segments")?.as_array()
+        }
     }
 }
 
@@ -404,25 +790,24 @@ fn segments_array_mut(document: &mut DocumentMut, line: LineKey) -> Option<&mut 
             .get_mut("line")?
             .get_mut("segments")?
             .as_array_mut(),
-        LineKey::Numbered(n) => document
-            .get_mut("line")?
-            .get_mut(n.to_string())?
-            .get_mut("segments")?
-            .as_array_mut(),
+        LineKey::Numbered(n) => {
+            let key = numbered_line_key(document, n)?;
+            document
+                .get_mut("line")?
+                .get_mut(&key)?
+                .get_mut("segments")?
+                .as_array_mut()
+        }
     }
 }
 
-/// Stringified labels for display. Non-string entries render with
-/// a `<non-string>` placeholder rather than being filtered out:
-/// dropping them would desync the view's row count from
-/// `segment_count`, letting the cursor land on a hidden index and
-/// reorder the wrong underlying value. With the placeholder, the
-/// user sees the bad entry, knows their TOML is wrong (the load
-/// layer rejects it at parse time), and can reorder or delete it.
-///
-/// When `[line].segments` is absent (fresh config, never-edited
-/// single-line case), surfaces the runtime defaults so the editor
-/// matches the populated preview the user sees.
+/// Test-only label projection that mirrors the display rendering
+/// for bare-string entries (returns the segment id) while keeping
+/// the original `<non-string>` placeholder for everything else.
+/// Production now goes through `display_rows`; this stays scoped
+/// to `#[cfg(test)]` so legacy assertions on the bare-string path
+/// keep working without coupling to the richer ListRowData shape.
+#[cfg(test)]
 fn segment_labels(document: &DocumentMut, line: LineKey) -> Vec<String> {
     if let Some(arr) = segments_array(document, line) {
         return arr
@@ -564,14 +949,17 @@ fn materialize_default_single_line_segments(document: &mut DocumentMut) {
     }
 }
 
-/// Boot-path warnings are suppressed during the inline reparse so
-/// they don't re-fire every keystroke. A reparse failure surfaces
-/// as a warning AND leaves `config` at its last-good value: the
-/// preview keeps showing the last-good state, and the user gets
-/// a signal that their edit produced a state the parser rejects
-/// (e.g., a non-string segment in a hand-edited TOML). Without
-/// the warning, the symptom would be a frozen preview with no
-/// indication why.
+/// Per-mutation reparse so the live preview reflects the new
+/// document. Validation warnings (unknown segment ids, unknown
+/// keys) are suppressed here because the segment builder fires
+/// the same warnings on each render through the captured log
+/// sink — emitting them again per keystroke would litter the
+/// warnings panel without adding signal. A *parse* failure (the
+/// `Err` branch) is a different problem: the entire document
+/// shape is gone, the preview has no way to recover, and the
+/// user needs immediate feedback. That branch warns AND leaves
+/// `config` at its last-good value so the preview keeps showing
+/// the last successful render rather than going blank.
 fn refresh_config(document: &DocumentMut, config: &mut config::Config) {
     match config::Config::from_str_validated(&document.to_string(), |_| {}) {
         Ok(new_config) => *config = new_config,
@@ -598,7 +986,10 @@ mod tests {
     }
 
     fn state() -> ItemsEditorState {
-        ItemsEditorState::new(LineKey::Single, MainMenuState::default())
+        ItemsEditorState::new(
+            LineKey::Single,
+            ItemsEditorPrev::MainMenu(MainMenuState::default()),
+        )
     }
 
     #[test]
@@ -674,7 +1065,12 @@ segments = ["model", "cwd"]
         update(&mut s, &mut doc, &mut cfg, key(KeyCode::Enter));
         update(&mut s, &mut doc, &mut cfg, key(KeyCode::Down));
         let line = cfg.line.expect("config must reparse with [line]");
-        assert_eq!(line.segments, vec!["cwd".to_string(), "model".to_string()]);
+        let ids: Vec<&str> = line
+            .segments
+            .iter()
+            .filter_map(config::LineEntry::segment_id)
+            .collect();
+        assert_eq!(ids, vec!["cwd", "model"]);
     }
 
     #[test]
@@ -1011,7 +1407,12 @@ segments = ["a", "b", "c"]
             "cursor stays at 1, now pointing at \"c\""
         );
         let line = cfg.line.expect("line config reparsed");
-        assert_eq!(line.segments, vec!["a".to_string(), "c".to_string()]);
+        let ids: Vec<&str> = line
+            .segments
+            .iter()
+            .filter_map(config::LineEntry::segment_id)
+            .collect();
+        assert_eq!(ids, vec!["a", "c"]);
     }
 
     #[test]
@@ -1266,7 +1667,7 @@ segments = ["alpha", "beta"]
 
         let prev = ItemsEditorState::new(
             LineKey::Numbered(NonZeroU32::new(1).expect("nonzero")),
-            MainMenuState::default(),
+            ItemsEditorPrev::MainMenu(MainMenuState::default()),
         );
         let mut doc = document(
             r#"layout = "multi-line"
@@ -1274,7 +1675,7 @@ segments = ["alpha", "beta"]
 "#,
         );
         let mut cfg = config_default();
-        let _ = apply_replace(prev, &mut doc, &mut cfg, 0, "model");
+        let _ = apply_replace(prev, &mut doc, &mut cfg, 0, RawTarget::SegmentId, "model");
 
         let entries = captured.drain();
         assert!(
@@ -1297,7 +1698,14 @@ segments = ["alpha", "beta"]
 "#,
         );
         let mut cfg = config_default();
-        let outcome = apply_replace(ItemsEditorState::default(), &mut doc, &mut cfg, 0, "");
+        let outcome = apply_replace(
+            ItemsEditorState::default(),
+            &mut doc,
+            &mut cfg,
+            0,
+            RawTarget::SegmentId,
+            "",
+        );
         assert!(matches!(
             outcome,
             ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(_))
@@ -1319,6 +1727,7 @@ segments = ["alpha", "beta", "gamma"]
             &mut doc,
             &mut cfg,
             1,
+            RawTarget::SegmentId,
             "BETA-renamed",
         );
         let restored = match outcome {
@@ -1461,7 +1870,7 @@ segments = ["a", "b"]
 
         let prev = ItemsEditorState::new(
             LineKey::Numbered(NonZeroU32::new(1).expect("nonzero")),
-            MainMenuState::default(),
+            ItemsEditorPrev::MainMenu(MainMenuState::default()),
         );
         let mut doc = document(
             r#"layout = "multi-line"
@@ -1528,5 +1937,498 @@ segments = ["a", "b"]
             update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char(verb)));
         }
         assert_eq!(doc.to_string(), raw);
+    }
+
+    #[test]
+    fn space_inserts_separator_after_cursor_segment() {
+        // Pin the v0.1 Space contract: pressing Space after a
+        // segment row inserts `{ type = "separator" }` immediately
+        // to the right; cursor advances onto the new entry so the
+        // user can `r` it for a custom character without re-
+        // navigating.
+        let mut s = state();
+        let mut doc = document(
+            r#"[line]
+segments = ["model", "git_branch"]
+"#,
+        );
+        let mut cfg = config_default();
+        let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char(' ')));
+        assert!(matches!(outcome, ScreenOutcome::Stay));
+        assert_eq!(
+            s.list.cursor(),
+            1,
+            "cursor advances onto inserted separator"
+        );
+        let arr = segments_array(&doc, LineKey::Single).expect("array");
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.get(0).and_then(|v| v.as_str()), Some("model"));
+        let sep = arr
+            .get(1)
+            .and_then(|v| v.as_inline_table())
+            .expect("inline table");
+        assert_eq!(sep.get("type").and_then(|v| v.as_str()), Some("separator"));
+        assert!(
+            sep.get("character").is_none(),
+            "character omitted; uses global default",
+        );
+        assert_eq!(arr.get(2).and_then(|v| v.as_str()), Some("git_branch"));
+    }
+
+    #[test]
+    fn space_on_empty_array_inserts_at_zero() {
+        // Pre-condition for the picker chain: an empty array sees
+        // `Before(0)` so the new separator lands at index 0. The
+        // builder rejects this on the next render with a "leads
+        // with a separator entry" warn (see `build_one_line`), but
+        // the editor still surfaces the row so the user can delete
+        // it or follow up with a segment to make the boundary valid.
+        let mut s = state();
+        let mut doc = document("[line]\nsegments = []\n");
+        let mut cfg = config_default();
+        let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char(' ')));
+        assert!(matches!(outcome, ScreenOutcome::Stay));
+        let arr = segments_array(&doc, LineKey::Single).expect("array");
+        assert_eq!(arr.len(), 1);
+        let sep = arr.get(0).and_then(|v| v.as_inline_table()).expect("table");
+        assert_eq!(sep.get("type").and_then(|v| v.as_str()), Some("separator"));
+        assert_eq!(s.list.cursor(), 0);
+    }
+
+    #[test]
+    fn space_in_move_mode_is_inert() {
+        // Mirror of the existing `picker_keybindings_in_move_mode_are_inert`
+        // test for the `a`/`i`/←/→ family. Space must follow the
+        // same gate so an in-progress reorder doesn't accidentally
+        // mutate the array under the cursor.
+        let raw = "[line]\nsegments = [\"a\", \"b\"]\n";
+        let mut s = state();
+        let mut doc = document(raw);
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Enter));
+        assert!(s.list.move_mode());
+        let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char(' ')));
+        assert!(matches!(outcome, ScreenOutcome::Stay));
+        assert_eq!(doc.to_string(), raw, "Space in move-mode must not mutate");
+    }
+
+    #[test]
+    fn merge_verb_promotes_string_segment_to_inline_table_with_merge_flag() {
+        // `m` on a bare-string entry replaces it with
+        // `{ type = "model", merge = true }` so the boundary at the
+        // segment's right edge renders without a separator. Pin
+        // both the structural shape AND that the cursor stays put
+        // on the modified row.
+        let mut s = state();
+        let mut doc = document(
+            r#"[line]
+segments = ["model", "git_branch"]
+"#,
+        );
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('m')));
+        let arr = segments_array(&doc, LineKey::Single).expect("array");
+        let table = arr
+            .get(0)
+            .and_then(|v| v.as_inline_table())
+            .expect("inline table after merge");
+        assert_eq!(table.get("type").and_then(|v| v.as_str()), Some("model"));
+        assert_eq!(table.get("merge").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(s.list.cursor(), 0);
+    }
+
+    #[test]
+    fn merge_verb_toggles_off_and_demotes_to_bare_string() {
+        // Round-trip: `m` twice on a bare string returns to a bare
+        // string so the TOML stays clean. Pin the demotion path —
+        // a regression that leaves a `{ type = "model" }` table
+        // behind would visibly bloat the saved file.
+        let mut s = state();
+        let mut doc = document(
+            r#"[line]
+segments = ["model"]
+"#,
+        );
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('m')));
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('m')));
+        let arr = segments_array(&doc, LineKey::Single).expect("array");
+        assert_eq!(
+            arr.get(0).and_then(|v| v.as_str()),
+            Some("model"),
+            "second `m` demotes back to bare string",
+        );
+    }
+
+    #[test]
+    fn merge_verb_inert_on_separator_entry() {
+        // Per ADR-0024, `merge` is a segment-only flag; toggling
+        // it on a separator must be a no-op (the validator already
+        // warns at build time).
+        let raw = "[line]\nsegments = [{ type = \"separator\" }]\n";
+        let mut s = state();
+        let mut doc = document(raw);
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('m')));
+        assert_eq!(doc.to_string(), raw, "m on a separator must not mutate");
+    }
+
+    #[test]
+    fn classify_entry_distinguishes_separator_inline_table_from_segment() {
+        // The `r` and `m` dispatch arms switch on this; pin the
+        // three primary cases so a refactor that conflates inline
+        // tables fails here directly.
+        let doc = document(
+            r#"[line]
+segments = ["model", { type = "separator", character = " | " }, { type = "git_branch", merge = true }]
+"#,
+        );
+        assert_eq!(classify_entry(&doc, LineKey::Single, 0), EntryKind::Segment);
+        assert_eq!(
+            classify_entry(&doc, LineKey::Single, 1),
+            EntryKind::Separator
+        );
+        assert_eq!(classify_entry(&doc, LineKey::Single, 2), EntryKind::Segment);
+        assert_eq!(
+            classify_entry(&doc, LineKey::Single, 99),
+            EntryKind::Malformed
+        );
+    }
+
+    #[test]
+    fn raw_verb_on_separator_seeds_with_character_field() {
+        // Pin the separator-character branch: pressing `r` on an
+        // inline-table separator opens the raw editor seeded with
+        // the existing `character` value (or empty when the field
+        // is absent). The dispatch path is `classify_entry →
+        // RawTarget::SeparatorCharacter`; a regression that always
+        // chose `SegmentId` would seed with `"separator"` instead.
+        let mut s = state();
+        let mut doc = document(
+            r#"[line]
+segments = ["a", { type = "separator", character = " | " }]
+"#,
+        );
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Down));
+        let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('r')));
+        assert!(matches!(
+            outcome,
+            ScreenOutcome::NavigateTo(AppScreen::RawValueEditor(_))
+        ));
+    }
+
+    #[test]
+    fn apply_replace_with_separator_target_updates_character_field() {
+        // Pin the SeparatorCharacter commit path. After commit, the
+        // inline table's `character` reflects the new buffer; the
+        // entry's `type` stays `"separator"`.
+        let mut doc = document(
+            r#"[line]
+segments = [{ type = "separator", character = " | " }]
+"#,
+        );
+        let mut cfg = config_default();
+        let outcome = apply_replace(
+            ItemsEditorState::default(),
+            &mut doc,
+            &mut cfg,
+            0,
+            RawTarget::SeparatorCharacter,
+            " > ",
+        );
+        assert!(matches!(
+            outcome,
+            ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(_))
+        ));
+        let arr = segments_array(&doc, LineKey::Single).expect("array");
+        let sep = arr.get(0).and_then(|v| v.as_inline_table()).expect("table");
+        assert_eq!(sep.get("type").and_then(|v| v.as_str()), Some("separator"));
+        assert_eq!(sep.get("character").and_then(|v| v.as_str()), Some(" > "));
+    }
+
+    #[test]
+    fn apply_replace_with_separator_target_and_empty_value_sets_explicit_empty() {
+        // Per ADR-0024 the two separator states `character = ""`
+        // (explicit no-separator at this boundary) and absent
+        // `character` (fall back to global default) are distinct
+        // render outcomes. The raw editor must commit the buffer
+        // verbatim — including empty — so a round-trip through `r`
+        // doesn't silently swap modes. Users who want the absent-
+        // field state use `Space` to insert a fresh defaulted
+        // separator and skip `r` on it.
+        let mut doc = document(
+            r#"[line]
+segments = [{ type = "separator", character = " | " }]
+"#,
+        );
+        let mut cfg = config_default();
+        apply_replace(
+            ItemsEditorState::default(),
+            &mut doc,
+            &mut cfg,
+            0,
+            RawTarget::SeparatorCharacter,
+            "",
+        );
+        let arr = segments_array(&doc, LineKey::Single).expect("array");
+        let sep = arr.get(0).and_then(|v| v.as_inline_table()).expect("table");
+        assert_eq!(
+            sep.get("character").and_then(|v| v.as_str()),
+            Some(""),
+            "empty buffer must commit explicit empty, not remove the field",
+        );
+    }
+
+    #[test]
+    fn apply_replace_with_separator_target_preserves_default_state_via_space() {
+        // Companion contract: a defaulted separator (`{ type = "separator" }`,
+        // no character field) reaches that state via `Space`, not via
+        // `r` with an empty buffer. Pin that `Space` produces the
+        // absent-field form so the user's "use global default" intent
+        // has a reliable path.
+        let mut s = state();
+        let mut doc = document(
+            r#"[line]
+segments = ["model", "workspace"]
+"#,
+        );
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char(' ')));
+        let arr = segments_array(&doc, LineKey::Single).expect("array");
+        let sep = arr.get(1).and_then(|v| v.as_inline_table()).expect("table");
+        assert_eq!(sep.get("type").and_then(|v| v.as_str()), Some("separator"));
+        assert!(
+            sep.get("character").is_none(),
+            "Space must produce a defaulted separator (no `character` field)",
+        );
+    }
+
+    #[test]
+    fn numbered_line_resolves_zero_padded_keys_to_same_index() {
+        // The runtime accepts `[line.01]` as the same line as
+        // `[line.1]` (both parse to u32=1), and the editor must
+        // agree. Looking up `n.to_string()` ("1") would miss the
+        // actual TOML key ("01"); the editor walks the table and
+        // matches by parsed numeric value so swap / delete / insert
+        // all hit the right child.
+        let mut doc = document(
+            r#"layout = "multi-line"
+[line]
+
+[line.01]
+segments = ["model", "workspace"]
+"#,
+        );
+        let one = NonZeroU32::new(1).expect("nonzero");
+        // segments_array resolves the array even though the TOML
+        // key is "01", not "1".
+        let arr = segments_array(&doc, LineKey::Numbered(one)).expect("array");
+        assert_eq!(arr.len(), 2);
+        // And mutations land on the same key — delete + reload
+        // shows the original "01" key intact.
+        assert!(delete_segment_at(&mut doc, LineKey::Numbered(one), 1));
+        assert_eq!(segment_labels(&doc, LineKey::Numbered(one)), vec!["model"]);
+        let serialized = doc.to_string();
+        assert!(
+            serialized.contains("[line.01]"),
+            "original zero-padded key must survive the edit: {serialized}",
+        );
+    }
+
+    #[test]
+    fn raw_replace_preserves_inline_table_fields_on_segment_rename() {
+        // `r` on an inline-table segment entry like
+        // `{ type = "git_branch", merge = true }` must update only
+        // the `type` field, not blow away the table and rewrite as
+        // a bare string. A regression that calls `arr.replace(idx,
+        // new_value)` unconditionally drops `merge` (and any future
+        // per-entry knob) and silently breaks the `m` then `r`
+        // user flow.
+        let mut doc = document(
+            r#"[line]
+segments = [{ type = "git_branch", merge = true }, "cost"]
+"#,
+        );
+        let mut cfg = config_default();
+        let outcome = apply_replace(
+            ItemsEditorState::default(),
+            &mut doc,
+            &mut cfg,
+            0,
+            RawTarget::SegmentId,
+            "model",
+        );
+        assert!(matches!(
+            outcome,
+            ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(_))
+        ));
+        let arr = segments_array(&doc, LineKey::Single).expect("array");
+        let table = arr
+            .get(0)
+            .and_then(|v| v.as_inline_table())
+            .expect("entry must remain an inline table");
+        assert_eq!(
+            table.get("type").and_then(|v| v.as_str()),
+            Some("model"),
+            "type field must reflect the rename",
+        );
+        assert_eq!(
+            table.get("merge").and_then(|v| v.as_bool()),
+            Some(true),
+            "merge flag must survive the rename",
+        );
+    }
+
+    #[test]
+    fn toml_round_trip_preserves_inline_table_separator_entry() {
+        // The "save preserves my hand-edits" contract: a config
+        // with an inline-table separator round-trips through the
+        // editor's persistence layer (`toml_edit::DocumentMut`)
+        // without reformatting the inline table to a multi-line
+        // block. Pin both the byte-level survival AND the typed
+        // re-parse so a future toml_edit upgrade can't silently
+        // break user-visible formatting OR our LineEntry shape.
+        let raw = "[line]\nsegments = [\"model\", { type = \"separator\", character = \" | \" }, \"workspace\"]\n";
+        let doc: DocumentMut = raw.parse().expect("parse");
+        let serialized = doc.to_string();
+        assert!(
+            serialized.contains("{ type = \"separator\", character = \" | \" }"),
+            "inline-table separator must round-trip without reformatting: {serialized:?}",
+        );
+        let cfg: config::Config = serialized.parse().expect("reparse");
+        let line = cfg.line.as_ref().expect("line present");
+        match &line.segments[1] {
+            config::LineEntry::Item(item) => {
+                assert_eq!(item.kind.as_deref(), Some("separator"));
+                assert_eq!(item.character.as_deref(), Some(" | "));
+            }
+            other => panic!("expected LineEntry::Item, got {other:?}"),
+        }
+    }
+
+    /// Helper template for the m/d/c/k warn-firing tests. Drives one
+    /// keystroke against the items editor with a logging sink installed
+    /// and asserts that exactly one captured warn contains `expected`.
+    fn assert_arm_warn_fires(initial_doc: &str, key_code: KeyCode, expected: &str) {
+        use crate::logging::{self, Level};
+
+        let _serial = logging::_test_serial_lock();
+        let captured = std::sync::Arc::new(crate::logging::CapturedSink::default());
+        let _restore = logging::SinkGuard::install(captured.clone());
+        logging::set_level(Level::Warn);
+
+        let mut s = ItemsEditorState::new(
+            LineKey::Numbered(NonZeroU32::new(1).expect("nonzero")),
+            ItemsEditorPrev::MainMenu(MainMenuState::default()),
+        );
+        let mut doc = document(initial_doc);
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(key_code));
+
+        let entries = captured.drain();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.starts_with("[warn]") && e.contains(expected)),
+            "expected warn containing {expected:?} in {entries:?}",
+        );
+    }
+
+    #[test]
+    fn merge_verb_warns_when_inert_on_separator_entry() {
+        // Pin the symmetric warn alongside the existing inert-doc-state
+        // assertion in `merge_verb_inert_on_separator_entry`. A regression
+        // that swaps which arm warns (e.g., `m` warns on a successful
+        // toggle) would pass the inert test but fail this one.
+        let raw =
+            "layout = \"multi-line\"\n[line]\n\n[line.1]\nsegments = [{ type = \"separator\" }]\n";
+        assert_arm_warn_fires(raw, KeyCode::Char('m'), "merge toggle inert");
+    }
+
+    #[test]
+    fn merge_verb_inert_on_kindless_inline_table_entry() {
+        // Per ADR-0024, kindless inline tables are dropped at build
+        // time. Toggling `merge` on them would just write more
+        // invalid TOML. Pin the rejection so a future relax surfaces
+        // here rather than as a "saved file that the renderer
+        // rejects".
+        let raw = "[line]\nsegments = [\"model\", { character = \" | \" }]\n";
+        let mut s = state();
+        let mut doc = document(raw);
+        let mut cfg = config_default();
+        // Move cursor to the kindless entry (index 1).
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Down));
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('m')));
+        // Document unchanged — the entry is still the same kindless
+        // inline table; no `merge = true` got written.
+        let arr = segments_array(&doc, LineKey::Single).expect("array");
+        let table = arr
+            .get(1)
+            .and_then(|v| v.as_inline_table())
+            .expect("kindless table preserved");
+        assert!(
+            table.get("merge").is_none(),
+            "m on a kindless entry must not add `merge`",
+        );
+    }
+
+    #[test]
+    fn replace_segment_refuses_to_rename_separator_entry_under_kind_drift() {
+        // External-edit race: `open_raw_value_editor` dispatched on
+        // a segment classification, but between open and commit the
+        // entry at the same index flipped to a separator (file
+        // watcher reload, foreign edit). `replace_segment` re-checks
+        // the kind and refuses rather than corrupt the separator
+        // boundary into a malformed segment with leftover `character`.
+        let mut doc = document(
+            r#"[line]
+segments = [{ type = "separator", character = " | " }]
+"#,
+        );
+        assert!(
+            !replace_segment(&mut doc, LineKey::Single, 0, "model"),
+            "replace_segment must refuse the rename when the entry is now a separator",
+        );
+        let arr = segments_array(&doc, LineKey::Single).expect("array");
+        let table = arr
+            .get(0)
+            .and_then(|v| v.as_inline_table())
+            .expect("entry preserved");
+        assert_eq!(
+            table.get("type").and_then(|v| v.as_str()),
+            Some("separator"),
+            "type field unchanged after refused rename",
+        );
+        assert_eq!(
+            table.get("character").and_then(|v| v.as_str()),
+            Some(" | "),
+            "character field preserved",
+        );
+    }
+
+    #[test]
+    fn replace_segment_preserves_multiple_inline_table_fields_on_rename() {
+        // Pin the broader contract behind the `merge` preservation
+        // case: ANY non-`type` field inside an inline-table segment
+        // entry survives a rename, including forward-compat keys
+        // landed in `extra`. A regression that re-built the inline
+        // table from scratch would silently drop the user's
+        // additional fields.
+        let mut doc = document(
+            r#"[line]
+segments = [{ type = "git_branch", merge = true, color = "red", custom = 42 }, "cost"]
+"#,
+        );
+        assert!(replace_segment(&mut doc, LineKey::Single, 0, "model"));
+        let arr = segments_array(&doc, LineKey::Single).expect("array");
+        let table = arr
+            .get(0)
+            .and_then(|v| v.as_inline_table())
+            .expect("entry preserved as inline table");
+        assert_eq!(table.get("type").and_then(|v| v.as_str()), Some("model"));
+        assert_eq!(table.get("merge").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(table.get("color").and_then(|v| v.as_str()), Some("red"));
+        assert_eq!(table.get("custom").and_then(|v| v.as_integer()), Some(42));
     }
 }

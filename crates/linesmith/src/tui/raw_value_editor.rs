@@ -25,25 +25,48 @@ use crate::config;
 use super::app::{AppScreen, ScreenOutcome};
 use super::items_editor::{self, ItemsEditorState};
 
+/// What field of the segments-array entry the editor is mutating.
+/// Drives `apply_replace` dispatch: a separator-character commit
+/// updates the inline table's `character` field; a segment-id
+/// commit replaces the array entry with a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RawTarget {
+    /// Replace the array entry at `target_idx` with the buffer as a
+    /// TOML string. The default for non-separator rows.
+    SegmentId,
+    /// Update the `character` field of the inline-table separator
+    /// at `target_idx`. An empty buffer clears the field (boundary
+    /// falls back to `[layout_options].separator`).
+    SeparatorCharacter,
+}
+
 /// Editor state. `text` is the buffer; `cursor` is a char index
 /// into `text` (0..=text.chars().count()). `target_idx` is the
-/// segment array position being replaced; `prev` is the editor we
-/// return to.
+/// segments-array position being mutated; `target_kind` selects
+/// which field (segment id vs separator character); `prev` is the
+/// editor we return to.
 #[derive(Debug)]
 pub(super) struct RawValueEditorState {
     text: String,
     cursor: usize,
     target_idx: usize,
+    target_kind: RawTarget,
     prev: ItemsEditorState,
 }
 
 impl RawValueEditorState {
-    pub(super) fn new(initial: String, target_idx: usize, prev: ItemsEditorState) -> Self {
+    pub(super) fn new(
+        initial: String,
+        target_idx: usize,
+        target_kind: RawTarget,
+        prev: ItemsEditorState,
+    ) -> Self {
         let cursor = initial.chars().count();
         Self {
             text: initial,
             cursor,
             target_idx,
+            target_kind,
             prev,
         }
     }
@@ -66,9 +89,10 @@ pub(super) fn update(
         }
         (KeyCode::Enter, KeyModifiers::NONE) => {
             let target_idx = state.target_idx;
+            let target_kind = state.target_kind;
             let new_value = mem::take(&mut state.text);
             let prev = mem::take(&mut state.prev);
-            items_editor::apply_replace(prev, document, config, target_idx, &new_value)
+            items_editor::apply_replace(prev, document, config, target_idx, target_kind, &new_value)
         }
         (KeyCode::Backspace, KeyModifiers::NONE) => {
             delete_before_cursor(state);
@@ -239,7 +263,11 @@ mod tests {
         RawValueEditorState::new(
             initial.to_string(),
             0,
-            ItemsEditorState::new(items_editor::LineKey::Single, MainMenuState::default()),
+            RawTarget::SegmentId,
+            ItemsEditorState::new(
+                items_editor::LineKey::Single,
+                items_editor::ItemsEditorPrev::MainMenu(MainMenuState::default()),
+            ),
         )
     }
 
@@ -257,7 +285,12 @@ mod tests {
             ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(_))
         ));
         let line = cfg.line.expect("line reparsed");
-        assert_eq!(line.segments, vec!["model_2".to_string()]);
+        let ids: Vec<&str> = line
+            .segments
+            .iter()
+            .filter_map(config::LineEntry::segment_id)
+            .collect();
+        assert_eq!(ids, vec!["model_2"]);
     }
 
     #[test]

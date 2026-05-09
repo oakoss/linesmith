@@ -83,7 +83,9 @@ layout = "single-line"
 
 [line]
 # Single-line segment order. Overridden by [line.1], [line.2], ... when
-# layout = "multi-line".
+# layout = "multi-line". The array accepts a mixed shape per ADR-0024:
+# bare strings for plain segment ids, inline tables for per-boundary
+# separators or per-segment merge flags.
 segments = [
   "model",
   "workspace",
@@ -93,6 +95,16 @@ segments = [
   "cost",
 ]
 
+# Mixed example with a custom separator at one boundary plus a `merge`
+# flag suppressing the separator before the cost segment:
+# segments = [
+#   "model",
+#   { type = "separator", character = " | " }, # explicit override
+#   "git_branch",
+#   { type = "context_window", merge = true }, # no sep on its right
+#   "cost",
+# ]
+
 # Multi-line mode:
 # [line.1]
 # segments = ["model", "context_window", "rate_limit_5h"]
@@ -100,8 +112,10 @@ segments = [
 # segments = ["workspace", "git_branch", "cost", "effort"]
 
 [layout_options]
-# Separator: a reserved keyword OR an arbitrary literal string emitted
-# verbatim between segments.
+# Default separator — applied between adjacent segment entries that
+# don't have an explicit `{ type = "separator" }` between them in the
+# array, AND consulted by inline-table separator entries that omit
+# their own `character` field.
 #   "space"     - single space (default)
 #   "powerline" - Nerd Font right-arrow chevron (U+E0B0); see
 #                 powerline_width below
@@ -111,9 +125,9 @@ segments = [
 #   <anything>  - rendered verbatim (e.g. " | ", " · ", "->", "   ").
 #                 Whitespace-only literals are preserved as-is; only
 #                 the truly-empty string suppresses the separator.
-# Mixed per-segment separators (e.g., powerline at some boundaries,
-# space at others) require the separator-as-item refactor in a later
-# release.
+# Per-boundary separators (different character at different boundaries)
+# use inline-table entries inside `segments` — see the mixed example
+# above. ADR-0024 governs the array shape.
 separator = "space"
 
 # Cell-count of the powerline chevron. Most modern Nerd Fonts render
@@ -202,11 +216,12 @@ At parse time:
 
 1. **Schema conformance**: warn on unknown top-level keys; error on type mismatches (e.g. `theme = 42`)
 2. **Theme existence**: `theme` value resolves to a known theme at startup; unknown falls back to `default` with warning
-3. **Segment ID validity**: every ID in `line.segments` / `line.N.segments` matches a registered segment (built-in or plugin); unknown IDs warn and skip
-4. **Duplicate IDs**: same ID listed twice in a line warns; first occurrence wins
+3. **Segment ID validity**: every ID in `line.segments` / `line.N.segments` (extracted from bare strings or inline-table `type` fields, excluding `type = "separator"`) matches a registered segment (built-in or plugin); unknown IDs warn and skip
+4. **Duplicate IDs**: same segment ID listed twice in a line warns; first occurrence wins. Separator entries are positionally distinct and are not deduplicated.
 5. **Cross-line duplicates**: same segment in multiple lines allowed (rare but legal)
-6. **Per-segment override keys**: each segment declares its accepted override keys; unknown keys in `[segments.<id>]` warn and are ignored
-7. **`visible_if` expression syntax**: parse as rhai expression; invalid expressions warn and are treated as always-visible
+6. **Inline-table entry shape** (ADR-0024): inline-table entries in `segments` warn-and-drop when missing `type`. `character` on a non-separator entry warns and is ignored. `merge` on a separator entry warns and is ignored. Unknown keys inside the inline table land in the entry's `extra` bag and are silently retained for forward compatibility (matches the global "unknown keys are warnings, not errors" rule).
+7. **Per-segment override keys**: each segment declares its accepted override keys; unknown keys in `[segments.<id>]` warn and are ignored
+8. **`visible_if` expression syntax**: parse as rhai expression; invalid expressions warn and are treated as always-visible
 
 ### CLI flags that influence config
 

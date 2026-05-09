@@ -111,7 +111,19 @@ pub enum ColorPolicy {
 #[derive(Debug, Default, Clone, PartialEq, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct LineConfig {
-    pub segments: Vec<String>,
+    /// Custom deserializer routes each entry through `try_into` per-
+    /// item so a single malformed inline-table (e.g.
+    /// `{ type = 42 }`) doesn't abort the whole `Config::from_str`
+    /// — it surfaces as a kindless [`LineEntry::Item`] that the
+    /// builder warns and drops. Mirrors the per-item warn-and-drop
+    /// behavior the numbered-line path already had via
+    /// [`crate::segments::builder`]'s `extract_line_segments`. Without
+    /// this, single-line configs with one bad boundary override
+    /// fail to load entirely while multi-line configs degrade
+    /// gracefully — an asymmetry users hit when porting between
+    /// layouts.
+    #[serde(deserialize_with = "deserialize_line_entries")]
+    pub segments: Vec<LineEntry>,
     /// Anything under `[line]` other than `segments`. Holds
     /// `[line.N]` table values plus any forward-compat scalar keys
     /// future versions may add. The builder routes table values
@@ -124,6 +136,184 @@ pub struct LineConfig {
     #[serde(flatten)]
     #[schemars(with = "serde_json::Value")]
     pub numbered: BTreeMap<String, toml::Value>,
+}
+
+/// One entry in `[line].segments`. Per ADR-0024, the array is a
+/// mixed shape: bare strings (`"model"`) round-trip as
+/// [`LineEntry::Id`] for backward compatibility with the v0.x string-
+/// only schema; inline tables (`{ type = "separator", character = " | " }`)
+/// round-trip as [`LineEntry::Item`] and carry per-boundary settings.
+///
+/// Untagged because the strict-tagged form would reject the bare-string
+/// shorthand at parse time. Typo'd keys inside an inline table (e.g.
+/// `{ tpye = "separator" }`) land in [`LineEntryItem::extra`]
+/// rather than failing parse, preserving the spec's "unknown keys
+/// warn, never fail" contract. The runtime builder warns when a
+/// kindless inline table reaches it; per-key typo diagnostics
+/// inside `[line].segments` array entries are not yet surfaced
+/// at config-load time (the existing `validate_keys` pass walks
+/// only top-level / `[layout_options]` / `[segments.<id>]` shapes).
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum LineEntry {
+    /// Bare string: `"model"` is equivalent to `{ type = "model" }`.
+    Id(String),
+    /// Inline table: `{ type = "...", ... }`. Carries the kind tag
+    /// plus optional per-entry knobs (separator glyph, merge flag,
+    /// future ccstatusline-parity fields under [`LineEntryItem::extra`]).
+    Item(LineEntryItem),
+}
+
+/// Inline-table form of [`LineEntry`]. Typed fields cover today's
+/// known knobs; everything else lands in [`extra`](Self::extra) so
+/// future fields parse without a schema bump.
+#[derive(Debug, Default, Clone, PartialEq, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct LineEntryItem {
+    /// `"separator"` or a segment id (`"model"`, `"git_branch"`, ...).
+    /// When absent, the builder warns and drops the entry.
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    /// Separator glyph for `type = "separator"` entries. Ignored
+    /// (with warning) on non-separator entries. When `None` on a
+    /// separator entry, the builder falls back to
+    /// `[layout_options].separator`.
+    pub character: Option<String>,
+    /// When `true` on a segment entry, the boundary to its right
+    /// renders without a separator (suppresses the implicit
+    /// interleave AND any explicit [`LineEntry::Item`] separator at
+    /// that boundary). Ignored (with warning) on separator entries.
+    pub merge: Option<bool>,
+    /// Forward-compat bag: keys outside the typed fields land here
+    /// per the `toml::Value` flatten pattern. The builder
+    /// warn-and-drops unknown keys today; future ADRs may consume.
+    ///
+    /// Schema bypass: `toml::Value` has no `JsonSchema` impl, so
+    /// remap to `serde_json::Value`'s open-ended schema for the
+    /// `additionalProperties` fallthrough.
+    #[serde(flatten)]
+    #[schemars(with = "serde_json::Value")]
+    pub extra: BTreeMap<String, toml::Value>,
+}
+
+impl LineEntry {
+    /// The entry's `type` tag — segment id, `"separator"`, or `None`
+    /// for a malformed inline table missing `type`. The builder
+    /// warns and drops `None` entries.
+    #[must_use]
+    pub fn kind(&self) -> Option<&str> {
+        match self {
+            Self::Id(s) => Some(s.as_str()),
+            Self::Item(item) => item.kind.as_deref(),
+        }
+    }
+
+    /// `true` when the entry is `type = "separator"`. Bare strings
+    /// are never separators; an inline table without a `type` field
+    /// is also not classified as a separator (the builder drops it).
+    #[must_use]
+    pub fn is_separator(&self) -> bool {
+        self.kind() == Some("separator")
+    }
+
+    /// The segment id, or `None` for separators / kindless entries.
+    #[must_use]
+    pub fn segment_id(&self) -> Option<&str> {
+        match self.kind() {
+            Some("separator") | None => None,
+            Some(id) => Some(id),
+        }
+    }
+
+    /// The separator-glyph override on a `type = "separator"` entry,
+    /// or `None` when the entry uses the global default. Always
+    /// `None` for non-separator entries.
+    #[must_use]
+    pub fn separator_character(&self) -> Option<&str> {
+        match self {
+            Self::Item(item) if item.kind.as_deref() == Some("separator") => {
+                item.character.as_deref()
+            }
+            _ => None,
+        }
+    }
+
+    /// `true` when this entry sets `merge = true`. Always `false`
+    /// for separators and bare-string entries. Inline tables on
+    /// separators with a `merge` field warn at build time and the
+    /// flag is not honored here.
+    #[must_use]
+    pub fn merge(&self) -> bool {
+        match self {
+            Self::Item(item) if item.kind.as_deref() != Some("separator") => {
+                item.merge.unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl From<&str> for LineEntry {
+    fn from(s: &str) -> Self {
+        Self::Id(s.to_string())
+    }
+}
+
+impl From<String> for LineEntry {
+    fn from(s: String) -> Self {
+        Self::Id(s)
+    }
+}
+
+/// Per-item-tolerant deserialization for `LineConfig.segments`.
+/// Reads the array as `Vec<toml::Value>` then converts each entry
+/// individually: a string becomes [`LineEntry::Id`], a well-formed
+/// inline-table becomes [`LineEntry::Item`], and any malformed item
+/// (wrong-typed `type`, non-string non-table value, table that
+/// fails the `LineEntryItem` shape) falls through to a kindless
+/// [`LineEntry::Item`] that the builder warns and drops.
+///
+/// Mirrors the per-item warn-and-drop behavior of the numbered-line
+/// path so single-line and multi-line configs treat malformed items
+/// identically: parse never aborts on one bad entry; the builder
+/// surfaces the diagnostic at render time.
+fn deserialize_line_entries<'de, D>(deserializer: D) -> Result<Vec<LineEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<toml::Value>::deserialize(deserializer)?;
+    Ok(raw.into_iter().map(value_to_line_entry).collect())
+}
+
+fn value_to_line_entry(value: toml::Value) -> LineEntry {
+    if let toml::Value::String(s) = &value {
+        return LineEntry::Id(s.clone());
+    }
+    if let toml::Value::Table(_) = &value {
+        if let Ok(item) = value.clone().try_into::<LineEntryItem>() {
+            return LineEntry::Item(item);
+        }
+    }
+    // Malformed: capture in a kindless `LineEntryItem` so the entry
+    // survives parse + round-trips through the document but reaches
+    // the builder as a "no `type`" warn-and-drop. Tables preserve
+    // their keys in `extra` for forward-compat; bare scalars stash
+    // under a synthetic key so the value isn't silently dropped at
+    // load time.
+    let mut extra: BTreeMap<String, toml::Value> = BTreeMap::new();
+    if let toml::Value::Table(table) = value {
+        for (k, v) in table {
+            extra.insert(k, v);
+        }
+    } else {
+        extra.insert("__malformed__".to_string(), value);
+    }
+    LineEntry::Item(LineEntryItem {
+        kind: None,
+        character: None,
+        merge: None,
+        extra,
+    })
 }
 
 /// Top-level `layout = "..."` selector. Defaults to `SingleLine`
@@ -560,7 +750,10 @@ mod tests {
         )
         .expect("parse ok");
         let line = c.line.expect("line present");
-        assert_eq!(line.segments, vec!["model", "workspace", "cost"]);
+        assert_eq!(
+            entry_ids(&line.segments),
+            vec!["model", "workspace", "cost"]
+        );
         assert!(line.numbered.is_empty(), "no numbered tables expected");
     }
 
@@ -591,6 +784,15 @@ mod tests {
             .iter()
             .map(|v| v.as_str().expect("expected string").to_string())
             .collect()
+    }
+
+    /// Convenience accessor: project a `Vec<LineEntry>` to the
+    /// segment-id sequence (separators filtered out, kindless
+    /// entries filtered out). Tests that don't care about the
+    /// inline-table form use this to keep assertions readable as
+    /// `vec!["model", "git_branch"]`.
+    fn entry_ids(entries: &[LineEntry]) -> Vec<&str> {
+        entries.iter().filter_map(LineEntry::segment_id).collect()
     }
 
     #[test]
@@ -637,7 +839,7 @@ mod tests {
         )
         .expect("parse ok");
         let line = c.line.expect("line present");
-        assert_eq!(line.segments, vec!["fallback"]);
+        assert_eq!(entry_ids(&line.segments), vec!["fallback"]);
         assert_eq!(line.numbered.len(), 2);
         assert_eq!(numbered_segments(&line.numbered["1"]), vec!["a", "b"]);
         assert_eq!(numbered_segments(&line.numbered["2"]), vec!["c"]);
@@ -687,7 +889,7 @@ mod tests {
         )
         .expect("parse ok despite unknown sibling keys");
         let line = c.line.expect("line present");
-        assert_eq!(line.segments, vec!["model"]);
+        assert_eq!(entry_ids(&line.segments), vec!["model"]);
         // Unknown siblings show up in the flatten map; the [line.1]
         // table sits next to them.
         assert!(line.numbered.contains_key("segmnts"));
@@ -872,8 +1074,8 @@ mod tests {
         );
         let parsed: Config = wrapped.parse().expect("wrapped body parses as Config");
         assert_eq!(
-            parsed.line.expect("line").segments,
-            vec!["model".to_string()]
+            entry_ids(&parsed.line.expect("line").segments),
+            vec!["model"]
         );
     }
 
@@ -1303,7 +1505,7 @@ mod tests {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "\u{FEFF}[line]\nsegments = [\"model\"]\n").unwrap();
         let c = Config::load(&path).expect("ok").expect("present");
-        assert_eq!(c.line.expect("line").segments, vec!["model".to_string()]);
+        assert_eq!(entry_ids(&c.line.expect("line").segments), vec!["model"]);
     }
 
     #[test]

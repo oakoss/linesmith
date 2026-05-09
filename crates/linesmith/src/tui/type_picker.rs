@@ -376,8 +376,8 @@ segments = ["a", "b"]
         let mut cfg = config::Config::default();
         update(&mut s, &mut doc, &mut cfg, key(KeyCode::Enter));
         let segments = cfg.line.expect("line reparsed").segments;
-        assert_eq!(segments[0], pick);
-        assert_eq!(segments[1], "a");
-        assert_eq!(segments[2], "b");
+        assert_eq!(segments[0].segment_id(), Some(pick));
+        assert_eq!(segments[1].segment_id(), Some("a"));
+        assert_eq!(segments[2].segment_id(), Some("b"));
     }
 }

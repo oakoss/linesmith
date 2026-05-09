@@ -1,23 +1,26 @@
 use super::super::{PowerlineWidth, Separator, DEFAULT_SEGMENT_IDS};
 use crate::config;
 
-/// Resolve the single-line id list and warn on an explicitly empty
+/// Resolve the single-line entry list and warn on an explicitly empty
 /// `[line].segments`. Returns one vec wrapped in an outer vec for
 /// uniform treatment by [`build_lines`].
-pub(super) fn single_line_ids(
+pub(super) fn single_line_entries(
     line_cfg: Option<&config::LineConfig>,
     warn: &mut impl FnMut(&str),
-) -> Vec<Vec<String>> {
+) -> Vec<Vec<config::LineEntry>> {
     if let Some(line) = line_cfg {
         if line.segments.is_empty() {
             warn("[line].segments is empty; no segments will render");
         }
     }
-    let ids: Vec<String> = match line_cfg {
+    let entries: Vec<config::LineEntry> = match line_cfg {
         Some(l) => l.segments.clone(),
-        None => DEFAULT_SEGMENT_IDS.iter().map(|&s| s.to_string()).collect(),
+        None => DEFAULT_SEGMENT_IDS
+            .iter()
+            .map(|&s| config::LineEntry::Id(s.to_string()))
+            .collect(),
     };
-    vec![ids]
+    vec![entries]
 }
 
 /// Validate `[line.N]` sub-tables for multi-line mode. The flatten
@@ -32,12 +35,12 @@ pub(super) fn single_line_ids(
 pub(super) fn validated_numbered_lines(
     line_cfg: Option<&config::LineConfig>,
     warn: &mut impl FnMut(&str),
-) -> Option<Vec<Vec<String>>> {
+) -> Option<Vec<Vec<config::LineEntry>>> {
     let line = line_cfg?;
     if line.numbered.is_empty() {
         return None;
     }
-    let mut valid: Vec<(u32, Vec<String>)> = line
+    let mut valid: Vec<(u32, Vec<config::LineEntry>)> = line
         .numbered
         .iter()
         .filter_map(|(key, value)| {
@@ -79,17 +82,18 @@ pub(super) fn validated_numbered_lines(
     Some(valid.into_iter().map(|(_, segs)| segs).collect())
 }
 
-/// Pull `segments: Vec<String>` out of one `[line.N]` value. Returns
-/// `None` on every shape mismatch (non-table, missing/wrong-typed
-/// `segments`, non-string entries) with a targeted diagnostic. The
-/// only production caller pre-filters non-table values, but the
-/// non-table branch is kept as defense in depth so a future caller
-/// can't reach a panic by passing the wrong shape.
+/// Pull the `segments` array out of one `[line.N]` value as a
+/// `Vec<LineEntry>`. Per ADR-0024, the array accepts a mixed shape:
+/// bare strings round-trip as [`config::LineEntry::Id`]; inline
+/// tables round-trip as [`config::LineEntry::Item`]. Returns `None`
+/// on shape mismatches (non-table, missing/wrong-typed `segments`)
+/// with a targeted diagnostic; non-string/non-table entries inside
+/// the array warn and drop per-item.
 fn extract_line_segments(
     key: &str,
     value: &toml::Value,
     warn: &mut impl FnMut(&str),
-) -> Option<Vec<String>> {
+) -> Option<Vec<config::LineEntry>> {
     let table = match value {
         toml::Value::Table(t) => t,
         other => {
@@ -111,7 +115,7 @@ fn extract_line_segments(
         toml::Value::Array(a) => a,
         other => {
             warn(&format!(
-                "[line.{key}].segments is a {} (expected an array of strings); skipping",
+                "[line.{key}].segments is a {} (expected an array of strings or inline tables); skipping",
                 describe_toml_value(other)
             ));
             return None;
@@ -120,10 +124,18 @@ fn extract_line_segments(
     let mut segs = Vec::with_capacity(array.len());
     for (i, item) in array.iter().enumerate() {
         match item {
-            toml::Value::String(s) => segs.push(s.clone()),
+            toml::Value::String(s) => segs.push(config::LineEntry::Id(s.clone())),
+            toml::Value::Table(t) => {
+                match toml::Value::Table(t.clone()).try_into::<config::LineEntryItem>() {
+                    Ok(parsed) => segs.push(config::LineEntry::Item(parsed)),
+                    Err(e) => warn(&format!(
+                        "[line.{key}].segments[{i}] inline table didn't parse ({e}); skipping that item",
+                    )),
+                }
+            }
             other => {
                 warn(&format!(
-                    "[line.{key}].segments[{i}] is a {} (expected a string); skipping that item",
+                    "[line.{key}].segments[{i}] is a {} (expected a string or inline table); skipping that item",
                     describe_toml_value(other)
                 ));
             }

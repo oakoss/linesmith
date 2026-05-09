@@ -23,6 +23,7 @@ use crate::logging::CapturedSink;
 use crate::theme::{Capability, Theme};
 
 use super::items_editor::{self, ItemsEditorState};
+use super::line_picker::{self, LinePickerState};
 use super::main_menu::{self, MainMenuState};
 use super::placeholder::{self, PlaceholderState};
 use super::preview;
@@ -39,6 +40,7 @@ pub(super) enum AppScreen {
     Placeholder(PlaceholderState),
     ConfirmQuit(ConfirmQuitState),
     ItemsEditor(ItemsEditorState),
+    LinePicker(LinePickerState),
     TypePicker(TypePickerState),
     RawValueEditor(RawValueEditorState),
 }
@@ -308,6 +310,9 @@ pub(super) fn update(mut model: Model, event: Event) -> Model {
         AppScreen::ItemsEditor(state) => {
             items_editor::update(state, &mut model.document, &mut model.config, key)
         }
+        AppScreen::LinePicker(state) => {
+            line_picker::update(state, &mut model.document, &mut model.config, key)
+        }
         AppScreen::TypePicker(state) => {
             type_picker::update(state, &mut model.document, &mut model.config, key)
         }
@@ -469,6 +474,7 @@ pub(super) fn view(model: &Model, frame: &mut Frame) {
         AppScreen::ItemsEditor(state) => {
             items_editor::view(state, &model.document, frame, chunks[1])
         }
+        AppScreen::LinePicker(state) => line_picker::view(state, &model.document, frame, chunks[1]),
         AppScreen::TypePicker(state) => type_picker::view(state, frame, chunks[1]),
         AppScreen::RawValueEditor(state) => raw_value_editor::view(state, frame, chunks[1]),
     }
@@ -1202,7 +1208,12 @@ mod tests {
         let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
         let m = update(m, key(KeyCode::Down, KeyModifiers::NONE));
         let line = m.config.line.clone().expect("line config reparsed");
-        assert_eq!(line.segments, vec!["b".to_string(), "a".to_string()]);
+        let ids: Vec<&str> = line
+            .segments
+            .iter()
+            .filter_map(linesmith_core::config::LineEntry::segment_id)
+            .collect();
+        assert_eq!(ids, vec!["b", "a"]);
         let written = m.document.to_string();
         assert!(
             written.contains("\"b\"") && written.contains("\"a\""),
@@ -1229,7 +1240,12 @@ mod tests {
         // Commit and assert the buffer landed in the document.
         let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
         let line = m.config.line.clone().expect("line reparsed");
-        assert_eq!(line.segments, vec!["alphaq".to_string()]);
+        let ids: Vec<&str> = line
+            .segments
+            .iter()
+            .filter_map(linesmith_core::config::LineEntry::segment_id)
+            .collect();
+        assert_eq!(ids, vec!["alphaq"]);
     }
 
     #[test]
@@ -1301,8 +1317,11 @@ mod tests {
         assert!(matches!(m.screen, AppScreen::RawValueEditor(_)));
         let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
         let line = m.config.line.clone().expect("line reparsed");
+        let first_id = line.segments[0]
+            .segment_id()
+            .expect("first entry is a segment id");
         assert_eq!(
-            line.segments[0], "model",
+            first_id, "model",
             "first runtime default must round-trip through r → Enter",
         );
         assert_eq!(line.segments.len(), 6);
@@ -1324,9 +1343,14 @@ mod tests {
         assert!(matches!(m.screen, AppScreen::RawValueEditor(_)));
         let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
         let line = m.config.line.clone().expect("line reparsed");
+        let ids: Vec<&str> = line
+            .segments
+            .iter()
+            .filter_map(linesmith_core::config::LineEntry::segment_id)
+            .collect();
         assert_eq!(
-            line.segments,
-            vec!["<non-string>".to_string()],
+            ids,
+            vec!["<non-string>"],
             "literal '<non-string>' must round-trip; placeholder check must inspect TOML type",
         );
     }
@@ -1349,9 +1373,14 @@ mod tests {
         assert!(matches!(m.screen, AppScreen::RawValueEditor(_)));
         let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
         let line = m.config.line.clone().expect("line reparsed");
+        let ids: Vec<&str> = line
+            .segments
+            .iter()
+            .filter_map(linesmith_core::config::LineEntry::segment_id)
+            .collect();
         assert_eq!(
-            line.segments,
-            vec!["a".to_string(), String::new()],
+            ids,
+            vec!["a", ""],
             "non-string entry replaced with empty seed",
         );
     }
@@ -1381,7 +1410,7 @@ mod tests {
         let line = m.config.line.clone().expect("line reparsed");
         // After(0) inserts at index 1 → ["a", picked].
         assert_eq!(line.segments.len(), 2);
-        assert_eq!(line.segments[0], "a");
+        assert_eq!(line.segments[0].segment_id(), Some("a"));
     }
 
     #[test]

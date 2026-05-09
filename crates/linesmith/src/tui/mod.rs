@@ -15,6 +15,7 @@
 
 mod app;
 mod items_editor;
+mod line_picker;
 mod list_screen;
 mod main_menu;
 mod placeholder;
@@ -701,13 +702,18 @@ mod tests {
         // Parse still succeeds — the editor opens against the user's
         // real config, not defaults. Save remains allowed: forward-
         // compat unknown keys aren't a reason to refuse round-trip.
-        let segments = out
+        let ids: Vec<String> = out
             .config
             .line
             .as_ref()
-            .map(|l| l.segments.clone())
+            .map(|l| {
+                l.segments
+                    .iter()
+                    .filter_map(|e| e.segment_id().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default();
-        assert_eq!(segments, vec!["model".to_string()]);
+        assert_eq!(ids, vec!["model".to_string()]);
         let msg = out.warning.expect("unknown-key warning present");
         assert!(msg.contains("bogus_top_level_key"), "got {msg:?}");
         assert_eq!(out.save_target.as_deref(), Some(path.as_path()));
@@ -726,13 +732,18 @@ mod tests {
         fs::write(&path, raw).expect("write");
         let out = load_config(Some(&path)).expect("ok");
         assert!(out.warning.is_none(), "valid TOML emits no warning");
-        let segments = out
+        let ids: Vec<String> = out
             .config
             .line
             .as_ref()
-            .map(|l| l.segments.clone())
+            .map(|l| {
+                l.segments
+                    .iter()
+                    .filter_map(|e| e.segment_id().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default();
-        assert_eq!(segments, vec!["model".to_string()]);
+        assert_eq!(ids, vec!["model".to_string()]);
         assert_eq!(out.original_text, raw);
         // toml_edit round-trips byte-for-byte on a clean parse —
         // pin that the loaded document is initially identical to

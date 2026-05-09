@@ -1833,3 +1833,401 @@ fn build_lines_multi_line_dedupes_within_line_but_not_across_lines() {
         "expected one dedup warning, got: {warns:?}"
     );
 }
+
+// -------------------------------------------------------------------
+// Per-boundary separator + merge entries (ADR-0024)
+// -------------------------------------------------------------------
+
+/// Collect every `LineItem::Separator` in source order. Pairs with
+/// `nth_segment` for tests asserting the exact `Segment, Separator,
+/// Segment, ...` shape produced by `build_one_line`.
+fn separators_in_order(items: &[LineItem]) -> Vec<&Separator> {
+    items
+        .iter()
+        .filter_map(|i| match i {
+            LineItem::Separator(s) => Some(s),
+            LineItem::Segment(_) => None,
+        })
+        .collect()
+}
+
+#[test]
+fn inline_table_separator_with_character_overrides_global_default() {
+    // Pin ADR-0024's single-boundary override: an explicit
+    // `{ type = "separator", character = " | " }` between two
+    // segments emits `Separator::Literal(" | ")` rather than the
+    // global `[layout_options].separator = "space"` default. The
+    // entry's `character` field IS load-bearing — a regression
+    // that ignores it would silently fall back to Space and
+    // confuse the user about why their custom glyph isn't showing.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model", { type = "separator", character = " | " }, "workspace"]
+        "#,
+    )
+    .expect("parse");
+    let (items, warns) = built_with_warns(Some(&cfg));
+    assert!(warns.is_empty(), "no warnings expected: {warns:?}");
+    assert_eq!(segment_count(&items), 2);
+    let seps = separators_in_order(&items);
+    assert_eq!(seps.len(), 1, "exactly one separator between two segments");
+    assert_eq!(
+        seps[0],
+        &Separator::Literal(std::borrow::Cow::Owned(" | ".to_string())),
+    );
+}
+
+#[test]
+fn inline_table_separator_without_character_uses_layout_default() {
+    // Pin the fallback chain: `{ type = "separator" }` with no
+    // `character` field consults `[layout_options].separator`.
+    // Tests that the items editor's "insert with default glyph"
+    // contract (Space → `{ type = "separator" }`) doesn't accidentally
+    // drop the user's global preference.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model", { type = "separator" }, "workspace"]
+            [layout_options]
+            separator = " · "
+        "#,
+    )
+    .expect("parse");
+    let items = built(Some(&cfg));
+    let seps = separators_in_order(&items);
+    assert_eq!(seps.len(), 1);
+    assert_eq!(
+        seps[0],
+        &Separator::Literal(std::borrow::Cow::Owned(" · ".to_string())),
+    );
+}
+
+#[test]
+fn merge_flag_suppresses_implicit_interleave_at_boundary() {
+    // The simplest merge case: `{ type = "model", merge = true }`
+    // followed by another segment — the implicit layout-options
+    // separator does NOT fire between them. Pin the count of
+    // separators (zero between the merged segment and its right
+    // neighbor); a regression in `merge_pending` clearing logic
+    // would fail this directly.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = [{ type = "model", merge = true }, "workspace"]
+            [layout_options]
+            separator = " | "
+        "#,
+    )
+    .expect("parse");
+    let items = built(Some(&cfg));
+    assert_eq!(segment_count(&items), 2);
+    assert_eq!(
+        separators_in_order(&items).len(),
+        0,
+        "merge=true on left segment must drop the boundary separator",
+    );
+}
+
+#[test]
+fn merge_flag_suppresses_explicit_separator_entry_at_boundary() {
+    // The non-obvious case the doc-comment for `merge_pending` calls
+    // out: `seg(merge), |, seg` drops BOTH the explicit separator
+    // entry AND the implicit interleave. The merge flag persists
+    // across the explicit separator. A regression that only handled
+    // the implicit case would emit the explicit `|` here.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = [
+                { type = "model", merge = true },
+                { type = "separator", character = " | " },
+                "workspace",
+            ]
+        "#,
+    )
+    .expect("parse");
+    let items = built(Some(&cfg));
+    assert_eq!(segment_count(&items), 2);
+    assert_eq!(
+        separators_in_order(&items).len(),
+        0,
+        "merge=true must consume the next explicit separator AND skip implicit interleave",
+    );
+}
+
+#[test]
+fn merge_flag_clears_after_one_boundary() {
+    // Pin the re-arming contract: merge_pending only suppresses ONE
+    // boundary. After the merging segment's right neighbor lands,
+    // the flag clears and subsequent separators interleave normally.
+    // `seg(merge), seg, seg` → only the first boundary is suppressed;
+    // the second gets the global default.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = [{ type = "model", merge = true }, "workspace", "cost"]
+            [layout_options]
+            separator = " | "
+        "#,
+    )
+    .expect("parse");
+    let items = built(Some(&cfg));
+    assert_eq!(segment_count(&items), 3);
+    let seps = separators_in_order(&items);
+    assert_eq!(seps.len(), 1, "only the second boundary gets a separator");
+    assert_eq!(
+        seps[0],
+        &Separator::Literal(std::borrow::Cow::Owned(" | ".to_string())),
+    );
+}
+
+#[test]
+fn back_to_back_merge_chains_drop_every_intermediate_separator() {
+    // Two merging segments in a row: every boundary between them
+    // and through to the final segment is suppressed. Pin so a
+    // future relaxation that clears merge_pending too eagerly (e.g.
+    // on the explicit separator skip) doesn't silently insert one.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = [
+                { type = "model", merge = true },
+                { type = "workspace", merge = true },
+                "cost",
+            ]
+            [layout_options]
+            separator = " | "
+        "#,
+    )
+    .expect("parse");
+    let items = built(Some(&cfg));
+    assert_eq!(segment_count(&items), 3);
+    assert_eq!(separators_in_order(&items).len(), 0);
+}
+
+#[test]
+fn consecutive_separator_entries_warn_with_specific_message() {
+    // Adjacent `|, |` → second skipped with the "consecutive" warn,
+    // not the misleading "without a preceding segment" one. Pin
+    // the message text so a regression to the catch-all wording
+    // fails this assertion directly.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = [
+                "model",
+                { type = "separator", character = " | " },
+                { type = "separator", character = " · " },
+                "workspace",
+            ]
+        "#,
+    )
+    .expect("parse");
+    let (items, warns) = built_with_warns(Some(&cfg));
+    assert_eq!(segment_count(&items), 2);
+    assert_eq!(
+        separators_in_order(&items).len(),
+        1,
+        "duplicate adjacent separator entries collapse to one",
+    );
+    assert!(
+        warns.iter().any(|w| w.contains("consecutive separator")),
+        "missing 'consecutive separator' warn: {warns:?}",
+    );
+    assert!(
+        !warns.iter().any(|w| w.contains("without a preceding")),
+        "incorrect 'without a preceding' warn fired for adjacent separators: {warns:?}",
+    );
+}
+
+#[test]
+fn leading_separator_entry_warns_with_specific_message() {
+    // Pin the head-of-array case separately: `|, seg` → first
+    // separator skipped with "leads with a separator entry". Distinct
+    // from the consecutive case so user diagnostics point at the
+    // right fix.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = [{ type = "separator", character = " | " }, "model"]
+        "#,
+    )
+    .expect("parse");
+    let (items, warns) = built_with_warns(Some(&cfg));
+    assert_eq!(segment_count(&items), 1);
+    assert_eq!(separators_in_order(&items).len(), 0);
+    assert!(
+        warns.iter().any(|w| w.contains("leads with a separator")),
+        "missing 'leads with a separator' warn: {warns:?}",
+    );
+}
+
+#[test]
+fn kindless_inline_table_entry_warns_and_drops() {
+    // `{ character = " | " }` (no `type`) is malformed per ADR-0024.
+    // Pin the warn-and-drop semantics so a future schema relax
+    // doesn't silently treat kindless entries as separators.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model", { character = " | " }, "workspace"]
+        "#,
+    )
+    .expect("parse");
+    let (items, warns) = built_with_warns(Some(&cfg));
+    assert_eq!(segment_count(&items), 2, "kindless entry dropped");
+    assert!(
+        warns.iter().any(|w| w.contains("missing `type`")),
+        "missing kindless-entry warn: {warns:?}",
+    );
+}
+
+#[test]
+fn merge_field_on_separator_entry_warns_and_is_ignored() {
+    // `merge` is a segment-only flag per ADR-0024. A separator with
+    // `merge = true` set must NOT suppress the next boundary —
+    // separators don't have a "right neighbor" semantic for merge.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = [
+                "model",
+                { type = "separator", character = " | ", merge = true },
+                "workspace",
+                "cost",
+            ]
+            [layout_options]
+            separator = " · "
+        "#,
+    )
+    .expect("parse");
+    let (items, warns) = built_with_warns(Some(&cfg));
+    assert_eq!(segment_count(&items), 3);
+    let seps = separators_in_order(&items);
+    assert_eq!(
+        seps.len(),
+        2,
+        "boundary count unaffected by separator merge"
+    );
+    assert!(
+        warns.iter().any(|w| w.contains("`merge")),
+        "missing merge-on-separator warn: {warns:?}",
+    );
+}
+
+#[test]
+fn character_field_on_segment_entry_warns_and_is_ignored() {
+    // `character` is a separator-only field. A segment entry with
+    // `character` set must not affect anything; warn so the user
+    // knows the field is inert.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = [{ type = "model", character = "ignored" }, "workspace"]
+        "#,
+    )
+    .expect("parse");
+    let (_, warns) = built_with_warns(Some(&cfg));
+    assert!(
+        warns.iter().any(|w| w.contains("`character")),
+        "missing character-on-segment warn: {warns:?}",
+    );
+}
+
+#[test]
+fn unknown_inline_table_keys_round_trip_through_extra_bag() {
+    // Forward-compat contract from ADR-0024: a v0.2-only field like
+    // `{ type = "separator", color = "red" }` parses cleanly into
+    // `LineEntryItem.extra` and the v0.1 builder doesn't fail. Pin
+    // through `Config::from_str` since this is the load-time
+    // forward-compat surface a downgrading user hits first.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = [
+                "model",
+                { type = "separator", character = " | ", color = "red", bold = true },
+                "workspace",
+            ]
+        "#,
+    )
+    .expect("config with unknown inline-table keys must parse");
+    // The unknown keys land in `extra`; the builder still emits a
+    // valid LineItem::Separator with the known `character`.
+    let (items, _warns) = built_with_warns(Some(&cfg));
+    let seps = separators_in_order(&items);
+    assert_eq!(
+        seps[0],
+        &Separator::Literal(std::borrow::Cow::Owned(" | ".to_string())),
+    );
+    // And the LineEntryItem itself preserves the unknown keys.
+    let line = cfg.line.as_ref().expect("line config present");
+    let entry = &line.segments[1];
+    let extra_keys: Vec<&str> = match entry {
+        config::LineEntry::Item(item) => item.extra.keys().map(String::as_str).collect(),
+        config::LineEntry::Id(_) => panic!("expected LineEntry::Item"),
+    };
+    assert!(
+        extra_keys.contains(&"color"),
+        "color preserved: {extra_keys:?}",
+    );
+    assert!(
+        extra_keys.contains(&"bold"),
+        "bold preserved: {extra_keys:?}",
+    );
+}
+
+#[test]
+fn malformed_segment_entry_with_wrong_value_type_warns_at_build_time() {
+    // `{ type = 42 }` (integer instead of string) is shape-invalid
+    // per ADR-0024. Both the single-line and numbered-line parse
+    // paths now warn-and-drop the malformed entry rather than
+    // aborting the whole file load — the typed `LineConfig.segments`
+    // field uses a per-item-tolerant deserializer that lands the bad
+    // entry in a kindless `LineEntry::Item`, and the builder warns
+    // on kindless entries with a "missing `type`" diagnostic. Pin
+    // both halves: parse succeeds AND build warns AND the well-
+    // formed neighbors render unaffected.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model", { type = 42 }, "workspace"]
+        "#,
+    )
+    .expect("malformed entry must not abort the whole parse");
+    let (items, warns) = built_with_warns(Some(&cfg));
+    assert_eq!(
+        segment_count(&items),
+        2,
+        "well-formed neighbors render; malformed entry drops",
+    );
+    assert!(
+        warns.iter().any(|w| w.contains("missing `type`")),
+        "missing-type warn must fire on the malformed entry: {warns:?}",
+    );
+}
+
+#[test]
+fn inline_table_separator_round_trips_through_config_parse() {
+    // Parse-layer half of the round-trip contract: a hand-written
+    // mixed-array config parses to `LineEntry::Item` with the
+    // expected `kind`/`character` shape. The full editor → save →
+    // reload preservation lives in the linesmith TUI tests where
+    // `toml_edit::DocumentMut` is available.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model", { type = "separator", character = " | " }, "workspace"]
+        "#,
+    )
+    .expect("parse");
+    let line = cfg.line.as_ref().expect("line present");
+    match &line.segments[1] {
+        config::LineEntry::Item(item) => {
+            assert_eq!(item.kind.as_deref(), Some("separator"));
+            assert_eq!(item.character.as_deref(), Some(" | "));
+        }
+        other => panic!("expected LineEntry::Item, got {other:?}"),
+    }
+}

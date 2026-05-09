@@ -1373,16 +1373,33 @@ fn check_config_segments(snapshot: &DoctorConfigSnapshot) -> CheckResult {
     let mut unknown: Vec<String> = Vec::new();
     let mut malformed_lines: Vec<String> = Vec::new();
     if let Some(line) = &config.line {
-        for id in &line.segments {
-            if !known.contains(id) {
-                unknown.push(id.clone());
+        // Single-line `[line].segments` walk. Mirrors the numbered-line
+        // classification below: separators skip, kindless inline tables
+        // surface as malformed (the runtime builder warn-and-drops the
+        // same shape — doctor must agree so users get the diagnostic
+        // here rather than only via the debug log).
+        for entry in &line.segments {
+            if entry.is_separator() {
+                continue;
+            }
+            match entry.segment_id() {
+                Some(id) => {
+                    if !known.contains(id) {
+                        unknown.push(id.to_string());
+                    }
+                }
+                None => malformed_lines.push(
+                    "[line].segments has an inline-table entry without a `type` field".to_string(),
+                ),
             }
         }
         // `[line.N]` numbered tables: each value should be a table
-        // with a `segments` array of strings. The runtime builder
-        // warns on malformed shapes and exits 0; doctor surfaces
-        // them as a visible WARN at health-check time so a user
-        // fixing config doesn't have to spelunk through a debug log.
+        // with a `segments` array of bare strings or inline tables
+        // (per ADR-0024 — `{ type = "separator" }`, `{ type = "model",
+        // merge = true }`, etc.). The runtime builder warns on
+        // malformed shapes and exits 0; doctor surfaces them as a
+        // visible WARN at health-check time so a user fixing config
+        // doesn't have to spelunk through a debug log.
         for (key, value) in &line.numbered {
             // `$schema` is the JSON-schema sentinel, not a line index.
             if key == "$schema" {
@@ -1402,16 +1419,24 @@ fn check_config_segments(snapshot: &DoctorConfigSnapshot) -> CheckResult {
             match table.get("segments") {
                 Some(toml::Value::Array(arr)) => {
                     for item in arr {
-                        match item.as_str() {
-                            Some(id) if !known.contains(id) => unknown.push(id.to_string()),
-                            None => malformed_lines
-                                .push(format!("[line.{key}].segments contains a non-string entry")),
-                            _ => {}
+                        match numbered_entry_id(item) {
+                            NumberedEntry::Segment(id) => {
+                                if !known.contains(id) {
+                                    unknown.push(id.to_string());
+                                }
+                            }
+                            NumberedEntry::Separator => {}
+                            NumberedEntry::KindlessTable => malformed_lines.push(format!(
+                                "[line.{key}].segments has an inline-table entry without a `type` field"
+                            )),
+                            NumberedEntry::WrongShape => malformed_lines.push(format!(
+                                "[line.{key}].segments contains an entry that is neither a string nor an inline table"
+                            )),
                         }
                     }
                 }
                 Some(_) => malformed_lines.push(format!(
-                    "[line.{key}].segments (must be an array of strings)"
+                    "[line.{key}].segments (must be an array of strings or inline tables)"
                 )),
                 None => malformed_lines.push(format!("[line.{key}] missing `segments` array")),
             }
@@ -2553,7 +2578,12 @@ fn any_git_segment_enabled(read: &ConfigReadOutcome) -> bool {
             .iter()
             .any(|b| *b == id && b.starts_with("git_"))
     };
-    if line.segments.iter().any(|id| is_builtin_git(id)) {
+    if line
+        .segments
+        .iter()
+        .filter_map(|e| e.segment_id())
+        .any(is_builtin_git)
+    {
         return true;
     }
     line.numbered.values().any(|v| {
@@ -2561,10 +2591,41 @@ fn any_git_segment_enabled(read: &ConfigReadOutcome) -> bool {
             .and_then(|t| t.get("segments"))
             .and_then(|s| s.as_array())
             .is_some_and(|arr| {
-                arr.iter()
-                    .any(|item| item.as_str().is_some_and(is_builtin_git))
+                arr.iter().any(|item| match numbered_entry_id(item) {
+                    NumberedEntry::Segment(id) => is_builtin_git(id),
+                    NumberedEntry::Separator
+                    | NumberedEntry::KindlessTable
+                    | NumberedEntry::WrongShape => false,
+                })
             })
     })
+}
+
+/// Classify one entry inside a `[line.N].segments` array per
+/// ADR-0024: bare string or inline table with a `type` field.
+/// `Segment(id)` carries the borrowed id (stripped of `"separator"`
+/// — separators don't count as segments here). The `KindlessTable`
+/// and `WrongShape` variants surface as malformed-line warnings.
+enum NumberedEntry<'a> {
+    Segment(&'a str),
+    Separator,
+    KindlessTable,
+    WrongShape,
+}
+
+fn numbered_entry_id(item: &toml::Value) -> NumberedEntry<'_> {
+    if let Some(s) = item.as_str() {
+        return NumberedEntry::Segment(s);
+    }
+    if let Some(table) = item.as_table() {
+        match table.get("type").and_then(|v| v.as_str()) {
+            Some("separator") => NumberedEntry::Separator,
+            Some(id) => NumberedEntry::Segment(id),
+            None => NumberedEntry::KindlessTable,
+        }
+    } else {
+        NumberedEntry::WrongShape
+    }
 }
 
 fn self_category(env: &DoctorEnv) -> Category {
@@ -4327,6 +4388,87 @@ mod tests {
         assert!(
             check.label().contains("bogus_id"),
             "label must name the unknown numbered-line id: {}",
+            check.label(),
+        );
+    }
+
+    #[test]
+    fn config_segments_pass_on_inline_table_entries_in_numbered_line() {
+        // Pin that the doctor's numbered-line check accepts inline-
+        // table entries (`{ type = "separator" }`, `{ type =
+        // "git_branch", merge = true }`) per ADR-0024. A regression
+        // to "must be an array of strings" would surface a false
+        // WARN for every multi-line config that adopts the mixed-
+        // array shape.
+        let raw = r#"
+            layout = "multi-line"
+            [line]
+
+            [line.1]
+            segments = [
+                "model",
+                { type = "separator", character = " | " },
+                { type = "git_branch", merge = true },
+            ]
+        "#;
+        let parsed: Config = raw.parse().expect("parse ok");
+        let mut env = DoctorEnv::healthy();
+        env.config = config_snapshot_loaded(parsed);
+        let r = build_report(&env);
+        assert_eq!(
+            find_check(&r, "config.segments_resolvable").severity(),
+            Severity::Pass,
+            "valid inline-table entries must not warn",
+        );
+    }
+
+    #[test]
+    fn config_segments_warn_on_kindless_inline_table_in_single_line() {
+        // The single-line walk must classify inline-table entries
+        // the same way the numbered-line walk does. Without it,
+        // `[line] segments = [{ character = " | " }]` (kindless)
+        // silently passes the check even though the runtime warns
+        // and drops the entry — a misleading "all green" result
+        // for a config the renderer rejects.
+        let raw = r#"
+            [line]
+            segments = ["model", { character = " | " }]
+        "#;
+        let parsed: Config = raw.parse().expect("parse ok");
+        let mut env = DoctorEnv::healthy();
+        env.config = config_snapshot_loaded(parsed);
+        let r = build_report(&env);
+        let check = find_check(&r, "config.segments_resolvable");
+        assert_eq!(check.severity(), Severity::Warn);
+        assert!(
+            check.label().contains("`type`"),
+            "label must mention the missing type field: {}",
+            check.label(),
+        );
+    }
+
+    #[test]
+    fn config_segments_warn_on_kindless_inline_table_in_numbered_line() {
+        // The flip side: a kindless inline table (`{ character = " | " }`
+        // with no `type`) is malformed per ADR-0024 and the doctor
+        // should surface it as a WARN, distinct from the unknown-id
+        // case so the user gets a targeted hint about adding `type`.
+        let raw = r#"
+            layout = "multi-line"
+            [line]
+
+            [line.1]
+            segments = ["model", { character = " | " }]
+        "#;
+        let parsed: Config = raw.parse().expect("parse ok");
+        let mut env = DoctorEnv::healthy();
+        env.config = config_snapshot_loaded(parsed);
+        let r = build_report(&env);
+        let check = find_check(&r, "config.segments_resolvable");
+        assert_eq!(check.severity(), Severity::Warn);
+        assert!(
+            check.label().contains("`type`"),
+            "label must mention the missing type field: {}",
             check.label(),
         );
     }
@@ -7081,6 +7223,31 @@ segments = ["model", "cost", "context_window"]
         .expect("parse");
         let snap = config_snapshot_loaded(parsed);
         assert!(!any_git_segment_enabled(&snap.read));
+    }
+
+    #[test]
+    fn any_git_segment_enabled_finds_id_in_inline_table_numbered_entry() {
+        // Pin that a multi-line config enabling git via
+        // `{ type = "git_branch", merge = true }` in a numbered
+        // line registers as a git config (per ADR-0024 — inline-
+        // table segment entries count). Otherwise doctor skips the
+        // repo-warning checks when run outside a repo and the user
+        // gets no diagnostic for an actually-git-segment-using
+        // config.
+        let parsed: Config = r#"
+layout = "multi-line"
+[line]
+
+[line.1]
+segments = ["model", { type = "git_branch", merge = true }]
+"#
+        .parse()
+        .expect("parse");
+        let snap = config_snapshot_loaded(parsed);
+        assert!(
+            any_git_segment_enabled(&snap.read),
+            "inline-table git_branch in numbered line must count as git-enabled",
+        );
     }
 
     // --- Self/update_available classifier ---
