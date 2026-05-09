@@ -22,6 +22,7 @@ use crate::config;
 use crate::logging::CapturedSink;
 use crate::theme::{Capability, Theme};
 
+use super::environment_warning::{prepend_env_warnings, EnvironmentSnapshot};
 use super::items_editor::{self, ItemsEditorState};
 use super::line_picker::{self, LinePickerState};
 use super::main_menu::{self, MainMenuState};
@@ -442,13 +443,31 @@ pub(super) fn view(model: &Model, frame: &mut Frame) {
     // shrink/drop against the surface that actually displays
     // them, not the outer frame width.
     let inner_width = area.width.saturating_sub(2);
-    let (preview_lines, warnings) = preview::render_lines(
+    let (preview_lines, mut warnings) = preview::render_lines(
         &model.config,
         &model.theme,
         model.capability,
         inner_width,
         model.sink.as_deref(),
     );
+
+    // Prepend environment warnings (NO_COLOR, TTY status, palette
+    // tier mismatch, VSCode contrast shim, tmux passthrough) to
+    // the runtime warnings panel. These describe the user's
+    // terminal setup rather than the current render, so they read
+    // first as context for everything below. Env is re-snapshotted
+    // per render — cheap (a handful of env lookups, all libc-local)
+    // and avoids a Model field for a session-constant. Color policy
+    // is read from the parsed config so user overrides
+    // (`color = "always"` / `"never"`) suppress ladder warnings
+    // that would otherwise misattribute the cause.
+    let env_snapshot = EnvironmentSnapshot::from_process();
+    let color_policy = model
+        .config
+        .layout_options
+        .as_ref()
+        .map_or(config::ColorPolicy::Auto, |lo| lo.color);
+    prepend_env_warnings(&mut warnings, model.capability, color_policy, &env_snapshot);
 
     // Height: 2 border rows + at least 1 content row + 1 row per
     // warning (capped). Capped at 16 total so a pathological
