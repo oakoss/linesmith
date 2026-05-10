@@ -1,6 +1,6 @@
 # TUI screen-state enum + reusable ListScreen / PropertyScreen templates
 
-- Status: accepted
+- Status: partially superseded by [ADR-0025](0025-tui-instant-apply-save-model.md) — save-UX section only; screen-state machine, `ListScreen` / `PropertyScreen` templates, preview rendering, Elm-style Update path are unchanged
 - Date: 2026-04-28
 - Deciders: Jace
 - Surfacing bead: lsm-yevo
