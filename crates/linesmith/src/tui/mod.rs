@@ -22,6 +22,7 @@ mod main_menu;
 mod placeholder;
 mod preview;
 mod raw_value_editor;
+mod theme_picker;
 mod type_picker;
 
 use std::io::{self, Write};
@@ -103,6 +104,7 @@ pub(super) fn run(config_path: Option<&Path>, stderr: &mut dyn Write) -> u8 {
         load.original_text,
         load.save_target,
         theme,
+        theme_registry,
         capability,
         Some(Arc::clone(&captured_sink)),
     );

@@ -15,6 +15,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
+use linesmith_core::theme::ThemeRegistry;
+
 use crate::config::{Config, LayoutMode};
 
 use super::app::{AppScreen, ScreenOutcome};
@@ -24,6 +26,7 @@ use super::list_screen::{
     self, ListOutcome, ListRowData, ListScreenState, ListScreenView, VerbHint,
 };
 use super::placeholder::PlaceholderState;
+use super::theme_picker::ThemePickerState;
 
 #[derive(Debug, Default, Clone)]
 pub(super) struct MainMenuState {
@@ -87,12 +90,17 @@ const MENU_ITEMS: &[MainMenuItem] = &[
 /// configuration (`verbs = &[]`, `move_mode_supported = false`);
 /// they fall through to `unreachable!` so a misconfiguration that
 /// would silently swallow keypresses fails loudly instead.
-pub(super) fn update(state: &mut MainMenuState, config: &Config, key: KeyEvent) -> ScreenOutcome {
+pub(super) fn update(
+    state: &mut MainMenuState,
+    config: &Config,
+    theme_registry: &ThemeRegistry,
+    key: KeyEvent,
+) -> ScreenOutcome {
     if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Esc {
         return ScreenOutcome::Quit;
     }
     match list_screen::handle_key(&mut state.list, key, MENU_ITEMS.len(), &[], false) {
-        ListOutcome::Activate => activate(state, config),
+        ListOutcome::Activate => activate(state, config, theme_registry),
         ListOutcome::Consumed | ListOutcome::Unhandled => ScreenOutcome::Stay,
         outcome @ (ListOutcome::Action(_) | ListOutcome::MoveSwap { .. }) => {
             unreachable!(
@@ -111,7 +119,11 @@ pub(super) fn update(state: &mut MainMenuState, config: &Config, key: KeyEvent) 
 ///
 /// The cursor is always in range here: `handle_key` clamps it
 /// before returning `Activate`.
-fn activate(state: &mut MainMenuState, config: &Config) -> ScreenOutcome {
+fn activate(
+    state: &mut MainMenuState,
+    config: &Config,
+    theme_registry: &ThemeRegistry,
+) -> ScreenOutcome {
     debug_assert!(
         state.list.cursor() < MENU_ITEMS.len(),
         "list_screen::handle_key must clamp the cursor before Activate",
@@ -163,6 +175,18 @@ fn activate(state: &mut MainMenuState, config: &Config) -> ScreenOutcome {
                 prev,
             ))),
         },
+        MainMenuItem::EditColors => {
+            // Theme picker. v0.1 ships theme selection only;
+            // per-segment color overrides land in a future "Edit
+            // Colors" mode. Until then, this row is the theme-
+            // switching surface.
+            let current = config.theme.as_deref().unwrap_or("default");
+            ScreenOutcome::NavigateTo(AppScreen::ThemePicker(ThemePickerState::new(
+                prev,
+                theme_registry,
+                current,
+            )))
+        }
         other => ScreenOutcome::NavigateTo(AppScreen::Placeholder(PlaceholderState::new(
             other.label(),
             prev,
@@ -214,10 +238,20 @@ mod tests {
         KeyEvent::new(code, mods)
     }
 
+    /// Built-in-only registry; routing tests don't exercise theme content.
+    fn registry() -> ThemeRegistry {
+        ThemeRegistry::with_built_ins()
+    }
+
     #[test]
     fn esc_quits() {
         let mut state = MainMenuState::default();
-        let outcome = update(&mut state, &Config::default(), key(KeyCode::Esc));
+        let outcome = update(
+            &mut state,
+            &Config::default(),
+            &registry(),
+            key(KeyCode::Esc),
+        );
         assert!(matches!(outcome, ScreenOutcome::Quit));
     }
 
@@ -234,7 +268,12 @@ mod tests {
         // mid-fall-through still fails.
         for mods in [KeyModifiers::SHIFT, KeyModifiers::CONTROL] {
             let mut state = MainMenuState::default();
-            let outcome = update(&mut state, &Config::default(), key_mod(KeyCode::Esc, mods));
+            let outcome = update(
+                &mut state,
+                &Config::default(),
+                &registry(),
+                key_mod(KeyCode::Esc, mods),
+            );
             assert!(
                 matches!(outcome, ScreenOutcome::Stay),
                 "mods={mods:?} should fall through to Stay, got {outcome:?}",
@@ -281,6 +320,7 @@ mod tests {
             String::new(),
             None,
             crate::theme::default_theme().clone(),
+            registry(),
             crate::theme::Capability::None,
             None,
         );
@@ -333,7 +373,7 @@ mod tests {
             layout: LayoutMode::MultiLine,
             ..Config::default()
         };
-        let outcome = update(&mut state, &cfg, key(KeyCode::Enter));
+        let outcome = update(&mut state, &cfg, &registry(), key(KeyCode::Enter));
         match outcome {
             ScreenOutcome::NavigateTo(AppScreen::LinePicker(p)) => {
                 assert_eq!(
@@ -360,7 +400,7 @@ mod tests {
             layout: LayoutMode::SingleLine,
             ..Config::default()
         };
-        let outcome = update(&mut state, &cfg, key(KeyCode::Enter));
+        let outcome = update(&mut state, &cfg, &registry(), key(KeyCode::Enter));
         match outcome {
             ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(s)) => {
                 assert_eq!(s.line(), super::super::items_editor::LineKey::Single);
@@ -393,12 +433,112 @@ mod tests {
             ..Config::default()
         };
         let mut state = MainMenuState::default();
-        let outcome = update(&mut state, &cfg, key(KeyCode::Enter));
+        let outcome = update(&mut state, &cfg, &registry(), key(KeyCode::Enter));
         match outcome {
             ScreenOutcome::NavigateTo(AppScreen::LinePicker(_)) => {}
             other => {
                 panic!("expected LinePicker for auto-promoted multi-line config, got {other:?}",)
             }
+        }
+    }
+
+    #[test]
+    fn edit_colors_routes_to_theme_picker_regardless_of_layout_mode() {
+        // EditLines has layout-conditional routing (single-line →
+        // ItemsEditor, multi-line → LinePicker). EditColors should
+        // be layout-independent — the theme picker applies to both.
+        // Pin so a future refactor that mistakenly mirrors EditLines'
+        // conditional doesn't silently send multi-line users to a
+        // placeholder.
+        for layout in [LayoutMode::SingleLine, LayoutMode::MultiLine] {
+            let cfg = Config {
+                layout,
+                ..Config::default()
+            };
+            let mut state = MainMenuState::default();
+            // Cursor on EditColors (row 1).
+            update(&mut state, &cfg, &registry(), key(KeyCode::Down));
+            let outcome = update(&mut state, &cfg, &registry(), key(KeyCode::Enter));
+            assert!(
+                matches!(
+                    outcome,
+                    ScreenOutcome::NavigateTo(AppScreen::ThemePicker(_))
+                ),
+                "layout={layout:?}: expected ThemePicker, got {outcome:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn edit_colors_threads_config_theme_into_picker_initial_cursor() {
+        // The EditColors arm reads `config.theme.as_deref().unwrap_or("default")`
+        // and passes that string into `ThemePickerState::new` as the
+        // `current` arg. The picker uses it to seed the initial
+        // cursor position. Pin the wiring end-to-end so a regression
+        // that hard-codes `"default"`, passes `""`, or threads the
+        // wrong field doesn't slip past the screen-variant assertions
+        // already in `enter_on_each_non_exit_row_routes_to_correct_screen`.
+        let cfg = Config {
+            theme: Some("dracula".into()),
+            ..Config::default()
+        };
+        let mut state = MainMenuState::default();
+        // Cursor on EditColors (row 1).
+        update(&mut state, &cfg, &registry(), key(KeyCode::Down));
+        let outcome = update(&mut state, &cfg, &registry(), key(KeyCode::Enter));
+        match outcome {
+            ScreenOutcome::NavigateTo(AppScreen::ThemePicker(p)) => {
+                assert_eq!(
+                    p.cursor_theme().name(),
+                    "dracula",
+                    "MainMenu must thread `config.theme` into the picker's initial cursor",
+                );
+            }
+            other => panic!("expected ThemePicker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn theme_picker_round_trips_main_menu_cursor_through_esc_back_nav() {
+        // Drive the full Activate → ThemePicker → Esc → MainMenu
+        // path via `app::update` and pin that the restored MainMenu
+        // cursor lands on EditColors (row 1), not the default 0.
+        // Mirrors `cursor_preserved_across_activate_esc_activate_round_trip`
+        // for Placeholder. Catches a regression that resets the
+        // MainMenuState anywhere along the back-nav chain — most
+        // likely shape would be calling `mem::take(&mut state.prev)`
+        // a second time mid-flight, or replacing it with
+        // `MainMenuState::default()` in the picker's Esc arm.
+        use super::super::app::{update as app_update, AppScreen, Event, Model};
+        let model = Model::new(
+            crate::config::Config::default(),
+            toml_edit::DocumentMut::new(),
+            String::new(),
+            None,
+            crate::theme::default_theme().clone(),
+            registry(),
+            crate::theme::Capability::None,
+            None,
+        );
+        // Walk to EditColors (row 1).
+        let model = app_update(model, Event::Key(key(KeyCode::Down)));
+        // Activate → ThemePicker.
+        let model = app_update(model, Event::Key(key(KeyCode::Enter)));
+        match &model.screen {
+            AppScreen::ThemePicker(_) => {}
+            other => panic!("expected ThemePicker after Enter on EditColors, got {other:?}"),
+        }
+        // Esc → MainMenu, cursor preserved on row 1.
+        let model = app_update(model, Event::Key(key(KeyCode::Esc)));
+        match &model.screen {
+            AppScreen::MainMenu(state) => {
+                assert_eq!(
+                    state.list.cursor(),
+                    1,
+                    "MainMenu cursor must survive Esc back-nav from ThemePicker",
+                );
+            }
+            other => panic!("expected MainMenu after Esc, got {other:?}"),
         }
     }
 
@@ -427,7 +567,7 @@ mod tests {
             ..Config::default()
         };
         let mut state = MainMenuState::default();
-        let outcome = update(&mut state, &cfg, key(KeyCode::Enter));
+        let outcome = update(&mut state, &cfg, &registry(), key(KeyCode::Enter));
         match outcome {
             ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(s)) => {
                 assert_eq!(s.line(), super::super::items_editor::LineKey::Single);
@@ -444,35 +584,59 @@ mod tests {
         // pressing Enter must emit `Quit`, not navigate.
         let mut state = MainMenuState::default();
         for _ in 0..(MENU_ITEMS.len() - 1) {
-            let outcome = update(&mut state, &Config::default(), key(KeyCode::Down));
+            let outcome = update(
+                &mut state,
+                &Config::default(),
+                &registry(),
+                key(KeyCode::Down),
+            );
             assert!(matches!(outcome, ScreenOutcome::Stay));
         }
         assert_eq!(MENU_ITEMS[state.list.cursor()], MainMenuItem::Exit);
-        let outcome = update(&mut state, &Config::default(), key(KeyCode::Enter));
+        let outcome = update(
+            &mut state,
+            &Config::default(),
+            &registry(),
+            key(KeyCode::Enter),
+        );
         assert!(matches!(outcome, ScreenOutcome::Quit));
     }
 
     #[test]
     fn enter_on_each_non_exit_row_routes_to_correct_screen() {
         // Walks the menu and asserts every non-Exit row routes to
-        // its expected destination — `EditLines` opens the items
-        // editor; every other row still opens a placeholder named
-        // after the item's label. Catches a copy-paste bug in
-        // `activate` where the wrong item label / variant could
-        // ship.
+        // its expected destination. EditLines opens the items
+        // editor; EditColors opens the theme picker; every other
+        // row still opens a placeholder named after the item's
+        // label. Catches a copy-paste bug in `activate` where the
+        // wrong item label / variant could ship.
         for (idx, item) in MENU_ITEMS.iter().enumerate() {
             if matches!(item, MainMenuItem::Exit) {
                 continue;
             }
             let mut state = MainMenuState::default();
             for _ in 0..idx {
-                update(&mut state, &Config::default(), key(KeyCode::Down));
+                update(
+                    &mut state,
+                    &Config::default(),
+                    &registry(),
+                    key(KeyCode::Down),
+                );
             }
             assert_eq!(state.list.cursor(), idx);
-            let outcome = update(&mut state, &Config::default(), key(KeyCode::Enter));
+            let outcome = update(
+                &mut state,
+                &Config::default(),
+                &registry(),
+                key(KeyCode::Enter),
+            );
             match (item, outcome) {
                 (MainMenuItem::EditLines, ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(_))) => {
                 }
+                (
+                    MainMenuItem::EditColors,
+                    ScreenOutcome::NavigateTo(AppScreen::ThemePicker(_)),
+                ) => {}
                 (other_item, ScreenOutcome::NavigateTo(AppScreen::Placeholder(p))) => {
                     assert_eq!(p.name, other_item.label(), "row {idx}");
                 }
@@ -488,12 +652,27 @@ mod tests {
         // it. Pin that the cursor index is preserved across the
         // transition.
         let mut state = MainMenuState::default();
-        update(&mut state, &Config::default(), key(KeyCode::Down));
-        update(&mut state, &Config::default(), key(KeyCode::Down));
+        update(
+            &mut state,
+            &Config::default(),
+            &registry(),
+            key(KeyCode::Down),
+        );
+        update(
+            &mut state,
+            &Config::default(),
+            &registry(),
+            key(KeyCode::Down),
+        );
         // Cursor now on row 2 (Powerline Setup). Activating it
         // should pack a MainMenuState with cursor=2 into the
         // Placeholder.
-        let outcome = update(&mut state, &Config::default(), key(KeyCode::Enter));
+        let outcome = update(
+            &mut state,
+            &Config::default(),
+            &registry(),
+            key(KeyCode::Enter),
+        );
         match outcome {
             ScreenOutcome::NavigateTo(AppScreen::Placeholder(p)) => {
                 assert_eq!(p.name, "Powerline Setup");
@@ -506,14 +685,24 @@ mod tests {
     #[test]
     fn down_advances_cursor() {
         let mut state = MainMenuState::default();
-        update(&mut state, &Config::default(), key(KeyCode::Down));
+        update(
+            &mut state,
+            &Config::default(),
+            &registry(),
+            key(KeyCode::Down),
+        );
         assert_eq!(state.list.cursor(), 1);
     }
 
     #[test]
     fn up_at_top_wraps_to_last() {
         let mut state = MainMenuState::default();
-        update(&mut state, &Config::default(), key(KeyCode::Up));
+        update(
+            &mut state,
+            &Config::default(),
+            &registry(),
+            key(KeyCode::Up),
+        );
         assert_eq!(state.list.cursor(), MENU_ITEMS.len() - 1);
     }
 }

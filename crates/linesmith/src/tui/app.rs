@@ -20,7 +20,7 @@ use toml_edit::DocumentMut;
 
 use crate::config;
 use crate::logging::CapturedSink;
-use crate::theme::{Capability, Theme};
+use crate::theme::{Capability, Theme, ThemeRegistry};
 
 use super::environment_warning::{prepend_env_warnings, EnvironmentSnapshot};
 use super::items_editor::{self, ItemsEditorState};
@@ -29,6 +29,7 @@ use super::main_menu::{self, MainMenuState};
 use super::placeholder::{self, PlaceholderState};
 use super::preview;
 use super::raw_value_editor::{self, RawValueEditorState};
+use super::theme_picker::{self, ThemePickerState};
 use super::type_picker::{self, TypePickerState};
 
 /// Top-level UI state. Each variant carries its own state struct.
@@ -44,6 +45,7 @@ pub(super) enum AppScreen {
     LinePicker(LinePickerState),
     TypePicker(TypePickerState),
     RawValueEditor(RawValueEditorState),
+    ThemePicker(ThemePickerState),
 }
 
 impl AppScreen {
@@ -89,10 +91,11 @@ pub(super) struct Model {
     #[allow(dead_code)]
     pub(super) config: config::Config,
     /// Mutable TOML document the editor mutates and Ctrl+S writes
-    /// back. Edit screens (lsm-herx.7+ items editor, format-enum
-    /// editor, etc.) take `&mut model.document` and apply scoped
-    /// edits; `is_dirty()` compares the stringified form against
-    /// `original_text` to gate the save / confirm-on-quit prompts.
+    /// back. Edit screens (items editor, line picker, theme picker,
+    /// raw-value editor) take `&mut model.document` and apply
+    /// scoped edits; `is_dirty()` compares the stringified form
+    /// against `original_text` to gate the save / confirm-on-quit
+    /// prompts.
     pub(super) document: DocumentMut,
     /// Exact bytes the boot path read from disk (or empty when no
     /// file existed / no path was provided). The dirty-check
@@ -105,6 +108,14 @@ pub(super) struct Model {
     /// the user's broken-but-present TOML with defaults.
     pub(super) save_target: Option<PathBuf>,
     pub(super) theme: Theme,
+    /// Full theme registry (built-in + user themes). Built at boot
+    /// from `with_built_ins()` plus `with_user_themes(...)` when an
+    /// XDG themes dir resolves. Held immutably; a quit-and-reopen
+    /// picks up new user themes. Theme selection updates
+    /// `model.theme` directly rather than touching the registry.
+    /// Kept private so sibling modules can't mutate it post-boot
+    /// and desync the picker's snapshot.
+    theme_registry: ThemeRegistry,
     pub(super) capability: Capability,
     /// Process-wide log sink the boot path swapped in. The view
     /// passes a borrow to `preview::render_lines`, which drains
@@ -124,12 +135,19 @@ impl Model {
     /// `save_target` — comes pre-resolved from `super::load_config`
     /// so this constructor is total: no fallible reads happen on
     /// `Model` itself, and tests don't need to stub a filesystem.
+    // Eight `Model::new` parameters is one over clippy's default
+    // threshold but each is load-bearing initialization the
+    // constructor can't synthesize. Grouping into a `BootSnapshot`
+    // struct would just shuffle the same eight values one
+    // indirection deeper.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         config: config::Config,
         document: DocumentMut,
         original_text: String,
         save_target: Option<PathBuf>,
         theme: Theme,
+        theme_registry: ThemeRegistry,
         capability: Capability,
         sink: Option<Arc<CapturedSink>>,
     ) -> Self {
@@ -140,6 +158,7 @@ impl Model {
             original_text,
             save_target,
             theme,
+            theme_registry,
             capability,
             sink,
             quit: false,
@@ -305,7 +324,9 @@ pub(super) fn update(mut model: Model, event: Event) -> Model {
         return apply_quit(model);
     }
     let outcome = match &mut model.screen {
-        AppScreen::MainMenu(state) => main_menu::update(state, &model.config, key),
+        AppScreen::MainMenu(state) => {
+            main_menu::update(state, &model.config, &model.theme_registry, key)
+        }
         AppScreen::Placeholder(state) => placeholder::update(state, key),
         AppScreen::ConfirmQuit(state) => confirm_quit_update(state, key),
         AppScreen::ItemsEditor(state) => {
@@ -320,6 +341,13 @@ pub(super) fn update(mut model: Model, event: Event) -> Model {
         AppScreen::RawValueEditor(state) => {
             raw_value_editor::update(state, &mut model.document, &mut model.config, key)
         }
+        AppScreen::ThemePicker(state) => theme_picker::update(
+            state,
+            &mut model.document,
+            &mut model.config,
+            &mut model.theme,
+            key,
+        ),
     };
     match outcome {
         ScreenOutcome::Stay => {}
@@ -443,9 +471,20 @@ pub(super) fn view(model: &Model, frame: &mut Frame) {
     // shrink/drop against the surface that actually displays
     // them, not the outer frame width.
     let inner_width = area.width.saturating_sub(2);
+    // While the theme picker is active, render the preview header
+    // with the cursor's theme rather than the committed one. The
+    // user moves up/down and sees each theme's effect on their
+    // current segments without first having to commit + re-open.
+    // Esc reverts (model.theme is unchanged) and the next render
+    // falls back to the committed theme. Enter commits both
+    // document state AND model.theme via theme_picker::update.
+    let preview_theme: &Theme = match &model.screen {
+        AppScreen::ThemePicker(state) => state.cursor_theme(),
+        _ => &model.theme,
+    };
     let (preview_lines, mut warnings) = preview::render_lines(
         &model.config,
-        &model.theme,
+        preview_theme,
         model.capability,
         inner_width,
         model.sink.as_deref(),
@@ -496,6 +535,7 @@ pub(super) fn view(model: &Model, frame: &mut Frame) {
         AppScreen::LinePicker(state) => line_picker::view(state, &model.document, frame, chunks[1]),
         AppScreen::TypePicker(state) => type_picker::view(state, frame, chunks[1]),
         AppScreen::RawValueEditor(state) => raw_value_editor::view(state, frame, chunks[1]),
+        AppScreen::ThemePicker(state) => theme_picker::view(state, frame, chunks[1]),
     }
 }
 
@@ -590,6 +630,7 @@ mod tests {
             String::new(),
             None,
             crate::theme::default_theme().clone(),
+            ThemeRegistry::with_built_ins(),
             Capability::None,
             None,
         )
@@ -607,6 +648,7 @@ mod tests {
             original.to_string(),
             Some(save_target),
             crate::theme::default_theme().clone(),
+            ThemeRegistry::with_built_ins(),
             Capability::None,
             None,
         )
@@ -670,6 +712,7 @@ mod tests {
             String::new(),
             Some(path.clone()),
             crate::theme::default_theme().clone(),
+            ThemeRegistry::with_built_ins(),
             Capability::None,
             None,
         );
@@ -1179,14 +1222,46 @@ mod tests {
     }
 
     #[test]
+    fn theme_picker_cursor_diverges_from_committed_theme_on_navigation() {
+        // Unit-level pin for the live-preview override's data half:
+        // while the ThemePicker is active, `state.cursor_theme()`
+        // returns a different theme from `model.theme` after the
+        // user navigates away from the committed selection. This
+        // is what `app::view`'s preview branch reads, but this
+        // test does NOT assert that `view` actually consumes it —
+        // it only pins that the picker's snapshot tracks the cursor
+        // independently of `model.theme`. The end-to-end regression
+        // (`view` drops the match arm and renders the committed
+        // theme despite picker state) needs an integration test
+        // against rendered output (TestBackend buffer assertion).
+        let m = update(model(), key(KeyCode::Down, KeyModifiers::NONE)); // EditColors
+        let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE)); // → ThemePicker
+        match &m.screen {
+            AppScreen::ThemePicker(_) => {}
+            other => panic!("expected ThemePicker, got {other:?}"),
+        }
+        let m = update(m, key(KeyCode::Down, KeyModifiers::NONE));
+        let cursor_theme_name = match &m.screen {
+            AppScreen::ThemePicker(state) => state.cursor_theme().name().to_string(),
+            other => panic!("expected ThemePicker, got {other:?}"),
+        };
+        assert_ne!(
+            cursor_theme_name,
+            m.theme.name(),
+            "cursor must move off the committed theme on Down",
+        );
+    }
+
+    #[test]
     fn enter_on_main_menu_navigates_to_placeholder() {
         // Pin the dispatch chain: top-level update → screen
         // update → NavigateTo application. Walks past EditLines
-        // (now routed to ItemsEditor) to a row that still uses
-        // Placeholder, so this test stays focused on the dispatch
-        // chain rather than which screen variant a specific row
-        // happens to open.
+        // (ItemsEditor) and EditColors (ThemePicker) to a row that
+        // still uses Placeholder, so this test stays focused on the
+        // dispatch chain rather than which screen variant a specific
+        // row happens to open.
         let m = update(model(), key(KeyCode::Down, KeyModifiers::NONE));
+        let m = update(m, key(KeyCode::Down, KeyModifiers::NONE));
         let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!m.quit);
         assert!(
@@ -1201,7 +1276,10 @@ mod tests {
         // screen dispatch, so `q` quits even from a sub-screen.
         // The placeholder's `update` only handles Esc; without
         // upstream filtering, `q` would no-op on the placeholder.
+        // Walks past EditLines (ItemsEditor) and EditColors
+        // (ThemePicker) to PowerlineSetup which still placeholders.
         let m = update(model(), key(KeyCode::Down, KeyModifiers::NONE));
+        let m = update(m, key(KeyCode::Down, KeyModifiers::NONE));
         let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(m.screen, AppScreen::Placeholder(_)));
         let m = update(m, key(KeyCode::Char('q'), KeyModifiers::NONE));
@@ -1461,8 +1539,11 @@ mod tests {
         // Activate from MainMenu to land on Placeholder, then Esc
         // navigates back. Pins both the screen restoration and the
         // top-level Esc handling (Esc must reach the screen's
-        // update — `is_unconditional_quit` rejects it).
+        // update — `is_unconditional_quit` rejects it). Walks past
+        // EditLines and EditColors to a row that still uses
+        // Placeholder (PowerlineSetup, row 2).
         let m = update(model(), key(KeyCode::Down, KeyModifiers::NONE));
+        let m = update(m, key(KeyCode::Down, KeyModifiers::NONE));
         let m = update(m, key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(m.screen, AppScreen::Placeholder(_)));
         let m = update(m, key(KeyCode::Esc, KeyModifiers::NONE));
