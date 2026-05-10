@@ -291,8 +291,8 @@ mod tests {
 
     #[test]
     fn always_policy_suppresses_ladder_but_keeps_terminal_specific() {
-        // Codex P2 fix pin. Under `color = "always"`, the user has
-        // overridden auto-detection; ladder warnings would
+        // Under `color = "always"`, the user has overridden auto-
+        // detection; ladder warnings would
         // misattribute the cause of any rendering issue. VSCode
         // and tmux warnings still apply because the shim and tmux
         // affect rendered colors regardless of how they got
@@ -318,11 +318,10 @@ mod tests {
 
     #[test]
     fn never_policy_emits_no_warnings_at_all() {
-        // Codex P2 fix pin. Under `color = "never"` every warning
-        // in this module is about color rendering, which the user
-        // opted out of. Pin the panel-is-silent contract so a
-        // future variant addition that bypasses the policy guard
-        // surfaces here.
+        // Under `color = "never"` every warning in this module is
+        // about color rendering, which the user opted out of. Pin
+        // the panel-is-silent contract so a future variant addition
+        // that bypasses the policy guard surfaces here.
         let env = EnvironmentSnapshot {
             no_color: true,
             term_program: Some("vscode".to_string()),
@@ -378,11 +377,10 @@ mod tests {
 
     #[test]
     fn tmux_warning_only_fires_when_colors_render_at_reduced_tier() {
-        // Codex P3 + code-reviewer fix pin. The Tc-passthrough
-        // remediation only applies when colors ARE rendering at a
-        // reduced tier — at Capability::None the colors are off
-        // entirely and Tc passthrough wouldn't help; at TrueColor
-        // the user's setup is correct.
+        // The Tc-passthrough remediation only applies when colors
+        // ARE rendering at a reduced tier. At Capability::None
+        // colors are off entirely and Tc passthrough wouldn't help;
+        // at TrueColor the user's setup is correct.
         let tmux_env = EnvironmentSnapshot {
             tmux_active: true,
             ..empty_env()
