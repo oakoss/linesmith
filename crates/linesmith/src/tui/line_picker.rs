@@ -93,6 +93,7 @@ pub(super) fn update(
                 if let Some(idx) = new_lines.iter().position(|n| *n == next) {
                     state.list.set_cursor(idx, new_lines.len());
                 }
+                return ScreenOutcome::Committed;
             }
             AddLineOutcome::DuplicateIndex => {
                 // The numeric line index is taken — possibly by a
@@ -118,6 +119,7 @@ pub(super) fn update(
     let lines = numbered_lines(document);
     let row_count = lines.len();
     let cursor = state.list.cursor();
+    let mut committed = false;
 
     match list_screen::handle_key(&mut state.list, key, row_count, VERB_LETTERS, false) {
         ListOutcome::Activate => {
@@ -143,6 +145,7 @@ pub(super) fn update(
                     refresh_config(document, config);
                     let new_count = numbered_lines(document).len();
                     state.list.set_cursor(cursor, new_count);
+                    committed = true;
                 } else {
                     linesmith_core::lsm_warn!(
                         "line picker: could not remove `[line.{}]`; document not editable",
@@ -156,7 +159,11 @@ pub(super) fn update(
         | ListOutcome::Consumed
         | ListOutcome::Unhandled => {}
     }
-    ScreenOutcome::Stay
+    if committed {
+        ScreenOutcome::Committed
+    } else {
+        ScreenOutcome::Stay
+    }
 }
 
 pub(super) fn view(state: &LinePickerState, document: &DocumentMut, frame: &mut Frame, area: Rect) {
@@ -420,7 +427,10 @@ segments = []
         let mut doc = document("");
         let mut cfg = config::Config::default();
         let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('a')));
-        assert!(matches!(outcome, ScreenOutcome::Stay));
+        assert!(
+            matches!(outcome, ScreenOutcome::Committed),
+            "successful `a` add must signal Committed so the dispatcher auto-saves: {outcome:?}",
+        );
         let lines = numbered_lines(&doc);
         let nums: Vec<u32> = lines.iter().map(|n| n.get()).collect();
         assert_eq!(nums, vec![1]);

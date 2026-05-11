@@ -282,7 +282,7 @@ mod tests {
         let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Enter));
         assert!(matches!(
             outcome,
-            ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(_))
+            ScreenOutcome::CommitAndNavigate(AppScreen::ItemsEditor(_))
         ));
         let line = cfg.line.expect("line reparsed");
         let ids: Vec<&str> = line

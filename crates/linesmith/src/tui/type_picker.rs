@@ -350,8 +350,8 @@ segments = ["a", "b"]
         let mut cfg = config::Config::default();
         let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Enter));
         match outcome {
-            ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(_)) => {}
-            other => panic!("expected NavigateTo(ItemsEditor), got {other:?}"),
+            ScreenOutcome::CommitAndNavigate(AppScreen::ItemsEditor(_)) => {}
+            other => panic!("expected CommitAndNavigate(ItemsEditor), got {other:?}"),
         }
         let written = doc.to_string();
         assert!(

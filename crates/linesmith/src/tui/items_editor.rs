@@ -233,11 +233,11 @@ pub(super) fn update(
                         InsertTarget::After(idx) => idx + 1,
                     };
                     state.list.set_cursor(new_cursor, new_count);
-                } else {
-                    linesmith_core::lsm_warn!(
-                        "items editor: insert separator failed (line={line:?}); editor unchanged",
-                    );
+                    return ScreenOutcome::Committed;
                 }
+                linesmith_core::lsm_warn!(
+                    "items editor: insert separator failed (line={line:?}); editor unchanged",
+                );
                 return ScreenOutcome::Stay;
             }
             _ => {}
@@ -246,12 +246,14 @@ pub(super) fn update(
     let line = state.line;
     let row_count = segment_count(document, line);
     let cursor = state.list.cursor();
+    let mut committed = false;
     match list_screen::handle_key(&mut state.list, key, row_count, VERB_LETTERS, true) {
         ListOutcome::MoveSwap { from, to } => {
             if swap_segments(document, line, from, to) {
                 let new_count = segment_count(document, line);
                 state.list.set_cursor(to, new_count);
                 refresh_config(document, config);
+                committed = true;
             }
         }
         ListOutcome::Action('r') => {
@@ -262,6 +264,7 @@ pub(super) fn update(
                 let new_count = segment_count(document, line);
                 state.list.set_cursor(cursor, new_count);
                 refresh_config(document, config);
+                committed = true;
             } else {
                 linesmith_core::lsm_warn!(
                     "items editor: merge toggle inert at index {cursor} (line={line:?}); merge applies to segment entries only",
@@ -273,6 +276,7 @@ pub(super) fn update(
                 let new_count = segment_count(document, line);
                 state.list.set_cursor(cursor, new_count);
                 refresh_config(document, config);
+                committed = true;
             }
             // No warn arm: ListScreen gates `Action(c)` on
             // `num_rows > 0` and `delete_segment_at` materializes
@@ -284,6 +288,7 @@ pub(super) fn update(
             if clear_segments(document, line) {
                 state.list.set_cursor(0, 0);
                 refresh_config(document, config);
+                committed = true;
             }
         }
         ListOutcome::Action('k') => {
@@ -291,6 +296,7 @@ pub(super) fn update(
                 let new_count = segment_count(document, line);
                 state.list.set_cursor(cursor + 1, new_count);
                 refresh_config(document, config);
+                committed = true;
             }
         }
         ListOutcome::Activate
@@ -298,7 +304,11 @@ pub(super) fn update(
         | ListOutcome::Consumed
         | ListOutcome::Unhandled => {}
     }
-    ScreenOutcome::Stay
+    if committed {
+        ScreenOutcome::Committed
+    } else {
+        ScreenOutcome::Stay
+    }
 }
 
 /// Resolve the Esc back-nav target. `mem::take` swaps the prev
@@ -430,7 +440,7 @@ pub(super) fn apply_replace(
     refresh_config(document, config);
     let new_count = segment_count(document, line);
     prev.list.set_cursor(target_idx, new_count);
-    ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(prev))
+    ScreenOutcome::CommitAndNavigate(AppScreen::ItemsEditor(prev))
 }
 
 /// Replace the segment-id at `idx` with `new_value`, preserving
@@ -666,7 +676,7 @@ pub(super) fn apply_insert(
     };
     let new_count = segment_count(document, line);
     prev.list.set_cursor(inserted_at, new_count);
-    ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(prev))
+    ScreenOutcome::CommitAndNavigate(AppScreen::ItemsEditor(prev))
 }
 
 /// Render the segment list. Separators render distinctly with the
@@ -1043,7 +1053,11 @@ segments = ["model", "cwd", "git"]
         update(&mut s, &mut doc, &mut cfg, key(KeyCode::Enter));
         assert!(s.list.move_mode());
         assert_eq!(s.list.cursor(), 0);
-        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Down));
+        let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Down));
+        assert!(
+            matches!(outcome, ScreenOutcome::Committed),
+            "move-swap is a commit: {outcome:?}",
+        );
         assert_eq!(s.list.cursor(), 1, "cursor must follow the moved row");
         let labels = segment_labels(&doc, LineKey::Single);
         assert_eq!(labels, vec!["cwd", "model", "git"]);
@@ -1399,7 +1413,11 @@ segments = ["a", "b", "c"]
         );
         let mut cfg = config_default();
         update(&mut s, &mut doc, &mut cfg, key(KeyCode::Down));
-        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('d')));
+        let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('d')));
+        assert!(
+            matches!(outcome, ScreenOutcome::Committed),
+            "delete verb is a commit; dispatcher must auto-save: {outcome:?}",
+        );
         assert_eq!(segment_labels(&doc, LineKey::Single), vec!["a", "c"]);
         assert_eq!(
             s.list.cursor(),
@@ -1468,7 +1486,11 @@ segments = ["a", "b", "c"]
 "#,
         );
         let mut cfg = config_default();
-        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('c')));
+        let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('c')));
+        assert!(
+            matches!(outcome, ScreenOutcome::Committed),
+            "clear verb is a commit: {outcome:?}",
+        );
         assert_eq!(segment_count(&doc, LineKey::Single), 0);
         assert_eq!(s.list.cursor(), 0);
         let arr = segments_array(&doc, LineKey::Single).expect("explicit empty array");
@@ -1499,7 +1521,11 @@ segments = ["a", "b", "c"]
         );
         let mut cfg = config_default();
         update(&mut s, &mut doc, &mut cfg, key(KeyCode::Down));
-        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('k')));
+        let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('k')));
+        assert!(
+            matches!(outcome, ScreenOutcome::Committed),
+            "clone verb is a commit: {outcome:?}",
+        );
         assert_eq!(
             segment_labels(&doc, LineKey::Single),
             vec!["a", "b", "b", "c"],
@@ -1708,7 +1734,7 @@ segments = ["alpha", "beta"]
         );
         assert!(matches!(
             outcome,
-            ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(_))
+            ScreenOutcome::CommitAndNavigate(AppScreen::ItemsEditor(_))
         ));
         let labels = segment_labels(&doc, LineKey::Single);
         assert_eq!(labels, vec!["", "beta"]);
@@ -1731,7 +1757,7 @@ segments = ["alpha", "beta", "gamma"]
             "BETA-renamed",
         );
         let restored = match outcome {
-            ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(s)) => s,
+            ScreenOutcome::CommitAndNavigate(AppScreen::ItemsEditor(s)) => s,
             other => panic!("expected NavigateTo(ItemsEditor), got {other:?}"),
         };
         let labels = segment_labels(&doc, LineKey::Single);
@@ -1815,7 +1841,7 @@ segments = ["a", "b"]
             "model",
         );
         let restored = match outcome {
-            ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(s)) => s,
+            ScreenOutcome::CommitAndNavigate(AppScreen::ItemsEditor(s)) => s,
             other => panic!("expected NavigateTo(ItemsEditor), got {other:?}"),
         };
         assert_eq!(
@@ -1842,7 +1868,7 @@ segments = ["a", "b"]
                 "model",
             );
             let restored = match outcome {
-                ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(s)) => s,
+                ScreenOutcome::CommitAndNavigate(AppScreen::ItemsEditor(s)) => s,
                 other => panic!("expected NavigateTo(ItemsEditor), got {other:?}"),
             };
             assert_eq!(
@@ -1909,7 +1935,7 @@ segments = ["a", "b"]
             "model",
         );
         let restored = match outcome {
-            ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(s)) => s,
+            ScreenOutcome::CommitAndNavigate(AppScreen::ItemsEditor(s)) => s,
             other => panic!("expected NavigateTo(ItemsEditor), got {other:?}"),
         };
         assert_eq!(
@@ -1954,7 +1980,10 @@ segments = ["model", "git_branch"]
         );
         let mut cfg = config_default();
         let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char(' ')));
-        assert!(matches!(outcome, ScreenOutcome::Stay));
+        assert!(
+            matches!(outcome, ScreenOutcome::Committed),
+            "Space-insert is a commit; dispatcher must auto-save: {outcome:?}",
+        );
         assert_eq!(
             s.list.cursor(),
             1,
@@ -1987,7 +2016,10 @@ segments = ["model", "git_branch"]
         let mut doc = document("[line]\nsegments = []\n");
         let mut cfg = config_default();
         let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char(' ')));
-        assert!(matches!(outcome, ScreenOutcome::Stay));
+        assert!(
+            matches!(outcome, ScreenOutcome::Committed),
+            "Space-insert on empty array is a commit: {outcome:?}",
+        );
         let arr = segments_array(&doc, LineKey::Single).expect("array");
         assert_eq!(arr.len(), 1);
         let sep = arr.get(0).and_then(|v| v.as_inline_table()).expect("table");
@@ -2026,7 +2058,11 @@ segments = ["model", "git_branch"]
 "#,
         );
         let mut cfg = config_default();
-        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('m')));
+        let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('m')));
+        assert!(
+            matches!(outcome, ScreenOutcome::Committed),
+            "merge toggle is a commit: {outcome:?}",
+        );
         let arr = segments_array(&doc, LineKey::Single).expect("array");
         let table = arr
             .get(0)
@@ -2069,7 +2105,11 @@ segments = ["model"]
         let mut s = state();
         let mut doc = document(raw);
         let mut cfg = config_default();
-        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('m')));
+        let outcome = update(&mut s, &mut doc, &mut cfg, key(KeyCode::Char('m')));
+        assert!(
+            matches!(outcome, ScreenOutcome::Stay),
+            "inert merge must NOT signal Committed (no document mutation): {outcome:?}",
+        );
         assert_eq!(doc.to_string(), raw, "m on a separator must not mutate");
     }
 
@@ -2139,7 +2179,7 @@ segments = [{ type = "separator", character = " | " }]
         );
         assert!(matches!(
             outcome,
-            ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(_))
+            ScreenOutcome::CommitAndNavigate(AppScreen::ItemsEditor(_))
         ));
         let arr = segments_array(&doc, LineKey::Single).expect("array");
         let sep = arr.get(0).and_then(|v| v.as_inline_table()).expect("table");
@@ -2261,7 +2301,7 @@ segments = [{ type = "git_branch", merge = true }, "cost"]
         );
         assert!(matches!(
             outcome,
-            ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(_))
+            ScreenOutcome::CommitAndNavigate(AppScreen::ItemsEditor(_))
         ));
         let arr = segments_array(&doc, LineKey::Single).expect("array");
         let table = arr

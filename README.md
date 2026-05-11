@@ -179,6 +179,10 @@ mise run test             # run all tests
 
 Commit style: [Conventional Commits](https://www.conventionalcommits.org/) enforced by [cog](https://docs.cocogitto.io/). Full contribution workflow — bead tracker conventions, commit scope list, spec pipeline — lives in [`AGENTS.md`](AGENTS.md). Cutting a release? See [`docs/ops/release-runbook.md`](docs/ops/release-runbook.md).
 
+## Known limitations
+
+- **External edits during `linesmith config` are clobbered.** Editing the config file in another tool (vim, `sed -i`, etc.) while the TUI is open will be overwritten on the next pick. The TUI snapshots the config bytes at boot and doesn't re-read disk before each auto-save. Workaround: quit the TUI before external edits, or quit-and-reopen afterwards. A file-mtime check / fsevents-inotify watcher is tracked as a follow-up.
+
 ## License
 
 [MIT](LICENSE). The core stays open source; any future plugin ecosystem can ship under any license.

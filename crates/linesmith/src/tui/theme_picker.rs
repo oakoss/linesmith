@@ -129,7 +129,7 @@ pub(super) fn update(
                 set_theme_in_document(document, theme.name());
                 refresh_config(document, config);
                 *model_theme = theme.clone();
-                return ScreenOutcome::NavigateTo(AppScreen::MainMenu(state.take_prev()));
+                return ScreenOutcome::CommitAndNavigate(AppScreen::MainMenu(state.take_prev()));
             }
             // Defensive: `list_screen::handle_key` currently returns
             // `Unhandled` (not `Activate`) when `row_count == 0`, so
@@ -320,7 +320,7 @@ mod tests {
         let outcome = update(&mut s, &mut doc, &mut cfg, &mut theme, key(KeyCode::Enter));
         assert!(matches!(
             outcome,
-            ScreenOutcome::NavigateTo(AppScreen::MainMenu(_))
+            ScreenOutcome::CommitAndNavigate(AppScreen::MainMenu(_))
         ));
         let serialized = doc.to_string();
         assert!(
@@ -588,7 +588,7 @@ info = "#0088ff"
         let outcome = update(&mut s, &mut doc, &mut cfg, &mut theme, key(KeyCode::Enter));
         assert!(matches!(
             outcome,
-            ScreenOutcome::NavigateTo(AppScreen::MainMenu(_))
+            ScreenOutcome::CommitAndNavigate(AppScreen::MainMenu(_))
         ));
         assert_eq!(
             doc.to_string(),
