@@ -79,6 +79,7 @@ ureq = "3"
 # compare); the criterion book lists it as mandatory when invoked
 # through the cargo harness.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+insta = "1"
 toml = "1"
 # Round-trip-preserving TOML editor used by `linesmith config`'s
 # write-back path. `toml` 1.x doesn't re-export a public mutable

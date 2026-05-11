@@ -442,6 +442,84 @@ mod tests {
         assert!(!raw.contains("linesmith"));
     }
 
+    fn state_with_status(status: InstallationStatus) -> InstallScreenState {
+        InstallScreenState {
+            list: ListScreenState::default(),
+            prev: MainMenuState::default(),
+            status,
+            settings_path: std::path::PathBuf::new(),
+            install_command: "linesmith".to_string(),
+        }
+    }
+
+    fn render_to_string(state: &InstallScreenState, width: u16, height: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("backend");
+        terminal
+            .draw(|frame| view(state, frame, frame.area()))
+            .expect("draw");
+        crate::tui::buffer_to_string(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn snapshot_install_screen_not_present() {
+        let s = state_with_status(InstallationStatus::NotPresent);
+        insta::assert_snapshot!("install_screen_not_present", render_to_string(&s, 60, 14));
+    }
+
+    #[test]
+    fn snapshot_install_screen_not_installed() {
+        let s = state_with_status(InstallationStatus::NotInstalled);
+        insta::assert_snapshot!("install_screen_not_installed", render_to_string(&s, 60, 14));
+    }
+
+    #[test]
+    fn snapshot_install_screen_installed() {
+        let s = state_with_status(InstallationStatus::Installed {
+            command: "linesmith".to_string(),
+        });
+        insta::assert_snapshot!("install_screen_installed", render_to_string(&s, 60, 14));
+    }
+
+    #[test]
+    fn snapshot_install_screen_other_tool() {
+        let s = state_with_status(InstallationStatus::Other {
+            command: "ccstatusline".to_string(),
+        });
+        insta::assert_snapshot!("install_screen_other_tool", render_to_string(&s, 60, 14));
+    }
+
+    #[test]
+    fn snapshot_install_screen_other_tool_wide() {
+        // 60w truncates the title mid-quoted-command. Pin the full
+        // title at 100w so a regression in title composition stays
+        // visible across both widths.
+        let s = state_with_status(InstallationStatus::Other {
+            command: "ccstatusline".to_string(),
+        });
+        insta::assert_snapshot!(
+            "install_screen_other_tool_wide",
+            render_to_string(&s, 100, 14)
+        );
+    }
+
+    #[test]
+    fn snapshot_install_screen_cursor_on_uninstall_row() {
+        // The Uninstall row has its own description ("Remove the
+        // linesmith statusLine") and is the only row that flips the
+        // description footer when cursor moves. Pin that swap.
+        let mut s = state_with_status(InstallationStatus::Installed {
+            command: "linesmith".to_string(),
+        });
+        s.list.set_cursor(1, 2);
+        insta::assert_snapshot!(
+            "install_screen_cursor_on_uninstall_row",
+            render_to_string(&s, 60, 14)
+        );
+    }
+
     #[test]
     fn esc_back_navigates_to_main_menu_without_acting() {
         let tmp = TempDir::new().expect("tempdir");

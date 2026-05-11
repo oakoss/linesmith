@@ -15,6 +15,7 @@ target/
 .claude/scheduled_tasks.lock
 .claude/.review-mark
 .claude/.review-mark.*
+.claude/.no-review-gate
 
 # Node (managed by mise)
 node_modules/

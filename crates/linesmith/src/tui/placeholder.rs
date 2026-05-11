@@ -131,6 +131,23 @@ mod tests {
         }
     }
 
+    fn render_to_string(state: &PlaceholderState, width: u16, height: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("backend");
+        terminal
+            .draw(|frame| view(state, frame, frame.area()))
+            .expect("draw");
+        crate::tui::buffer_to_string(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn snapshot_placeholder_renders_centered_panel() {
+        let state = PlaceholderState::new("Edit Colors", MainMenuState::default());
+        insta::assert_snapshot!("placeholder_canonical", render_to_string(&state, 60, 14));
+    }
+
     #[test]
     fn esc_with_modifier_does_not_back_navigate() {
         // Shift+Esc / Ctrl+Esc shouldn't trigger back-nav — the user

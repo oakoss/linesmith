@@ -1,0 +1,24 @@
+---
+source: crates/linesmith/src/tui/theme_picker.rs
+expression: "render_to_string(&s, 80, 20)"
+---
+             pick theme — config references unknown theme `drakula`             
+                                                                                
+                                                                                
+▶ default                                                                       
+  minimal                                                                       
+  catppuccin-latte                                                              
+  catppuccin-frappe                                                             
+  catppuccin-macchiato                                                          
+  catppuccin-mocha                                                              
+  dracula                                                                       
+  nord                                                                          
+  gruvbox                                                                       
+  tokyo-night                                                                   
+  rose-pine                                                                     
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                             • press Enter to apply

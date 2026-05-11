@@ -1,0 +1,10 @@
+---
+source: crates/linesmith/src/tui/items_editor.rs
+expression: "render_to_string(&s, &doc, 60, 14)"
+---
+                         edit lines                         
+           move-mode: ↑↓ reorder · Esc/Enter exit           
+                                                            
+▶ model                                                     
+  context_window                                            
+  git_branch

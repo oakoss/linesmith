@@ -1,0 +1,18 @@
+---
+source: crates/linesmith/src/tui/placeholder.rs
+expression: "render_to_string(&state, 60, 14)"
+---
+┌ Edit Colors ─────────────────────────────────────────────┐
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                       Coming soon.                       │
+│                                                          │
+│    Press Esc to return to the main menu, or q to quit.   │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+└──────────────────────────────────────────────────────────┘

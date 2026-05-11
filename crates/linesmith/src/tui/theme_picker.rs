@@ -623,4 +623,32 @@ info = "#0088ff"
             "reparse must see theme at root, not as a child of [line]: {serialized}",
         );
     }
+
+    fn render_to_string(state: &ThemePickerState, width: u16, height: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("backend");
+        terminal
+            .draw(|frame| view(state, frame, frame.area()))
+            .expect("draw");
+        crate::tui::buffer_to_string(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn snapshot_theme_picker_default_selection() {
+        let s = state_for("default");
+        insta::assert_snapshot!("theme_picker_default", render_to_string(&s, 60, 20));
+    }
+
+    #[test]
+    fn snapshot_theme_picker_unknown_current_banner() {
+        // Config references a theme the registry doesn't know — the
+        // title flips to the warning banner so the user sees why
+        // their `theme = "drakula"` won't apply. A silent regression
+        // here would let typo'd themes get overwritten without
+        // notice.
+        let s = state_for("drakula");
+        insta::assert_snapshot!("theme_picker_unknown_current", render_to_string(&s, 80, 20));
+    }
 }

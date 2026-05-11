@@ -2471,4 +2471,93 @@ segments = [{ type = "git_branch", merge = true, color = "red", custom = 42 }, "
         assert_eq!(table.get("color").and_then(|v| v.as_str()), Some("red"));
         assert_eq!(table.get("custom").and_then(|v| v.as_integer()), Some(42));
     }
+
+    fn render_to_string(
+        state: &ItemsEditorState,
+        doc: &DocumentMut,
+        width: u16,
+        height: u16,
+    ) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("backend");
+        terminal
+            .draw(|frame| view(state, doc, frame, frame.area()))
+            .expect("draw");
+        crate::tui::buffer_to_string(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn snapshot_items_editor_empty_segments() {
+        let s = state();
+        let doc = document("[line]\nsegments = []\n");
+        insta::assert_snapshot!("items_editor_empty", render_to_string(&s, &doc, 60, 14));
+    }
+
+    #[test]
+    fn snapshot_items_editor_default_fallback_when_no_line_table() {
+        // No `[line]` at all: the editor falls back to DEFAULT_SEGMENT_IDS.
+        // A regression returning an empty Vec here would break fresh installs
+        // without tripping any other test.
+        let s = state();
+        let doc = document("");
+        insta::assert_snapshot!(
+            "items_editor_default_fallback",
+            render_to_string(&s, &doc, 60, 14)
+        );
+    }
+
+    #[test]
+    fn snapshot_items_editor_move_mode() {
+        // Move-mode swaps the help-row payload to the reorder hint;
+        // the SGR-only highlight swap (BOLD → REVERSED) is not visible
+        // in the snapshot, but the help-row text is.
+        let mut s = state();
+        let mut doc = document(
+            r#"[line]
+segments = ["model", "context_window", "git_branch"]
+"#,
+        );
+        let mut cfg = config_default();
+        update(&mut s, &mut doc, &mut cfg, key(KeyCode::Enter));
+        assert!(s.list.move_mode(), "expected move-mode after Enter");
+        insta::assert_snapshot!("items_editor_move_mode", render_to_string(&s, &doc, 60, 14));
+    }
+
+    #[test]
+    fn snapshot_items_editor_populated_segments() {
+        let s = state();
+        let doc = document(
+            r#"[line]
+segments = ["model", "context_window", "git_branch", "cwd"]
+"#,
+        );
+        insta::assert_snapshot!("items_editor_populated", render_to_string(&s, &doc, 60, 14));
+    }
+
+    #[test]
+    fn snapshot_items_editor_narrow_width() {
+        // Pairs with `_wide_width` — ListScreen's grapheme-aware
+        // truncation at 40w should produce a coherent render rather
+        // than overflowing.
+        let s = state();
+        let doc = document(
+            r#"[line]
+segments = ["model", "context_window", "git_branch", "cwd"]
+"#,
+        );
+        insta::assert_snapshot!("items_editor_narrow", render_to_string(&s, &doc, 40, 14));
+    }
+
+    #[test]
+    fn snapshot_items_editor_wide_width() {
+        let s = state();
+        let doc = document(
+            r#"[line]
+segments = ["model", "context_window", "git_branch", "cwd"]
+"#,
+        );
+        insta::assert_snapshot!("items_editor_wide", render_to_string(&s, &doc, 100, 14));
+    }
 }

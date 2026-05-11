@@ -1,0 +1,11 @@
+---
+source: crates/linesmith/src/tui/items_editor.rs
+expression: "render_to_string(&s, &doc, 60, 14)"
+---
+                         edit lines                         
+a add · i insert ·   Space sep · r raw · m merge · d delete 
+                                                            
+▶ model                                                     
+  context_window                                            
+  git_branch                                                
+  cwd

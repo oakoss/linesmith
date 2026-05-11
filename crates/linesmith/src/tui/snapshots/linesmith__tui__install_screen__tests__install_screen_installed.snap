@@ -1,0 +1,18 @@
+---
+source: crates/linesmith/src/tui/install_screen.rs
+expression: "render_to_string(&s, 60, 14)"
+---
+     install to Claude Code — ✓ installed as "linesmith"    
+                   i install · u uninstall                  
+                                                            
+▶ Install                                                   
+  Uninstall                                                 
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+   Add the linesmith statusLine to ~/.claude/settings.json

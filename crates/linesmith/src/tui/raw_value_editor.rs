@@ -474,4 +474,29 @@ mod tests {
         assert_eq!(s.text, "é日");
         assert_eq!(s.cursor, 2);
     }
+
+    fn render_to_string(state: &RawValueEditorState, width: u16, height: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("backend");
+        terminal
+            .draw(|frame| view(state, frame, frame.area()))
+            .expect("draw");
+        crate::tui::buffer_to_string(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn snapshot_raw_value_editor_with_seed_text() {
+        // `frame.set_cursor(...)` doesn't materialize into the TestBackend
+        // buffer, so cursor position isn't pinned here.
+        let s = editor("model");
+        insta::assert_snapshot!("raw_value_editor_seed", render_to_string(&s, 60, 12));
+    }
+
+    #[test]
+    fn snapshot_raw_value_editor_empty_buffer() {
+        let s = editor("");
+        insta::assert_snapshot!("raw_value_editor_empty", render_to_string(&s, 60, 12));
+    }
 }

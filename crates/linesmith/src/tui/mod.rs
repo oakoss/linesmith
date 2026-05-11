@@ -495,6 +495,26 @@ fn load_config(path: Option<&Path>) -> io::Result<LoadOutcome> {
     }
 }
 
+/// Dump a `ratatui` `Buffer` to a plain string for snapshot assertions.
+/// Styling is stripped; snapshots stay grep-friendly.
+#[cfg(test)]
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {
+    let mut out = String::with_capacity((buf.area.width as usize + 1) * buf.area.height as usize);
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            let sym = buf[(x, y)].symbol();
+            if sym.is_empty() {
+                out.push(' ');
+            } else {
+                out.push_str(sym);
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,0 +1,8 @@
+---
+source: crates/linesmith/src/tui/type_picker.rs
+expression: "render_to_string(&s, 60, 18)"
+---
+                         add segment                        
+           ←→ navigate · Enter select · Esc cancel          
+                                                            
+   model  context_window  context_bar  workspace  cost  …

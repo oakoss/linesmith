@@ -849,4 +849,43 @@ mod tests {
         );
         assert_eq!(state.list.cursor(), MENU_ITEMS.len() - 1);
     }
+
+    fn render_to_string(state: &MainMenuState, width: u16, height: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("backend");
+        terminal
+            .draw(|frame| view(state, frame, frame.area()))
+            .expect("draw");
+        crate::tui::buffer_to_string(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn snapshot_main_menu_default_cursor() {
+        let state = MainMenuState::default();
+        insta::assert_snapshot!("main_menu_default_cursor", render_to_string(&state, 60, 14));
+    }
+
+    #[test]
+    fn snapshot_main_menu_cursor_on_install_row() {
+        let install_row = MENU_ITEMS
+            .iter()
+            .position(|i| matches!(i, MainMenuItem::InstallToClaudeCode))
+            .expect("install row present");
+        let mut state = MainMenuState::default();
+        for _ in 0..install_row {
+            update(
+                &mut state,
+                &Config::default(),
+                &registry(),
+                no_install_ctx(),
+                key(KeyCode::Down),
+            );
+        }
+        insta::assert_snapshot!(
+            "main_menu_cursor_on_install_row",
+            render_to_string(&state, 60, 14)
+        );
+    }
 }

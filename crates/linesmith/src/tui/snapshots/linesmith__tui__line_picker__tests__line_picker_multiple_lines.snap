@@ -1,0 +1,20 @@
+---
+source: crates/linesmith/src/tui/line_picker.rs
+expression: "render_to_string(&s, &doc, 60, 16)"
+---
+                      pick line to edit                     
+                      a add · d delete                      
+                                                            
+▶ Line 1                                                    
+  Line 2                                                    
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                                                            
+                           (empty)

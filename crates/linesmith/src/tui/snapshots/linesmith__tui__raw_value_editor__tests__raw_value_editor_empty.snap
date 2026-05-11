@@ -1,0 +1,6 @@
+---
+source: crates/linesmith/src/tui/raw_value_editor.rs
+expression: "render_to_string(&s, 60, 12)"
+---
+                       edit raw value                       
+    Enter commit · Esc cancel · ← → cursor · Bksp delete

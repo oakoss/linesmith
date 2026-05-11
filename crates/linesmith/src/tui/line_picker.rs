@@ -763,4 +763,43 @@ segments = ["b"]
             ),
         }
     }
+
+    fn render_to_string(
+        state: &LinePickerState,
+        doc: &DocumentMut,
+        width: u16,
+        height: u16,
+    ) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("backend");
+        terminal
+            .draw(|frame| view(state, doc, frame, frame.area()))
+            .expect("draw");
+        crate::tui::buffer_to_string(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn snapshot_line_picker_multiple_lines() {
+        // `[line.status]` is in the fixture intentionally — non-numeric
+        // keys must be dropped from the picker list.
+        let s = state();
+        let doc = document(
+            r#"layout = "multi-line"
+[line.1]
+segments = []
+
+[line.2]
+segments = []
+
+[line.status]
+segments = []
+"#,
+        );
+        insta::assert_snapshot!(
+            "line_picker_multiple_lines",
+            render_to_string(&s, &doc, 60, 16)
+        );
+    }
 }

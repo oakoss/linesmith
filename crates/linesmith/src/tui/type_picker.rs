@@ -380,4 +380,21 @@ segments = ["a", "b"]
         assert_eq!(segments[1].segment_id(), Some("a"));
         assert_eq!(segments[2].segment_id(), Some("b"));
     }
+
+    fn render_to_string(state: &TypePickerState, width: u16, height: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("backend");
+        terminal
+            .draw(|frame| view(state, frame, frame.area()))
+            .expect("draw");
+        crate::tui::buffer_to_string(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn snapshot_type_picker_after_first_segment() {
+        let s = picker_state(InsertTarget::After(0));
+        insta::assert_snapshot!("type_picker_after_first", render_to_string(&s, 60, 18));
+    }
 }
