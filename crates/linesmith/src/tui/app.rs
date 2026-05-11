@@ -23,6 +23,7 @@ use crate::logging::CapturedSink;
 use crate::theme::{Capability, Theme, ThemeRegistry};
 
 use super::environment_warning::{prepend_env_warnings, EnvironmentSnapshot};
+use super::install_screen::{self, InstallScreenState};
 use super::items_editor::{self, ItemsEditorState};
 use super::line_picker::{self, LinePickerState};
 use super::main_menu::{self, MainMenuState};
@@ -45,6 +46,7 @@ pub(super) enum AppScreen {
     TypePicker(TypePickerState),
     RawValueEditor(RawValueEditorState),
     ThemePicker(ThemePickerState),
+    InstallToClaudeCode(InstallScreenState),
 }
 
 impl AppScreen {
@@ -79,7 +81,8 @@ impl AppScreen {
             | AppScreen::ItemsEditor(_)
             | AppScreen::LinePicker(_)
             | AppScreen::TypePicker(_)
-            | AppScreen::ThemePicker(_) => {
+            | AppScreen::ThemePicker(_)
+            | AppScreen::InstallToClaudeCode(_) => {
                 " [Enter] confirm   [Esc] back   [q] quit   [Ctrl+C] force-quit "
             }
         }
@@ -157,6 +160,16 @@ pub(super) struct Model {
     /// dispatcher after each `ScreenOutcome::Committed`; rendered by
     /// `view` inside the preview pane.
     pub(super) save_feedback: SaveFeedback,
+    /// Resolved path to `~/.claude/settings.json` for the install
+    /// screen. `None` when `$HOME` is unset; the install screen
+    /// routes to a Placeholder in that case so the user gets a
+    /// visible diagnostic instead of a no-op.
+    pub(super) install_settings_path: Option<PathBuf>,
+    /// `statusLine.command` value the install screen will write —
+    /// `"linesmith"` for the default case, `"linesmith --config <p>"`
+    /// when the TUI was invoked with `--config`. Pre-resolved at boot
+    /// so the screen doesn't need to traverse `CliEnv` mid-dispatch.
+    pub(super) install_command: String,
     pub(super) quit: bool,
 }
 
@@ -172,8 +185,8 @@ impl Model {
     // Eight `Model::new` parameters is one over clippy's default
     // threshold but each is load-bearing initialization the
     // constructor can't synthesize. Grouping into a `BootSnapshot`
-    // struct would just shuffle the same eight values one
-    // indirection deeper.
+    // struct would just shuffle the same values one indirection
+    // deeper.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         config: config::Config,
@@ -184,6 +197,8 @@ impl Model {
         theme_registry: ThemeRegistry,
         capability: Capability,
         sink: Option<Arc<CapturedSink>>,
+        install_settings_path: Option<PathBuf>,
+        install_command: String,
     ) -> Self {
         Self {
             screen: AppScreen::MainMenu(MainMenuState::default()),
@@ -195,6 +210,8 @@ impl Model {
             theme_registry,
             capability,
             sink,
+            install_settings_path,
+            install_command,
             save_feedback: SaveFeedback::None,
             quit: false,
         }
@@ -384,7 +401,17 @@ pub(super) fn update(mut model: Model, event: Event) -> Model {
     }
     let outcome = match &mut model.screen {
         AppScreen::MainMenu(state) => {
-            main_menu::update(state, &model.config, &model.theme_registry, key)
+            let install_ctx = main_menu::InstallContext {
+                settings_path: model.install_settings_path.as_deref(),
+                install_command: &model.install_command,
+            };
+            main_menu::update(
+                state,
+                &model.config,
+                &model.theme_registry,
+                install_ctx,
+                key,
+            )
         }
         AppScreen::Placeholder(state) => placeholder::update(state, key),
         AppScreen::ItemsEditor(state) => {
@@ -406,6 +433,7 @@ pub(super) fn update(mut model: Model, event: Event) -> Model {
             &mut model.theme,
             key,
         ),
+        AppScreen::InstallToClaudeCode(state) => install_screen::update(state, key),
     };
     match outcome {
         ScreenOutcome::Stay => {}
@@ -669,6 +697,7 @@ pub(super) fn view(model: &Model, frame: &mut Frame) {
         AppScreen::TypePicker(state) => type_picker::view(state, frame, chunks[1]),
         AppScreen::RawValueEditor(state) => raw_value_editor::view(state, frame, chunks[1]),
         AppScreen::ThemePicker(state) => theme_picker::view(state, frame, chunks[1]),
+        AppScreen::InstallToClaudeCode(state) => install_screen::view(state, frame, chunks[1]),
     }
 
     render_footer_hints(&model.screen, frame, chunks[2]);
@@ -786,6 +815,8 @@ mod tests {
             ThemeRegistry::with_built_ins(),
             Capability::None,
             None,
+            None,
+            "linesmith".to_string(),
         )
     }
 
@@ -804,6 +835,8 @@ mod tests {
             ThemeRegistry::with_built_ins(),
             Capability::None,
             None,
+            None,
+            "linesmith".to_string(),
         )
     }
 
@@ -844,6 +877,8 @@ mod tests {
             ThemeRegistry::with_built_ins(),
             Capability::None,
             None,
+            None,
+            "linesmith".to_string(),
         );
         let outcome = m.save();
         assert!(

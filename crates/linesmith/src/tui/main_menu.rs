@@ -20,6 +20,7 @@ use linesmith_core::theme::ThemeRegistry;
 use crate::config::{Config, LayoutMode};
 
 use super::app::{AppScreen, ScreenOutcome};
+use super::install_screen::InstallScreenState;
 use super::items_editor::{ItemsEditorPrev, ItemsEditorState, LineKey};
 use super::line_picker::LinePickerState;
 use super::list_screen::{
@@ -94,13 +95,14 @@ pub(super) fn update(
     state: &mut MainMenuState,
     config: &Config,
     theme_registry: &ThemeRegistry,
+    install_ctx: InstallContext<'_>,
     key: KeyEvent,
 ) -> ScreenOutcome {
     if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Esc {
         return ScreenOutcome::Quit;
     }
     match list_screen::handle_key(&mut state.list, key, MENU_ITEMS.len(), &[], false) {
-        ListOutcome::Activate => activate(state, config, theme_registry),
+        ListOutcome::Activate => activate(state, config, theme_registry, install_ctx),
         ListOutcome::Consumed | ListOutcome::Unhandled => ScreenOutcome::Stay,
         outcome @ (ListOutcome::Action(_) | ListOutcome::MoveSwap { .. }) => {
             unreachable!(
@@ -110,6 +112,16 @@ pub(super) fn update(
             )
         }
     }
+}
+
+/// Pre-resolved install state passed through to the InstallToClaudeCode
+/// row's activate path. Bundles the two values so the dispatch signature
+/// doesn't grow another pair every time a new context-dependent screen
+/// lands.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct InstallContext<'a> {
+    pub settings_path: Option<&'a std::path::Path>,
+    pub install_command: &'a str,
 }
 
 /// Resolve the highlighted menu item to a `ScreenOutcome`. Exit
@@ -123,6 +135,7 @@ fn activate(
     state: &mut MainMenuState,
     config: &Config,
     theme_registry: &ThemeRegistry,
+    install_ctx: InstallContext<'_>,
 ) -> ScreenOutcome {
     debug_assert!(
         state.list.cursor() < MENU_ITEMS.len(),
@@ -187,6 +200,24 @@ fn activate(
                 current,
             )))
         }
+        MainMenuItem::InstallToClaudeCode => {
+            if let Some(settings_path) = install_ctx.settings_path {
+                ScreenOutcome::NavigateTo(AppScreen::InstallToClaudeCode(InstallScreenState::new(
+                    prev,
+                    settings_path.to_path_buf(),
+                    install_ctx.install_command.to_string(),
+                )))
+            } else {
+                // $HOME unset → no settings path resolves. Surface
+                // through the Placeholder so the user sees the
+                // menu row resolve to something rather than
+                // silently no-op.
+                ScreenOutcome::NavigateTo(AppScreen::Placeholder(PlaceholderState::new(
+                    MainMenuItem::InstallToClaudeCode.label(),
+                    prev,
+                )))
+            }
+        }
         other => ScreenOutcome::NavigateTo(AppScreen::Placeholder(PlaceholderState::new(
             other.label(),
             prev,
@@ -243,6 +274,16 @@ mod tests {
         ThemeRegistry::with_built_ins()
     }
 
+    /// Inert install context for routing tests that don't exercise the
+    /// InstallToClaudeCode arm. `None` settings_path routes that row
+    /// to a Placeholder (the "$HOME unset" fallback).
+    fn no_install_ctx() -> InstallContext<'static> {
+        InstallContext {
+            settings_path: None,
+            install_command: "linesmith",
+        }
+    }
+
     #[test]
     fn esc_quits() {
         let mut state = MainMenuState::default();
@@ -250,6 +291,7 @@ mod tests {
             &mut state,
             &Config::default(),
             &registry(),
+            no_install_ctx(),
             key(KeyCode::Esc),
         );
         assert!(matches!(outcome, ScreenOutcome::Quit));
@@ -272,6 +314,7 @@ mod tests {
                 &mut state,
                 &Config::default(),
                 &registry(),
+                no_install_ctx(),
                 key_mod(KeyCode::Esc, mods),
             );
             assert!(
@@ -323,6 +366,8 @@ mod tests {
             registry(),
             crate::theme::Capability::None,
             None,
+            None,
+            "linesmith".to_string(),
         );
         // Down twice → cursor on row 2 (Powerline Setup).
         model = app_update(model, Event::Key(key(KeyCode::Down)));
@@ -373,7 +418,13 @@ mod tests {
             layout: LayoutMode::MultiLine,
             ..Config::default()
         };
-        let outcome = update(&mut state, &cfg, &registry(), key(KeyCode::Enter));
+        let outcome = update(
+            &mut state,
+            &cfg,
+            &registry(),
+            no_install_ctx(),
+            key(KeyCode::Enter),
+        );
         match outcome {
             ScreenOutcome::NavigateTo(AppScreen::LinePicker(p)) => {
                 assert_eq!(
@@ -400,7 +451,13 @@ mod tests {
             layout: LayoutMode::SingleLine,
             ..Config::default()
         };
-        let outcome = update(&mut state, &cfg, &registry(), key(KeyCode::Enter));
+        let outcome = update(
+            &mut state,
+            &cfg,
+            &registry(),
+            no_install_ctx(),
+            key(KeyCode::Enter),
+        );
         match outcome {
             ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(s)) => {
                 assert_eq!(s.line(), super::super::items_editor::LineKey::Single);
@@ -433,7 +490,13 @@ mod tests {
             ..Config::default()
         };
         let mut state = MainMenuState::default();
-        let outcome = update(&mut state, &cfg, &registry(), key(KeyCode::Enter));
+        let outcome = update(
+            &mut state,
+            &cfg,
+            &registry(),
+            no_install_ctx(),
+            key(KeyCode::Enter),
+        );
         match outcome {
             ScreenOutcome::NavigateTo(AppScreen::LinePicker(_)) => {}
             other => {
@@ -457,8 +520,20 @@ mod tests {
             };
             let mut state = MainMenuState::default();
             // Cursor on EditColors (row 1).
-            update(&mut state, &cfg, &registry(), key(KeyCode::Down));
-            let outcome = update(&mut state, &cfg, &registry(), key(KeyCode::Enter));
+            update(
+                &mut state,
+                &cfg,
+                &registry(),
+                no_install_ctx(),
+                key(KeyCode::Down),
+            );
+            let outcome = update(
+                &mut state,
+                &cfg,
+                &registry(),
+                no_install_ctx(),
+                key(KeyCode::Enter),
+            );
             assert!(
                 matches!(
                     outcome,
@@ -484,8 +559,20 @@ mod tests {
         };
         let mut state = MainMenuState::default();
         // Cursor on EditColors (row 1).
-        update(&mut state, &cfg, &registry(), key(KeyCode::Down));
-        let outcome = update(&mut state, &cfg, &registry(), key(KeyCode::Enter));
+        update(
+            &mut state,
+            &cfg,
+            &registry(),
+            no_install_ctx(),
+            key(KeyCode::Down),
+        );
+        let outcome = update(
+            &mut state,
+            &cfg,
+            &registry(),
+            no_install_ctx(),
+            key(KeyCode::Enter),
+        );
         match outcome {
             ScreenOutcome::NavigateTo(AppScreen::ThemePicker(p)) => {
                 assert_eq!(
@@ -519,6 +606,8 @@ mod tests {
             registry(),
             crate::theme::Capability::None,
             None,
+            None,
+            "linesmith".to_string(),
         );
         // Walk to EditColors (row 1).
         let model = app_update(model, Event::Key(key(KeyCode::Down)));
@@ -567,7 +656,13 @@ mod tests {
             ..Config::default()
         };
         let mut state = MainMenuState::default();
-        let outcome = update(&mut state, &cfg, &registry(), key(KeyCode::Enter));
+        let outcome = update(
+            &mut state,
+            &cfg,
+            &registry(),
+            no_install_ctx(),
+            key(KeyCode::Enter),
+        );
         match outcome {
             ScreenOutcome::NavigateTo(AppScreen::ItemsEditor(s)) => {
                 assert_eq!(s.line(), super::super::items_editor::LineKey::Single);
@@ -588,6 +683,7 @@ mod tests {
                 &mut state,
                 &Config::default(),
                 &registry(),
+                no_install_ctx(),
                 key(KeyCode::Down),
             );
             assert!(matches!(outcome, ScreenOutcome::Stay));
@@ -597,6 +693,7 @@ mod tests {
             &mut state,
             &Config::default(),
             &registry(),
+            no_install_ctx(),
             key(KeyCode::Enter),
         );
         assert!(matches!(outcome, ScreenOutcome::Quit));
@@ -620,6 +717,7 @@ mod tests {
                     &mut state,
                     &Config::default(),
                     &registry(),
+                    no_install_ctx(),
                     key(KeyCode::Down),
                 );
             }
@@ -628,6 +726,7 @@ mod tests {
                 &mut state,
                 &Config::default(),
                 &registry(),
+                no_install_ctx(),
                 key(KeyCode::Enter),
             );
             match (item, outcome) {
@@ -646,6 +745,46 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_install_row_with_resolved_settings_path_opens_install_screen() {
+        // The default-pathed `no_install_ctx()` routes
+        // InstallToClaudeCode to the Placeholder fallback. Pin the
+        // happy path explicitly: when `settings_path` is `Some`,
+        // pressing Enter on that row opens the real install screen.
+        // A regression that swapped the variant order or pattern-
+        // matched the wrong arm would only surface here.
+        let install_row = MENU_ITEMS
+            .iter()
+            .position(|i| matches!(i, MainMenuItem::InstallToClaudeCode))
+            .expect("install row present");
+        let mut state = MainMenuState::default();
+        for _ in 0..install_row {
+            update(
+                &mut state,
+                &Config::default(),
+                &registry(),
+                no_install_ctx(),
+                key(KeyCode::Down),
+            );
+        }
+        let path = std::path::PathBuf::from("/tmp/test-settings.json");
+        let ctx = InstallContext {
+            settings_path: Some(&path),
+            install_command: "linesmith",
+        };
+        let outcome = update(
+            &mut state,
+            &Config::default(),
+            &registry(),
+            ctx,
+            key(KeyCode::Enter),
+        );
+        match outcome {
+            ScreenOutcome::NavigateTo(AppScreen::InstallToClaudeCode(_)) => {}
+            other => panic!("expected InstallToClaudeCode, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn placeholder_carries_main_menu_state_for_back_nav() {
         // After activating, the previous MainMenuState (with cursor
         // position) lives inside the Placeholder so Esc can restore
@@ -656,12 +795,14 @@ mod tests {
             &mut state,
             &Config::default(),
             &registry(),
+            no_install_ctx(),
             key(KeyCode::Down),
         );
         update(
             &mut state,
             &Config::default(),
             &registry(),
+            no_install_ctx(),
             key(KeyCode::Down),
         );
         // Cursor now on row 2 (Powerline Setup). Activating it
@@ -671,6 +812,7 @@ mod tests {
             &mut state,
             &Config::default(),
             &registry(),
+            no_install_ctx(),
             key(KeyCode::Enter),
         );
         match outcome {
@@ -689,6 +831,7 @@ mod tests {
             &mut state,
             &Config::default(),
             &registry(),
+            no_install_ctx(),
             key(KeyCode::Down),
         );
         assert_eq!(state.list.cursor(), 1);
@@ -701,6 +844,7 @@ mod tests {
             &mut state,
             &Config::default(),
             &registry(),
+            no_install_ctx(),
             key(KeyCode::Up),
         );
         assert_eq!(state.list.cursor(), MENU_ITEMS.len() - 1);

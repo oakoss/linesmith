@@ -6,7 +6,8 @@
 
 use crate::segments::builder::build_lines;
 use crate::{
-    cli, config, detect_terminal_width, presets, run_lines_with_context, runtime, theme, RunContext,
+    claude_settings, cli, config, detect_terminal_width, presets, run_lines_with_context, runtime,
+    theme, RunContext,
 };
 use linesmith_plugin::PluginRegistry;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -178,8 +179,216 @@ where
         }
         cli::Action::Doctor { plain, config } => doctor_action(plain, config, stdout, stderr),
         cli::Action::Config { config } => config_action(config, stderr, env),
+        cli::Action::Install { config } => install_action(config, stdout, stderr, env),
+        cli::Action::Uninstall => uninstall_action(stdout, stderr, env),
         cli::Action::Run(args) => run_cli(args, stdin, stdout, stderr, env),
     }
+}
+
+/// `linesmith install`: wire the linesmith statusLine into
+/// `~/.claude/settings.json`. Atomic write with a `.bak` backup of
+/// any prior contents. Exits 1 with a diagnostic if `$HOME` is
+/// unset, if the existing settings.json is malformed, or if the
+/// disk write fails.
+fn install_action(
+    config_override: Option<PathBuf>,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    env: &CliEnv,
+) -> u8 {
+    let Some(settings_path) = claude_settings::default_settings_path(env) else {
+        let _ = writeln!(
+            stderr,
+            "linesmith: install: cannot resolve ~/.claude/settings.json (HOME unset)"
+        );
+        return 1;
+    };
+    let install_config = effective_install_config(config_override.as_deref(), env);
+    if let Some(p) = &install_config {
+        if p.to_str().is_none() {
+            let _ = writeln!(
+                stderr,
+                "linesmith: install: --config path contains non-UTF-8 bytes; refusing to write a broken statusLine — fix the path or use a UTF-8-clean equivalent",
+            );
+            return 1;
+        }
+    }
+    let command = json_command_value(install_config.as_deref());
+    // Warn before mutating: an existing third-party statusLine
+    // would be backed up to .bak but the user should know.
+    match claude_settings::detect_installation_status(&settings_path) {
+        Ok(claude_settings::InstallationStatus::Other { command }) => {
+            let _ = writeln!(
+                stderr,
+                "linesmith: install: replacing existing statusLine (was: {command}); prior settings backed up to .bak",
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            let _ = writeln!(
+                stderr,
+                "linesmith: install: could not read {}: {e}",
+                settings_path.display(),
+            );
+            return 1;
+        }
+    }
+    match claude_settings::install(&settings_path, &command) {
+        Ok(outcome) => {
+            let action_word = match outcome {
+                claude_settings::InstallOutcome::Created => "created",
+                claude_settings::InstallOutcome::Updated => "updated",
+            };
+            let _ = writeln!(
+                stdout,
+                "linesmith: {action_word} {} with statusLine = {command:?}",
+                settings_path.display(),
+            );
+            0
+        }
+        Err(e) => {
+            let _ = writeln!(
+                stderr,
+                "linesmith: install: could not write {}: {e}",
+                settings_path.display(),
+            );
+            1
+        }
+    }
+}
+
+/// `linesmith uninstall`: remove the statusLine entry from
+/// `~/.claude/settings.json`. Bails when the existing statusLine
+/// points to a different tool (e.g. ccstatusline) so the user
+/// doesn't accidentally remove their working setup.
+fn uninstall_action(stdout: &mut dyn Write, stderr: &mut dyn Write, env: &CliEnv) -> u8 {
+    let Some(settings_path) = claude_settings::default_settings_path(env) else {
+        let _ = writeln!(
+            stderr,
+            "linesmith: uninstall: cannot resolve ~/.claude/settings.json (HOME unset)"
+        );
+        return 1;
+    };
+    match claude_settings::detect_installation_status(&settings_path) {
+        Ok(claude_settings::InstallationStatus::Other { command }) => {
+            let _ = writeln!(
+                stderr,
+                "linesmith: uninstall: statusLine points to {command:?}, not linesmith; refusing to remove. Edit ~/.claude/settings.json by hand to confirm.",
+            );
+            return 1;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            let _ = writeln!(
+                stderr,
+                "linesmith: uninstall: could not read {}: {e}",
+                settings_path.display(),
+            );
+            return 1;
+        }
+    }
+    match claude_settings::uninstall(&settings_path) {
+        Ok(claude_settings::UninstallOutcome::Removed) => {
+            let _ = writeln!(
+                stdout,
+                "linesmith: removed statusLine from {} (prior contents backed up to .bak)",
+                settings_path.display(),
+            );
+            0
+        }
+        Ok(claude_settings::UninstallOutcome::NoFile) => {
+            let _ = writeln!(
+                stdout,
+                "linesmith: no settings file at {} — nothing to uninstall",
+                settings_path.display(),
+            );
+            0
+        }
+        Ok(claude_settings::UninstallOutcome::NoStatusLine) => {
+            let _ = writeln!(
+                stdout,
+                "linesmith: {} has no statusLine entry — nothing to uninstall",
+                settings_path.display(),
+            );
+            0
+        }
+        Err(e) => {
+            let _ = writeln!(
+                stderr,
+                "linesmith: uninstall: could not write {}: {e}",
+                settings_path.display(),
+            );
+            1
+        }
+    }
+}
+
+/// Pick the `--config` path to bake into the installed `statusLine`.
+/// Returns the explicit `--config` flag if present, else
+/// `$LINESMITH_CONFIG`, else `None` (bare `linesmith` command — relies
+/// on XDG defaults at exec time). Excludes XDG-resolved defaults so a
+/// `~/.claude/settings.json` that ships between machines stays
+/// portable; only paths the user explicitly chose travel with it.
+/// Empty values (whether `--config ""` from a shell-expanded missing
+/// var or `LINESMITH_CONFIG=""`) are treated as unset, matching the
+/// config resolver's policy — otherwise install would write
+/// `linesmith --config ''`, a command that fails on every tick.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn effective_install_config(
+    explicit_override: Option<&Path>,
+    env: &CliEnv,
+) -> Option<PathBuf> {
+    if let Some(p) = explicit_override.filter(|p| !p.as_os_str().is_empty()) {
+        return Some(p.to_path_buf());
+    }
+    env.linesmith_config
+        .as_ref()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Build the `statusLine.command` JSON string value for an install.
+/// Mirrors [`json_command`]'s policy but returns just the string body
+/// (no surrounding quotes — `serde_json` adds those on serialize) AND
+/// shell-quotes the config path so Claude Code's shell tokenization
+/// doesn't break on whitespace or metacharacters. Init writes a
+/// copy-paste snippet so it warns and lets the user hand-edit; install
+/// writes the file directly so it must produce a working command.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) fn json_command_value(explicit_path: Option<&Path>) -> String {
+    match explicit_path {
+        Some(p) => format!(
+            "linesmith --config {}",
+            shell_quote_arg(&p.to_string_lossy())
+        ),
+        None => "linesmith".to_string(),
+    }
+}
+
+/// POSIX-style single-quote wrapping. Wraps `s` in `'...'`, escaping
+/// any inner `'` as `'\''`. Returns `s` unchanged when it has no
+/// characters needing quoting (per [`needs_shell_quoting`]) and no
+/// leading dash — keeping the common path readable in the written
+/// `settings.json`. Windows shells parse single quotes literally, but
+/// Claude Code itself invokes commands through a POSIX-style shell on
+/// every platform supported by the install surface, so the wrapping
+/// is unconditional once any flagged character appears.
+fn shell_quote_arg(s: &str) -> String {
+    let needs_wrap = s.starts_with('-') || s.chars().any(needs_shell_quoting);
+    if !needs_wrap {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Dispatch the `linesmith config` interactive TUI editor. With the
@@ -189,12 +398,17 @@ where
 #[cfg(feature = "config-ui")]
 fn config_action(config_override: Option<PathBuf>, stderr: &mut dyn Write, env: &CliEnv) -> u8 {
     let resolved = config::resolve_config_path(
-        config_override,
+        config_override.clone(),
         env.linesmith_config.as_deref(),
         env.xdg_config_home.as_deref(),
         env.home.as_deref(),
     );
-    crate::tui::run(resolved.as_ref().map(|c| c.path.as_path()), stderr)
+    crate::tui::run(
+        resolved.as_ref().map(|c| c.path.as_path()),
+        config_override.as_deref(),
+        stderr,
+        env,
+    )
 }
 
 #[cfg(not(feature = "config-ui"))]
@@ -741,6 +955,8 @@ fn needs_shell_quoting(c: char) -> bool {
     if matches!(
         c,
         ' ' | '\t'
+            | '\n'
+            | '\r'
             | '\''
             | '"'
             | '`'
@@ -3387,6 +3603,326 @@ mod tests {
             "false-positive warning:\n{}",
             String::from_utf8_lossy(&stderr)
         );
+    }
+
+    #[test]
+    fn shell_quote_arg_passes_through_clean_paths() {
+        // A plain ASCII absolute path round-trips unchanged so the
+        // common case keeps `settings.json` readable.
+        assert_eq!(
+            super::shell_quote_arg("/etc/linesmith/config.toml"),
+            "/etc/linesmith/config.toml"
+        );
+    }
+
+    #[test]
+    fn shell_quote_arg_wraps_paths_with_whitespace() {
+        // Without quoting, Claude Code's shell tokenizer would split
+        // this path into multiple argv items and the statusline would
+        // silently fail every tick.
+        assert_eq!(
+            super::shell_quote_arg("/Users/me/My Config/config.toml"),
+            "'/Users/me/My Config/config.toml'"
+        );
+    }
+
+    #[test]
+    fn shell_quote_arg_escapes_embedded_single_quotes() {
+        // POSIX single-quote-inside-single-quote dance: close, escape,
+        // reopen. Pins the exact byte sequence so a regression that
+        // double-escapes or drops the close-quote breaks here.
+        assert_eq!(super::shell_quote_arg("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn shell_quote_arg_wraps_paths_containing_newlines() {
+        // Newline-in-path is exotic but real (some sync tools allow
+        // it). Unquoted, the shell splits the command on the newline
+        // and runs the tail as a second command — a true silent
+        // failure that the install path must defend against.
+        assert_eq!(super::shell_quote_arg("a\nb"), "'a\nb'");
+        assert_eq!(super::shell_quote_arg("c\rd"), "'c\rd'");
+    }
+
+    #[test]
+    fn shell_quote_arg_wraps_leading_dash_paths() {
+        // A bare leading dash would be parsed as a flag at
+        // re-invocation; wrap it so lexopt sees it as `--config`'s
+        // value, not a separate flag.
+        assert_eq!(super::shell_quote_arg("-weird"), "'-weird'");
+    }
+
+    #[test]
+    fn json_command_value_quotes_paths_with_spaces() {
+        let cmd = super::json_command_value(Some(Path::new("/Users/me/My Cfg/c.toml")));
+        assert_eq!(cmd, "linesmith --config '/Users/me/My Cfg/c.toml'");
+    }
+
+    #[test]
+    fn install_action_creates_settings_when_absent() {
+        let home = tempdir();
+        let env = CliEnv {
+            xdg_config_home: None,
+            home: Some(home.path().as_os_str().to_owned()),
+            ..CliEnv::for_tests()
+        };
+        let (code, stdout, stderr) = run_cli_main(&["install"], b"", &env);
+        assert_eq!(code, 0);
+        assert!(stderr.is_empty(), "unexpected stderr: {stderr}");
+        assert!(stdout.contains("created"));
+        let written =
+            std::fs::read_to_string(home.path().join(".claude/settings.json")).expect("settings");
+        let parsed: serde_json::Value = serde_json::from_str(&written).expect("json");
+        assert_eq!(parsed["statusLine"]["command"].as_str(), Some("linesmith"));
+    }
+
+    #[test]
+    fn install_action_honors_linesmith_config_env_var() {
+        // Without this, `LINESMITH_CONFIG=/p linesmith install`
+        // writes a bare `linesmith` command and Claude Code (which
+        // doesn't inherit the env var) silently falls back to XDG
+        // defaults at exec time — a config-drift bug that's hard to
+        // diagnose because the install reports success.
+        let home = tempdir();
+        let custom = home.path().join("my-config.toml");
+        std::fs::write(&custom, "").expect("seed");
+        let env = CliEnv {
+            xdg_config_home: None,
+            home: Some(home.path().as_os_str().to_owned()),
+            linesmith_config: Some(custom.as_os_str().to_owned()),
+            ..CliEnv::for_tests()
+        };
+        let (code, _, _) = run_cli_main(&["install"], b"", &env);
+        assert_eq!(code, 0);
+        let written =
+            std::fs::read_to_string(home.path().join(".claude/settings.json")).expect("settings");
+        let parsed: serde_json::Value = serde_json::from_str(&written).expect("json");
+        let cmd = parsed["statusLine"]["command"].as_str().expect("command");
+        assert!(
+            cmd.contains(custom.to_str().expect("utf-8")),
+            "expected LINESMITH_CONFIG path in {cmd:?}",
+        );
+    }
+
+    #[test]
+    fn install_action_threads_config_flag_with_shell_quoting() {
+        // A `--config` path with whitespace must reach `settings.json`
+        // shell-quoted so Claude Code can actually exec it. Without
+        // the quoting in `json_command_value`, the written command
+        // would be `linesmith --config /Users/me/My Cfg/c.toml` and
+        // the statusline would silently fail every tick.
+        let home = tempdir();
+        let env = CliEnv {
+            xdg_config_home: None,
+            home: Some(home.path().as_os_str().to_owned()),
+            ..CliEnv::for_tests()
+        };
+        let weird = home.path().join("My Cfg/c.toml");
+        let (code, _stdout, stderr) = run_cli_main(
+            &["install", "--config", weird.to_str().expect("utf-8")],
+            b"",
+            &env,
+        );
+        assert_eq!(code, 0, "stderr: {stderr}");
+        let written =
+            std::fs::read_to_string(home.path().join(".claude/settings.json")).expect("settings");
+        let parsed: serde_json::Value = serde_json::from_str(&written).expect("json");
+        let cmd = parsed["statusLine"]["command"].as_str().expect("command");
+        assert!(
+            cmd.contains("'") && cmd.contains("My Cfg"),
+            "expected shell-quoted path in {cmd:?}",
+        );
+    }
+
+    #[test]
+    fn install_action_with_home_unset_exits_one() {
+        let env = CliEnv {
+            xdg_config_home: None,
+            home: None,
+            ..CliEnv::for_tests()
+        };
+        let (code, _stdout, stderr) = run_cli_main(&["install"], b"", &env);
+        assert_eq!(code, 1);
+        assert!(stderr.contains("HOME unset"), "stderr: {stderr}");
+    }
+
+    #[test]
+    fn install_action_with_empty_home_exits_one() {
+        // HOME="" (rare but real in container init scripts) would
+        // otherwise resolve to `./.claude/settings.json` relative to
+        // cwd — silently installing into the project directory while
+        // reporting success. Pin the same not-resolved exit path the
+        // unset case takes.
+        let env = CliEnv {
+            xdg_config_home: None,
+            home: Some(std::ffi::OsString::from("")),
+            ..CliEnv::for_tests()
+        };
+        let (code, _stdout, stderr) = run_cli_main(&["install"], b"", &env);
+        assert_eq!(code, 1);
+        assert!(stderr.contains("HOME unset"), "stderr: {stderr}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_action_refuses_non_utf8_config_path() {
+        // Non-UTF-8 paths are legal on Unix filesystems but
+        // `to_string_lossy()` would `U+FFFD`-substitute the bad bytes
+        // and write a `statusLine.command` that points at a different
+        // file. Init warns and lets the user hand-edit the snippet;
+        // install writes the file directly, so refuse rather than
+        // ship a broken command silently.
+        use std::os::unix::ffi::OsStringExt;
+        let home = tempdir();
+        let bad =
+            std::ffi::OsString::from_vec(vec![b'/', 0xff, 0xfe, b'.', b't', b'o', b'm', b'l']);
+        let env = CliEnv {
+            xdg_config_home: None,
+            home: Some(home.path().as_os_str().to_owned()),
+            linesmith_config: Some(bad),
+            ..CliEnv::for_tests()
+        };
+        let (code, _, stderr) = run_cli_main(&["install"], b"", &env);
+        assert_eq!(code, 1);
+        assert!(stderr.contains("non-UTF-8"), "stderr: {stderr}");
+        assert!(
+            !home.path().join(".claude/settings.json").exists(),
+            "refusal must not have created the settings file",
+        );
+    }
+
+    #[test]
+    fn install_action_treats_empty_linesmith_config_env_as_unset() {
+        // `LINESMITH_CONFIG=""` from a shell-expanded missing var
+        // would otherwise produce `linesmith --config ''` — a command
+        // that fails on every statusline tick. Mirror the config
+        // resolver's empty-as-unset policy: fall through to bare
+        // `linesmith`.
+        let home = tempdir();
+        let env = CliEnv {
+            xdg_config_home: None,
+            home: Some(home.path().as_os_str().to_owned()),
+            linesmith_config: Some(std::ffi::OsString::from("")),
+            ..CliEnv::for_tests()
+        };
+        let (code, _, _) = run_cli_main(&["install"], b"", &env);
+        assert_eq!(code, 0);
+        let written =
+            std::fs::read_to_string(home.path().join(".claude/settings.json")).expect("settings");
+        let parsed: serde_json::Value = serde_json::from_str(&written).expect("json");
+        assert_eq!(parsed["statusLine"]["command"].as_str(), Some("linesmith"));
+    }
+
+    #[test]
+    fn install_action_warns_when_replacing_third_party_status_line() {
+        // CLI install is the scripted-setup surface, so it warns and
+        // proceeds after backing up the prior bytes. The interactive
+        // TUI surface refuses the same situation (see
+        // `install_screen::apply_install`) because the user has a
+        // visible status indicator and can choose to uninstall first.
+        let home = tempdir();
+        let claude_dir = home.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir");
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"statusLine":{"type":"command","command":"ccstatusline"}}"#,
+        )
+        .expect("seed");
+        let env = CliEnv {
+            xdg_config_home: None,
+            home: Some(home.path().as_os_str().to_owned()),
+            ..CliEnv::for_tests()
+        };
+        let (code, stdout, stderr) = run_cli_main(&["install"], b"", &env);
+        assert_eq!(code, 0);
+        assert!(stderr.contains("replacing"), "stderr: {stderr}");
+        assert!(stderr.contains("ccstatusline"), "stderr: {stderr}");
+        assert!(stdout.contains("updated"), "stdout: {stdout}");
+        let bak = std::fs::read_to_string(claude_dir.join("settings.json.bak")).expect("bak");
+        assert!(bak.contains("ccstatusline"));
+    }
+
+    #[test]
+    fn uninstall_action_refuses_to_remove_third_party_status_line() {
+        // The CLI exit code matters: scripted setup needs a parseable
+        // failure signal so a CI job doesn't mistake the no-op for a
+        // successful uninstall.
+        let home = tempdir();
+        let claude_dir = home.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir");
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"statusLine":{"type":"command","command":"ccstatusline"}}"#,
+        )
+        .expect("seed");
+        let env = CliEnv {
+            xdg_config_home: None,
+            home: Some(home.path().as_os_str().to_owned()),
+            ..CliEnv::for_tests()
+        };
+        let (code, _stdout, stderr) = run_cli_main(&["uninstall"], b"", &env);
+        assert_eq!(code, 1);
+        assert!(stderr.contains("ccstatusline"), "stderr: {stderr}");
+        assert!(stderr.contains("refusing"), "stderr: {stderr}");
+        let unchanged =
+            std::fs::read_to_string(claude_dir.join("settings.json")).expect("settings");
+        assert!(unchanged.contains("ccstatusline"));
+    }
+
+    #[test]
+    fn uninstall_action_idempotent_when_no_file_or_no_status_line() {
+        let home = tempdir();
+        let env = CliEnv {
+            xdg_config_home: None,
+            home: Some(home.path().as_os_str().to_owned()),
+            ..CliEnv::for_tests()
+        };
+        // No file at all.
+        let (code, stdout, stderr) = run_cli_main(&["uninstall"], b"", &env);
+        assert_eq!(code, 0);
+        assert!(stdout.contains("no settings file"), "stdout: {stdout}");
+        assert!(stderr.is_empty());
+
+        // File exists but no statusLine key.
+        let claude_dir = home.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir");
+        std::fs::write(claude_dir.join("settings.json"), r#"{"model":"sonnet"}"#).expect("seed");
+        let (code, stdout, stderr) = run_cli_main(&["uninstall"], b"", &env);
+        assert_eq!(code, 0);
+        assert!(stdout.contains("no statusLine"), "stdout: {stdout}");
+        assert!(stderr.is_empty());
+        // File untouched: no statusLine added, no backup written.
+        let still_there =
+            std::fs::read_to_string(claude_dir.join("settings.json")).expect("settings");
+        assert!(still_there.contains("sonnet"));
+        assert!(!claude_dir.join("settings.json.bak").exists());
+    }
+
+    #[test]
+    fn install_then_uninstall_round_trip_leaves_unrelated_keys_intact() {
+        let home = tempdir();
+        let claude_dir = home.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("mkdir");
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"model":"sonnet","permissions":{"allow":["Bash"]}}"#,
+        )
+        .expect("seed");
+        let env = CliEnv {
+            xdg_config_home: None,
+            home: Some(home.path().as_os_str().to_owned()),
+            ..CliEnv::for_tests()
+        };
+        let (code, _, _) = run_cli_main(&["install"], b"", &env);
+        assert_eq!(code, 0);
+        let (code, _, _) = run_cli_main(&["uninstall"], b"", &env);
+        assert_eq!(code, 0);
+        let final_json =
+            std::fs::read_to_string(claude_dir.join("settings.json")).expect("settings");
+        let parsed: serde_json::Value = serde_json::from_str(&final_json).expect("json");
+        assert_eq!(parsed["model"].as_str(), Some("sonnet"));
+        assert_eq!(parsed["permissions"]["allow"][0].as_str(), Some("Bash"));
+        assert!(parsed.get("statusLine").is_none());
     }
 
     #[test]

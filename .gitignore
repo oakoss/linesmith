@@ -13,6 +13,8 @@ target/
 # Claude Code
 .claude/plans/
 .claude/scheduled_tasks.lock
+.claude/.review-mark
+.claude/.review-mark.*
 
 # Node (managed by mise)
 node_modules/

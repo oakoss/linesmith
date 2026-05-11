@@ -14,6 +14,8 @@
 //! `cli`, `doctor`, `cli_main`, and `CliEnv` are the only items
 //! the binary itself surfaces beyond the entry point.
 
+pub(crate) mod atomic;
+pub(crate) mod claude_settings;
 pub mod cli;
 pub mod doctor;
 pub(crate) mod driver;

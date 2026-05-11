@@ -15,6 +15,7 @@
 
 mod app;
 mod environment_warning;
+mod install_screen;
 mod items_editor;
 mod line_picker;
 mod list_screen;
@@ -53,7 +54,12 @@ use app::{update, Event, Model};
 /// re-export). `pub(super)` is the most-restrictive shape that still
 /// reaches `driver::config_action`; allow the redundancy lint here.
 #[allow(clippy::redundant_pub_crate)]
-pub(super) fn run(config_path: Option<&Path>, stderr: &mut dyn Write) -> u8 {
+pub(super) fn run(
+    config_path: Option<&Path>,
+    install_explicit_config: Option<&Path>,
+    stderr: &mut dyn Write,
+    env: &crate::driver::CliEnv,
+) -> u8 {
     let load = match load_config(config_path) {
         Ok(out) => out,
         Err(err) => {
@@ -98,6 +104,30 @@ pub(super) fn run(config_path: Option<&Path>, stderr: &mut dyn Write) -> u8 {
     let captured_sink = Arc::new(CapturedSink::default());
     let _sink_guard = SinkGuard::install(captured_sink.clone());
 
+    // Pre-resolve the install screen's settings path + command so
+    // the install row in MainMenu doesn't have to traverse `CliEnv`
+    // mid-dispatch. `$HOME` unset (rare on container sandboxes)
+    // leaves the path None and the menu row routes to a Placeholder.
+    // `effective_install_config` deliberately excludes XDG-resolved
+    // defaults so a synced `settings.json` stays portable across
+    // machines — only paths the user explicitly chose (`--config` or
+    // `$LINESMITH_CONFIG`) get baked in. `json_command_value` then
+    // shell-quotes them so the written `statusLine.command` works
+    // as-is even when the path contains whitespace or metacharacters.
+    let install_settings_path = crate::claude_settings::default_settings_path(env);
+    let install_config = crate::driver::effective_install_config(install_explicit_config, env)
+        .and_then(|p| {
+            if p.to_str().is_some() {
+                Some(p)
+            } else {
+                linesmith_core::lsm_warn!(
+                    "install: --config path contains non-UTF-8 bytes; the install screen will offer the bare `linesmith` command instead",
+                );
+                None
+            }
+        });
+    let install_command = crate::driver::json_command_value(install_config.as_deref());
+
     let model = Model::new(
         load.config,
         load.document,
@@ -107,6 +137,8 @@ pub(super) fn run(config_path: Option<&Path>, stderr: &mut dyn Write) -> u8 {
         theme_registry,
         capability,
         Some(Arc::clone(&captured_sink)),
+        install_settings_path,
+        install_command,
     );
 
     // Install the panic hook *before* enter_terminal so a panic
@@ -150,55 +182,12 @@ pub(super) fn run(config_path: Option<&Path>, stderr: &mut dyn Write) -> u8 {
     }
 }
 
-/// Atomically replace `path` with `contents`. Writes to a temp
-/// file in the same directory, fsyncs, then renames over the
-/// destination — so a crash mid-write leaves the original file
-/// intact (and the temp file orphaned but harmless), and the
-/// rename itself is atomic on both Unix (`rename(2)`) and Windows
-/// (`MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`, which `tempfile`
-/// invokes via `persist`). Parent directory is created if missing
-/// — covers the "user pointed `--config` at a path under
-/// `~/.config/linesmith/` before that directory existed" case so
-/// the first save isn't a `NotFound` failure.
-// Same `redundant_pub_crate` / `unreachable_pub` clash as `run`
-// above; same resolution.
+/// Re-export of the shared atomic-write helper so existing
+/// `super::atomic_write(...)` call sites in this module stay terse.
+/// The shared implementation in [`crate::atomic`] is also used by
+/// the Claude Code settings install/uninstall path.
 #[allow(clippy::redundant_pub_crate)]
-pub(super) fn atomic_write(path: &Path, contents: &str) -> io::Result<()> {
-    // Resolve to absolute up front so the temp directory choice
-    // can't drift if cwd changes between save attempts (a TUI host
-    // process that chdirs after spawn would otherwise land the
-    // temp on a different filesystem and lose `persist`'s atomic
-    // contract via cross-device rename).
-    let absolute: PathBuf = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let parent = absolute.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "atomic_write: path has no parent directory",
-        )
-    })?;
-    std::fs::create_dir_all(parent)?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    tmp.write_all(contents.as_bytes())?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(&absolute).map_err(|e| {
-        // Log the orphaned temp path so a user investigating
-        // "why did save fail" doesn't also have to wonder where
-        // the leftover `.tmpXXXXXX` next to their config came
-        // from. The `Drop` on `e.file` cleans up if it can, but a
-        // partial-persist on Windows ("destination open by another
-        // process") can leave the temp behind.
-        linesmith_core::lsm_warn!(
-            "atomic_write: persist failed; orphaned temp at {} may be removed manually",
-            e.file.path().display(),
-        );
-        e.error
-    })?;
-    Ok(())
-}
+pub(super) use crate::atomic::atomic_write;
 
 /// Drain any entries the captured sink picked up during boot and
 /// write them to `stderr`. Used by the early-return arm when
@@ -522,61 +511,8 @@ mod tests {
         )
     }
 
-    #[test]
-    fn atomic_write_creates_new_file_with_contents() {
-        let tmp = TempDir::new().expect("tempdir");
-        let path = tmp.path().join("config.toml");
-        atomic_write(&path, "[line]\nsegments = []\n").expect("write");
-        let read = fs::read_to_string(&path).expect("read");
-        assert_eq!(read, "[line]\nsegments = []\n");
-    }
-
-    #[test]
-    fn atomic_write_replaces_existing_file_atomically() {
-        // Pin the round-trip: writing fresh contents over an
-        // existing file leaves the destination with the new
-        // bytes, not concatenated. Failure mode would be a
-        // non-atomic write that appends or partially overwrites.
-        let tmp = TempDir::new().expect("tempdir");
-        let path = tmp.path().join("config.toml");
-        fs::write(&path, "old contents that should disappear").expect("seed");
-        atomic_write(&path, "new bytes").expect("write");
-        assert_eq!(fs::read_to_string(&path).expect("read"), "new bytes");
-    }
-
-    #[test]
-    fn atomic_write_creates_missing_parent_directory() {
-        // Pin: pointing --config at a path under a directory
-        // that doesn't exist (e.g., `~/.config/linesmith/` when
-        // the user has never run linesmith) creates the parent
-        // before writing. Without this, the first save would
-        // NotFound and the user wouldn't understand why.
-        let tmp = TempDir::new().expect("tempdir");
-        let nested = tmp.path().join("nested/subdir/config.toml");
-        atomic_write(&nested, "x").expect("write");
-        assert_eq!(fs::read_to_string(&nested).expect("read"), "x");
-    }
-
-    #[test]
-    fn atomic_write_does_not_leave_temp_file_on_success() {
-        // The tempfile crate's persist() consumes the temp; pin
-        // that no `*.tmp` siblings linger after a successful
-        // write. Without this, a future refactor that drops the
-        // persist() call would silently leave temps around.
-        let tmp = TempDir::new().expect("tempdir");
-        let path = tmp.path().join("config.toml");
-        atomic_write(&path, "x").expect("write");
-        let entries: Vec<_> = fs::read_dir(tmp.path())
-            .expect("read_dir")
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name())
-            .collect();
-        assert_eq!(
-            entries.len(),
-            1,
-            "expected only the destination file, got {entries:?}",
-        );
-    }
+    // atomic_write tests live in `crate::atomic::tests` since the
+    // implementation moved out of this module.
 
     #[test]
     fn flush_captured_to_stderr_drains_with_boot_path_prefix() {

@@ -63,6 +63,20 @@ pub enum Action {
     Config {
         config: Option<PathBuf>,
     },
+    /// Wire linesmith into Claude Code's `~/.claude/settings.json`
+    /// statusLine. Atomic write with a `.bak` backup of any prior
+    /// contents. `config`, when present, becomes the `--config`
+    /// argument of the installed `linesmith` invocation; absent it
+    /// installs as bare `linesmith` and relies on the resolved
+    /// default at runtime.
+    Install {
+        config: Option<PathBuf>,
+    },
+    /// Remove linesmith's statusLine entry from
+    /// `~/.claude/settings.json`. Atomic write with a `.bak`
+    /// backup. No-op when the file doesn't exist or has no
+    /// `statusLine` key.
+    Uninstall,
 }
 
 /// Help text. Kept short; full docs live at
@@ -75,6 +89,8 @@ USAGE:
     linesmith init [--no-doctor]
     linesmith doctor [--plain]
     linesmith config
+    linesmith install
+    linesmith uninstall
     linesmith themes list
     linesmith presets list
     linesmith presets apply <NAME> [--force]
@@ -100,6 +116,12 @@ SUBCOMMANDS:
                            exits 1 on any FAIL
     config                 Boot the interactive TUI editor for `config.toml`.
                            Requires the `config-ui` feature (default-on)
+    install                Add the linesmith statusLine block to
+                           `~/.claude/settings.json` (atomic write, `.bak`
+                           backup of any prior contents)
+    uninstall              Remove the linesmith statusLine block from
+                           `~/.claude/settings.json` (atomic write, `.bak`
+                           backup)
     themes list            List available themes (built-in + user)
     presets list           List available config presets
     presets apply <NAME>   Write a preset's config.toml to the resolved path
@@ -242,6 +264,24 @@ fn dispatch_subcommand(
                 });
             }
             Ok(Some(Action::Config { config }))
+        }
+        "install" => {
+            if positional.len() > 1 {
+                return Err(lexopt::Error::UnexpectedValue {
+                    option: "install".to_string(),
+                    value: positional[1].to_string_lossy().to_string().into(),
+                });
+            }
+            Ok(Some(Action::Install { config }))
+        }
+        "uninstall" => {
+            if positional.len() > 1 {
+                return Err(lexopt::Error::UnexpectedValue {
+                    option: "uninstall".to_string(),
+                    value: positional[1].to_string_lossy().to_string().into(),
+                });
+            }
+            Ok(Some(Action::Uninstall))
         }
         "themes" => {
             let sub = positional.get(1).map(|s| s.to_string_lossy().into_owned());
@@ -808,6 +848,52 @@ mod tests {
     #[test]
     fn config_subcommand_with_extra_positional_errors() {
         let err = parse_args(&["config", "extra"]).unwrap_err();
+        assert!(matches!(err, lexopt::Error::UnexpectedValue { .. }));
+    }
+
+    #[test]
+    fn install_subcommand_parses_without_flags() {
+        assert_eq!(
+            parse_args(&["install"]).expect("ok"),
+            Action::Install { config: None },
+        );
+    }
+
+    #[test]
+    fn install_subcommand_threads_config_flag_into_action() {
+        // `linesmith --config /tmp/x.toml install` installs a
+        // statusLine pointing at `linesmith --config /tmp/x.toml`,
+        // not bare `linesmith`. Pin both orderings.
+        let got = parse_args(&["--config", "/tmp/x.toml", "install"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::Install {
+                config: Some(PathBuf::from("/tmp/x.toml")),
+            },
+        );
+        let got = parse_args(&["install", "--config", "/tmp/x.toml"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::Install {
+                config: Some(PathBuf::from("/tmp/x.toml")),
+            },
+        );
+    }
+
+    #[test]
+    fn install_subcommand_with_extra_positional_errors() {
+        let err = parse_args(&["install", "extra"]).unwrap_err();
+        assert!(matches!(err, lexopt::Error::UnexpectedValue { .. }));
+    }
+
+    #[test]
+    fn uninstall_subcommand_parses_without_flags() {
+        assert_eq!(parse_args(&["uninstall"]).expect("ok"), Action::Uninstall);
+    }
+
+    #[test]
+    fn uninstall_subcommand_with_extra_positional_errors() {
+        let err = parse_args(&["uninstall", "extra"]).unwrap_err();
         assert!(matches!(err, lexopt::Error::UnexpectedValue { .. }));
     }
 
