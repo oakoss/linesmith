@@ -1,11 +1,9 @@
 # Surface layout decisions through a typed observer callback
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-05-13
 - Deciders: Jace
 - Surfacing bead: lsm-xd8n
-
-> **Status note.** This ADR remains `proposed` until the governed spec (`docs/specs/segment-system.md`) is updated to reflect the new `LineItem::Segment { id, segment }` shape, the `LayoutObservers` contract, and the `LayoutDecision` emit sites. Status flips to `accepted` in the follow-up commit that lands the spec update.
 
 ## Context and Problem Statement
 

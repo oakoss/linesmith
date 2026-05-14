@@ -1,9 +1,9 @@
 # Segment System
 
 - Status: draft
-- Version: 0.7
-- Last updated: 2026-05-05
-- Driving ADRs: [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0004](../adrs/0004-rhai-for-plugins.md), [ADR-0005](../adrs/0005-role-based-themes.md), [ADR-0008](../adrs/0008-canonical-type-refinements.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md)
+- Version: 0.9
+- Last updated: 2026-05-13
+- Driving ADRs: [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0004](../adrs/0004-rhai-for-plugins.md), [ADR-0005](../adrs/0005-role-based-themes.md), [ADR-0008](../adrs/0008-canonical-type-refinements.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md), [ADR-0024](../adrs/0024-per-boundary-separator-toml.md), [ADR-0026](../adrs/0026-layout-decision-observability.md)
 
 ## Overview
 
@@ -258,10 +258,20 @@ The layout pipeline takes a `Vec<LineItem>` rather than a flat segment list. A `
 ```rust
 #[non_exhaustive]
 pub enum LineItem {
-    Segment(Box<dyn Segment>),
+    Segment {
+        /// Stable identifier for this configured entry. Sourced from
+        /// `LineEntry::segment_id()` (the TOML key) when set; falls back
+        /// to a type-based name disambiguated by occurrence index for
+        /// unnamed inline entries: `"git"`, `"git#2"`, `"git#3"`.
+        /// Built-in ids are `Cow::Borrowed`; user-config ids are `Cow::Owned`.
+        id: Cow<'static, str>,
+        segment: Box<dyn Segment>,
+    },
     Separator(Separator),
 }
 ```
+
+The `id` field routes layout-decision events (see [Layout decision contract](#layout-decision-contract)) back to the user-known config name — "cost was dropped" rather than "the segment at index 3 was dropped." It lives on the `LineItem`, not on `Segment`, because the same segment type can carry different ids across configs; the id is a layout property, not a render property.
 
 `build_segments` / `build_lines` resolve `[layout_options].separator` once and interleave it between every adjacent pair of segments. The renderer walks the list directly; there is no implicit "default separator between segments" — every gap is an explicit `LineItem::Separator` produced by the builder.
 
@@ -372,6 +382,8 @@ stdin payload → StatusContext + config
      stdout bytes
 ```
 
+The layout engine takes a `&mut LayoutObservers<'_>` rather than a bare `warn` callback, bundling the existing error-warn channel with a typed `on_decision` channel for layout-pressure events (see [Layout decision contract](#layout-decision-contract)). Production stdout passes an `lsm_error!`-routing warn closure and no decision callback; the TUI live preview adds `.with_decision(callback)` to receive `LayoutDecision` events per render.
+
 ### Layout algorithm
 
 Input: `Vec<LineItem>` (segments interleaved with inline separators, per [Line items and separators](#line-items-and-separators)), terminal width `W`.
@@ -419,6 +431,61 @@ Input: `Vec<LineItem>` (segments interleaved with inline separators, per [Line i
 Priority-0 segments are never dropped or truncated by the reflow loop. If total width still exceeds `W` after all droppable segments are removed, render anyway (terminal wraps or truncates visually; worse UX than hiding, but priority-0 means "user said don't drop this").
 
 The `truncatable` flag is opt-in (default `false`). The built-in `workspace` segment opts in so a long `repo/feature-branch-name` shrinks under width pressure instead of disappearing. Numeric segments (model, cost, percent meters, countdowns) leave it `false`: a half-cut percentage reads as the wrong number, which is worse than no number.
+
+### Layout decision contract
+
+Per [ADR-0026](../adrs/0026-layout-decision-observability.md), the layout engine emits typed events at five decision sites so the TUI live preview can address segments by name when a layout decision fires. Production stdout pays no observable cost: the engine emits through a lazy-construction callback that only runs when an observer is attached.
+
+**Observer channel.** Layout engine entry points take a `&mut LayoutObservers<'_>` rather than a bare `warn` callback:
+
+```rust
+pub struct LayoutObservers<'a> {
+    // private fields — closures captured at the caller's stack frame
+}
+
+impl<'a> LayoutObservers<'a> {
+    pub fn new(warn: &'a mut dyn FnMut(&str)) -> Self;
+    pub fn with_decision(self, on_decision: &'a mut dyn FnMut(&LayoutDecision)) -> Self;
+}
+```
+
+Production callers construct `LayoutObservers::new(warn)`; the TUI preview chains `.with_decision(callback)` to receive decision events. The engine emits via `observers.emit_with(|| LayoutDecision::shrink_applied(id.clone(), from, to, target))` — the closure only runs when an observer is attached, so disabled-path cost stays at one `Option::is_none()` check per decision site even when segment ids are `Cow::Owned`.
+
+**Decision variants.** One per emit site, with pre/post numerics so the consumer phrases the user-facing string:
+
+```rust
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LayoutDecision {
+    #[non_exhaustive]
+    PriorityDrop { id: Cow<'static, str>, priority: u8, terminal_width: u16, overflow: u32, dropped_width: u16 },
+    #[non_exhaustive]
+    ShrinkApplied { id: Cow<'static, str>, from: u16, to: u16, target: u16 },
+    #[non_exhaustive]
+    ReflowApplied { id: Cow<'static, str>, from: u16, to: u16, target: u16 },
+    #[non_exhaustive]
+    WidthBoundUnderMinDrop { id: Cow<'static, str>, rendered_width: u16, min: u16 },
+    #[non_exhaustive]
+    WidthBoundOverMaxTruncate { id: Cow<'static, str>, rendered_width: u16, max: u16 },
+}
+
+impl LayoutDecision {
+    /// Remediation hint for the variant, or `None` if not applicable.
+    /// Returns `&'static str` so the table is testable without touching emit sites.
+    pub fn remediation(&self) -> Option<&'static str>;
+}
+```
+
+Per-variant struct bodies are `#[non_exhaustive]` so the engine can add a field without breaking pattern-matchers (consumers spell `, ..` in struct-variant matches). The enum itself is NOT `#[non_exhaustive]` — adding a sixth variant SHOULD break every consumer's `match` at compile time, by design.
+
+**Emit sites.** The five decision sites in `apply_layout`:
+
+1. `PriorityDrop` — reflow loop drops a segment outright: `try_shrink` returned no compact form, `try_reflow` end-ellipsis was infeasible (e.g. target falls below the ellipsis floor), or the segment is not `truncatable`. Fires whenever the engine removes a segment under width pressure, regardless of which earlier path it tried.
+2. `ShrinkApplied` — `try_shrink` returned a valid compact render.
+3. `ReflowApplied` — `try_reflow` end-ellipsis succeeded.
+4. `WidthBoundUnderMinDrop` — `apply_width_bounds` returned `None` because rendered width fell below `width.min`.
+5. `WidthBoundOverMaxTruncate` — `apply_width_bounds` clipped a too-wide render via `truncate_to`. The emit happens at the `apply_width_bounds` call site, NOT inside `truncate_to` itself — that helper is also reached from `try_reflow`, and a generic emit there would double-fire on reflow paths.
+
+Engine-only `pub(crate)` constructors (`LayoutDecision::shrink_applied(...)` and siblings) `debug_assert!` the implicit width relations: `to <= target < from` for compaction (the `apply_layout` call site enforces `overflow >= 1`), `priority > 0` for drop (mirrors `highest_priority_droppable`'s filter), `rendered_width < min` for under-min drop, `rendered_width > max` for over-max truncate.
 
 ### Multi-line layouts
 
@@ -552,3 +619,4 @@ Fixtures: lists of `(SegmentId, width, priority)` tuples.
 - 2026-04-27: v0.6. Adds `Segment::shrink_to_fit(&self, ctx, rc, target) -> Option<RenderedSegment>`. The reflow loop now calls it before falling back to `truncatable` end-ellipsis or drop, letting structured-tail segments (`git_branch`'s `* ↑2 ↓1`) shed decoration while keeping the signal-bearing prefix under layout pressure — not just under terminal narrowness. Default impl returns `None` (current behavior preserved); `git_branch` overrides to suppress its dirty + ahead/behind markers when `target` is below the full-assembly width.
 - 2026-05-05: v0.7. Separator-as-item refactor. Separators are now positional `LineItem::Separator` entries the builder produces from `[layout_options].separator`, not a `default_separator` field on `SegmentDefaults`. Strikes that field, the `with_default_separator` chainable, and the `apply_layout_separator` helper. The plugin per-render override path (`RenderedSegment::with_separator`) stays and beats the inline separator at that one boundary. Resolves the prior §Open questions "Separator ownership" item: the layout owns separators authoritatively. Drop logic now removes the adjacent separator with the segment (right-edge first, left-edge fallback when the segment was last in the line).
 - 2026-05-08: v0.8. Per [ADR-0024](../adrs/0024-per-boundary-separator-toml.md), `[line].segments` accepts a mixed array of bare strings and inline tables. Bare strings (`"model"`) keep parsing as before — string-only configs are byte-identical at the renderer. Inline tables (`{ type = "separator", character = " | " }`, `{ type = "model", merge = true }`) reach the builder as `config::LineEntry::Item`. The builder now walks `Vec<LineEntry>` instead of `Vec<&str>`: explicit `type = "separator"` entries materialize as `LineItem::Separator(...)` using the entry's `character` override or the global `[layout_options].separator` fallback; segment entries with `merge = true` suppress the boundary at their right edge (both implicit interleave AND any adjacent explicit separator entry). Adjacency invariants in §Line items and separators apply unchanged — leading/trailing/orphan separators are pruned at the renderer's adjacency pass.
+- 2026-05-13: v0.9. Per [ADR-0026](../adrs/0026-layout-decision-observability.md), the layout engine surfaces typed events at five decision sites. SemVer-breaking variant shape change: `LineItem::Segment(Box<dyn Segment>)` → `LineItem::Segment { id: Cow<'static, str>, segment: Box<dyn Segment> }` — migration recipe `LineItem::Segment(seg)` → `LineItem::Segment { id, segment: seg }` at every construction and pattern-match site. New `pub struct LayoutObservers<'a>` bundles `warn` (required) and `on_decision` (optional); engine entry points take `&mut LayoutObservers<'_>` instead of a bare `warn` callback. New `pub enum LayoutDecision` with five variants (`PriorityDrop`, `ShrinkApplied`, `ReflowApplied`, `WidthBoundUnderMinDrop`, `WidthBoundOverMaxTruncate`) — per-variant struct bodies are `#[non_exhaustive]` for field-additive forward-compat, the enum itself is NOT (so a future variant breaks every consumer's `match` at compile time, by design). Engine-only `pub(crate)` constructors `debug_assert!` width-relation invariants. The engine emits via `observers.emit_with(|| LayoutDecision::shrink_applied(id.clone(), from, to, target))` — lazy construction means the production-stdout path pays only one `Option::is_none()` check per decision site, zero allocations even when segment ids are `Cow::Owned`.
