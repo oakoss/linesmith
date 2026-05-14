@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- **core:** `LineItem::Segment` promoted from tuple variant
+  `(Box<dyn Segment>)` to struct variant `{ id: Cow<'static, str>,
+  segment: Box<dyn Segment> }` per
+  [ADR-0026](docs/adrs/0026-layout-decision-observability.md). The new
+  `id` field carries the user's config-side segment name so the layout
+  engine can address `LayoutDecision` events to it.
+  Migration recipe: `LineItem::Segment(seg)` →
+  `LineItem::Segment { id, segment: seg }` at every construction and
+  pattern-match site. The `linesmith-core` crate is pre-1.0 and
+  `LineItem` is `#[non_exhaustive]`, but existing-variant shape
+  changes are still SemVer-breaking — `#[non_exhaustive]` only
+  protects against new-variant additions.
+
 ## [0.1.2] - 2026-05-01
 
 ### Bug Fixes

@@ -114,7 +114,7 @@ fn build_named_segments(
     let segs: Vec<&dyn Segment> = items
         .iter()
         .filter_map(|i| match i {
-            LineItem::Segment(s) => Some(s.as_ref()),
+            LineItem::Segment { segment, .. } => Some(segment.as_ref()),
             _ => None,
         })
         .collect();

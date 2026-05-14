@@ -2,6 +2,7 @@ use super::dispatch::*;
 use super::layout::*;
 use super::plugins::*;
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
@@ -29,7 +30,7 @@ fn built_with_warns(cfg: Option<&config::Config>) -> (Vec<LineItem>, Vec<String>
 fn segment_count(items: &[LineItem]) -> usize {
     items
         .iter()
-        .filter(|i| matches!(i, LineItem::Segment(_)))
+        .filter(|i| matches!(i, LineItem::Segment { .. }))
         .count()
 }
 
@@ -40,7 +41,7 @@ fn nth_segment(items: &[LineItem], n: usize) -> &dyn Segment {
     items
         .iter()
         .filter_map(|i| match i {
-            LineItem::Segment(s) => Some(s.as_ref()),
+            LineItem::Segment { segment, .. } => Some(segment.as_ref()),
             LineItem::Separator(_) => None,
         })
         .nth(n)
@@ -61,7 +62,7 @@ fn nth_segment(items: &[LineItem], n: usize) -> &dyn Segment {
 fn first_inline_separator(items: &[LineItem]) -> Option<&Separator> {
     items.iter().find_map(|i| match i {
         LineItem::Separator(s) => Some(s),
-        LineItem::Segment(_) => None,
+        LineItem::Segment { .. } => None,
     })
 }
 
@@ -259,9 +260,15 @@ fn plugin_runtime_separator_override_replaces_inline_separator() {
         }
     }
     let items: Vec<LineItem> = vec![
-        LineItem::Segment(Box::new(OverrideNoneSeg("a"))),
+        LineItem::Segment {
+            id: Cow::Borrowed("a"),
+            segment: Box::new(OverrideNoneSeg("a")),
+        },
         LineItem::Separator(Separator::powerline()),
-        LineItem::Segment(Box::new(OverrideNoneSeg("b"))),
+        LineItem::Segment {
+            id: Cow::Borrowed("b"),
+            segment: Box::new(OverrideNoneSeg("b")),
+        },
     ];
     let line = crate::layout::render_with_warn(
         &items,
@@ -302,9 +309,15 @@ fn plugin_runtime_literal_override_replaces_inline_powerline() {
         }
     }
     let items: Vec<LineItem> = vec![
-        LineItem::Segment(Box::new(OverrideLiteralSeg("a"))),
+        LineItem::Segment {
+            id: Cow::Borrowed("a"),
+            segment: Box::new(OverrideLiteralSeg("a")),
+        },
         LineItem::Separator(Separator::powerline()),
-        LineItem::Segment(Box::new(OverrideLiteralSeg("b"))),
+        LineItem::Segment {
+            id: Cow::Borrowed("b"),
+            segment: Box::new(OverrideLiteralSeg("b")),
+        },
     ];
     let line = crate::layout::render_with_warn(
         &items,
@@ -341,7 +354,10 @@ fn plugin_runtime_override_on_last_segment_is_silently_discarded() {
         }
     }
     // Single-segment line — no inline-separator slot to the right.
-    let items: Vec<LineItem> = vec![LineItem::Segment(Box::new(OverrideNoneSeg("a")))];
+    let items: Vec<LineItem> = vec![LineItem::Segment {
+        id: Cow::Borrowed("a"),
+        segment: Box::new(OverrideNoneSeg("a")),
+    }];
     let line = crate::layout::render_with_warn(
         &items,
         &stub_ctx(),
@@ -406,9 +422,15 @@ fn plugin_compact_form_separator_override_wins_over_pre_shrink_inline() {
         }
     }
     let items: Vec<LineItem> = vec![
-        LineItem::Segment(Box::new(ChevronUnlessCompactSeg)),
+        LineItem::Segment {
+            id: Cow::Borrowed("chevron"),
+            segment: Box::new(ChevronUnlessCompactSeg),
+        },
         LineItem::Separator(Separator::powerline()),
-        LineItem::Segment(Box::new(AnchorSeg)),
+        LineItem::Segment {
+            id: Cow::Borrowed("anchor"),
+            segment: Box::new(AnchorSeg),
+        },
     ];
     // Full assembly: 20 + 3 + 1 = 24 cells. Budget 11 forces shrink.
     // Compact: 7 cells; with the override propagated, the
@@ -453,10 +475,16 @@ fn user_constructed_adjacent_separators_drop_second() {
         }
     }
     let items: Vec<LineItem> = vec![
-        LineItem::Segment(Box::new(RawSeg("a"))),
+        LineItem::Segment {
+            id: Cow::Borrowed("a"),
+            segment: Box::new(RawSeg("a")),
+        },
         LineItem::Separator(Separator::Literal(std::borrow::Cow::Borrowed(" | "))),
         LineItem::Separator(Separator::Literal(std::borrow::Cow::Borrowed(" - "))),
-        LineItem::Segment(Box::new(RawSeg("b"))),
+        LineItem::Segment {
+            id: Cow::Borrowed("b"),
+            segment: Box::new(RawSeg("b")),
+        },
     ];
     let line = crate::layout::render_with_warn(
         &items,
@@ -1019,6 +1047,19 @@ fn plugin_id_resolves_through_build_segments() {
         .expect("plugin render ok")
         .expect("visible");
     assert_eq!(plugin_render.text(), "from-plugin");
+    // Plugin ids must land as `Cow::Owned` (ADR-0026) — `resolve_segment_id`
+    // short-circuits to `Cow::Borrowed` only for built-ins.
+    let plugin_item = built
+        .iter()
+        .find_map(|i| match i {
+            LineItem::Segment { id, .. } if id.as_ref() == "my_plugin" => Some(id.clone()),
+            _ => None,
+        })
+        .expect("plugin slot in built items");
+    assert!(
+        matches!(plugin_item, Cow::Owned(_)),
+        "plugin id must be Cow::Owned, got {plugin_item:?}",
+    );
 }
 
 #[test]
@@ -1048,7 +1089,7 @@ fn build_segments_falls_back_to_first_line_for_multi_line_configs() {
     let actual: Vec<u8> = segs
         .iter()
         .filter_map(|i| match i {
-            LineItem::Segment(s) => Some(s.defaults().priority),
+            LineItem::Segment { segment, .. } => Some(segment.defaults().priority),
             LineItem::Separator(_) => None,
         })
         .collect();
@@ -1278,7 +1319,7 @@ fn line_segment_priorities(items: &[LineItem]) -> Vec<u8> {
     items
         .iter()
         .filter_map(|i| match i {
-            LineItem::Segment(s) => Some(s.defaults().priority),
+            LineItem::Segment { segment, .. } => Some(segment.defaults().priority),
             LineItem::Separator(_) => None,
         })
         .collect()
@@ -1846,7 +1887,7 @@ fn separators_in_order(items: &[LineItem]) -> Vec<&Separator> {
         .iter()
         .filter_map(|i| match i {
             LineItem::Separator(s) => Some(s),
-            LineItem::Segment(_) => None,
+            LineItem::Segment { .. } => None,
         })
         .collect()
 }
@@ -2206,6 +2247,98 @@ fn malformed_segment_entry_with_wrong_value_type_warns_at_build_time() {
         warns.iter().any(|w| w.contains("missing `type`")),
         "missing-type warn must fire on the malformed entry: {warns:?}",
     );
+}
+
+#[test]
+fn resolve_segment_id_returns_borrowed_for_every_built_in() {
+    // Pins the zero-alloc-per-emit guarantee from ADR-0026. A regression
+    // that always returns `Cow::Owned` (e.g. flipping the map_or_else
+    // arms or using `Cow::from(id)` on a `&str`) would silently break
+    // the perf contract.
+    for built_in in BUILT_IN_SEGMENT_IDS {
+        let resolved = resolve_segment_id(built_in);
+        assert_eq!(
+            resolved.as_ref(),
+            *built_in,
+            "resolved id content must round-trip — catches a regression that returns a fixed borrowed constant",
+        );
+        assert!(
+            matches!(resolved, Cow::Borrowed(_)),
+            "built-in id {built_in:?} must resolve to Cow::Borrowed, got {resolved:?}",
+        );
+    }
+}
+
+#[test]
+fn resolve_segment_id_returns_owned_for_non_built_in_ids() {
+    for non_built_in in &["my_plugin", "totally-not-a-segment", ""] {
+        let resolved = resolve_segment_id(non_built_in);
+        assert!(
+            matches!(resolved, Cow::Owned(_)),
+            "non-built-in id {non_built_in:?} must resolve to Cow::Owned, got {resolved:?}",
+        );
+    }
+}
+
+#[test]
+fn build_default_segments_emits_borrowed_ids_in_canonical_order() {
+    // `build_default_segments` bypasses `resolve_segment_id` and
+    // constructs `Cow::Borrowed(*id)` directly per ADR-0026's
+    // zero-alloc shortcut for the default no-config path. The
+    // `debug_assert!` at the call site catches DEFAULT/BUILT_IN
+    // drift in debug builds; this test pins the release-mode
+    // contract that each emitted id is Cow::Borrowed.
+    let items = build_default_segments();
+    let ids: Vec<&str> = items
+        .iter()
+        .filter_map(|i| match i {
+            LineItem::Segment { id, .. } => Some(id.as_ref()),
+            LineItem::Separator(_) => None,
+        })
+        .collect();
+    assert_eq!(ids, DEFAULT_SEGMENT_IDS.to_vec());
+    for item in &items {
+        if let LineItem::Segment { id, .. } = item {
+            assert!(
+                matches!(id, Cow::Borrowed(_)),
+                "default-path id {id:?} must be Cow::Borrowed",
+            );
+        }
+    }
+}
+
+#[test]
+fn build_segments_records_config_id_on_each_segment() {
+    // Pins ADR-0026's addressing contract end-to-end: every segment
+    // the builder emits carries the user's config-side id, in
+    // declaration order. A regression that hard-codes an id or swaps
+    // the resolver chain trips here. Built-in ids stay `Cow::Borrowed`
+    // (matching the zero-alloc-per-emit cost model).
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model", "git_branch", "workspace"]
+        "#,
+    )
+    .expect("parse");
+    let (items, warns) = built_with_warns(Some(&cfg));
+    assert!(warns.is_empty(), "expected no warnings, got {warns:?}");
+    let ids: Vec<&str> = items
+        .iter()
+        .filter_map(|i| match i {
+            LineItem::Segment { id, .. } => Some(id.as_ref()),
+            LineItem::Separator(_) => None,
+        })
+        .collect();
+    assert_eq!(ids, vec!["model", "git_branch", "workspace"]);
+    for item in &items {
+        if let LineItem::Segment { id, .. } = item {
+            assert!(
+                matches!(id, Cow::Borrowed(_)),
+                "built-in id {id:?} must be Cow::Borrowed on the production-config path",
+            );
+        }
+    }
 }
 
 #[test]

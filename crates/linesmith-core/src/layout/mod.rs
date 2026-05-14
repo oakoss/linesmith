@@ -169,6 +169,8 @@ enum LayoutItem<'a> {
 }
 
 struct SegmentEntry<'a> {
+    /// User-facing config name threaded through for `LayoutDecision` events (ADR-0026).
+    id: &'a std::borrow::Cow<'static, str>,
     rendered: RenderedSegment,
     defaults: SegmentDefaults,
     segment: &'a dyn Segment,
@@ -196,9 +198,9 @@ fn collect_items_with<'a>(
     let mut out: Vec<LayoutItem<'a>> = Vec::with_capacity(items.len());
     for item in items {
         match item {
-            LineItem::Segment(seg) => {
-                let defaults = seg.defaults();
-                let rendered = match seg.render(ctx, rc) {
+            LineItem::Segment { id, segment } => {
+                let defaults = segment.defaults();
+                let rendered = match segment.render(ctx, rc) {
                     Ok(Some(r)) => r,
                     Ok(None) => {
                         pop_trailing_separator(&mut out);
@@ -215,9 +217,10 @@ fn collect_items_with<'a>(
                     continue;
                 };
                 out.push(LayoutItem::Segment(SegmentEntry {
+                    id,
                     rendered,
                     defaults,
-                    segment: seg.as_ref(),
+                    segment: segment.as_ref(),
                 }));
             }
             LineItem::Separator(sep) => {
@@ -460,6 +463,7 @@ fn try_reflow<'a>(item: &SegmentEntry<'a>, overflow: u32) -> Option<SegmentEntry
         return None;
     }
     Some(SegmentEntry {
+        id: item.id,
         rendered: truncated,
         defaults: item.defaults,
         segment: item.segment,

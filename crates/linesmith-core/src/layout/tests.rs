@@ -21,6 +21,11 @@ fn noop_segment() -> &'static dyn Segment {
     &NOOP
 }
 
+/// Stable id shared by layout test fixtures. Tests asserting distinct ids
+/// per slot must define their own statics; copy-pasting `TEST_SEG_ID`
+/// across two slots would compare `"test"` to `"test"` and silently pass.
+static TEST_SEG_ID: Cow<'static, str> = Cow::Borrowed("test");
+
 fn empty_ctx() -> DataContext {
     DataContext::new(StatusContext {
         tool: Tool::ClaudeCode,
@@ -52,6 +57,7 @@ fn empty_rc() -> RenderContext {
 /// builder does.
 fn item(text: &str, priority: u8) -> LayoutItem<'static> {
     LayoutItem::Segment(SegmentEntry {
+        id: &TEST_SEG_ID,
         rendered: RenderedSegment::new(text),
         defaults: SegmentDefaults::with_priority(priority),
         segment: noop_segment(),
@@ -102,12 +108,18 @@ fn interleaved(
 
 /// Wrap `segments` as a [`LineItem`] sequence with `sep` interleaved
 /// between adjacent segments. For tests that drive the public render
-/// entry points (`render_with_warn`, `render_to_runs`).
+/// entry points (`render_with_warn`, `render_to_runs`). Synthesizes
+/// stable test ids (`"seg0"`, `"seg1"`, ...) so the `LineItem`
+/// addressing contract from ADR-0026 stays exercised; tests that need
+/// a specific id should build the `LineItem` literal directly.
 fn line_items_with(segments: Vec<Box<dyn Segment>>, sep: Separator) -> Vec<LineItem> {
     let n = segments.len();
     let mut out = Vec::with_capacity(n.saturating_mul(2));
-    for (i, seg) in segments.into_iter().enumerate() {
-        out.push(LineItem::Segment(seg));
+    for (i, segment) in segments.into_iter().enumerate() {
+        out.push(LineItem::Segment {
+            id: std::borrow::Cow::Owned(format!("seg{i}")),
+            segment,
+        });
         if i + 1 < n {
             out.push(LineItem::Separator(sep.clone()));
         }
@@ -145,6 +157,7 @@ fn render_items_wraps_each_styled_segment_under_palette16() {
         item("a", 10),
         space(),
         LayoutItem::Segment(SegmentEntry {
+            id: &TEST_SEG_ID,
             rendered: RenderedSegment::new("b").with_role(Role::Warning),
             defaults: SegmentDefaults::with_priority(10),
             segment: noop_segment(),
@@ -390,6 +403,7 @@ fn total_width_returns_u32_beyond_u16_range() {
     // sum = 3 * u16::MAX + 2. Must not wrap u32.
     fn wide(text: String) -> LayoutItem<'static> {
         LayoutItem::Segment(SegmentEntry {
+            id: &TEST_SEG_ID,
             rendered: RenderedSegment::new(text),
             defaults: SegmentDefaults::with_priority(10),
             segment: noop_segment(),
@@ -518,6 +532,7 @@ fn render_with_warn_constructs_render_context_from_terminal_width_arg() {
 
 fn truncatable_item(text: &str, priority: u8) -> LayoutItem<'static> {
     LayoutItem::Segment(SegmentEntry {
+        id: &TEST_SEG_ID,
         rendered: RenderedSegment::new(text),
         defaults: SegmentDefaults::with_priority(priority).with_truncatable(true),
         segment: noop_segment(),
@@ -570,6 +585,7 @@ fn reflow_drops_when_truncation_would_fall_below_floor() {
 
 fn truncatable_with_bounds(text: &str, priority: u8, bounds: WidthBounds) -> LayoutItem<'static> {
     LayoutItem::Segment(SegmentEntry {
+        id: &TEST_SEG_ID,
         rendered: RenderedSegment::new(text),
         defaults: SegmentDefaults::with_priority(priority)
             .with_truncatable(true)
@@ -643,6 +659,7 @@ fn reflow_does_not_touch_priority_zero_even_when_truncatable() {
     // selects it (the existing droppable filter guards this).
     let items = vec![
         LayoutItem::Segment(SegmentEntry {
+            id: &TEST_SEG_ID,
             rendered: RenderedSegment::new("untouchable-long-name"),
             defaults: SegmentDefaults::with_priority(0).with_truncatable(true),
             segment: noop_segment(),
@@ -1389,4 +1406,33 @@ impl Segment for DroppableStub {
     fn defaults(&self) -> SegmentDefaults {
         SegmentDefaults::with_priority(200)
     }
+}
+
+#[test]
+fn try_reflow_preserves_segment_id_reference() {
+    // ADR-0026 contract: try_reflow rebuilds the SegmentEntry but
+    // must thread the original id reference through, otherwise the
+    // emit sites in apply_layout (lsm-b00q) would lose the user's
+    // config name across reflow. Pointer-equality pins that the
+    // borrow chain survives — a regression that re-borrows from a
+    // different Cow (or worse, clones it) would fail here.
+    static ALT_ID: Cow<'static, str> = Cow::Borrowed("alt");
+    let entry = SegmentEntry {
+        id: &ALT_ID,
+        rendered: RenderedSegment::new("workspace-with-extra-content"),
+        defaults: SegmentDefaults::with_priority(100).with_truncatable(true),
+        segment: noop_segment(),
+    };
+    let original_id_ptr = std::ptr::from_ref(entry.id);
+    let reflowed =
+        super::try_reflow(&entry, 10).expect("reflow must succeed at target 18 / floor 2");
+    assert!(
+        std::ptr::eq(std::ptr::from_ref(reflowed.id), original_id_ptr),
+        "try_reflow must preserve the id reference, not clone it",
+    );
+    assert_eq!(
+        reflowed.id.as_ref(),
+        "alt",
+        "id content must survive — defense-in-depth alongside ptr::eq",
+    );
 }

@@ -508,6 +508,10 @@ pub const DEFAULT_SEGMENT_IDS: &[&str] = &[
 /// plugins whose `const ID` shadows a built-in. Add new built-ins
 /// here AND to [`built_in_by_id`].
 ///
+/// Also used by `resolve_segment_id` (O(n) per segment at build time,
+/// not render time) to pin built-in ids to `Cow::Borrowed` per ADR-0026.
+/// If the list grows past ~50 entries, swap to a `phf::Set`.
+///
 /// [`PluginRegistry`]: linesmith_plugin::PluginRegistry
 pub const BUILT_IN_SEGMENT_IDS: &[&str] = &[
     "model",
@@ -539,6 +543,13 @@ pub const BUILT_IN_SEGMENT_IDS: &[&str] = &[
 /// from it (`format`, `invert`, `compact`, `use_days`, `icon`,
 /// `label`, `stale_marker`, `progress_width`). Other built-ins
 /// currently ignore `extras`.
+///
+/// Every arm in this `match` must have a corresponding entry in
+/// [`BUILT_IN_SEGMENT_IDS`] and vice versa. The forward direction is
+/// covered by `built_in_by_id_resolves_every_id_in_built_in_segment_ids`;
+/// a match arm missing from the const would silently let a plugin shadow
+/// the built-in and degrade its `Cow::Borrowed` short-circuit to
+/// `Cow::Owned`. Add new built-ins to both lists together.
 #[must_use]
 pub fn built_in_by_id(
     id: &str,
@@ -700,19 +711,45 @@ fn merge_user_override(inner: &Style, override_style: &Style) -> Style {
 /// rightmost segment, or a segment whose right-neighbor separator
 /// has already been pruned, has no boundary to apply to and is
 /// silently discarded.
+///
+/// Per-variant `#[non_exhaustive]` is omitted from `LineItem::Segment`
+/// because consumers pattern-match `{ id, segment }` directly and the
+/// consumer set is narrow (builder + tests + benches). Contrast
+/// `LayoutDecision`'s per-variant `#[non_exhaustive]` (ADR-0026 §C):
+/// those events are observability surfaces with an unknown consumer set,
+/// so field-additive forward-compat justifies the `, ..` pattern cost.
 #[non_exhaustive]
 pub enum LineItem {
-    Segment(Box<dyn Segment>),
+    /// A segment paired with the user-facing config id that names it
+    /// (per ADR-0026). Sourced from `LineEntry::segment_id()` (the TOML key).
+    ///
+    /// `id` is a label, not an identity: the layout engine threads it
+    /// through `LayoutDecision` events but does not verify it against the
+    /// inner segment's type. External constructors must keep the two in sync.
+    ///
+    /// `Cow::Borrowed` vs `Cow::Owned` is a per-emit allocation trade-off,
+    /// not a correctness invariant. Built-in ids land as `Cow::Borrowed`;
+    /// plugin and user-config ids land as `Cow::Owned`. External
+    /// constructors that don't preserve this partition are correct but pay
+    /// one extra allocation per built-in emit.
+    Segment {
+        id: std::borrow::Cow<'static, str>,
+        segment: Box<dyn Segment>,
+    },
     Separator(Separator),
 }
 
 impl std::fmt::Debug for LineItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            // The trait has no `Debug` bound, so surface the layout
-            // intent (priority, width hints) — that's what's load-
-            // bearing in panic dumps and `dbg!` output anyway.
-            Self::Segment(seg) => f.debug_tuple("Segment").field(&seg.defaults()).finish(),
+            // The trait has no `Debug` bound, so surface the id +
+            // layout intent (priority, width hints) — that's what's
+            // load-bearing in panic dumps and `dbg!` output anyway.
+            Self::Segment { id, segment } => f
+                .debug_struct("Segment")
+                .field("id", id)
+                .field("defaults", &segment.defaults())
+                .finish(),
             Self::Separator(sep) => f.debug_tuple("Separator").field(sep).finish(),
         }
     }
@@ -837,22 +874,30 @@ mod layout_type_tests {
         // The hand-written `Debug` impl on `LineItem` exists because
         // `Box<dyn Segment>` blocks `derive(Debug)`. Pin that both
         // variants format without panicking and that the variant
-        // tag is visible in the output (so panic backtraces and
-        // `dbg!` calls actually identify the slot).
+        // tag + id are visible in the output so panic backtraces
+        // and `dbg!` calls identify the slot.
         struct StubSeg;
         impl Segment for StubSeg {
             fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
                 Ok(None)
             }
         }
-        let seg = LineItem::Segment(Box::new(StubSeg));
+        let seg = LineItem::Segment {
+            id: std::borrow::Cow::Borrowed("stub"),
+            segment: Box::new(StubSeg),
+        };
         let sep = LineItem::Separator(Separator::powerline());
         let seg_dbg = format!("{seg:?}");
         let sep_dbg = format!("{sep:?}");
-        assert!(seg_dbg.starts_with("Segment("), "got {seg_dbg:?}");
+        assert!(seg_dbg.starts_with("Segment {"), "got {seg_dbg:?}");
         assert!(sep_dbg.starts_with("Separator("), "got {sep_dbg:?}");
-        // The Segment-variant body surfaces the segment's defaults
-        // so panic dumps carry the priority/width context.
+        // The Segment-variant body surfaces id + defaults so panic
+        // dumps carry the slot name + priority/width context.
+        // Field-named `id:` + `defaults:` defend against a regression
+        // that renames either field while preserving the body content.
+        assert!(seg_dbg.contains("id:"), "got {seg_dbg:?}");
+        assert!(seg_dbg.contains("defaults:"), "got {seg_dbg:?}");
+        assert!(seg_dbg.contains("stub"), "got {seg_dbg:?}");
         assert!(seg_dbg.contains("priority"), "got {seg_dbg:?}");
     }
 

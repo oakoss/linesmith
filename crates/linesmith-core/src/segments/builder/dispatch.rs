@@ -6,7 +6,9 @@ use rhai::{Dynamic, Engine, Map};
 
 use linesmith_plugin::{CompiledPlugin, PluginRegistry};
 
-use super::super::{built_in_by_id, LineItem, Segment, Separator, DEFAULT_SEGMENT_IDS};
+use super::super::{
+    built_in_by_id, LineItem, Segment, Separator, BUILT_IN_SEGMENT_IDS, DEFAULT_SEGMENT_IDS,
+};
 use super::layout::{resolve_layout_separator, single_line_entries, validated_numbered_lines};
 use super::plugins::{apply_override, bundle_plugins, toml_table_to_dynamic};
 use crate::config;
@@ -16,22 +18,32 @@ use crate::plugins::RhaiSegment;
 /// `Separator::Space` between each pair, no overrides applied.
 #[must_use]
 pub fn build_default_segments() -> Vec<LineItem> {
-    let segs: Vec<Box<dyn Segment>> = DEFAULT_SEGMENT_IDS
+    debug_assert!(
+        DEFAULT_SEGMENT_IDS
+            .iter()
+            .all(|id| BUILT_IN_SEGMENT_IDS.contains(id)),
+        "DEFAULT_SEGMENT_IDS must be a subset of BUILT_IN_SEGMENT_IDS so the \
+         `Cow::Borrowed(*id)` shortcut here matches what resolve_segment_id would emit"
+    );
+    let segs: Vec<(Cow<'static, str>, Box<dyn Segment>)> = DEFAULT_SEGMENT_IDS
         .iter()
-        .filter_map(|id| built_in_by_id(id, None, &mut |_| {}))
+        .filter_map(|id| built_in_by_id(id, None, &mut |_| {}).map(|seg| (Cow::Borrowed(*id), seg)))
         .collect();
     interleave_separators(segs, &Separator::Space)
 }
 
 /// Walk a built segment list and interleave `sep` between adjacent
-/// segments, producing the [`LineItem`] sequence the renderer
-/// consumes. No leading or trailing separator.
-fn interleave_separators(segs: Vec<Box<dyn Segment>>, sep: &Separator) -> Vec<LineItem> {
+/// segments, producing the [`LineItem`] sequence the renderer consumes.
+/// No leading or trailing separator.
+fn interleave_separators(
+    segs: Vec<(Cow<'static, str>, Box<dyn Segment>)>,
+    sep: &Separator,
+) -> Vec<LineItem> {
     let n = segs.len();
     // n=0 saturates to 0; n>=1 gives 2n-1 slots (n segments + n-1 separators).
     let mut items = Vec::with_capacity(n.saturating_mul(2).saturating_sub(1));
-    for (i, seg) in segs.into_iter().enumerate() {
-        items.push(LineItem::Segment(seg));
+    for (i, (id, segment)) in segs.into_iter().enumerate() {
+        items.push(LineItem::Segment { id, segment });
         if i + 1 < n {
             items.push(LineItem::Separator(sep.clone()));
         }
@@ -277,7 +289,7 @@ fn build_one_line(
                     continue;
                 }
                 match items.last() {
-                    Some(LineItem::Segment(_)) => {} // proceed below
+                    Some(LineItem::Segment { .. }) => {} // proceed below
                     Some(LineItem::Separator(_)) => {
                         warn(
                             "[line].segments has consecutive separator entries; keeping the first",
@@ -340,13 +352,29 @@ fn build_one_line(
                 // the global default separator. When the previous
                 // item is already a Separator (explicit), don't
                 // double-up.
-                if matches!(items.last(), Some(LineItem::Segment(_))) && !merge_pending {
+                if matches!(items.last(), Some(LineItem::Segment { .. })) && !merge_pending {
                     items.push(LineItem::Separator(layout_separator.clone()));
                 }
-                items.push(LineItem::Segment(seg));
+                items.push(LineItem::Segment {
+                    id: resolve_segment_id(id),
+                    segment: seg,
+                });
                 merge_pending = entry.merge();
             }
         }
     }
     items
+}
+
+/// Resolve a config-string id to `Cow<'static, str>` (per ADR-0026).
+/// Built-ins match [`BUILT_IN_SEGMENT_IDS`] and return `Cow::Borrowed`;
+/// plugin and user-config ids fall through to `Cow::Owned`.
+pub(super) fn resolve_segment_id(id: &str) -> Cow<'static, str> {
+    BUILT_IN_SEGMENT_IDS
+        .iter()
+        .find(|&&built_in| built_in == id)
+        .map_or_else(
+            || Cow::Owned(id.to_string()),
+            |&built_in| Cow::Borrowed(built_in),
+        )
 }
