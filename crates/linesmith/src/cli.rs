@@ -59,9 +59,15 @@ pub enum Action {
     /// Boot the interactive `linesmith config` TUI editor (per
     /// ADR-0015 / ADR-0016). Loads the config at `config` if set,
     /// else the resolved default path; if no file exists, starts
-    /// against an in-memory `Config::default()`.
+    /// against an in-memory `Config::default()`. `color_override`
+    /// carries the top-level `--no-color` / `--force-color` flag so
+    /// the TUI's preview honors the same color-resolution chain the
+    /// daily render path uses. `Run` and `Config` are the only
+    /// variants that consume `color_override`; the parse-time gate
+    /// in [`parse`] rejects it on every other subcommand.
     Config {
         config: Option<PathBuf>,
+        color_override: Option<ColorOverride>,
     },
     /// Wire linesmith into Claude Code's `~/.claude/settings.json`
     /// statusLine. Atomic write with a `.bak` backup of any prior
@@ -184,11 +190,17 @@ where
         }
     }
     let color_override_snapshot = args.color_override;
-    let action =
-        match dispatch_subcommand(&positional, force, plain, no_doctor, args.config.clone())? {
-            Some(action) => action,
-            None => Action::Run(args),
-        };
+    let action = match dispatch_subcommand(
+        &positional,
+        force,
+        plain,
+        no_doctor,
+        args.config.clone(),
+        color_override_snapshot,
+    )? {
+        Some(action) => action,
+        None => Action::Run(args),
+    };
     // `--force` only has meaning under `presets apply`; accepting it
     // on any other action would encourage muscle-memory misuse.
     if force && !matches!(action, Action::PresetsApply { .. }) {
@@ -206,14 +218,16 @@ where
     if no_doctor && !matches!(action, Action::Init { .. }) {
         return Err(lexopt::Error::UnexpectedOption("--no-doctor".to_string()));
     }
-    // Doctor renders without ANSI today (glyph alphabet + separator
-    // are the only mode axes), so `--no-color` / `--force-color` would
-    // be silent no-ops. Reject so a user piping doctor output through
-    // a colorized log capture doesn't think they suppressed something
-    // that was never there. Once doctor grows colored output, thread
-    // the override through Action::Doctor at the same time.
-    if matches!(action, Action::Doctor { .. }) {
-        if let Some(override_) = color_override_snapshot {
+    // `--no-color` / `--force-color` only have meaning on the
+    // subcommands that emit ANSI: the daily render path (`Run`) and
+    // the TUI editor (`Config`). On the rest — Doctor renders glyph-
+    // only; Init/Install/Uninstall write files; ThemesList/PresetsList
+    // are plain-text catalogs — accepting the flag would be a silent
+    // no-op a user piping through a colorized log capture might
+    // mistake for a successful suppression. Whitelist the variants
+    // that consume the override; everything else rejects.
+    if let Some(override_) = color_override_snapshot {
+        if !matches!(action, Action::Run(_) | Action::Config { .. }) {
             let flag = match override_ {
                 ColorOverride::Never => "--no-color",
                 ColorOverride::Always => "--force-color",
@@ -232,6 +246,7 @@ fn dispatch_subcommand(
     plain: bool,
     no_doctor: bool,
     config: Option<PathBuf>,
+    color_override: Option<ColorOverride>,
 ) -> Result<Option<Action>, lexopt::Error> {
     if positional.is_empty() {
         return Ok(None);
@@ -263,7 +278,10 @@ fn dispatch_subcommand(
                     value: positional[1].to_string_lossy().to_string().into(),
                 });
             }
-            Ok(Some(Action::Config { config }))
+            Ok(Some(Action::Config {
+                config,
+                color_override,
+            }))
         }
         "install" => {
             if positional.len() > 1 {
@@ -463,7 +481,9 @@ mod tests {
     fn conflicting_color_flags_last_wins() {
         // lexopt assigns in order; last flag on the command line wins.
         // Users don't get an error when both flags appear — they get
-        // the most recently specified intent.
+        // the most recently specified intent. Pin both Action::Run
+        // (CliArgs.color_override) and Action::Config (variant field)
+        // since they capture the override at different sites.
         let got = parse_args(&["--no-color", "--force-color"]).expect("ok");
         match got {
             Action::Run(args) => assert_eq!(args.color_override, Some(ColorOverride::Always)),
@@ -474,6 +494,35 @@ mod tests {
             Action::Run(args) => assert_eq!(args.color_override, Some(ColorOverride::Never)),
             _ => panic!("expected Run action"),
         }
+        let got = parse_args(&["--no-color", "--force-color", "config"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::Config {
+                config: None,
+                color_override: Some(ColorOverride::Always),
+            }
+        );
+        let got = parse_args(&["--force-color", "--no-color", "config"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::Config {
+                config: None,
+                color_override: Some(ColorOverride::Never),
+            }
+        );
+        // Interleaved ordering: flag → subcommand → flag is the most
+        // common shell-history shape. lexopt accepts positionals and
+        // flags in any order, but a parser that switched to two-pass
+        // parsing (flags first, positionals second) could regress
+        // this. Pin both flags-before vs flags-around explicitly.
+        let got = parse_args(&["--no-color", "config", "--force-color"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::Config {
+                config: None,
+                color_override: Some(ColorOverride::Always),
+            }
+        );
     }
 
     #[test]
@@ -760,22 +809,51 @@ mod tests {
     }
 
     #[test]
-    fn color_overrides_rejected_on_doctor() {
-        // Doctor renders without ANSI today; honoring --no-color /
-        // --force-color silently would let a user think they
-        // suppressed something that was never there. Reject at parse
-        // time. When doctor gains color, thread the override into
-        // Action::Doctor and remove this rejection.
-        for (flag, expected) in [
-            ("--no-color", "--no-color"),
-            ("--force-color", "--force-color"),
-        ] {
-            let err = parse_args(&[flag, "doctor"]).unwrap_err();
-            assert!(
-                matches!(err, lexopt::Error::UnexpectedOption(ref s) if s == expected),
-                "flag {flag} should be rejected on doctor, got {err:?}"
-            );
+    fn color_overrides_rejected_on_subcommands_without_color_output() {
+        // Only `Run` (daily render path) and `Config` (TUI preview)
+        // emit ANSI; the rest would silently no-op a color flag.
+        // Reject so a user piping output through a colorized log
+        // capture doesn't think they suppressed something that was
+        // never there.
+        let cases: &[&[&str]] = &[
+            &["doctor"],
+            &["init"],
+            &["install"],
+            &["uninstall"],
+            &["themes", "list"],
+            &["presets", "list"],
+            &["presets", "apply", "minimal"],
+        ];
+        for argv in cases {
+            for flag in ["--no-color", "--force-color"] {
+                let mut full = vec![flag];
+                full.extend_from_slice(argv);
+                let err = parse_args(&full).unwrap_err();
+                assert!(
+                    matches!(err, lexopt::Error::UnexpectedOption(ref s) if s == flag),
+                    "flag {flag} should be rejected on {argv:?}, got {err:?}"
+                );
+            }
         }
+        // Spot-check: the gate fires regardless of where the flag
+        // sits relative to the subcommand. The 14 cases above all
+        // pass the flag before; pin one after to prove
+        // ordering-invariance.
+        let err = parse_args(&["doctor", "--no-color"]).unwrap_err();
+        assert!(
+            matches!(err, lexopt::Error::UnexpectedOption(ref s) if s == "--no-color"),
+            "flag should reject after subcommand too, got {err:?}"
+        );
+        // Spot-check: `presets apply` without a NAME must fail at
+        // dispatch (MissingValue) before the color-rejection gate
+        // fires. A future refactor that flips the ordering would
+        // surface "--no-color" instead of the real "missing NAME"
+        // problem; this pins the precedence.
+        let err = parse_args(&["--no-color", "presets", "apply"]).unwrap_err();
+        assert!(
+            matches!(err, lexopt::Error::MissingValue { .. }),
+            "missing-name error must win over color-rejection, got {err:?}"
+        );
     }
 
     #[test]
@@ -820,7 +898,10 @@ mod tests {
     fn config_subcommand_parses_with_no_flags() {
         assert_eq!(
             parse_args(&["config"]).expect("ok"),
-            Action::Config { config: None }
+            Action::Config {
+                config: None,
+                color_override: None,
+            }
         );
     }
 
@@ -834,6 +915,7 @@ mod tests {
             got,
             Action::Config {
                 config: Some(PathBuf::from("/tmp/alt.toml")),
+                color_override: None,
             }
         );
         let got = parse_args(&["config", "--config", "/tmp/alt.toml"]).expect("ok");
@@ -841,6 +923,59 @@ mod tests {
             got,
             Action::Config {
                 config: Some(PathBuf::from("/tmp/alt.toml")),
+                color_override: None,
+            }
+        );
+    }
+
+    #[test]
+    fn config_subcommand_threads_no_color_flag_into_action() {
+        let got = parse_args(&["--no-color", "config"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::Config {
+                config: None,
+                color_override: Some(ColorOverride::Never),
+            }
+        );
+        let got = parse_args(&["config", "--no-color"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::Config {
+                config: None,
+                color_override: Some(ColorOverride::Never),
+            }
+        );
+    }
+
+    #[test]
+    fn config_subcommand_threads_force_color_flag_into_action() {
+        let got = parse_args(&["--force-color", "config"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::Config {
+                config: None,
+                color_override: Some(ColorOverride::Always),
+            }
+        );
+        let got = parse_args(&["config", "--force-color"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::Config {
+                config: None,
+                color_override: Some(ColorOverride::Always),
+            }
+        );
+    }
+
+    #[test]
+    fn config_subcommand_threads_color_flag_and_config_flag_together() {
+        let got = parse_args(&["--no-color", "--config", "/tmp/alt.toml", "config"]).expect("ok");
+        assert_eq!(
+            got,
+            Action::Config {
+                config: Some(PathBuf::from("/tmp/alt.toml")),
+                color_override: Some(ColorOverride::Never),
             }
         );
     }

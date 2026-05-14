@@ -57,6 +57,7 @@ use app::{update, Event, Model};
 pub(super) fn run(
     config_path: Option<&Path>,
     install_explicit_config: Option<&Path>,
+    color_override: Option<crate::cli::ColorOverride>,
     stderr: &mut dyn Write,
     env: &crate::driver::CliEnv,
 ) -> u8 {
@@ -76,21 +77,22 @@ pub(super) fn run(
         let _ = writeln!(stderr, "linesmith config: {warning}");
     }
 
-    // Resolve theme + color capability so the preview tracks the
-    // user's configured rendering. Theme registry is built from
-    // XDG-derived dirs; capability honors `[layout_options].color`
-    // and falls through to `Capability::detect` (which checks
-    // `NO_COLOR` and probes the terminal). `FORCE_COLOR` and the
-    // production driver's CLI flags aren't honored here — full
-    // parity with the driver's resolve chain is a separate task.
-    let xdg = crate::data_context::xdg::XdgEnv::from_process_env();
+    // Resolve theme + color capability through the same hermetic
+    // chain the production driver uses, so the preview tracks the
+    // user's configured rendering without reading process env
+    // directly. `CliEnv` carries the snapshotted XDG dirs, `NO_COLOR`,
+    // `FORCE_COLOR`, and the test-only `color_capability` escape
+    // hatch; `color_override` threads top-level `--no-color` /
+    // `--force-color` flags from `Action::Config`.
+    let xdg = crate::driver::cli_env_to_xdg(env);
     let user_themes_dir = crate::runtime::themes::user_themes_dir(&xdg);
     let theme_registry =
         crate::runtime::themes::build_theme_registry(user_themes_dir.as_deref(), |msg| {
             let _ = writeln!(stderr, "linesmith config: {msg}");
         });
     let theme = resolve_theme(load.config.theme.as_deref(), &theme_registry, stderr).clone();
-    let capability = resolve_capability(&load.config);
+    let capability =
+        crate::driver::resolve_color_capability(color_override, env, Some(&load.config));
 
     // Install the captured-log sink *before* enter_terminal so any
     // macro emission that fires between sink install and the first
@@ -108,12 +110,9 @@ pub(super) fn run(
     // the install row in MainMenu doesn't have to traverse `CliEnv`
     // mid-dispatch. `$HOME` unset (rare on container sandboxes)
     // leaves the path None and the menu row routes to a Placeholder.
-    // `effective_install_config` deliberately excludes XDG-resolved
-    // defaults so a synced `settings.json` stays portable across
-    // machines — only paths the user explicitly chose (`--config` or
-    // `$LINESMITH_CONFIG`) get baked in. `json_command_value` then
-    // shell-quotes them so the written `statusLine.command` works
-    // as-is even when the path contains whitespace or metacharacters.
+    // XDG-resolved defaults are excluded so a synced `settings.json`
+    // stays portable across machines; only explicitly chosen paths
+    // (`--config` or `$LINESMITH_CONFIG`) get baked in.
     let install_settings_path = crate::claude_settings::default_settings_path(env);
     let install_config = crate::driver::effective_install_config(install_explicit_config, env)
         .and_then(|p| {
@@ -174,7 +173,7 @@ pub(super) fn run(
             // The event loop failed; surface anything macros emitted
             // between the last successful frame drain and the failure
             // point so the user sees the underlying diagnostic, not
-            // just the I/O error code.
+            // only the I/O error code.
             flush_captured_to_stderr(&captured_sink, stderr);
             let _ = writeln!(stderr, "linesmith config: event loop: {err}");
             1
@@ -184,8 +183,6 @@ pub(super) fn run(
 
 /// Re-export of the shared atomic-write helper so existing
 /// `super::atomic_write(...)` call sites in this module stay terse.
-/// The shared implementation in [`crate::atomic`] is also used by
-/// the Claude Code settings install/uninstall path.
 #[allow(clippy::redundant_pub_crate)]
 pub(super) use crate::atomic::atomic_write;
 
@@ -319,32 +316,6 @@ fn install_panic_hook() {
         let _ = leave_terminal();
         prev(info);
     }));
-}
-
-/// Resolve the color capability for the preview from
-/// `[layout_options].color`: Never → strip color, Always →
-/// richest the terminal supports (with TrueColor rescue when not
-/// a TTY), Auto → `Capability::detect` (which checks `NO_COLOR`
-/// and probes the terminal). `FORCE_COLOR` and the CLI's
-/// `--force-color` / `--no-color` flags aren't honored here; the
-/// editor doesn't take args.
-fn resolve_capability(config: &config::Config) -> crate::theme::Capability {
-    use crate::theme::Capability;
-    match config.layout_options.as_ref().map(|l| l.color) {
-        Some(config::ColorPolicy::Never) => Capability::None,
-        Some(config::ColorPolicy::Always) => {
-            // `from_terminal` strips `NO_COLOR` and runs the
-            // supports-color probe; if the probe says "no TTY"
-            // we still want color (the user asked for it).
-            let probed = Capability::from_terminal();
-            if probed == Capability::None {
-                Capability::TrueColor
-            } else {
-                probed
-            }
-        }
-        _ => Capability::detect(),
-    }
 }
 
 /// Resolve the user's configured theme name against the registry.
@@ -495,8 +466,8 @@ fn load_config(path: Option<&Path>) -> io::Result<LoadOutcome> {
     }
 }
 
-/// Dump a `ratatui` `Buffer` to a plain string for snapshot assertions.
-/// Styling is stripped; snapshots stay grep-friendly.
+/// Renders a `ratatui` `Buffer` to a plain string, stripping styling,
+/// so snapshot assertions stay grep-friendly.
 #[cfg(test)]
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {
@@ -578,7 +549,7 @@ mod tests {
         // Without this filter, Windows users would double-fire
         // every `Action` verb and double-toggle move-mode on
         // Enter. Pin the filter so a future "match all key kinds"
-        // refactor regresses noisily instead of just on Windows.
+        // refactor regresses noisily instead of only on Windows.
         let outcome = classify_event(CtEvent::Key(key_event(KeyEventKind::Release)));
         assert!(outcome.is_none());
     }

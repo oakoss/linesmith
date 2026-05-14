@@ -178,7 +178,10 @@ where
             init_action(config, no_doctor, stdin, stdout, stderr, env)
         }
         cli::Action::Doctor { plain, config } => doctor_action(plain, config, stdout, stderr),
-        cli::Action::Config { config } => config_action(config, stderr, env),
+        cli::Action::Config {
+            config,
+            color_override,
+        } => config_action(config, color_override, stderr, env),
         cli::Action::Install { config } => install_action(config, stdout, stderr, env),
         cli::Action::Uninstall => uninstall_action(stdout, stderr, env),
         cli::Action::Run(args) => run_cli(args, stdin, stdout, stderr, env),
@@ -214,8 +217,7 @@ fn install_action(
         }
     }
     let command = json_command_value(install_config.as_deref());
-    // Warn before mutating: an existing third-party statusLine
-    // would be backed up to .bak but the user should know.
+    // Warn before mutating so the user knows before the .bak is written.
     match claude_settings::detect_installation_status(&settings_path) {
         Ok(claude_settings::InstallationStatus::Other { command }) => {
             let _ = writeln!(
@@ -347,13 +349,11 @@ pub(crate) fn effective_install_config(
         .map(PathBuf::from)
 }
 
-/// Build the `statusLine.command` JSON string value for an install.
-/// Mirrors [`json_command`]'s policy but returns just the string body
-/// (no surrounding quotes — `serde_json` adds those on serialize) AND
-/// shell-quotes the config path so Claude Code's shell tokenization
-/// doesn't break on whitespace or metacharacters. Init writes a
-/// copy-paste snippet so it warns and lets the user hand-edit; install
-/// writes the file directly so it must produce a working command.
+/// Like [`json_command`] but unquoted (serde_json wraps the value on
+/// serialize) and shell-quotes the config path so Claude Code's shell
+/// tokenization handles whitespace and metacharacters. Unlike init,
+/// which emits a copy-paste snippet the user can hand-edit, install
+/// writes directly — so the command must work as-is.
 #[allow(clippy::redundant_pub_crate)]
 pub(crate) fn json_command_value(explicit_path: Option<&Path>) -> String {
     match explicit_path {
@@ -396,7 +396,12 @@ fn shell_quote_arg(s: &str) -> String {
 /// actionable error and exits 2; the daily render path stays clear of
 /// the TUI substrate either way.
 #[cfg(feature = "config-ui")]
-fn config_action(config_override: Option<PathBuf>, stderr: &mut dyn Write, env: &CliEnv) -> u8 {
+fn config_action(
+    config_override: Option<PathBuf>,
+    color_override: Option<cli::ColorOverride>,
+    stderr: &mut dyn Write,
+    env: &CliEnv,
+) -> u8 {
     let resolved = config::resolve_config_path(
         config_override.clone(),
         env.linesmith_config.as_deref(),
@@ -406,13 +411,19 @@ fn config_action(config_override: Option<PathBuf>, stderr: &mut dyn Write, env: 
     crate::tui::run(
         resolved.as_ref().map(|c| c.path.as_path()),
         config_override.as_deref(),
+        color_override,
         stderr,
         env,
     )
 }
 
 #[cfg(not(feature = "config-ui"))]
-fn config_action(_config_override: Option<PathBuf>, stderr: &mut dyn Write, _env: &CliEnv) -> u8 {
+fn config_action(
+    _config_override: Option<PathBuf>,
+    _color_override: Option<cli::ColorOverride>,
+    stderr: &mut dyn Write,
+    _env: &CliEnv,
+) -> u8 {
     let _ = writeln!(
         stderr,
         "linesmith: this build was compiled without the `config-ui` feature; rebuild with `cargo install linesmith` (defaults on) or `cargo build --features config-ui` to enable it.",
@@ -657,7 +668,7 @@ fn write_config_with_backup(
             // removed before the rename was attempted. Without this
             // breadcrumb, a user seeing only "could not back up"
             // would assume nothing changed and miss that a
-            // recoverable backup was just consumed.
+            // recoverable backup was consumed.
             if clobbered_prior_bak {
                 let _ = writeln!(
                     stderr,
@@ -839,7 +850,7 @@ fn init_with_choices(
         return code;
     }
 
-    // Snippet must point at the file we just wrote. If the user
+    // Snippet must point at the file we wrote above. If the user
     // resolved the path explicitly (via `--config` OR `LINESMITH_CONFIG`),
     // bare `linesmith` would re-resolve to the XDG default and miss
     // it. The `explicit` bit lets us emit the right `--config <path>`
@@ -868,7 +879,7 @@ fn init_with_choices(
     // credentials unresolvable, etc.) and the user should
     // know before they try `linesmith` for real. Pass the
     // resolved path through so doctor inspects exactly the
-    // file we just wrote, not whatever its own cascade might
+    // file written above, not whatever its own cascade might
     // re-resolve to (which can differ when --config or
     // $LINESMITH_CONFIG were involved).
     let _ = writeln!(stdout);
@@ -880,7 +891,7 @@ fn init_with_choices(
 /// JSON-encode the `command` string for the Claude Code snippet emitted
 /// by `init_with_choices`. When the user resolved an explicit path (via
 /// `--config` or `LINESMITH_CONFIG`), Claude Code must call
-/// `linesmith --config <PATH>` to read the file we just wrote;
+/// `linesmith --config <PATH>` to read that file;
 /// otherwise plain `linesmith` finds the XDG default. Only JSON
 /// escaping happens here (backslashes + double quotes); shell quoting
 /// is the caller's problem because POSIX and Windows shells disagree
@@ -1057,7 +1068,8 @@ fn load_plugins(
 /// XDG inputs gets the same conversion, and so `linesmith-cli`
 /// keeps owning the `CliEnv → XdgEnv` map after the workspace
 /// split (per ADR-0018).
-fn cli_env_to_xdg(env: &CliEnv) -> crate::data_context::xdg::XdgEnv {
+#[allow(clippy::redundant_pub_crate)]
+pub(super) fn cli_env_to_xdg(env: &CliEnv) -> crate::data_context::xdg::XdgEnv {
     crate::data_context::xdg::XdgEnv::from_os_options(
         None,
         env.xdg_config_home.clone(),
@@ -1141,7 +1153,8 @@ fn layout_options(cfg: Option<&config::Config>) -> Option<&config::LayoutOptions
 ///   4. `FORCE_COLOR` env var
 ///   5. `[layout_options].color` in config
 ///   6. default `auto` — detect via `supports-color`
-fn resolve_color_capability(
+#[allow(clippy::redundant_pub_crate)]
+pub(super) fn resolve_color_capability(
     cli_override: Option<cli::ColorOverride>,
     env: &CliEnv,
     cfg: Option<&config::Config>,
@@ -1697,8 +1710,8 @@ mod tests {
 
     #[test]
     fn cli_env_routes_home_through_to_config_resolution() {
-        // Proves env.home actually reaches resolve_config_path rather
-        // than getting shadowed by a process env::var read.
+        // Proves env.home reaches resolve_config_path rather than
+        // getting shadowed by a process env::var read.
         let dir = tempdir();
         let cfg_dir = dir.path().join(".config/linesmith");
         std::fs::create_dir_all(&cfg_dir).unwrap();
@@ -1781,7 +1794,7 @@ mod tests {
         // End-to-end multi-line: config declares two [line.N]
         // sub-tables; stdout must carry two newline-separated rows
         // with each line's segments resolved independently. Pin the
-        // exact bytes (not just newline count) so a regression that
+        // exact bytes (not only newline count) so a regression that
         // crosses the per-line boundary surfaces.
         let json = br#"{
             "model": { "display_name": "Claude" },
@@ -1869,10 +1882,10 @@ mod tests {
 
     #[test]
     fn check_config_surfaces_multi_line_validation_warnings() {
-        // `--check-config` consumes `build_lines` (not just
+        // `--check-config` consumes `build_lines` (not only
         // `build_segments`) so multi-line edge-case warnings
         // ([line.foo], single-line+numbered, etc.) flow through the
-        // editor-facing validator, not just the render path.
+        // editor-facing validator, not only the render path.
         let dir = tempdir();
         let path = dir.path().join("config.toml");
         std::fs::write(
@@ -1900,10 +1913,10 @@ mod tests {
 
     #[test]
     fn multi_line_parse_failure_emits_one_question_marker_not_per_line() {
-        // The render loop iterates per line, but parse failure
-        // returns before the loop runs and emits a single `?\n`.
-        // Without this pin, a refactor that moves the parse into the
-        // loop would silently spam `?\n?\n?\n` for an N-line config.
+        // Pin: parse failure short-circuits with a single `?\n`
+        // before the render loop runs. Without this, a refactor
+        // that moves the parse into the loop would silently spam
+        // `?\n?\n?\n` for an N-line config.
         let dir = tempdir();
         let path = dir.path().join("config.toml");
         std::fs::write(
@@ -1968,7 +1981,7 @@ mod tests {
     fn power_user_preset_renders_two_lines_end_to_end() {
         // The preset-shape test in presets/mod.rs pins layout +
         // per-line ids; this one pins the full pipeline (preset →
-        // builder → renderer) actually produces two lines. Catches
+        // builder → renderer) produces two lines. Catches
         // a regression where a refactor breaks any layer in the
         // chain.
         let json = br#"{
@@ -2341,7 +2354,7 @@ mod tests {
 
     /// Build a `CliEnv` suitable for driving the resolver directly —
     /// the test-only capability override is cleared so the chain
-    /// actually executes.
+    /// executes.
     fn policy_env() -> CliEnv {
         CliEnv {
             color_capability: None,
@@ -2445,7 +2458,7 @@ mod tests {
             ..config::Config::default()
         };
         // Without a TTY under `cargo test`, `from_terminal` returns None;
-        // the assertion is just that the resolver didn't short-circuit.
+        // the assertion is that the resolver didn't short-circuit.
         let got = resolve_color_capability(None, &policy_env(), Some(&cfg));
         assert_eq!(got, theme::Capability::from_terminal());
     }
@@ -2971,7 +2984,7 @@ mod tests {
         // init writes the config, with the "Running doctor..."
         // separator line and the report appearing inline. The
         // resolved-config path threads through to doctor so it
-        // inspects exactly the file we just wrote.
+        // inspects exactly the file written above.
         let dir = tempdir();
         let env = env_with_home(dir.path());
         let (_code, stdout, _stderr) = run_init_with_doctor(
@@ -2993,7 +3006,7 @@ mod tests {
             stdout.contains("linesmith doctor (v"),
             "doctor report header must appear inline:\n{stdout}",
         );
-        // Doctor reads the file we just wrote — confirm by
+        // Doctor reads the file written by init — confirm by
         // looking for the Config section's PASS line for it.
         assert!(
             stdout.contains("Config file:") && stdout.contains("config.toml"),
@@ -3105,7 +3118,7 @@ mod tests {
         // When --config <PATH> was used, the snippet must tell Claude
         // Code to call `linesmith --config <PATH>`. A bare
         // `linesmith` would point at the XDG default and the file
-        // `init` just wrote would never be read.
+        // `init` wrote would never be read.
         let dir = tempdir();
         let custom = dir.path().join("custom-init.toml");
         let env = env_with_home(dir.path());
@@ -3133,9 +3146,9 @@ mod tests {
     #[test]
     fn init_snippet_preserves_env_resolved_config_path() {
         // When the user's explicit path comes from `LINESMITH_CONFIG`,
-        // the snippet must include `--config <path>` just as it does
+        // the snippet must include `--config <path>` as it does
         // for the CLI flag. A bare `linesmith` snippet would
-        // re-resolve to the XDG default and miss the file we just
+        // re-resolve to the XDG default and miss the file init
         // wrote.
         let dir = tempdir();
         let custom = dir.path().join("env-init.toml");
@@ -3176,7 +3189,7 @@ mod tests {
     #[test]
     fn init_warns_about_env_resolved_path_with_spaces() {
         // The user-edit warning must also fire on env-resolved paths,
-        // not just --config. Same broken-snippet failure mode
+        // not only --config. Same broken-snippet failure mode
         // either way.
         let dir = tempdir();
         let custom = dir.path().join("env path with spaces.toml");
@@ -3707,7 +3720,7 @@ mod tests {
     #[test]
     fn install_action_threads_config_flag_with_shell_quoting() {
         // A `--config` path with whitespace must reach `settings.json`
-        // shell-quoted so Claude Code can actually exec it. Without
+        // shell-quoted so Claude Code can exec it. Without
         // the quoting in `json_command_value`, the written command
         // would be `linesmith --config /Users/me/My Cfg/c.toml` and
         // the statusline would silently fail every tick.
@@ -4010,7 +4023,7 @@ mod tests {
     fn doctor_action_with_home_unset_exits_one() {
         // The hermetic counterpart to the CLI-dispatch smoke: when
         // env.home FAILs, doctor_action surfaces it as exit 1
-        // end-to-end, not just at the build_report layer.
+        // end-to-end, not only at the build_report layer.
         let mut env = crate::doctor::DoctorEnv::healthy();
         env.home_env = crate::doctor::EnvVarState::Unset;
         let (code, _stdout, _stderr) = run_doctor(env, false);
@@ -4081,7 +4094,7 @@ mod tests {
         // before reaching `DoctorEnv::from_process` would still
         // pass that test (because the snapshot is built directly).
         // This goes through `doctor_action` — the path the binary
-        // actually takes — and asserts the rendered report names
+        // takes — and asserts the rendered report names
         // the path the user supplied. If the override is silently
         // dropped, the report instead describes the host's
         // $HOME-derived path (or "no config path resolved"), which
