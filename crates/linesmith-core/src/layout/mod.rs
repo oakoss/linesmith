@@ -15,6 +15,9 @@ use crate::segments::{
 use crate::theme::{self, Capability, Style, StyledRun, Theme};
 use unicode_segmentation::UnicodeSegmentation;
 
+mod decision;
+pub use decision::LayoutDecision;
+
 /// Render `items` for `ctx` within `terminal_width` cells. Returns the
 /// final line without a trailing newline. Segment render errors go
 /// through [`crate::lsm_error!`] so a broken segment always surfaces,

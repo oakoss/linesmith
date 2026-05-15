@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **core:** `LayoutDecision` public enum with five variants
+  (`PriorityDrop`, `ShrinkApplied`, `ReflowApplied`,
+  `WidthBoundUnderMinDrop`, `WidthBoundOverMaxTruncate`) and a
+  `remediation()` method, per
+  [ADR-0026](docs/adrs/0026-layout-decision-observability.md). The
+  type is the typed-event scaffold for the layout engine's emit
+  sites (wired by lsm-b00q) and the TUI live preview's per-segment
+  status badges (lsm-dtdq). Per-variant struct bodies are
+  `#[non_exhaustive]` for field-additive forward-compat; the enum
+  itself is exhaustive, so a future sixth variant breaks every
+  consumer's `match` at compile time, by design.
+
 ### Breaking Changes
 
 - **core:** `LineItem::Segment` promoted from tuple variant
