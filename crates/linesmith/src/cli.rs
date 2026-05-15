@@ -190,6 +190,7 @@ where
         }
     }
     let color_override_snapshot = args.color_override;
+    let check_config_snapshot = args.check_config;
     let action = match dispatch_subcommand(
         &positional,
         force,
@@ -217,6 +218,13 @@ where
     // itself) and other absurdities.
     if no_doctor && !matches!(action, Action::Init { .. }) {
         return Err(lexopt::Error::UnexpectedOption("--no-doctor".to_string()));
+    }
+    // `--check-config` only has meaning under `Run` (validates config,
+    // exits before render). Every other subcommand would silently no-op it.
+    if check_config_snapshot && !matches!(action, Action::Run(_)) {
+        return Err(lexopt::Error::UnexpectedOption(
+            "--check-config".to_string(),
+        ));
     }
     // `--no-color` / `--force-color` only have meaning on the
     // subcommands that emit ANSI: the daily render path (`Run`) and
@@ -805,6 +813,40 @@ mod tests {
                 plain: false,
                 config: Some(PathBuf::from("/tmp/alt.toml")),
             }
+        );
+    }
+
+    #[test]
+    fn check_config_flag_rejected_outside_run() {
+        // `--check-config` must error outside `Run` rather than silently
+        // no-op: driver.rs::run_with_env only branches on check_config
+        // for the render path.
+        let cases: &[&[&str]] = &[
+            &["--check-config", "init"],
+            &["--check-config", "doctor"],
+            &["--check-config", "config"],
+            &["--check-config", "install"],
+            &["--check-config", "uninstall"],
+            &["--check-config", "themes", "list"],
+            &["--check-config", "presets", "list"],
+            &["--check-config", "presets", "apply", "minimal"],
+        ];
+        for argv in cases {
+            let err = parse_args(argv).unwrap_err();
+            assert!(
+                matches!(err, lexopt::Error::UnexpectedOption(ref s) if s == "--check-config"),
+                "args {argv:?} should reject --check-config, got {err:?}"
+            );
+        }
+        let err = parse_args(&["doctor", "--check-config"]).unwrap_err();
+        assert!(
+            matches!(err, lexopt::Error::UnexpectedOption(ref s) if s == "--check-config"),
+            "flag should reject after subcommand too, got {err:?}"
+        );
+        let err = parse_args(&["--check-config", "presets", "apply"]).unwrap_err();
+        assert!(
+            matches!(err, lexopt::Error::MissingValue { .. }),
+            "missing-name error must win over check-config-rejection, got {err:?}"
         );
     }
 
