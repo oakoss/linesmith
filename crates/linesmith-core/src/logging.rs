@@ -557,10 +557,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "out-of-range byte")]
     fn from_u8_debug_panics_on_out_of_range() {
         // Only covered in debug builds; release saturates to Debug.
         let _ = from_u8(99);
+    }
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn from_u8_saturates_out_of_range_to_debug_in_release() {
+        // Out-of-range bytes saturate to Debug so nothing is suppressed.
+        assert_eq!(from_u8(3), Level::Debug);
+        assert_eq!(from_u8(99), Level::Debug);
+        assert_eq!(from_u8(u8::MAX), Level::Debug);
     }
 
     #[test]
