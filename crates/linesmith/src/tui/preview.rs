@@ -118,7 +118,8 @@ fn render_line(
     capability: Capability,
     mut warn: impl FnMut(&str),
 ) -> Line<'static> {
-    let runs = render_to_runs(items, ctx, width, &mut warn);
+    let mut observers = crate::layout::LayoutObservers::new(&mut warn);
+    let runs = render_to_runs(items, ctx, width, &mut observers);
     let spans: Vec<Span<'static>> = runs
         .iter()
         .map(|r| run_to_span(r, theme, capability))

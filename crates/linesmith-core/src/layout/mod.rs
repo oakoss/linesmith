@@ -18,21 +18,77 @@ use unicode_segmentation::UnicodeSegmentation;
 mod decision;
 pub use decision::LayoutDecision;
 
+/// Two-channel observer the layout engine threads through every
+/// render entry point per ADR-0026. `warn` is required (the engine
+/// uses it for segment-render error diagnostics); `on_decision` is
+/// optional and receives a typed [`LayoutDecision`] per emit site.
+///
+/// The TUI live preview attaches `on_decision` to collect per-frame
+/// status; the production stdout path doesn't attach one, so
+/// disabled-path cost is one `Option::is_none()` check per emit site
+/// (struct construction is deferred behind [`Self::emit_with`]'s
+/// closure, so even `Cow::Owned` user-config ids don't allocate
+/// when no observer is attached).
+///
+/// Single lifetime `'a` because Rust unifies independent borrows to
+/// their shortest common lifetime — a second lifetime parameter
+/// would buy no flexibility for `&mut dyn FnMut` borrows.
+pub struct LayoutObservers<'a> {
+    warn: &'a mut dyn FnMut(&str),
+    on_decision: Option<&'a mut dyn FnMut(&LayoutDecision)>,
+}
+
+impl<'a> LayoutObservers<'a> {
+    /// Construct with the required `warn` channel; no observer attached.
+    pub fn new(warn: &'a mut dyn FnMut(&str)) -> Self {
+        Self {
+            warn,
+            on_decision: None,
+        }
+    }
+
+    /// Attach an `on_decision` callback so the engine routes typed
+    /// `LayoutDecision` events through it at every emit site. Calling
+    /// twice replaces the previous callback (last-write-wins).
+    #[must_use]
+    pub fn with_decision(mut self, on_decision: &'a mut dyn FnMut(&LayoutDecision)) -> Self {
+        self.on_decision = Some(on_decision);
+        self
+    }
+
+    /// Engine-side: emit a warning through the `warn` channel.
+    pub(crate) fn warn(&mut self, msg: &str) {
+        (self.warn)(msg);
+    }
+
+    /// Engine-side: emit a typed decision. The closure constructs
+    /// the `LayoutDecision` only when an observer is attached, so
+    /// production callers (no `on_decision`) pay zero allocations
+    /// per emit site even for `Cow::Owned` user-config segment ids.
+    #[allow(dead_code)] // wired by lsm-b00q when apply_layout gains emit sites
+    pub(crate) fn emit_with(&mut self, decision: impl FnOnce() -> LayoutDecision) {
+        if let Some(cb) = self.on_decision.as_mut() {
+            cb(&decision());
+        }
+    }
+}
+
 /// Render `items` for `ctx` within `terminal_width` cells. Returns the
 /// final line without a trailing newline. Segment render errors go
 /// through [`crate::lsm_error!`] so a broken segment always surfaces,
 /// even under `LINESMITH_LOG=off` — a blank statusline with zero
 /// diagnostic is a bad UX even when the user opted into quiet mode.
 /// Output is unstyled (callers that want theming use
-/// [`render_with_warn`] with their own closure).
+/// [`render_with_observers`] with their own observers).
 #[must_use]
 pub fn render(items: &[LineItem], ctx: &DataContext, terminal_width: u16) -> String {
     let mut warn = |msg: &str| crate::lsm_error!("{msg}");
-    render_with_warn(
+    let mut observers = LayoutObservers::new(&mut warn);
+    render_with_observers(
         items,
         ctx,
         terminal_width,
-        &mut warn,
+        &mut observers,
         theme::default_theme(),
         Capability::None,
         false,
@@ -40,10 +96,11 @@ pub fn render(items: &[LineItem], ctx: &DataContext, terminal_width: u16) -> Str
 }
 
 /// Same as [`render`] but routes segment render-error diagnostics
-/// through `warn` and emits ANSI SGR around each segment per `theme`
-/// and `capability`. Used by [`crate::run_with_context`] so `cli_main`
-/// tests can capture segment errors alongside exit codes while the
-/// render path picks up theme colors.
+/// (and `LayoutDecision` events, when an observer is attached)
+/// through `observers`, and emits ANSI SGR around each segment per
+/// `theme` and `capability`. Used by [`crate::run_with_context`] so
+/// `cli_main` tests can capture segment errors alongside exit codes
+/// while the render path picks up theme colors.
 ///
 /// `hyperlinks` gates OSC 8 emission for runs whose `Style.hyperlink`
 /// is set. Pass `true` when the terminal advertises OSC 8 support
@@ -55,16 +112,16 @@ pub fn render(items: &[LineItem], ctx: &DataContext, terminal_width: u16) -> Str
 /// layout, same bytes. Callers that need the styled-run form (e.g.
 /// the TUI preview pane) call [`render_to_runs`] directly.
 #[must_use]
-pub fn render_with_warn(
+pub fn render_with_observers(
     items: &[LineItem],
     ctx: &DataContext,
     terminal_width: u16,
-    warn: &mut dyn FnMut(&str),
+    observers: &mut LayoutObservers<'_>,
     theme: &Theme,
     capability: Capability,
     hyperlinks: bool,
 ) -> String {
-    let runs = render_to_runs(items, ctx, terminal_width, warn);
+    let runs = render_to_runs(items, ctx, terminal_width, observers);
     runs_to_ansi(&runs, theme, capability, hyperlinks)
 }
 
@@ -72,26 +129,29 @@ pub fn render_with_warn(
 /// surviving segment, plus one run per non-empty surviving separator
 /// (in render order). Layout decisions — priority-drop,
 /// `shrink_to_fit`, truncatable reflow, width-bound truncation —
-/// match [`render`] / [`render_with_warn`] exactly; only the emit
-/// form differs.
+/// match [`render`] / [`render_with_observers`] exactly; only the
+/// emit form differs.
 ///
 /// `Separator::None` contributes no run; it would be an empty-text
 /// run with no consumer use. Separator runs carry [`Style::default`];
 /// separators inherit no styling from their flanking segments.
 ///
-/// Segment render errors and `Ok(None)` go through `warn` exactly as
-/// in the ANSI path; the run sequence reflects only segments that
-/// survived to the layout pass, with separators surviving only
-/// between two surviving segments.
+/// Segment render errors and `Ok(None)` go through `observers.warn`
+/// exactly as in the ANSI path; the run sequence reflects only
+/// segments that survived to the layout pass, with separators
+/// surviving only between two surviving segments.
+///
+/// The five `LayoutDecision` emit sites (one per variant) land in
+/// lsm-b00q; until then `on_decision` receives zero events.
 #[must_use]
 pub fn render_to_runs(
     items: &[LineItem],
     ctx: &DataContext,
     terminal_width: u16,
-    warn: &mut dyn FnMut(&str),
+    observers: &mut LayoutObservers<'_>,
 ) -> Vec<StyledRun> {
     let rc = RenderContext::new(terminal_width);
-    let layout_items = collect_items_with(items, ctx, &rc, warn);
+    let layout_items = collect_items_with(items, ctx, &rc, observers);
     let laid_out = apply_layout(layout_items, ctx, &rc, terminal_width);
     items_to_runs(&laid_out)
 }
@@ -196,7 +256,7 @@ fn collect_items_with<'a>(
     items: &'a [LineItem],
     ctx: &DataContext,
     rc: &RenderContext,
-    warn: &mut dyn FnMut(&str),
+    observers: &mut LayoutObservers<'_>,
 ) -> Vec<LayoutItem<'a>> {
     let mut out: Vec<LayoutItem<'a>> = Vec::with_capacity(items.len());
     for item in items {
@@ -210,7 +270,7 @@ fn collect_items_with<'a>(
                         continue;
                     }
                     Err(err) => {
-                        warn(&format!("segment error: {err}"));
+                        observers.warn(&format!("segment error: {err}"));
                         pop_trailing_separator(&mut out);
                         continue;
                     }
@@ -357,7 +417,7 @@ fn drop_segment_and_adjacent_separator(items: &mut Vec<LayoutItem<'_>>, idx: usi
     }
 }
 
-/// Test-only helper that mirrors `render_with_warn`'s compose order.
+/// Test-only helper that mirrors `render_with_observers`'s compose order.
 /// Lets unit tests build [`LayoutItem`] literals directly without
 /// restating the layout-then-emit dance per case.
 #[cfg(test)]

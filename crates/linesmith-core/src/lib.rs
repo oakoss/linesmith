@@ -197,13 +197,15 @@ pub fn run_lines_with_context(
     let data_ctx = data_context::DataContext::with_cwd(status_ctx, ctx.cwd.clone());
 
     for items in lines {
-        let line = layout::render_with_warn(
+        let mut warn = |msg: &str| {
+            let _ = writeln!(stderr, "linesmith: {msg}");
+        };
+        let mut observers = layout::LayoutObservers::new(&mut warn);
+        let line = layout::render_with_observers(
             items,
             &data_ctx,
             ctx.terminal_width,
-            &mut |msg| {
-                let _ = writeln!(stderr, "linesmith: {msg}");
-            },
+            &mut observers,
             ctx.theme,
             ctx.capability,
             ctx.hyperlinks,

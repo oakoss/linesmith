@@ -270,11 +270,13 @@ fn plugin_runtime_separator_override_replaces_inline_separator() {
             segment: Box::new(OverrideNoneSeg("b")),
         },
     ];
-    let line = crate::layout::render_with_warn(
+    let mut warn = |_: &str| {};
+    let mut observers = crate::layout::LayoutObservers::new(&mut warn);
+    let line = crate::layout::render_with_observers(
         &items,
         &stub_ctx(),
         100,
-        &mut |_| {},
+        &mut observers,
         theme::default_theme(),
         theme::Capability::None,
         false,
@@ -319,11 +321,13 @@ fn plugin_runtime_literal_override_replaces_inline_powerline() {
             segment: Box::new(OverrideLiteralSeg("b")),
         },
     ];
-    let line = crate::layout::render_with_warn(
+    let mut warn = |_: &str| {};
+    let mut observers = crate::layout::LayoutObservers::new(&mut warn);
+    let line = crate::layout::render_with_observers(
         &items,
         &stub_ctx(),
         100,
-        &mut |_| {},
+        &mut observers,
         theme::default_theme(),
         theme::Capability::None,
         false,
@@ -358,11 +362,13 @@ fn plugin_runtime_override_on_last_segment_is_silently_discarded() {
         id: Cow::Borrowed("a"),
         segment: Box::new(OverrideNoneSeg("a")),
     }];
-    let line = crate::layout::render_with_warn(
+    let mut warn = |_: &str| {};
+    let mut observers = crate::layout::LayoutObservers::new(&mut warn);
+    let line = crate::layout::render_with_observers(
         &items,
         &stub_ctx(),
         100,
-        &mut |_| {},
+        &mut observers,
         theme::default_theme(),
         theme::Capability::None,
         false,
@@ -435,11 +441,13 @@ fn plugin_compact_form_separator_override_wins_over_pre_shrink_inline() {
     // Full assembly: 20 + 3 + 1 = 24 cells. Budget 11 forces shrink.
     // Compact: 7 cells; with the override propagated, the
     // separator goes to None: 7 + 0 + 1 = 8 cells.
-    let line = crate::layout::render_with_warn(
+    let mut warn = |_: &str| {};
+    let mut observers = crate::layout::LayoutObservers::new(&mut warn);
+    let line = crate::layout::render_with_observers(
         &items,
         &stub_ctx(),
         11,
-        &mut |_| {},
+        &mut observers,
         theme::default_theme(),
         theme::Capability::None,
         false,
@@ -486,11 +494,13 @@ fn user_constructed_adjacent_separators_drop_second() {
             segment: Box::new(RawSeg("b")),
         },
     ];
-    let line = crate::layout::render_with_warn(
+    let mut warn = |_: &str| {};
+    let mut observers = crate::layout::LayoutObservers::new(&mut warn);
+    let line = crate::layout::render_with_observers(
         &items,
         &stub_ctx(),
         100,
-        &mut |_| {},
+        &mut observers,
         theme::default_theme(),
         theme::Capability::None,
         false,

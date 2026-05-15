@@ -381,7 +381,7 @@ fn config_reorders_and_filters_segments() {
 
 #[test]
 fn config_style_override_emits_sgr_bytes_end_to_end() {
-    // TOML → SegmentOverride → parse_style → with_user_style → render_with_warn
+    // TOML → SegmentOverride → parse_style → with_user_style → render_with_observers
     // pipeline: the model segment's rendered text should be wrapped in a
     // TrueColor-red + bold SGR prefix followed by a reset.
     let cfg = linesmith_core::config::Config::from_str(
@@ -397,11 +397,13 @@ fn config_style_override_emits_sgr_bytes_end_to_end() {
     let status_ctx = linesmith_core::input::parse(include_bytes!("fixtures/claude_minimal.json"))
         .expect("parse");
     let ctx = linesmith_core::data_context::DataContext::new(status_ctx);
-    let line = linesmith_core::layout::render_with_warn(
+    let mut warn = |_: &str| {};
+    let mut observers = linesmith_core::layout::LayoutObservers::new(&mut warn);
+    let line = linesmith_core::layout::render_with_observers(
         &segments,
         &ctx,
         200,
-        &mut |_| {},
+        &mut observers,
         linesmith_core::theme::default_theme(),
         linesmith_core::theme::Capability::TrueColor,
         false,

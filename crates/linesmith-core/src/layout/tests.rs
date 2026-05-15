@@ -106,9 +106,17 @@ fn interleaved(
     out
 }
 
+/// Bind a `LayoutObservers` that discards warnings.
+macro_rules! let_noop_observers {
+    ($name:ident) => {
+        let mut __warn_for_observers: fn(&str) = |_: &str| {};
+        let mut $name = LayoutObservers::new(&mut __warn_for_observers);
+    };
+}
+
 /// Wrap `segments` as a [`LineItem`] sequence with `sep` interleaved
 /// between adjacent segments. For tests that drive the public render
-/// entry points (`render_with_warn`, `render_to_runs`). Synthesizes
+/// entry points (`render_with_observers`, `render_to_runs`). Synthesizes
 /// stable test ids (`"seg0"`, `"seg1"`, ...) so the `LineItem`
 /// addressing contract from ADR-0026 stays exercised; tests that need
 /// a specific id should build the `LineItem` literal directly.
@@ -450,9 +458,9 @@ fn segment_error_is_logged_and_hides_segment() {
         Box::new(StubSegment(Ok(Some(RenderedSegment::new("ok-after"))))),
     ]);
     let mut warnings = Vec::new();
-    let items = collect_items_with(&line, &empty_ctx(), &empty_rc(), &mut |msg| {
-        warnings.push(msg.to_string());
-    });
+    let mut warn = |msg: &str| warnings.push(msg.to_string());
+    let mut observers = LayoutObservers::new(&mut warn);
+    let items = collect_items_with(&line, &empty_ctx(), &empty_rc(), &mut observers);
     // The Err segment vanishes; the separator that flanked it goes
     // with it (both adjacency rules at once). Two surviving segments
     // separated by one surviving Space = 3 LayoutItems.
@@ -473,9 +481,9 @@ fn ok_none_is_silently_hidden() {
         Box::new(StubSegment(Ok(None))),
     ]);
     let mut warnings = Vec::new();
-    let items = collect_items_with(&line, &empty_ctx(), &empty_rc(), &mut |msg| {
-        warnings.push(msg.to_string());
-    });
+    let mut warn = |msg: &str| warnings.push(msg.to_string());
+    let mut observers = LayoutObservers::new(&mut warn);
+    let items = collect_items_with(&line, &empty_ctx(), &empty_rc(), &mut observers);
     // Hidden segment plus its trailing separator both prune away.
     assert_eq!(items.len(), 1);
     assert_eq!(segment_text(&items[0]), "visible");
@@ -499,28 +507,30 @@ fn render_context_threads_terminal_width_into_segments() {
     // alone doesn't prove the value moves.
     let line = line_items_spaced(vec![Box::new(WidthEcho)]);
     let mut warnings = Vec::new();
+    let mut warn = |msg: &str| warnings.push(msg.to_string());
+    let mut observers = LayoutObservers::new(&mut warn);
     let rc = RenderContext::new(42);
-    let items = collect_items_with(&line, &empty_ctx(), &rc, &mut |msg| {
-        warnings.push(msg.to_string());
-    });
+    let items = collect_items_with(&line, &empty_ctx(), &rc, &mut observers);
     assert_eq!(items.len(), 1);
     assert_eq!(segment_text(&items[0]), "42");
 }
 
 #[test]
-fn render_with_warn_constructs_render_context_from_terminal_width_arg() {
-    // Pins the construction line in `render_with_warn`: the public
-    // entrypoint must build `RenderContext::new(terminal_width)`
+fn render_with_observers_constructs_render_context_from_terminal_width_arg() {
+    // Pins the construction line in `render_with_observers`: the
+    // public entrypoint must build `RenderContext::new(terminal_width)`
     // from its argument and pass it to segments. A regression that
     // hard-coded a default would slip past the
     // `collect_items_with`-only test above.
     let line = line_items_spaced(vec![Box::new(WidthEcho)]);
     let mut warnings = Vec::new();
-    let out = render_with_warn(
+    let mut warn = |msg: &str| warnings.push(msg.to_string());
+    let mut observers = LayoutObservers::new(&mut warn);
+    let out = render_with_observers(
         &line,
         &empty_ctx(),
         137,
-        &mut |msg| warnings.push(msg.to_string()),
+        &mut observers,
         theme::default_theme(),
         theme::Capability::None,
         false,
@@ -727,11 +737,13 @@ fn shrink_to_fit_replaces_full_render_when_compact_form_fits() {
         Box::new(AnchorSegment("KEEP")),
     ]);
     let mut warnings = Vec::new();
-    let line = render_with_warn(
+    let mut warn = |m: &str| warnings.push(m.to_string());
+    let mut observers = LayoutObservers::new(&mut warn);
+    let line = render_with_observers(
         &items,
         &empty_ctx(),
         17,
-        &mut |m| warnings.push(m.to_string()),
+        &mut observers,
         theme::default_theme(),
         theme::Capability::None,
         false,
@@ -754,11 +766,13 @@ fn shrink_to_fit_falls_back_to_drop_when_compact_form_too_wide() {
         Box::new(AnchorSegment("X")),
     ]);
     let mut warnings = Vec::new();
-    let line = render_with_warn(
+    let mut warn = |m: &str| warnings.push(m.to_string());
+    let mut observers = LayoutObservers::new(&mut warn);
+    let line = render_with_observers(
         &items,
         &empty_ctx(),
         5,
-        &mut |m| warnings.push(m.to_string()),
+        &mut observers,
         theme::default_theme(),
         theme::Capability::None,
         false,
@@ -795,11 +809,12 @@ fn shrink_to_fit_honors_configured_width_min_floor() {
         }
     }
     let items = line_items_spaced(vec![Box::new(LowFloorShrink), Box::new(AnchorSegment("X"))]);
-    let line = render_with_warn(
+    let_noop_observers!(observers);
+    let line = render_with_observers(
         &items,
         &empty_ctx(),
         7,
-        &mut |_| {},
+        &mut observers,
         theme::default_theme(),
         theme::Capability::None,
         false,
@@ -817,7 +832,7 @@ fn shrink_to_fit_rejects_too_wide_response_and_drops() {
     // fall through to drop. The contract violation also fires
     // `lsm_warn!` (visible on stderr during test runs); that
     // side effect isn't captured by the warn closure passed to
-    // `render_with_warn`, which only carries segment-render
+    // `render_with_observers`, which only carries segment-render
     // errors — asserting layout outcome is the testable
     // contract here.
     struct MisbehavingSegment;
@@ -841,11 +856,12 @@ fn shrink_to_fit_rejects_too_wide_response_and_drops() {
         Box::new(MisbehavingSegment),
         Box::new(AnchorSegment("X")),
     ]);
-    let line = render_with_warn(
+    let_noop_observers!(observers);
+    let line = render_with_observers(
         &items,
         &empty_ctx(),
         5,
-        &mut |_| {},
+        &mut observers,
         theme::default_theme(),
         theme::Capability::None,
         false,
@@ -881,11 +897,13 @@ fn shrink_to_fit_runs_before_truncatable_end_ellipsis() {
         Box::new(StubSegment(Ok(Some(RenderedSegment::new("X"))))),
     ]);
     let mut warnings = Vec::new();
-    let line = render_with_warn(
+    let mut warn = |m: &str| warnings.push(m.to_string());
+    let mut observers = LayoutObservers::new(&mut warn);
+    let line = render_with_observers(
         &items,
         &empty_ctx(),
         13,
-        &mut |m| warnings.push(m.to_string()),
+        &mut observers,
         theme::default_theme(),
         theme::Capability::None,
         false,
@@ -903,7 +921,8 @@ fn shrink_to_fit_runs_before_truncatable_end_ellipsis() {
 #[test]
 fn render_to_runs_empty_input_yields_no_runs() {
     let items: Vec<LineItem> = vec![];
-    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut |_| {});
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
     assert!(runs.is_empty());
 }
 
@@ -915,7 +934,8 @@ fn render_to_runs_emits_segment_then_separator_then_segment() {
         Box::new(StubSegment(Ok(Some(RenderedSegment::new("a"))))),
         Box::new(StubSegment(Ok(Some(RenderedSegment::new("b"))))),
     ]);
-    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut |_| {});
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
     assert_eq!(runs.len(), 3);
     assert_eq!(runs[0].text, "a");
     assert_eq!(runs[0].style, Style::default());
@@ -937,7 +957,8 @@ fn render_to_runs_preserves_segment_style() {
             RenderedSegment::new("warn").with_role(Role::Warning),
         )))),
     ]);
-    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut |_| {});
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
     assert_eq!(runs.len(), 3);
     assert_eq!(runs[2].text, "warn");
     assert_eq!(runs[2].style.role, Some(Role::Warning));
@@ -959,7 +980,8 @@ fn render_to_runs_skips_separator_none_between_segments() {
     );
     // The plugin per-render override on segment "a" replaces the
     // inline Space with Separator::None at that boundary.
-    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut |_| {});
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[0].text, "a");
     assert_eq!(runs[1].text, "b");
@@ -979,7 +1001,8 @@ fn render_to_runs_drops_segments_under_width_pressure() {
     ]);
     // Total: 4 + 1 + 9 + 1 + 6 = 21. Budget 12 forces the
     // priority-200 middle segment to drop.
-    let runs = render_to_runs(&items, &empty_ctx(), 12, &mut |_| {});
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 12, &mut observers);
     let texts: Vec<&str> = runs.iter().map(|r| r.text.as_str()).collect();
     assert_eq!(texts, vec!["keep", " ", "anchor"]);
 }
@@ -1002,16 +1025,18 @@ fn round_trip_line() -> Vec<LineItem> {
 
 fn round_trip_assert(terminal_width: u16, capability: theme::Capability, hyperlinks: bool) {
     let items = round_trip_line();
-    let direct = render_with_warn(
+    let_noop_observers!(observers_direct);
+    let direct = render_with_observers(
         &items,
         &empty_ctx(),
         terminal_width,
-        &mut |_| {},
+        &mut observers_direct,
         theme::default_theme(),
         capability,
         hyperlinks,
     );
-    let runs = render_to_runs(&items, &empty_ctx(), terminal_width, &mut |_| {});
+    let_noop_observers!(observers_runs);
+    let runs = render_to_runs(&items, &empty_ctx(), terminal_width, &mut observers_runs);
     let recomposed = runs_to_ansi(&runs, theme::default_theme(), capability, hyperlinks);
     assert_eq!(
         direct, recomposed,
@@ -1020,10 +1045,10 @@ fn round_trip_assert(terminal_width: u16, capability: theme::Capability, hyperli
 }
 
 #[test]
-fn render_to_runs_then_runs_to_ansi_matches_render_with_warn() {
+fn render_to_runs_then_runs_to_ansi_matches_render_with_observers() {
     // Round-trip pin: `render_to_runs` → `runs_to_ansi` must match
-    // `render_with_warn` byte-for-byte. The contract that lets
-    // `render_with_warn` stay a thin wrapper.
+    // `render_with_observers` byte-for-byte. The contract that lets
+    // `render_with_observers` stay a thin wrapper.
     round_trip_assert(100, theme::Capability::Palette16, false);
 }
 
@@ -1069,7 +1094,8 @@ fn render_to_runs_with_one_survivor_emits_no_trailing_separator() {
     ]);
     // Total: 1 + 1 + 9 = 11. Budget 1 drops the priority-200
     // segment; "a" survives alone with no trailing separator.
-    let runs = render_to_runs(&items, &empty_ctx(), 1, &mut |_| {});
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 1, &mut observers);
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].text, "a");
 }
@@ -1089,7 +1115,8 @@ fn render_to_runs_emits_powerline_chevron_with_muted_role() {
         ],
         Separator::powerline(),
     );
-    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut |_| {});
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
     assert_eq!(runs.len(), 3);
     assert_eq!(runs[1].text, " \u{E0B0} ");
     assert_eq!(runs[1].style.role, Some(Role::Muted));
@@ -1121,8 +1148,8 @@ fn powerline_chevrons_are_charged_to_total_width_in_layout() {
 }
 
 #[test]
-fn render_with_warn_emits_powerline_chevron_wrapped_in_muted_sgr() {
-    // End-to-end pin: drive two segments through `render_with_warn`
+fn render_with_observers_emits_powerline_chevron_wrapped_in_muted_sgr() {
+    // End-to-end pin: drive two segments through `render_with_observers`
     // under Palette16 with powerline separators between them. The
     // output must contain the padded chevron wrapped in *some* SGR
     // open + reset; the exact bytes are computed from
@@ -1146,11 +1173,12 @@ fn render_with_warn_emits_powerline_chevron_wrapped_in_muted_sgr() {
         ],
         Separator::powerline(),
     );
-    let line = render_with_warn(
+    let_noop_observers!(observers);
+    let line = render_with_observers(
         &items,
         &empty_ctx(),
         100,
-        &mut |_| {},
+        &mut observers,
         theme::default_theme(),
         theme::Capability::Palette16,
         false,
@@ -1182,7 +1210,8 @@ fn render_to_runs_emits_literal_separator_with_default_style() {
         ],
         Separator::Literal(Cow::Borrowed(" | ")),
     );
-    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut |_| {});
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
     assert_eq!(runs.len(), 3);
     assert_eq!(runs[1].text, " | ");
     assert_eq!(runs[1].style, Style::default());
