@@ -65,7 +65,6 @@ impl<'a> LayoutObservers<'a> {
     /// the `LayoutDecision` only when an observer is attached, so
     /// production callers (no `on_decision`) pay zero allocations
     /// per emit site even for `Cow::Owned` user-config segment ids.
-    #[allow(dead_code)] // wired by lsm-b00q when apply_layout gains emit sites
     pub(crate) fn emit_with(&mut self, decision: impl FnOnce() -> LayoutDecision) {
         if let Some(cb) = self.on_decision.as_mut() {
             cb(&decision());
@@ -141,8 +140,13 @@ pub fn render_with_observers(
 /// segments that survived to the layout pass, with separators
 /// surviving only between two surviving segments.
 ///
-/// The five `LayoutDecision` emit sites (one per variant) land in
-/// lsm-b00q; until then `on_decision` receives zero events.
+/// When the caller has attached an `on_decision` callback via
+/// [`LayoutObservers::with_decision`], the engine routes a typed
+/// [`LayoutDecision`] event through it at each of the five emit
+/// sites (PriorityDrop, ShrinkApplied, ReflowApplied,
+/// WidthBoundUnderMinDrop, WidthBoundOverMaxTruncate). Width-bound
+/// events fire during [`collect_items_with`]; the rest fire inside
+/// [`apply_layout`]'s reflow loop.
 #[must_use]
 pub fn render_to_runs(
     items: &[LineItem],
@@ -152,7 +156,7 @@ pub fn render_to_runs(
 ) -> Vec<StyledRun> {
     let rc = RenderContext::new(terminal_width);
     let layout_items = collect_items_with(items, ctx, &rc, observers);
-    let laid_out = apply_layout(layout_items, ctx, &rc, terminal_width);
+    let laid_out = apply_layout(layout_items, ctx, &rc, terminal_width, observers);
     items_to_runs(&laid_out)
 }
 
@@ -275,7 +279,8 @@ fn collect_items_with<'a>(
                         continue;
                     }
                 };
-                let Some(rendered) = apply_width_bounds(rendered, defaults.width) else {
+                let Some(rendered) = apply_width_bounds(rendered, defaults.width, id, observers)
+                else {
                     pop_trailing_separator(&mut out);
                     continue;
                 };
@@ -334,9 +339,8 @@ fn apply_override_at(items: &mut [LayoutItem<'_>], idx: usize) {
     }
 }
 
-/// Pure layout pass — no styling, no emission. Runs the
-/// priority-drop / shrink / reflow loop and returns surviving items
-/// in render order. When a segment must be removed, the adjacent
+/// Runs the priority-drop / shrink / reflow loop and returns surviving
+/// items in render order. When a segment must be removed, the adjacent
 /// separator goes with it (see [`drop_segment_and_adjacent_separator`]).
 ///
 /// Per iteration, for the highest-priority droppable segment:
@@ -344,11 +348,18 @@ fn apply_override_at(items: &mut [LayoutItem<'_>], idx: usize) {
 /// drop the whole segment last. Each compaction path may produce a
 /// `right_separator` different from the pre-shrink value, so the
 /// inline override slot gets re-propagated after a rewrite.
+///
+/// Emits one [`LayoutDecision`] per iteration through `observers`:
+/// `ShrinkApplied`, `ReflowApplied`, or `PriorityDrop` depending on
+/// which branch fired. Width-bound emits (`WidthBoundUnderMinDrop` /
+/// `WidthBoundOverMaxTruncate`) fire earlier inside
+/// [`apply_width_bounds`] during [`collect_items_with`].
 fn apply_layout<'a>(
     mut items: Vec<LayoutItem<'a>>,
     ctx: &DataContext,
     rc: &RenderContext,
     terminal_width: u16,
+    observers: &mut LayoutObservers<'_>,
 ) -> Vec<LayoutItem<'a>> {
     let budget = u32::from(terminal_width);
     loop {
@@ -365,19 +376,55 @@ fn apply_layout<'a>(
         let LayoutItem::Segment(seg) = &items[drop_idx] else {
             break;
         };
+        // Capture immutable fields before the mutation below would
+        // invalidate `seg`. `id` is a pointer copy into the input
+        // `LineItem` slice, valid past any `items[drop_idx]` rewrite.
+        let id: &std::borrow::Cow<'static, str> = seg.id;
+        let priority = seg.defaults.priority;
+        let pre_width = seg.rendered.width;
+        let truncatable = seg.defaults.truncatable;
+        let target =
+            u16::try_from(u32::from(pre_width).saturating_sub(overflow)).unwrap_or(u16::MAX);
+
         if let Some(shrunk) = try_shrink(seg, ctx, rc, overflow) {
+            let to_width = shrunk.width;
             if let LayoutItem::Segment(s) = &mut items[drop_idx] {
                 s.rendered = shrunk;
             }
             apply_override_at(&mut items, drop_idx);
-        } else if seg.defaults.truncatable {
+            observers.emit_with(|| {
+                LayoutDecision::shrink_applied(id.clone(), pre_width, to_width, target)
+            });
+        } else if truncatable {
             if let Some(reflowed) = try_reflow(seg, overflow) {
+                let to_width = reflowed.rendered.width;
                 items[drop_idx] = LayoutItem::Segment(reflowed);
                 apply_override_at(&mut items, drop_idx);
+                observers.emit_with(|| {
+                    LayoutDecision::reflow_applied(id.clone(), pre_width, to_width, target)
+                });
             } else {
+                observers.emit_with(|| {
+                    LayoutDecision::priority_drop(
+                        id.clone(),
+                        priority,
+                        terminal_width,
+                        overflow,
+                        pre_width,
+                    )
+                });
                 drop_segment_and_adjacent_separator(&mut items, drop_idx);
             }
         } else {
+            observers.emit_with(|| {
+                LayoutDecision::priority_drop(
+                    id.clone(),
+                    priority,
+                    terminal_width,
+                    overflow,
+                    pre_width,
+                )
+            });
             drop_segment_and_adjacent_separator(&mut items, drop_idx);
         }
     }
@@ -419,7 +466,9 @@ fn drop_segment_and_adjacent_separator(items: &mut Vec<LayoutItem<'_>>, idx: usi
 
 /// Test-only helper that mirrors `render_with_observers`'s compose order.
 /// Lets unit tests build [`LayoutItem`] literals directly without
-/// restating the layout-then-emit dance per case.
+/// restating the layout-then-emit dance per case. Decisions are dropped
+/// here; tests that need to assert emits should drive `render_to_runs`
+/// with a `Vec<LayoutDecision>`-collecting observer.
 #[cfg(test)]
 fn render_items(
     items: Vec<LayoutItem<'_>>,
@@ -429,7 +478,9 @@ fn render_items(
     theme: &Theme,
     capability: Capability,
 ) -> String {
-    let laid_out = apply_layout(items, ctx, rc, terminal_width);
+    let mut warn: fn(&str) = |_: &str| {};
+    let mut observers = LayoutObservers::new(&mut warn);
+    let laid_out = apply_layout(items, ctx, rc, terminal_width, &mut observers);
     let runs = items_to_runs(&laid_out);
     runs_to_ansi(&runs, theme, capability, false)
 }
@@ -485,21 +536,40 @@ fn total_width(items: &[LayoutItem<'_>]) -> u32 {
         .sum()
 }
 
-/// Applies `bounds`: under-min drops the segment, over-max truncates with
-/// a trailing ellipsis and a recomputed width. `None` bounds is an
-/// explicit passthrough — the segment carries no constraints.
+/// Applies `bounds`: under-min drops the segment (emits
+/// `LayoutDecision::WidthBoundUnderMinDrop`), over-max truncates with
+/// a trailing ellipsis and a recomputed width (emits
+/// `LayoutDecision::WidthBoundOverMaxTruncate`). `None` bounds is an
+/// explicit passthrough — the segment carries no constraints, no event.
+///
+/// `id` is `&Cow<'static, str>` (not `&str`) so the emit-site
+/// `id.clone()` preserves the `Cow::Owned` vs `Cow::Borrowed`
+/// distinction the `LayoutDecision` constructors require.
+#[allow(clippy::ptr_arg)] // see doc — `Cow` identity is load-bearing for the LayoutDecision id.
 fn apply_width_bounds(
     rendered: RenderedSegment,
     bounds: Option<WidthBounds>,
+    id: &std::borrow::Cow<'static, str>,
+    observers: &mut LayoutObservers<'_>,
 ) -> Option<RenderedSegment> {
     let Some(bounds) = bounds else {
         return Some(rendered);
     };
     if rendered.width < bounds.min() {
+        let rendered_width = rendered.width;
+        let min = bounds.min();
+        observers.emit_with(|| {
+            LayoutDecision::width_bound_under_min_drop(id.clone(), rendered_width, min)
+        });
         return None;
     }
     if rendered.width > bounds.max() {
-        return Some(truncate_to(rendered, bounds.max()));
+        let rendered_width = rendered.width;
+        let max = bounds.max();
+        observers.emit_with(|| {
+            LayoutDecision::width_bound_over_max_truncate(id.clone(), rendered_width, max)
+        });
+        return Some(truncate_to(rendered, max));
     }
     Some(rendered)
 }

@@ -44,8 +44,9 @@ pub enum LayoutDecision {
         /// `u32` mirrors `total_width()`'s overflow-safe accumulator
         /// so a layout with many wide segments can't wrap `u16`.
         overflow: u32,
-        /// Pre-drop `rendered.width` of the segment removed
-        /// (not the line delta). `>= 1`.
+        /// Pre-drop `rendered.width` of the segment removed (not the
+        /// line delta). May be `0` — empty-render segments are valid
+        /// drop targets when separator pressure forces slot removal.
         dropped_width: u16,
     },
     /// `try_shrink` returned a valid compact render. `from` is the
@@ -90,11 +91,6 @@ pub enum LayoutDecision {
     },
 }
 
-// The `pub(crate)` constructors below have no production callers
-// until lsm-b00q wires them at the five emit sites in `apply_layout`.
-// Tests cover them, but `cargo clippy --lib` excludes #[cfg(test)] from
-// dead-code analysis. The allow lifts once lsm-b00q lands.
-#[allow(dead_code)]
 impl LayoutDecision {
     /// Engine-recommended remediation phrasing for the decision, or
     /// `None` when the decision doesn't have a user-actionable fix.
@@ -120,9 +116,10 @@ impl LayoutDecision {
 
     /// `priority > 0`: `apply_layout`'s `highest_priority_droppable` filter
     /// excludes priority-0 segments; the assertion catches a future bypass.
-    /// `overflow >= 1` and `dropped_width >= 1` mirror the engine invariants:
-    /// the loop only enters this branch when `total > budget`, and a zero-width
-    /// drop would be semantically empty.
+    /// `overflow >= 1` mirrors the engine invariant: the loop only enters
+    /// this branch when `total > budget`. `dropped_width == 0` is allowed —
+    /// a zero-cell render (`RenderedSegment::new("")`) is a valid drop
+    /// target when separator pressure forces removal of the slot itself.
     #[must_use]
     pub(crate) fn priority_drop(
         id: Cow<'static, str>,
@@ -132,8 +129,8 @@ impl LayoutDecision {
         dropped_width: u16,
     ) -> Self {
         debug_assert!(
-            priority > 0 && overflow >= 1 && dropped_width >= 1,
-            "PriorityDrop invariants: priority>0, overflow>=1, dropped_width>=1 (got priority={priority}, overflow={overflow}, dropped_width={dropped_width})"
+            priority > 0 && overflow >= 1,
+            "PriorityDrop invariants: priority>0, overflow>=1 (got priority={priority}, overflow={overflow})"
         );
         Self::PriorityDrop {
             id,
@@ -251,8 +248,9 @@ mod tests {
         let _ = LayoutDecision::shrink_applied(Cow::Borrowed("a"), 20, 16, 17);
         let _ = LayoutDecision::reflow_applied(Cow::Borrowed("a"), 20, 16, 17);
 
-        // PriorityDrop: priority=1 (minimum non-zero) accepted, with
-        // overflow=1 + dropped_width=1 at their minimum non-zero values.
+        // PriorityDrop: priority=1 + overflow=1 at their minimum
+        // non-zero boundaries; dropped_width is unconstrained, so
+        // `dropped_width=1` here is a typical value, not a boundary.
         let _ = LayoutDecision::priority_drop(Cow::Borrowed("a"), 1, 80, 1, 1);
 
         // Width bounds: rendered = bound ± 1 accepted (the strict
@@ -289,23 +287,24 @@ mod tests {
 
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "PriorityDrop invariants: priority>0, overflow>=1, dropped_width>=1")]
+    #[should_panic(expected = "PriorityDrop invariants: priority>0, overflow>=1")]
     fn priority_drop_panics_in_debug_when_priority_is_zero() {
         let _ = LayoutDecision::priority_drop(Cow::Borrowed("git"), 0, 80, 12, 6);
     }
 
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "PriorityDrop invariants: priority>0, overflow>=1, dropped_width>=1")]
+    #[should_panic(expected = "PriorityDrop invariants: priority>0, overflow>=1")]
     fn priority_drop_panics_when_overflow_is_zero() {
         let _ = LayoutDecision::priority_drop(Cow::Borrowed("git"), 200, 80, 0, 6);
     }
 
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "PriorityDrop invariants: priority>0, overflow>=1, dropped_width>=1")]
-    fn priority_drop_panics_when_dropped_width_is_zero() {
-        let _ = LayoutDecision::priority_drop(Cow::Borrowed("git"), 200, 80, 12, 0);
+    fn priority_drop_accepts_zero_dropped_width() {
+        // Zero-cell renders (e.g. `RenderedSegment::new("")`) can be
+        // selected for drop when separator pressure forces slot removal;
+        // the constructor must not panic on `dropped_width == 0`.
+        let _ = LayoutDecision::priority_drop(Cow::Borrowed("empty"), 200, 80, 5, 0);
     }
 
     #[test]

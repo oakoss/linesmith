@@ -303,14 +303,17 @@ fn render_inline_none_separator_collapses_neighbors() {
 fn apply_width_bounds_drops_below_min() {
     let bounds = WidthBounds::new(5, 10);
     let rendered = RenderedSegment::new("abc"); // width 3
-    assert!(apply_width_bounds(rendered, bounds).is_none());
+    let_noop_observers!(observers);
+    assert!(apply_width_bounds(rendered, bounds, &TEST_SEG_ID, &mut observers).is_none());
 }
 
 #[test]
 fn apply_width_bounds_truncates_above_max() {
     let bounds = WidthBounds::new(0, 5);
     let rendered = RenderedSegment::new("abcdefghij"); // width 10
-    let truncated = apply_width_bounds(rendered, bounds).expect("truncated");
+    let_noop_observers!(observers);
+    let truncated =
+        apply_width_bounds(rendered, bounds, &TEST_SEG_ID, &mut observers).expect("truncated");
     assert_eq!(truncated.width, 5);
     assert!(truncated.text.ends_with('…'));
     assert_eq!(truncated.text, "abcd…");
@@ -320,14 +323,18 @@ fn apply_width_bounds_truncates_above_max() {
 fn apply_width_bounds_passthrough_within_range() {
     let bounds = WidthBounds::new(2, 10);
     let original = RenderedSegment::new("hello");
-    let result = apply_width_bounds(original.clone(), bounds).expect("kept");
+    let_noop_observers!(observers);
+    let result =
+        apply_width_bounds(original.clone(), bounds, &TEST_SEG_ID, &mut observers).expect("kept");
     assert_eq!(result, original);
 }
 
 #[test]
 fn apply_width_bounds_none_is_passthrough() {
     let original = RenderedSegment::new("anything");
-    let result = apply_width_bounds(original.clone(), None).expect("kept");
+    let_noop_observers!(observers);
+    let result =
+        apply_width_bounds(original.clone(), None, &TEST_SEG_ID, &mut observers).expect("kept");
     assert_eq!(result, original);
 }
 
@@ -343,8 +350,14 @@ fn truncate_handles_wide_grapheme_without_splitting() {
     // The middle-dot is 1 cell; truncating "42% · 200k" (10 cells) to
     // 6 cells should yield "42% ·…" (5 cells of content + ellipsis).
     let bounds = WidthBounds::new(0, 6);
-    let truncated =
-        apply_width_bounds(RenderedSegment::new("42% · 200k"), bounds).expect("truncated");
+    let_noop_observers!(observers);
+    let truncated = apply_width_bounds(
+        RenderedSegment::new("42% · 200k"),
+        bounds,
+        &TEST_SEG_ID,
+        &mut observers,
+    )
+    .expect("truncated");
     assert_eq!(truncated.text, "42% ·…");
     assert_eq!(truncated.width, 6);
 }
@@ -1464,4 +1477,409 @@ fn try_reflow_preserves_segment_id_reference() {
         "alt",
         "id content must survive — defense-in-depth alongside ptr::eq",
     );
+}
+
+/// Capture LayoutDecision events into a Vec for assertion. Bind two
+/// locals via the macro because both `warn_buf` and `decisions` need
+/// to outlive `observers`; a fn-returning helper would fail the borrow
+/// check at the call site.
+macro_rules! let_capturing_observers {
+    ($name:ident, $decisions:ident) => {
+        let mut __warn_for_capture: fn(&str) = |_: &str| {};
+        let mut $decisions: Vec<LayoutDecision> = Vec::new();
+        let mut __on_decision_for_capture = |d: &LayoutDecision| $decisions.push(d.clone());
+        let mut $name = LayoutObservers::new(&mut __warn_for_capture)
+            .with_decision(&mut __on_decision_for_capture);
+    };
+}
+
+#[test]
+fn emit_priority_drop_when_segment_dropped_under_pressure() {
+    // High-priority `DroppableStub` (priority 200) next to a
+    // priority-0 anchor; budget forces a drop.
+    let items: Vec<LineItem> = vec![
+        LineItem::Segment {
+            id: Cow::Borrowed("anchor"),
+            segment: Box::new(StubSegment(Ok(Some(RenderedSegment::new("a"))))),
+        },
+        LineItem::Separator(Separator::Space),
+        LineItem::Segment {
+            id: Cow::Borrowed("droppable"),
+            segment: Box::new(DroppableStub("zzzzzz")),
+        },
+    ];
+    // Total 1+1+6 = 8. Budget 1 drops droppable; anchor survives.
+    let_capturing_observers!(observers, decisions);
+    let _ = render_to_runs(&items, &empty_ctx(), 1, &mut observers);
+    assert_eq!(decisions.len(), 1, "exactly one decision: {decisions:?}");
+    match &decisions[0] {
+        LayoutDecision::PriorityDrop {
+            id,
+            priority,
+            terminal_width,
+            overflow,
+            dropped_width,
+            ..
+        } => {
+            assert_eq!(id.as_ref(), "droppable");
+            assert_eq!(*priority, 200);
+            assert_eq!(*terminal_width, 1);
+            assert!(*overflow >= 1);
+            assert_eq!(*dropped_width, 6);
+        }
+        other => panic!("expected PriorityDrop, got {other:?}"),
+    }
+}
+
+#[test]
+fn emit_shrink_applied_when_shrink_to_fit_succeeds() {
+    // Segment offers a shrink_to_fit form. Layout pressure forces it
+    // before drop.
+    let items: Vec<LineItem> = vec![
+        LineItem::Segment {
+            id: Cow::Borrowed("shrinkable"),
+            segment: Box::new(ShrinkableSegment {
+                full: "longbranch * ↑2 ↓1",
+                compact: "longbranch",
+            }),
+        },
+        LineItem::Separator(Separator::Space),
+        LineItem::Segment {
+            id: Cow::Borrowed("anchor"),
+            segment: Box::new(AnchorSegment("KEEP")),
+        },
+    ];
+    // Full: 18 + 1 + 4 = 23. Budget 17 → overflow 6 → target 12.
+    // Compact 10 cells fits → shrink applied; line = "longbranch KEEP" (15).
+    let_capturing_observers!(observers, decisions);
+    let _ = render_to_runs(&items, &empty_ctx(), 17, &mut observers);
+    assert_eq!(decisions.len(), 1, "exactly one decision: {decisions:?}");
+    match &decisions[0] {
+        LayoutDecision::ShrinkApplied {
+            id,
+            from,
+            to,
+            target,
+            ..
+        } => {
+            assert_eq!(id.as_ref(), "shrinkable");
+            assert_eq!(*from, 18);
+            assert_eq!(*to, 10);
+            assert_eq!(*target, 12);
+        }
+        other => panic!("expected ShrinkApplied, got {other:?}"),
+    }
+}
+
+#[test]
+fn emit_reflow_applied_when_truncatable_segment_end_ellipsis_fits() {
+    // Truncatable segment without shrink_to_fit; budget forces
+    // try_reflow's end-ellipsis path.
+    struct TruncatableStub(&'static str);
+    impl Segment for TruncatableStub {
+        fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+            Ok(Some(RenderedSegment::new(self.0)))
+        }
+        fn defaults(&self) -> SegmentDefaults {
+            SegmentDefaults::with_priority(200).with_truncatable(true)
+        }
+    }
+    let items: Vec<LineItem> = vec![
+        LineItem::Segment {
+            id: Cow::Borrowed("reflowed"),
+            segment: Box::new(TruncatableStub("workspace-very-long-name")),
+        },
+        LineItem::Separator(Separator::Space),
+        LineItem::Segment {
+            id: Cow::Borrowed("anchor"),
+            segment: Box::new(AnchorSegment("X")),
+        },
+    ];
+    // Full: 24 + 1 + 1 = 26. Budget 10 → overflow 16 → target 8.
+    // try_reflow truncates to 8 cells ("workspa…" or similar).
+    let_capturing_observers!(observers, decisions);
+    let _ = render_to_runs(&items, &empty_ctx(), 10, &mut observers);
+    assert_eq!(decisions.len(), 1, "exactly one decision: {decisions:?}");
+    match &decisions[0] {
+        LayoutDecision::ReflowApplied {
+            id,
+            from,
+            to,
+            target,
+            ..
+        } => {
+            assert_eq!(id.as_ref(), "reflowed");
+            assert_eq!(*from, 24);
+            assert!(*to <= *target);
+            assert_eq!(*target, 8);
+        }
+        other => panic!("expected ReflowApplied, got {other:?}"),
+    }
+}
+
+#[test]
+fn emit_width_bound_under_min_drop_when_render_below_min_floor() {
+    // Segment with width.min=10 renders 3 cells → dropped before
+    // the layout pass.
+    struct NarrowSegment;
+    impl Segment for NarrowSegment {
+        fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+            Ok(Some(RenderedSegment::new("abc")))
+        }
+        fn defaults(&self) -> SegmentDefaults {
+            SegmentDefaults::with_priority(10)
+                .with_width(WidthBounds::new(10, u16::MAX).expect("valid"))
+        }
+    }
+    let items: Vec<LineItem> = vec![LineItem::Segment {
+        id: Cow::Borrowed("narrow"),
+        segment: Box::new(NarrowSegment),
+    }];
+    let_capturing_observers!(observers, decisions);
+    let _ = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
+    assert_eq!(decisions.len(), 1, "exactly one decision: {decisions:?}");
+    match &decisions[0] {
+        LayoutDecision::WidthBoundUnderMinDrop {
+            id,
+            rendered_width,
+            min,
+            ..
+        } => {
+            assert_eq!(id.as_ref(), "narrow");
+            assert_eq!(*rendered_width, 3);
+            assert_eq!(*min, 10);
+        }
+        other => panic!("expected WidthBoundUnderMinDrop, got {other:?}"),
+    }
+}
+
+#[test]
+fn emit_width_bound_over_max_truncate_when_render_above_max() {
+    // Segment with width.max=5 renders 10 cells → truncated at
+    // apply_width_bounds before the layout pass.
+    struct WideSegment;
+    impl Segment for WideSegment {
+        fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+            Ok(Some(RenderedSegment::new("abcdefghij")))
+        }
+        fn defaults(&self) -> SegmentDefaults {
+            SegmentDefaults::with_priority(10).with_width(WidthBounds::new(0, 5).expect("valid"))
+        }
+    }
+    let items: Vec<LineItem> = vec![LineItem::Segment {
+        id: Cow::Borrowed("wide"),
+        segment: Box::new(WideSegment),
+    }];
+    let_capturing_observers!(observers, decisions);
+    let _ = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
+    assert_eq!(decisions.len(), 1, "exactly one decision: {decisions:?}");
+    match &decisions[0] {
+        LayoutDecision::WidthBoundOverMaxTruncate {
+            id,
+            rendered_width,
+            max,
+            ..
+        } => {
+            assert_eq!(id.as_ref(), "wide");
+            assert_eq!(*rendered_width, 10);
+            assert_eq!(*max, 5);
+        }
+        other => panic!("expected WidthBoundOverMaxTruncate, got {other:?}"),
+    }
+}
+
+#[test]
+fn no_decisions_emitted_when_no_pressure_no_bounds() {
+    // Happy path: segments render within their bounds and the line
+    // fits the budget. No LayoutDecision events fire. Pins the
+    // "zero events on the disabled path" cost contract.
+    let items = line_items_spaced(vec![
+        Box::new(StubSegment(Ok(Some(RenderedSegment::new("a"))))),
+        Box::new(StubSegment(Ok(Some(RenderedSegment::new("b"))))),
+    ]);
+    let_capturing_observers!(observers, decisions);
+    let _ = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
+    assert!(
+        decisions.is_empty(),
+        "no decisions on happy path: {decisions:?}"
+    );
+}
+
+#[test]
+fn emit_priority_drop_via_truncatable_path_when_reflow_target_below_floor() {
+    // Truncatable segment with width.min=8 set high enough that
+    // `try_reflow`'s floor rejects every target the overflow demands.
+    // The engine falls through to drop; PriorityDrop fires via the
+    // truncatable branch — a distinct code path from the
+    // non-truncatable PriorityDrop covered above.
+    struct FloorBoundTruncatable;
+    impl Segment for FloorBoundTruncatable {
+        fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+            Ok(Some(RenderedSegment::new("abcdefghij"))) // 10 cells
+        }
+        fn defaults(&self) -> SegmentDefaults {
+            SegmentDefaults::with_priority(200)
+                .with_truncatable(true)
+                .with_width(WidthBounds::new(8, u16::MAX).expect("valid"))
+        }
+    }
+    let items: Vec<LineItem> = vec![
+        LineItem::Segment {
+            id: Cow::Borrowed("anchor"),
+            segment: Box::new(StubSegment(Ok(Some(RenderedSegment::new("a"))))),
+        },
+        LineItem::Separator(Separator::Space),
+        LineItem::Segment {
+            id: Cow::Borrowed("floor-bound"),
+            segment: Box::new(FloorBoundTruncatable),
+        },
+    ];
+    // Total: 1 + 1 + 10 = 12. Budget 6 → overflow 6 → target 4.
+    // Reflow floor max(8, 2) = 8 rejects target 4 → drop via the
+    // truncatable branch.
+    let_capturing_observers!(observers, decisions);
+    let _ = render_to_runs(&items, &empty_ctx(), 6, &mut observers);
+    assert_eq!(decisions.len(), 1, "exactly one decision: {decisions:?}");
+    match &decisions[0] {
+        LayoutDecision::PriorityDrop {
+            id,
+            priority,
+            terminal_width,
+            overflow,
+            dropped_width,
+            ..
+        } => {
+            assert_eq!(id.as_ref(), "floor-bound");
+            assert_eq!(*priority, 200);
+            assert_eq!(*terminal_width, 6);
+            assert!(*overflow >= 1);
+            assert_eq!(*dropped_width, 10);
+        }
+        other => panic!("expected PriorityDrop, got {other:?}"),
+    }
+}
+
+#[test]
+fn emit_multiple_decisions_in_iteration_order_under_compound_pressure() {
+    // Two reflow-loop iterations under compound pressure: priority-200
+    // (shrinkable) tries shrink first but the compact form still
+    // exceeds the target, so the segment drops; priority-150 then
+    // drops to clear remaining overflow. Pins both ordering and
+    // per-iteration capture so an emit-before-mutate vs mutate-before-
+    // emit swap is visible.
+    struct DroppableP150(&'static str);
+    impl Segment for DroppableP150 {
+        fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+            Ok(Some(RenderedSegment::new(self.0)))
+        }
+        fn defaults(&self) -> SegmentDefaults {
+            SegmentDefaults::with_priority(150)
+        }
+    }
+    let items: Vec<LineItem> = vec![
+        LineItem::Segment {
+            id: Cow::Borrowed("anchor"),
+            segment: Box::new(AnchorSegment("A")),
+        },
+        LineItem::Separator(Separator::Space),
+        LineItem::Segment {
+            id: Cow::Borrowed("shrinkable"),
+            segment: Box::new(ShrinkableSegment {
+                full: "longbranch * ↑2 ↓1",
+                compact: "longbranch",
+            }),
+        },
+        LineItem::Separator(Separator::Space),
+        LineItem::Segment {
+            id: Cow::Borrowed("droppable"),
+            segment: Box::new(DroppableP150("midpriority")),
+        },
+    ];
+    // Full: 1 + 1 + 18 + 1 + 11 = 32. Budget 11.
+    // Iter 1: priority 200 (shrinkable) fires. try_shrink target =
+    // saturating_sub(18, 21) = 0; compact (10) > 0 → reject. Not
+    // truncatable → drop "shrinkable".
+    // Iter 2: total = 1 + 1 + 11 = 13, still > 11. Priority 150
+    // fires; not truncatable → drop "droppable".
+    // Captured: [PriorityDrop shrinkable, PriorityDrop droppable].
+    let_capturing_observers!(observers, decisions);
+    let _ = render_to_runs(&items, &empty_ctx(), 11, &mut observers);
+    assert_eq!(decisions.len(), 2, "two decisions in order: {decisions:?}");
+    match (&decisions[0], &decisions[1]) {
+        (
+            LayoutDecision::PriorityDrop {
+                id: id1,
+                priority: p1,
+                ..
+            },
+            LayoutDecision::PriorityDrop {
+                id: id2,
+                priority: p2,
+                ..
+            },
+        ) => {
+            assert_eq!(
+                id1.as_ref(),
+                "shrinkable",
+                "shrinkable drops first (priority 200)"
+            );
+            assert_eq!(*p1, 200);
+            assert_eq!(
+                id2.as_ref(),
+                "droppable",
+                "droppable drops second (priority 150)"
+            );
+            assert_eq!(*p2, 150);
+        }
+        other => panic!("expected two PriorityDrops in order, got {other:?}"),
+    }
+}
+
+#[test]
+fn emit_priority_drop_does_not_panic_on_zero_width_segment() {
+    // Regression: `RenderedSegment::new("")` is a valid zero-cell
+    // render. Under separator pressure the engine can select such a
+    // segment to drop, and the PriorityDrop emit must accept
+    // `dropped_width == 0` instead of panicking debug builds.
+    struct EmptySegment;
+    impl Segment for EmptySegment {
+        fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+            Ok(Some(RenderedSegment::new("")))
+        }
+        fn defaults(&self) -> SegmentDefaults {
+            SegmentDefaults::with_priority(200)
+        }
+    }
+    // Two anchors flanking an empty priority-200 segment so the
+    // separators on either side give the engine overflow to chase.
+    let items: Vec<LineItem> = vec![
+        LineItem::Segment {
+            id: Cow::Borrowed("anchor-l"),
+            segment: Box::new(AnchorSegment("L")),
+        },
+        LineItem::Separator(Separator::Space),
+        LineItem::Segment {
+            id: Cow::Borrowed("empty"),
+            segment: Box::new(EmptySegment),
+        },
+        LineItem::Separator(Separator::Space),
+        LineItem::Segment {
+            id: Cow::Borrowed("anchor-r"),
+            segment: Box::new(AnchorSegment("R")),
+        },
+    ];
+    // Total widths: 1 + 1 + 0 + 1 + 1 = 4. Budget 2 forces drop;
+    // empty (priority 200) is the only droppable target.
+    let_capturing_observers!(observers, decisions);
+    let _ = render_to_runs(&items, &empty_ctx(), 2, &mut observers);
+    assert_eq!(decisions.len(), 1, "exactly one decision: {decisions:?}");
+    match &decisions[0] {
+        LayoutDecision::PriorityDrop {
+            id, dropped_width, ..
+        } => {
+            assert_eq!(id.as_ref(), "empty");
+            assert_eq!(*dropped_width, 0, "zero-width drop must round-trip cleanly");
+        }
+        other => panic!("expected PriorityDrop, got {other:?}"),
+    }
 }
