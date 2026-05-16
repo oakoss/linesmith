@@ -80,7 +80,19 @@ pub fn fetch_usage(
     match transport.get(&url, creds.token(), timeout) {
         Ok(resp) => interpret_status(resp),
         Err(e) if e.kind() == io::ErrorKind::TimedOut => Err(UsageError::Timeout),
-        Err(_) => Err(UsageError::NetworkError),
+        Err(e) => {
+            // `UsageError::NetworkError` coalesces ConnectionRefused /
+            // TLS / DNS / cert / read failures into one variant for the
+            // orchestrator's stale-cache fallback. `LINESMITH_LOG=debug`
+            // reveals the root cause without enlarging the public taxonomy.
+            //
+            // Redaction invariant: `io::Error` Display from `ureq_err_to_io`
+            // carries URL + OS-level kind only — ureq does not propagate
+            // request headers (Bearer token) into error Display, and the
+            // URL itself is user-supplied config without credentials.
+            crate::lsm_debug!("fetch_usage: transport error ({:?}): {e}", e.kind());
+            Err(UsageError::NetworkError)
+        }
     }
 }
 
@@ -94,7 +106,13 @@ fn build_url(base_url: &str) -> String {
 
 fn interpret_status(resp: HttpResponse) -> Result<UsageApiResponse, UsageError> {
     match resp.status {
-        200..=299 => serde_json::from_slice(&resp.body).map_err(|_| UsageError::ParseError),
+        200..=299 => serde_json::from_slice(&resp.body).map_err(|e| {
+            // Diagnosing live-endpoint shape drift requires serde's
+            // line/column/message; the public variant can't carry that.
+            // Body bytes stay out of logs.
+            crate::lsm_debug!("fetch_usage: parse error: {e}");
+            UsageError::ParseError
+        }),
         401 => Err(UsageError::Unauthorized),
         429 => {
             let retry_after = resp
@@ -168,40 +186,58 @@ impl UreqTransport {
 /// the user sees `[Network error]` with no clue the env var was the
 /// cause.
 fn resolve_proxy_from_env() -> Option<ureq::Proxy> {
-    match ureq::Proxy::try_from_env() {
-        Some(proxy) => Some(proxy),
-        None => {
-            // `try_from_env` returns `None` both when no env var is
-            // set AND when a set var fails to parse. Distinguish the
-            // two by re-reading the env vars in ureq's own iteration
-            // order; a set-but-unparsed value is the case worth
-            // warning about.
-            for var in [
-                "ALL_PROXY",
-                "all_proxy",
-                "HTTPS_PROXY",
-                "https_proxy",
-                "HTTP_PROXY",
-                "http_proxy",
-            ] {
-                if let Ok(val) = std::env::var(var) {
-                    if !val.is_empty() {
-                        // Log the variable NAME only. Proxy URLs
-                        // routinely embed credentials (`user:pass@`);
-                        // echoing the value to stderr / CI logs
-                        // would leak them precisely in the
-                        // misconfiguration scenario this warn is
-                        // trying to help diagnose.
-                        crate::lsm_warn!(
-                            "{var}: failed to parse as proxy URL; falling back to direct connection"
-                        );
-                        return None;
-                    }
-                }
-            }
+    resolve_proxy(ureq::Proxy::try_from_env, |var| match std::env::var(var) {
+        Ok(v) => Some(v),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            // Naming the variable (not the bytes) preserves the
+            // credential-leak guarantee. Without this arm, a non-UTF-8
+            // proxy env would silently route as no-proxy.
+            crate::lsm_warn!("{var}: contains non-UTF-8 bytes; ignoring as a proxy source");
             None
         }
+    })
+}
+
+/// Pure form of [`resolve_proxy_from_env`] with the `ureq` probe and
+/// the env reader as parameters, so tests drive all three branches
+/// (probe returns Some, env unset, env set-but-unparseable) without
+/// touching process env — racy under parallel `cargo test`.
+///
+/// **Invariant:** callers of `get_env` must not emit, log, or echo
+/// the returned value. The credential-leak guarantee in the warn
+/// path (variable NAME only) is a `resolve_proxy` invariant, not a
+/// per-call discipline — proxy URLs routinely embed `user:pass@`.
+fn resolve_proxy<P, G>(probe: P, get_env: G) -> Option<ureq::Proxy>
+where
+    P: FnOnce() -> Option<ureq::Proxy>,
+    G: Fn(&str) -> Option<String>,
+{
+    if let Some(proxy) = probe() {
+        return Some(proxy);
     }
+    // Probe returned None both when no env var is set AND when a set
+    // var fails to parse. Distinguish by re-reading in ureq's own
+    // iteration order; a set-but-unparsed value is the case worth
+    // warning about.
+    for var in [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
+        // No `let val` binding: prevents a future refactor from
+        // accidentally printing the proxy URL (which embeds credentials).
+        if get_env(var).is_some_and(|v| !v.is_empty()) {
+            crate::lsm_warn!(
+                "{var}: failed to parse as proxy URL; falling back to direct connection"
+            );
+            return None;
+        }
+    }
+    None
 }
 
 /// Build the `User-Agent` header value from the compile-time package
@@ -233,11 +269,20 @@ impl UsageTransport for UreqTransport {
             .map_err(ureq_err_to_io)?;
 
         let status: u16 = response.status().as_u16();
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
+        let retry_after = response.headers().get("retry-after").and_then(|v| {
+            v.to_str().map(String::from).ok().or_else(|| {
+                // RFC 9110 §10.2.3 specifies ASCII for `Retry-After`;
+                // non-ASCII bytes are server malice or misconfig. Warn
+                // only on 429 — that's where a silent drop misleads the
+                // caller into thinking rate-limiting isn't in effect.
+                if status == 429 {
+                    crate::lsm_warn!(
+                        "retry-after header contained non-ASCII bytes; falling back to default backoff"
+                    );
+                }
+                None
+            })
+        });
 
         // Cap the body read so a misbehaving / MITM'd server can't
         // OOM us. Oversized responses surface as ParseError in
@@ -566,5 +611,136 @@ mod tests {
         let transport = ok_transport(204, "", None);
         let err = fetch_usage(&transport, "https://x", &creds(), DEFAULT_TIMEOUT).unwrap_err();
         assert!(matches!(err, UsageError::ParseError));
+    }
+
+    #[test]
+    fn resolve_proxy_returns_probe_value_and_skips_env_check() {
+        let env_called = std::cell::Cell::new(false);
+        let (proxy, warns) = crate::logging::_test_capture_warns(|| {
+            resolve_proxy(
+                || ureq::Proxy::new("http://probe.example:8080").ok(),
+                |_| {
+                    env_called.set(true);
+                    None
+                },
+            )
+        });
+        assert!(proxy.is_some(), "probe Some passes through");
+        assert!(
+            !env_called.get(),
+            "env getter must not run when probe returned Some"
+        );
+        assert!(warns.is_empty(), "happy path must not warn, got {warns:?}");
+    }
+
+    #[test]
+    fn resolve_proxy_returns_none_silently_when_no_env_vars_set() {
+        let (proxy, warns) =
+            crate::logging::_test_capture_warns(|| resolve_proxy(|| None, |_| None));
+        assert!(proxy.is_none());
+        assert!(warns.is_empty(), "no env set must not warn, got {warns:?}");
+    }
+
+    #[test]
+    fn resolve_proxy_warns_with_var_name_only_when_value_unparseable() {
+        // A set-but-unparseable proxy env var must name the VARIABLE
+        // and the action in the warn, but never echo the value. Proxy
+        // URLs routinely embed `user:pass@`; leaking those into CI logs
+        // is the failure mode this redaction prevents.
+        let (proxy, warns) = crate::logging::_test_capture_warns(|| {
+            resolve_proxy(
+                || None,
+                |var| {
+                    if var == "HTTPS_PROXY" {
+                        Some("http://sneakyuser:sneakypass@badproxy.example:9090".to_string())
+                    } else {
+                        None
+                    }
+                },
+            )
+        });
+        assert!(proxy.is_none());
+        assert_eq!(warns.len(), 1, "expected one warn, got {warns:?}");
+        assert!(
+            warns[0].contains("HTTPS_PROXY"),
+            "warn must name the variable, got {:?}",
+            warns[0]
+        );
+        assert!(
+            warns[0].contains("falling back to direct connection"),
+            "warn must surface the action, got {:?}",
+            warns[0]
+        );
+        assert!(
+            !warns[0].contains("sneakyuser"),
+            "username must NOT appear in warn, got {:?}",
+            warns[0]
+        );
+        assert!(
+            !warns[0].contains("sneakypass"),
+            "password must NOT appear in warn, got {:?}",
+            warns[0]
+        );
+        assert!(
+            !warns[0].contains("badproxy"),
+            "URL host must NOT appear in warn, got {:?}",
+            warns[0]
+        );
+    }
+
+    #[test]
+    fn resolve_proxy_warns_for_first_unparseable_var_in_ureq_precedence_order() {
+        // ALL_PROXY, HTTPS_PROXY, and HTTP_PROXY are all set to
+        // unparseable garbage. The loop stops on the first match, so
+        // the warn must name ALL_PROXY (first in ureq's precedence) and
+        // not the later vars. The value is also banned from the warn
+        // (redaction guard for the precedence path).
+        let (proxy, warns) = crate::logging::_test_capture_warns(|| {
+            resolve_proxy(
+                || None,
+                |var| match var {
+                    "ALL_PROXY" | "HTTPS_PROXY" | "HTTP_PROXY" => Some("garbage://".to_string()),
+                    _ => None,
+                },
+            )
+        });
+        assert!(proxy.is_none());
+        assert_eq!(warns.len(), 1, "expected one warn, got {warns:?}");
+        assert!(
+            warns[0].contains("ALL_PROXY"),
+            "warn must name ALL_PROXY (first in precedence), got {:?}",
+            warns[0]
+        );
+        assert!(
+            !warns[0].contains("HTTPS_PROXY") && !warns[0].contains("HTTP_PROXY"),
+            "warn must not name later-precedence vars, got {:?}",
+            warns[0]
+        );
+        assert!(
+            !warns[0].contains("garbage"),
+            "warn must not echo the value (redaction guard), got {:?}",
+            warns[0]
+        );
+    }
+
+    #[test]
+    fn resolve_proxy_skips_empty_env_values_without_warning() {
+        // `export HTTPS_PROXY=""` is the same as unset for routing
+        // purposes — surfacing a warn would flood logs for users who
+        // null an inherited proxy via empty assignment.
+        let (proxy, warns) = crate::logging::_test_capture_warns(|| {
+            resolve_proxy(
+                || None,
+                |var| {
+                    if var == "HTTPS_PROXY" {
+                        Some(String::new())
+                    } else {
+                        None
+                    }
+                },
+            )
+        });
+        assert!(proxy.is_none());
+        assert!(warns.is_empty(), "empty value must not warn, got {warns:?}");
     }
 }
