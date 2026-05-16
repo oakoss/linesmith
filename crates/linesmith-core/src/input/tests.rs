@@ -139,6 +139,9 @@ fn parses_context_window() {
 
 #[test]
 fn used_percentage_above_100_clamps_instead_of_rejecting() {
+    // Value-range warn shape (vs. schema-drift): out-of-range numeric
+    // input clamps and fires a single warn echoing the raw value plus
+    // the clamping action.
     let json = br#"{
         "model": { "display_name": "X" },
         "workspace": { "project_dir": "/repo" },
@@ -149,9 +152,21 @@ fn used_percentage_above_100_clamps_instead_of_rejecting() {
             "total_output_tokens": 0
         }
     }"#;
-    let ctx = parse(json).expect("clamp succeeds");
+    let (ctx, warns) = crate::logging::_test_capture_warns(|| parse(json));
+    let ctx = ctx.expect("clamp succeeds");
     let cw = ctx.context_window.expect("context_window present");
     assert_eq!(cw.used.expect("used").value(), 100.0);
+    assert_eq!(warns.len(), 1, "expected exactly one warn, got {warns:?}");
+    assert!(
+        warns[0].starts_with("[warn] context_window.used_percentage = 150"),
+        "warn must echo the raw value, got {:?}",
+        warns[0]
+    );
+    assert!(
+        warns[0].contains("clamping to 100"),
+        "warn must surface the clamping action, got {:?}",
+        warns[0]
+    );
 }
 
 #[test]
@@ -218,8 +233,10 @@ fn used_percentage_in_range_passes_through_unchanged() {
 
 #[test]
 fn missing_used_percentage_degrades_leaf_to_none() {
-    // ADR-0014: missing leaf no longer aborts the parse; only the
-    // affected leaf goes None and peers like `size` survive.
+    // ADR-0014: missing `used_percentage` is the documented pre-first-
+    // API-call shape — silent absence, not schema drift. Peer leaves
+    // (`size`, `total_*_tokens`) survive. The diagnostic channel must
+    // stay quiet here; a warn would flood every fresh-session render.
     let json = br#"{
         "model": { "display_name": "X" },
         "workspace": { "project_dir": "/repo" },
@@ -229,15 +246,21 @@ fn missing_used_percentage_degrades_leaf_to_none() {
             "total_output_tokens": 0
         }
     }"#;
-    let ctx = parse(json).expect("missing leaf must not fail the whole parse");
+    let (ctx, warns) = crate::logging::_test_capture_warns(|| parse(json));
+    let ctx = ctx.expect("missing leaf must not fail the whole parse");
     let cw = ctx.context_window.expect("context_window present");
     assert!(cw.used.is_none());
     assert_eq!(cw.size, Some(200_000));
+    assert!(
+        warns.is_empty(),
+        "documented absence is silent; got {warns:?}"
+    );
 }
 
 #[test]
 fn wrong_type_used_percentage_degrades_leaf_to_none() {
-    // ADR-0014: type drift on a leaf no longer aborts the parse.
+    // ADR-0014: type drift on a leaf no longer aborts the parse, but
+    // it does fire a warn so upstream schema drift surfaces.
     let json = br#"{
         "model": { "display_name": "X" },
         "workspace": { "project_dir": "/repo" },
@@ -248,10 +271,22 @@ fn wrong_type_used_percentage_degrades_leaf_to_none() {
             "total_output_tokens": 0
         }
     }"#;
-    let ctx = parse(json).expect("type-drift leaf must not fail the whole parse");
+    let (ctx, warns) = crate::logging::_test_capture_warns(|| parse(json));
+    let ctx = ctx.expect("type-drift leaf must not fail the whole parse");
     let cw = ctx.context_window.expect("context_window present");
     assert!(cw.used.is_none());
     assert_eq!(cw.size, Some(200_000));
+    assert_eq!(warns.len(), 1, "expected exactly one warn, got {warns:?}");
+    assert!(
+        warns[0].starts_with("[warn] context_window.used_percentage:"),
+        "warn must name the leaf path, got {:?}",
+        warns[0]
+    );
+    assert!(
+        warns[0].contains("expected number"),
+        "warn must surface the type-drift reason, got {:?}",
+        warns[0]
+    );
 }
 
 #[test]
@@ -314,6 +349,9 @@ fn null_used_percentage_degrades_leaf_only() {
 
 #[test]
 fn null_context_window_size_degrades_leaf_only() {
+    // `context_window_size` is a CC-contracted required leaf — null
+    // is schema drift and must fire a warn naming the path so a CC
+    // payload regression surfaces upstream.
     let json = br#"{
         "model": { "display_name": "X" },
         "workspace": { "project_dir": "/repo" },
@@ -324,10 +362,18 @@ fn null_context_window_size_degrades_leaf_only() {
             "total_output_tokens": 0
         }
     }"#;
-    let ctx = parse(json).expect("null size must not fail the whole parse");
+    let (ctx, warns) = crate::logging::_test_capture_warns(|| parse(json));
+    let ctx = ctx.expect("null size must not fail the whole parse");
     let cw = ctx.context_window.expect("context_window present");
     assert!(cw.size.is_none());
     assert!(cw.used.is_some(), "used survives even when size is null");
+    assert_eq!(warns.len(), 1, "expected exactly one warn, got {warns:?}");
+    assert!(
+        warns[0]
+            .starts_with("[warn] context_window.context_window_size: null; degrading leaf to None"),
+        "warn must name the path and the null cause, got {:?}",
+        warns[0]
+    );
 }
 
 #[test]
@@ -898,9 +944,25 @@ fn effort_non_object_non_string_degrades_to_none() {
 fn effort_object_unknown_level_degrades_to_none() {
     // ADR-0014: unknown effort variant warns + degrades, symmetric
     // with parse_vim. A future CC level shouldn't blank the line.
+    //
+    // Unknown-enum-variant warn shape: the warn must echo the unknown
+    // variant AND list the known set so a CC-side rename is debuggable
+    // from the log line alone.
     let bytes = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"},"effort":{"level":"ultra"}}"#;
-    let ctx = parse(bytes).expect("unknown effort variant must not fail the whole parse");
+    let (ctx, warns) = crate::logging::_test_capture_warns(|| parse(bytes));
+    let ctx = ctx.expect("unknown effort variant must not fail the whole parse");
     assert_eq!(ctx.effort, None);
+    assert_eq!(warns.len(), 1, "expected exactly one warn, got {warns:?}");
+    assert!(
+        warns[0].contains("\"ultra\""),
+        "warn must echo the unknown variant, got {:?}",
+        warns[0]
+    );
+    assert!(
+        warns[0].contains("known:"),
+        "warn must list the known set for debuggability, got {:?}",
+        warns[0]
+    );
 }
 
 #[test]

@@ -28,6 +28,7 @@
 //! Not a general-purpose logger: no filtering by target, no
 //! structured fields. Add those when a call site needs them.
 
+use std::cell::RefCell;
 use std::io::{self, Write};
 use std::mem;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -263,6 +264,72 @@ pub fn _test_serial_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|p| p.into_inner())
 }
 
+/// RAII restorer for [`THREAD_SINK`]. Mirrors [`SinkGuard`] so the
+/// thread-local resets on every exit path from [`_test_capture_warns`],
+/// including unwinding panic under the dev/test profile.
+#[must_use = "binding to `_` drops the guard immediately, which restores the prior thread-local sink before the helper's window opens; bind to a real name to hold it"]
+struct ThreadSinkGuard {
+    /// The prior thread-local value, which may itself be `Some(sink)`
+    /// (nested helper) or `None` (first-time install). `Drop` takes
+    /// the field out via `Option::take` and assigns it back into the
+    /// thread-local; the field's outer `Option` is the borrow-checker
+    /// affordance for that `take`, not a guard-active sentinel.
+    prior: Option<Arc<CapturedSink>>,
+}
+
+impl Drop for ThreadSinkGuard {
+    fn drop(&mut self) {
+        // `cell.replace` returns the old value out from under the
+        // borrow so its `Drop` runs after the `RefMut` is released —
+        // matters if a future sink's Drop ever emits (which would
+        // re-enter `with_thread_sink` and try to borrow this cell).
+        let prior = self.prior.take();
+        let _old = THREAD_SINK.with(|cell| cell.replace(prior));
+    }
+}
+
+/// Test-only helper: run `f` with a thread-local [`CapturedSink`]
+/// shadowing the active sink for the calling thread, then return
+/// `f`'s result paired with the drained captured entries (captured-
+/// sink format: `[warn] <msg>` for warns, `[error] <msg>` for
+/// structural failures).
+///
+/// The thread-local sink is consulted **before** the process-wide
+/// level gate inside [`emit`], so calls through [`emit`] or
+/// [`emit_error`] (i.e. `lsm_warn!` / `lsm_error!`) capture regardless
+/// of `LINESMITH_LOG` or a peer test's `set_level`. Peer threads stay
+/// routed to the global sink, so parallel `cargo test` workers don't
+/// pollute each other's warn counts.
+///
+/// **Caveat for `lsm_debug!`:** the macro pre-gates on
+/// `is_enabled(Debug)` before calling `emit`, so a thread-local
+/// capture won't see debug emissions unless the process-wide level
+/// is `Debug`. Tests asserting debug output should hold
+/// [`_test_serial_lock`] and `set_level(Level::Debug)` directly
+/// rather than relying on the helper.
+///
+/// Holds [`_test_serial_lock`] for hermeticity with other tests that
+/// mutate process-wide state through the same lock. **Not reentrant**:
+/// a nested call on the same thread deadlocks at the serial lock —
+/// move shared setup outside the closure rather than nesting helpers.
+///
+/// `#[doc(hidden)]` and leading-underscore for the same reasons
+/// [`_test_serial_lock`] is: cross-crate test access without a
+/// SemVer commitment.
+#[doc(hidden)]
+pub fn _test_capture_warns<F, T>(f: F) -> (T, Vec<String>)
+where
+    F: FnOnce() -> T,
+{
+    let _serial = _test_serial_lock();
+    let sink = Arc::new(CapturedSink::default());
+    let prior = THREAD_SINK.with(|cell| cell.replace(Some(sink.clone())));
+    let _restore = ThreadSinkGuard { prior };
+    let result = f();
+    let captured = sink.drain();
+    (result, captured)
+}
+
 fn sink_slot() -> &'static Mutex<Arc<dyn LogSink>> {
     SINK.get_or_init(|| Mutex::new(Arc::new(StderrSink)))
 }
@@ -328,10 +395,52 @@ impl Drop for SinkGuard {
     }
 }
 
-/// Emit `msg` at `lvl` when the configured level allows. Routed
-/// through the active [`LogSink`]; the default sink writes to
-/// stderr, the TUI's [`CapturedSink`] buffers for in-frame display.
+// Per-thread sink overlay for testability. `None` in production;
+// `_test_capture_warns` swaps in a thread-private CapturedSink for
+// the duration of a test closure. Two concurrent captures installing
+// the *global* SinkGuard would race the slot and see each other's
+// emissions; the thread-local shadow makes the destination
+// per-thread, so parallel `cargo test` workers each get their own
+// captured set.
+thread_local! {
+    static THREAD_SINK: RefCell<Option<Arc<CapturedSink>>> = const { RefCell::new(None) };
+}
+
+/// Look up the calling thread's installed test sink, if any, and
+/// invoke `f` on it. Clones the `Arc` out before calling `f` so the
+/// `RefCell` borrow is released by the time `f` runs — a future sink
+/// impl that recursed into `emit` would otherwise hit a borrow
+/// panic. `try_with` returns false if the thread-local has already
+/// been destroyed (TLS teardown ordering during thread exit), routing
+/// the emission to the global sink rather than panicking.
+#[must_use = "callers must skip the global sink when the thread-local fired, or the emission double-routes"]
+fn with_thread_sink<F: FnOnce(&CapturedSink)>(f: F) -> bool {
+    let sink = THREAD_SINK
+        .try_with(|cell| cell.borrow().clone())
+        .ok()
+        .flatten();
+    if let Some(sink) = sink {
+        f(&sink);
+        true
+    } else {
+        false
+    }
+}
+
+/// Emit `msg` at `lvl` through the active [`LogSink`]. Production
+/// path: the default sink writes to stderr; the TUI's
+/// [`CapturedSink`] buffers for in-frame display; the level gate
+/// suppresses below the configured threshold.
+///
+/// A thread-local capture (installed by [`_test_capture_warns`])
+/// shadows the active sink **and** bypasses the level gate for the
+/// calling thread — tests assert that a warn fires, not whether the
+/// runtime gate happens to be open. Mirrors the existing always-fire
+/// semantics of [`emit_error`].
 pub fn emit(lvl: Level, msg: &str) {
+    if with_thread_sink(|sink| sink.emit(lvl, msg)) {
+        return;
+    }
     if !is_enabled(lvl) {
         return;
     }
@@ -343,6 +452,9 @@ pub fn emit(lvl: Level, msg: &str) {
 /// things that reach this function are render failures a user has no
 /// other way of seeing.
 pub fn emit_error(msg: &str) {
+    if with_thread_sink(|sink| sink.emit_error(msg)) {
+        return;
+    }
     current_sink().emit_error(msg);
 }
 
@@ -706,6 +818,58 @@ mod tests {
         emit(Level::Warn, "captured");
         assert_eq!(captured.snapshot(), vec!["[warn] captured".to_string()]);
         let _ = install_sink(prior);
+    }
+
+    #[test]
+    fn test_capture_warns_returns_function_result_and_captured_emissions() {
+        let (result, captured) = _test_capture_warns(|| {
+            emit(Level::Warn, "first");
+            emit(Level::Warn, "second");
+            42
+        });
+        assert_eq!(result, 42);
+        assert_eq!(
+            captured,
+            vec!["[warn] first".to_string(), "[warn] second".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_capture_warns_captures_emit_error_regardless_of_level() {
+        let (_, captured) = _test_capture_warns(|| {
+            emit_error("structural failure");
+        });
+        assert_eq!(captured, vec!["[error] structural failure".to_string()]);
+    }
+
+    #[test]
+    fn emit_routes_to_thread_local_sink_even_when_global_level_is_off() {
+        // `emit` consults the thread-local sink before the level gate,
+        // so a peer test that left `LEVEL=Off` can't silently suppress
+        // emissions inside a capture window. Setup is inline rather than
+        // via `_test_capture_warns` because we already hold the serial
+        // lock (the helper takes it; std::sync::Mutex is non-reentrant).
+        let _g = lock();
+        set_level(Level::Off);
+        let sink = Arc::new(CapturedSink::default());
+        let prior = THREAD_SINK.with(|cell| cell.replace(Some(sink.clone())));
+        let _restore = ThreadSinkGuard { prior };
+        emit(Level::Warn, "still captured");
+        assert_eq!(sink.drain(), vec!["[warn] still captured".to_string()]);
+        set_level(DEFAULT_LEVEL);
+    }
+
+    #[test]
+    fn test_capture_warns_subsequent_call_starts_empty() {
+        // No state leaks across invocations: each call installs a
+        // fresh CapturedSink and the thread-local restores to its
+        // prior value on return.
+        let _ = _test_capture_warns(|| emit(Level::Warn, "first"));
+        let (_, second) = _test_capture_warns(|| {});
+        assert!(
+            second.is_empty(),
+            "second call must start with no captured entries, got {second:?}"
+        );
     }
 
     #[test]
