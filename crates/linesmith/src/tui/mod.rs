@@ -893,7 +893,7 @@ mod tests {
         let captured = std::sync::Arc::new(CapturedSink::default());
         let _sink = SinkGuard::install(captured.clone());
         let mut calls = 0_u32;
-        let out = retry_on_interrupt(|| {
+        retry_on_interrupt(|| {
             calls += 1;
             if calls <= EINTR_STORM_THRESHOLD + 5 {
                 Err(io::Error::from(io::ErrorKind::Interrupted))
