@@ -320,6 +320,38 @@ fn workspace_and_git_branch_coexist_on_linked_worktree() {
 }
 
 #[test]
+fn git_branch_renders_per_worktree_branch_not_main() {
+    // Verifies git_branch reads HEAD from the linked worktree's own gitdir,
+    // not the primary's. `feat-wt-xyz` is unknown to the primary, so any
+    // rendering of `main` is a definite bug.
+    let (_primary, _wt_parent, worktree_dir) = linked_worktree_fixture("feat-wt-xyz");
+    let (env, _xdg) = cli_env_with_config(
+        worktree_dir,
+        r#"
+            [line]
+            segments = ["git_branch"]
+        "#,
+    );
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let code = linesmith::cli_main(
+        std::iter::empty::<&str>(),
+        Cursor::new(CLAUDE_MINIMAL),
+        &mut stdout,
+        &mut stderr,
+        &env,
+    );
+    assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&stderr));
+    let rendered = String::from_utf8(stdout).expect("utf8");
+    assert_eq!(
+        rendered.trim_end(),
+        "feat-wt-xyz",
+        "git_branch must render the worktree branch, not main: {rendered:?}"
+    );
+}
+
+#[test]
 fn git_branch_hides_outside_repo() {
     use tempfile::TempDir;
 

@@ -486,6 +486,99 @@ mod tests {
         assert_eq!(ctx.repo_kind, RepoKind::Bare);
     }
 
+    /// Fabricate the on-disk layout `git worktree add` produces without
+    /// shelling out. Primary has a real `.git/`; the worktree checkout has
+    /// a `.git` file pointing at `<primary>/.git/worktrees/<name>/`, which
+    /// holds the per-worktree `HEAD`, `commondir`, and `gitdir`.
+    fn hand_built_linked_worktree(name: &str, primary: &Path, wt_root: &Path) -> PathBuf {
+        let primary_git = primary.join(".git");
+        fs::create_dir_all(primary_git.join("refs/heads")).expect("mkdir refs/heads");
+        fs::create_dir_all(primary_git.join("objects")).expect("mkdir objects");
+        fs::write(primary_git.join("HEAD"), "ref: refs/heads/main\n").expect("write primary HEAD");
+
+        let admin_dir = primary_git.join("worktrees").join(name);
+        fs::create_dir_all(&admin_dir).expect("mkdir admin");
+        let worktree_branch = format!("wt-{name}");
+        fs::write(
+            admin_dir.join("HEAD"),
+            format!("ref: refs/heads/{worktree_branch}\n"),
+        )
+        .expect("write admin HEAD");
+        fs::write(admin_dir.join("commondir"), "../..\n").expect("write commondir");
+
+        let worktree_dir = wt_root.join(name);
+        fs::create_dir_all(&worktree_dir).expect("mkdir worktree");
+        fs::write(
+            admin_dir.join("gitdir"),
+            format!("{}\n", worktree_dir.join(".git").display()),
+        )
+        .expect("write gitdir");
+
+        fs::write(
+            worktree_dir.join(".git"),
+            format!("gitdir: {}\n", admin_dir.display()),
+        )
+        .expect("write .git pointer");
+
+        worktree_dir
+    }
+
+    #[test]
+    fn resolve_repo_classifies_hand_built_linked_worktree() {
+        let primary_tmp = TempDir::new().expect("primary");
+        let wt_tmp = TempDir::new().expect("wt root");
+        let worktree = hand_built_linked_worktree("feat-abc", primary_tmp.path(), wt_tmp.path());
+
+        let ctx = resolve_repo(&worktree).expect("resolve").expect("some");
+
+        let RepoKind::LinkedWorktree { name } = &ctx.repo_kind else {
+            panic!("expected LinkedWorktree, got {:?}", ctx.repo_kind);
+        };
+        assert_eq!(name, "feat-abc");
+        assert!(
+            ctx.repo_path.ends_with("worktrees/feat-abc"),
+            "repo_path should point at the per-worktree admin dir, got {:?}",
+            ctx.repo_path
+        );
+        match &ctx.head {
+            Head::Unborn { symbolic_ref } => assert_eq!(
+                symbolic_ref, "wt-feat-abc",
+                "head must come from the worktree admin HEAD, not the primary's"
+            ),
+            other => panic!("expected Unborn(wt-feat-abc), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_kind_returns_basename_for_real_linked_worktree() {
+        let primary = TempDir::new().expect("primary");
+        let wt_parent = TempDir::new().expect("wt parent");
+        run_git_init(primary.path());
+        run_git_commit_allow_empty(primary.path(), "seed");
+        let worktree_dir = wt_parent.path().join("feat-real-wt");
+        run_git(
+            primary.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feat-real-wt",
+                worktree_dir.to_str().expect("utf8 path"),
+            ],
+        );
+
+        let ctx = resolve_repo(&worktree_dir).expect("resolve").expect("some");
+        let RepoKind::LinkedWorktree { name } = &ctx.repo_kind else {
+            panic!("expected LinkedWorktree, got {:?}", ctx.repo_kind);
+        };
+        assert_eq!(name, "feat-real-wt");
+        match &ctx.head {
+            Head::Branch(b) => assert_eq!(b, "feat-real-wt"),
+            other => panic!("expected Branch(feat-real-wt), got {other:?}"),
+        }
+    }
+
     #[test]
     fn unborn_head_reports_symbolic_ref_target() {
         let tmp = TempDir::new().expect("tmp");
