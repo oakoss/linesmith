@@ -217,7 +217,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 fn run_loop(mut model: Model) -> io::Result<()> {
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    terminal.draw(|frame| app::view(&model, frame))?;
+    draw_with_retry(|op| terminal.draw(op).map(|_| ()), &model)?;
     loop {
         let Some(event) = poll_event()? else {
             continue;
@@ -226,7 +226,7 @@ fn run_loop(mut model: Model) -> io::Result<()> {
         if model.quit {
             return Ok(());
         }
-        terminal.draw(|frame| app::view(&model, frame))?;
+        draw_with_retry(|op| terminal.draw(op).map(|_| ()), &model)?;
     }
 }
 
@@ -235,11 +235,99 @@ fn run_loop(mut model: Model) -> io::Result<()> {
 /// Resize routes through [`Event::Resize`] specifically because the
 /// loop only redraws on real events — discarding resize would leave
 /// a stale frame until the next keypress.
+///
+/// `poll` and `read` retry on `ErrorKind::Interrupted` so a
+/// SIGWINCH-induced EINTR (or any other interrupting signal) doesn't
+/// drop the user out of the editor. Other I/O errors propagate as
+/// fatal.
 fn poll_event() -> io::Result<Option<Event>> {
-    if !cevent::poll(POLL_INTERVAL)? {
+    if !retry_on_interrupt(|| cevent::poll(POLL_INTERVAL))? {
         return Ok(None);
     }
-    Ok(classify_event(cevent::read()?))
+    Ok(classify_event(retry_on_interrupt(cevent::read)?))
+}
+
+/// True when an `io::Error` is from an interrupting signal (EINTR).
+/// The TUI's event loop retries these instead of aborting because a
+/// real user can trigger one by hitting Ctrl+L (some terminals turn
+/// it into a SIGWINCH) or by backgrounding + resuming `linesmith
+/// config`.
+fn is_recoverable_io_error(err: &io::Error) -> bool {
+    matches!(err.kind(), io::ErrorKind::Interrupted)
+}
+
+/// Call `op`, retrying on `ErrorKind::Interrupted`. Used to wrap
+/// crossterm's `poll` / `read` so a SIGWINCH (or any other
+/// interrupting signal) doesn't kill the event loop.
+///
+/// Unbounded retries are deliberate: a signal storm that never
+/// settles is a degenerate environment we can't fix from inside the
+/// editor, and bounding the count would just convert the storm into
+/// a hard abort one iteration later. Any non-Interrupted error
+/// surfaces immediately.
+const EINTR_STORM_THRESHOLD: u32 = 64;
+
+fn retry_on_interrupt<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut consecutive_eintr = 0_u32;
+    loop {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) if is_recoverable_io_error(&err) => {
+                consecutive_eintr = consecutive_eintr.saturating_add(1);
+                // Fire once at the threshold so the user has a breadcrumb
+                // when a signal source (debugger stepping, parent shell
+                // re-arming SIGCONT, misconfigured monitor) storms the
+                // loop and the editor appears unresponsive to keystrokes.
+                if consecutive_eintr == EINTR_STORM_THRESHOLD {
+                    linesmith_core::lsm_warn!(
+                        "tui: {EINTR_STORM_THRESHOLD} consecutive EINTRs from poll/read; likely signal storm — editor may be unresponsive to keystrokes"
+                    );
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Call `draw(&mut paint)`, logging + retrying once on any I/O
+/// error before bailing. A single transient stdout backpressure
+/// event (e.g. the terminal emulator briefly stalls under load)
+/// shouldn't kill the editor session, but a persistent failure
+/// should — retrying forever would silently mask a real fault
+/// (closed stdout, broken terminal handle).
+///
+/// The retry-once budget is the judgment call: zero retries
+/// regresses the bug; unbounded retries trade abort for hang. One
+/// retry covers the common transient case (single frame's worth of
+/// backpressure) while still surfacing a persistent failure to the
+/// caller within ~two attempts.
+///
+/// `draw` is generic so production callers can pass a
+/// `terminal.draw(...)`-adapter closure and tests can pass an error-
+/// injecting closure without dyn-trait HRTB friction.
+fn draw_with_retry<F>(mut draw: F, model: &Model) -> io::Result<()>
+where
+    F: FnMut(&mut dyn FnMut(&mut ratatui::Frame<'_>)) -> io::Result<()>,
+{
+    let mut op = |frame: &mut ratatui::Frame<'_>| app::view(model, frame);
+    match draw(&mut op) {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            linesmith_core::lsm_warn!("tui: draw failed ({first}); retrying once");
+            match draw(&mut op) {
+                Ok(()) => Ok(()),
+                Err(second) => {
+                    // `lsm_error!` so LINESMITH_LOG=off users still see why
+                    // the editor died, and both errors are named so the
+                    // caller doesn't lose the chain of causation.
+                    linesmith_core::lsm_error!(
+                        "tui: draw failed twice ({first}; then {second}); aborting editor"
+                    );
+                    Err(second)
+                }
+            }
+        }
+    }
 }
 
 /// Map a raw crossterm event to our internal [`Event`] enum.
@@ -728,5 +816,195 @@ mod tests {
         // Restore perms so TempDir's drop can clean up.
         let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
         assert!(outcome.is_err(), "expected error, got {outcome:?}");
+    }
+
+    #[test]
+    fn is_recoverable_io_error_only_for_interrupted() {
+        // Classifier contract: `Interrupted` only. Widening to `WouldBlock`
+        // hot-loops the event loop; narrowing to nothing re-introduces the
+        // SIGWINCH-kills-editor bug.
+        assert!(is_recoverable_io_error(&io::Error::from(
+            io::ErrorKind::Interrupted,
+        )));
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::Other,
+            io::ErrorKind::PermissionDenied,
+        ] {
+            assert!(
+                !is_recoverable_io_error(&io::Error::from(kind)),
+                "kind {kind:?} should NOT be classified as recoverable",
+            );
+        }
+    }
+
+    #[test]
+    fn retry_on_interrupt_returns_value_on_first_success() {
+        let mut calls = 0_u32;
+        let out = retry_on_interrupt(|| {
+            calls += 1;
+            Ok::<u32, io::Error>(42)
+        })
+        .expect("ok");
+        assert_eq!(out, 42);
+        assert_eq!(calls, 1, "no retry needed when first call succeeds");
+    }
+
+    #[test]
+    fn retry_on_interrupt_retries_past_eintr_and_returns_value() {
+        // Two EINTRs then success: pins that SIGWINCH-induced interrupts
+        // don't crash the editor.
+        let mut calls = 0_u32;
+        let out = retry_on_interrupt(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            } else {
+                Ok(7_i32)
+            }
+        })
+        .expect("ok");
+        assert_eq!(out, 7);
+        assert_eq!(calls, 3, "should retry through both EINTRs");
+    }
+
+    #[test]
+    fn retry_on_interrupt_propagates_non_interrupted_errors() {
+        // A non-recoverable error (e.g. BrokenPipe — terminal handle
+        // closed) must surface immediately, not be retried. Pin both
+        // the call count (no retry) and the kind round-trip.
+        let mut calls = 0_u32;
+        let outcome: io::Result<()> = retry_on_interrupt(|| {
+            calls += 1;
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        });
+        assert_eq!(calls, 1, "BrokenPipe should not retry");
+        let err = outcome.expect_err("expected error");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn retry_on_interrupt_emits_storm_breadcrumb_once_at_threshold() {
+        // Breadcrumb fires exactly once at threshold. Catches `==` → `>=`
+        // regressions (spammy logs) and counter-reset bugs (silent storms).
+        let _serial = crate::logging::_test_serial_lock();
+        let captured = std::sync::Arc::new(CapturedSink::default());
+        let _sink = SinkGuard::install(captured.clone());
+        let mut calls = 0_u32;
+        let out = retry_on_interrupt(|| {
+            calls += 1;
+            if calls <= EINTR_STORM_THRESHOLD + 5 {
+                Err(io::Error::from(io::ErrorKind::Interrupted))
+            } else {
+                Ok(())
+            }
+        })
+        .expect("ok after storm");
+        let entries = captured.drain();
+        let storm_hits = entries
+            .iter()
+            .filter(|e| e.contains("consecutive EINTRs"))
+            .count();
+        assert_eq!(
+            storm_hits, 1,
+            "storm breadcrumb must fire exactly once, got {entries:?}",
+        );
+    }
+
+    /// Minimal Model for the `draw_with_retry` test seam. The mock drawer
+    /// never invokes `app::view`, so field values only need to compile.
+    fn stub_model() -> Model {
+        use crate::theme::{Capability, ThemeRegistry};
+        Model::new(
+            config::Config::default(),
+            DocumentMut::new(),
+            String::new(),
+            None,
+            crate::theme::default_theme().clone(),
+            ThemeRegistry::with_built_ins(),
+            Capability::None,
+            None,
+            None,
+            "linesmith".to_string(),
+        )
+    }
+
+    #[test]
+    fn draw_with_retry_calls_draw_once_on_success() {
+        // Happy path: a single draw, no retry, no log emission.
+        let _serial = crate::logging::_test_serial_lock();
+        let model = stub_model();
+        let mut calls = 0_u32;
+        let drawer = |_op: &mut dyn FnMut(&mut ratatui::Frame<'_>)| -> io::Result<()> {
+            calls += 1;
+            Ok(())
+        };
+        draw_with_retry(drawer, &model).expect("ok");
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn draw_with_retry_retries_once_on_transient_failure() {
+        // Inject one transient error, then success. The wrapper
+        // logs a warn before retrying so users hunting "why did my
+        // frame stall?" see the diagnostic in the warnings panel.
+        let _serial = crate::logging::_test_serial_lock();
+        let captured = std::sync::Arc::new(CapturedSink::default());
+        let _sink = SinkGuard::install(captured.clone());
+        let model = stub_model();
+        let mut calls = 0_u32;
+        let drawer = |_op: &mut dyn FnMut(&mut ratatui::Frame<'_>)| -> io::Result<()> {
+            calls += 1;
+            if calls == 1 {
+                Err(io::Error::other("backpressure"))
+            } else {
+                Ok(())
+            }
+        };
+        draw_with_retry(drawer, &model).expect("retry succeeds");
+        assert_eq!(calls, 2, "should retry once after transient failure");
+        let entries = captured.drain();
+        assert!(
+            entries.iter().any(|e| e.contains("retrying once")),
+            "expected retry warn in captured sink, got {entries:?}",
+        );
+    }
+
+    #[test]
+    fn draw_with_retry_bails_on_persistent_failure() {
+        // Two failures → propagate the SECOND error. Distinct kinds pin
+        // which error was returned; caching the first would yield BrokenPipe.
+        let _serial = crate::logging::_test_serial_lock();
+        let captured = std::sync::Arc::new(CapturedSink::default());
+        let _sink = SinkGuard::install(captured.clone());
+        let model = stub_model();
+        let mut calls = 0_u32;
+        let drawer = |_op: &mut dyn FnMut(&mut ratatui::Frame<'_>)| -> io::Result<()> {
+            calls += 1;
+            if calls == 1 {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            } else {
+                Err(io::Error::from(io::ErrorKind::ConnectionReset))
+            }
+        };
+        let outcome = draw_with_retry(drawer, &model);
+        assert_eq!(calls, 2, "should give up after one retry");
+        let err = outcome.expect_err("expected error after retry");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::ConnectionReset,
+            "must surface the second failure, not the cached first one",
+        );
+        let entries = captured.drain();
+        assert!(
+            entries.iter().any(|e| e.contains("retrying once")),
+            "expected pre-retry warn in captured sink, got {entries:?}",
+        );
+        assert!(
+            entries.iter().any(|e| e.contains("aborting editor")),
+            "expected post-failure error in captured sink, got {entries:?}",
+        );
     }
 }
