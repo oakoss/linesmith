@@ -170,6 +170,50 @@ ccstatusline's full widget list (45+ total) also covers git (13 widgets — scop
 
 - **Log rotation.** ccusage reads all files under `projects/` — do Claude Code sessions share a single JSONL or rotate? The `session_id` field + `transcript_path` suggest one file per session, but long-running sessions may rotate. Needs verification for lsm-y6m.
 - **Multi-machine roaming.** If a user runs Claude Code on two machines, do the JSONLs sync? Not ccusage's concern; not linesmith's either in v0.1.
-- **`usageLimitResetTime`.** ccusage pulls this from some entries — source unclear from the schema (Claude Code may emit it only when the user has actually been rate-limited). Worth mapping when we implement the reset-timer widgets.
+- **`usageLimitResetTime`.** ccusage pulls this from some entries — source unclear from the schema (Claude Code may emit it only when the user has actually been rate-limited). Worth mapping when we implement the reset-timer widgets. _Resolved 2026-05-16 — see [§Verification: `usageLimitResetTime` provenance](#verification-usagelimitresettime-provenance-2026-05-16)._
 - **Dedup.** ccusage dedupes on `message.id` — implies the JSONL can contain duplicate entries (retries? rewrites on edit?). Our parser must follow suit.
 - **Performance.** ccusage reads every JSONL on every invocation. For a statusline called on every prompt, we'll need a cache (time-windowed; invalidate on file mtime change). Out of scope for this note.
+
+## Verification: `usageLimitResetTime` provenance (2026-05-16)
+
+Bead: `lsm-ghpj`. ADR-0013 left `FiveHourBlock.usage_limit_reset` deliberately unconsumed pending a check on when Claude Code actually writes the field. This subsection records the empirical answer.
+
+### Method
+
+Scanned the local `~/.claude/projects/*/*.jsonl` corpus on the bead author's machine: 14 unique JSONL files across 20+ project directories. The corpus spans Claude Code versions **2.1.108 → 2.1.143** (26 distinct versions observed via `"version":"..."` strings) and 123,161 total JSON records.
+
+Two complementary queries:
+
+1. `grep -h '"usageLimitResetTime"' ~/.claude/projects/*/*.jsonl | wc -l` — count of lines containing the field as a JSON key (the leading `"` rules out substring hits from conversation prose).
+2. A Python walk over every record's full JSON tree looking for `usageLimitResetTime` as an actual key (not a string value).
+
+Cross-checked for related field names:
+
+- `grep -hoE '"[a-zA-Z]*[Ll]imit[a-zA-Z]*"'` → only `"appliedLimit"` (a paginated-search response field), `"ghRateLimitHint"` (GitHub-flavored hint string in tool output), and `"limit"` (generic count parameter)
+- `grep -hoE '"[a-zA-Z]*[Rr]eset[a-zA-Z]*"'` → **zero** matches across the entire corpus
+
+### Findings
+
+- **The field never appears as a JSON key in any record.** Both queries returned 0. The substring `usageLimitResetTime` shows up only inside tool-result content (e.g. agents reading this bead description, or pasting ccusage's TypeScript source) — never on the record body itself.
+- **No analogous field exists.** No `*reset*` key of any casing is emitted anywhere in 123k records. Claude Code surfaces 5h-window boundaries via the statusline-hook payload's `cost`/`context_window` shape, not via per-message metadata.
+- **Rate-limit-style errors land as `"type":"overloaded_error"` (HTTP 529, transient server overload), not as 429 entries.** No 429 records exist in the corpus. The 529 entries carry `retryInMs` / `retryAttempt` / `maxRetries`, but no reset hint and no 5h-window boundary.
+- **Version stability is moot:** because no version writes the field, "stable across versions" is trivially true in the absent direction — every observed Claude Code 2.1.x release behaves identically (silent on this field).
+
+### Caveats
+
+- The corpus is a single user. The field could surface only under user-initiated 429s (Pro/Max-tier daily-cap exhaustion) which this user never hit in the observed window. ccusage's schema explicitly declares `usageLimitResetTime?: Date` as optional, consistent with rare-emission behavior.
+- ccusage's `_session-blocks.ts` reads the field defensively and falls back to `block.start + 5h` when absent — exactly the path linesmith already takes.
+
+### Decision
+
+**Outcome 3 from the bead applies:** the field is absent on essentially all sessions. Keep `block.end()` (= `block.start + 5h`, ccusage-style floor-to-hour) as the `rate_limit_5h_reset` source in JSONL mode. The `FiveHourBlock.usage_limit_reset` field stays on the aggregator (cheap to populate, may help a future "next deadline" diagnostic), but segments do not consume it.
+
+No ADR change. ADR-0013 §Per-segment render in JSONL mode and the `Confirmation` clause already describe this behavior.
+
+### Re-verification trigger
+
+Revisit this finding if:
+
+- A user reports `usageLimitResetTime` appearing in their own transcripts (likely a 429-triggered Pro/Max user hitting their daily cap)
+- Claude Code's changelog announces the field becoming a standard per-message metadata key
+- ccstatusline or CCometixLine begins consuming the field on the assumption it is reliably present

@@ -1,9 +1,9 @@
 # JSONL Aggregation
 
 - Status: draft
-- Version: 0.2
-- Last updated: 2026-04-22
-- Driving ADRs: [ADR-0009](../adrs/0009-json-parsing-stack.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md), [ADR-0011](../adrs/0011-rate-limit-data-source.md)
+- Version: 0.3
+- Last updated: 2026-05-16
+- Driving ADRs: [ADR-0009](../adrs/0009-json-parsing-stack.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md), [ADR-0011](../adrs/0011-rate-limit-data-source.md), [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md)
 
 ## Overview
 
@@ -24,7 +24,7 @@ This spec does NOT cover: the `ctx.usage()` fallback orchestration (lives in [da
 - Compute the **rolling 7-day window**: all entries whose `timestamp` falls in `[now - 7d, now]`
 - Report aggregated `token_counts` (input / output / cache_creation / cache_read) per window
 - Collect the set of `model` strings observed in each window (for diagnostic use; segments don't render this in v0.1)
-- Surface `usageLimitResetTime` when present in the most recent entry of the active 5h block
+- Surface `usageLimitResetTime` when present in the most recent entry of the active 5h block. Empirically the field never appears in real-world transcripts ([research/jsonl-data-source.md §Verification](../research/jsonl-data-source.md#verification-usagelimitresettime-provenance-2026-05-16)); the aggregator still deserializes it so a future Claude Code release that begins emitting it just works
 - Log malformed JSON lines at `warn!`, advance past them, continue aggregation; never fail the batch on a single bad line
 - Return [`JsonlError::DirectoryMissing`] when no project root exists at all — distinct from `NoEntries` (directory exists but is empty)
 
@@ -83,14 +83,14 @@ pub struct FiveHourBlock {
     /// casing variants.
     pub models: Vec<String>,
     /// Claude API reset hint if the most recent entry carried one.
-    /// Provenance is unverified — Claude Code may emit this only
-    /// during rate-limited interactions and the timestamp's semantic
-    /// (next 5h reset vs 429 lift) is not confirmed. Segments do NOT
-    /// consume this field as of v0.2; the `rate_limit_5h_reset`
-    /// JSONL-mode render uses [`FiveHourBlock::end`] instead. Kept on
-    /// the aggregator for future use once `lsm-ghpj` verifies the
-    /// semantic; at that point [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md)
-    /// may be revised to wire this field into the render path.
+    /// Verified absent across the surveyed Claude Code 2.1.108–2.1.143
+    /// corpus (123k records, zero `usageLimitResetTime` keys; see
+    /// [research/jsonl-data-source.md §Verification](../research/jsonl-data-source.md#verification-usagelimitresettime-provenance-2026-05-16)).
+    /// Aggregator deserializes the field so a future emission just
+    /// works, but segments do NOT consume it: the `rate_limit_5h_reset`
+    /// JSONL-mode render uses [`FiveHourBlock::end`] instead. ADR-0013
+    /// §Per-segment render in JSONL mode remains the authoritative
+    /// render contract; no change implied by the verification.
     pub usage_limit_reset: Option<Timestamp>,
 }
 
@@ -351,7 +351,7 @@ The working set is bounded by the 7-day window: once an entry falls outside that
 
 ## Open questions
 
-- **`usageLimitResetTime` provenance.** ccusage consumes this field, but neither [research/jsonl-data-source.md](../research/jsonl-data-source.md) nor Claude Code's documentation confirms when exactly Claude Code writes it. Empirically it appears only on some rate-limited interactions. The v0.1 aggregator surfaces it when present and lets the orchestrator decide what to do with a `None`.
+- ~~**`usageLimitResetTime` provenance.**~~ _Resolved 2026-05-16 (`lsm-ghpj`)._ Verified absent across a 26-version, 123k-record corpus ([research/jsonl-data-source.md §Verification](../research/jsonl-data-source.md#verification-usagelimitresettime-provenance-2026-05-16)). Aggregator continues to deserialize the field defensively; segments rely on `FiveHourBlock::end` for the 5h reset render per ADR-0013.
 
 - **Log rotation.** Claude Code might rotate long-running session transcripts — unverified. If it does, a session's entries span multiple files and dedup across them becomes load-bearing. Current design handles this correctly (dedup is cross-file) but the test fixtures don't explicitly cover the rotation case. File a follow-up if rotation is confirmed.
 
@@ -363,6 +363,14 @@ The working set is bounded by the 7-day window: once an entry falls outside that
 
 ## Change log
 
+- 2026-05-16 (v0.3): resolved the `usageLimitResetTime` open question (`lsm-ghpj`).
+  Empirical scan of a Claude Code 2.1.108–2.1.143 corpus (123k records, 26 versions)
+  found zero records carrying the field as a JSON key. Aggregator continues to
+  deserialize the field; segments do not consume it. ADR-0013's `FiveHourWindow.ends_at`
+  decision stands. Updated [§Functional requirements](#functional) note, the
+  [`FiveHourBlock.usage_limit_reset`](#jsonlaggregate) docstring, and the open
+  question entry. Research detail at
+  [research/jsonl-data-source.md §Verification](../research/jsonl-data-source.md#verification-usagelimitresettime-provenance-2026-05-16).
 - 2026-04-22 (v0.2): open question "utilization without tier detection" resolved by
   [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md) — the orchestrator
   surfaces a distinct [`UsageData::Jsonl`](data-fetching.md#oauth-usage-cache-stack)

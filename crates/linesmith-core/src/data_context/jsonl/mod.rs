@@ -50,6 +50,11 @@ pub struct FiveHourBlock {
     pub actual_last_activity: Timestamp,
     pub token_counts: TokenCounts,
     pub models: Vec<String>,
+    /// `usageLimitResetTime` from the most recent entry that carried
+    /// one. Verified absent across the surveyed Claude Code corpus
+    /// (lsm-ghpj, 2026-05-16); the field is deserialized defensively
+    /// but segments do not consume it — `rate_limit_5h_reset` uses
+    /// `block.end()` per ADR-0013.
     pub usage_limit_reset: Option<Timestamp>,
 }
 

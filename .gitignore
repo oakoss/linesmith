@@ -16,6 +16,7 @@ target/
 .claude/.review-mark
 .claude/.review-mark.*
 .claude/.no-review-gate
+.claude/worktrees/
 
 # Node (managed by mise)
 node_modules/
