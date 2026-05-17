@@ -231,6 +231,19 @@ The formula is regenerated + pushed by `cargo-dist` on each release. First-time 
 
 The formula ships both `x86_64-apple-darwin` and `aarch64-apple-darwin` bottles; Homebrew auto-selects based on host architecture. Linux users on Homebrew get `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu` bottles.
 
+### Repo metadata
+
+One-time GitHub metadata for topic search visibility and landing page copy. Run once per repo (e.g. when forking for a sibling project):
+
+```sh
+gh repo edit oakoss/linesmith \
+  --description "Status line for Claude Code and other AI coding CLIs — Rust, plugin API, role-based themes." \
+  --homepage "https://docs.rs/linesmith" \
+  --add-topic claude-code,statusline,rust,ai-coding,claude,cli,anthropic,terminal,prompt-tool
+```
+
+Topic conventions: hyphen-separated lowercase, ≤50 chars, max 20 per repo (GitHub limit). Topics above cover: tool family (`claude-code`, `claude`, `anthropic`), category (`statusline`, `cli`, `terminal`, `prompt-tool`), language (`rust`), and broader domain (`ai-coding`). Homepage points at `docs.rs/linesmith`, which resolves after the first `cargo publish`; forks should omit `--homepage` until then.
+
 ## Behavior
 
 ### Release runbook
