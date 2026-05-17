@@ -1017,4 +1017,170 @@ mod tests {
             .collect();
         assert!(dump.contains("Empty"), "title still renders:\n{dump}");
     }
+
+    /// Dump the buffer preserving full grapheme symbols. The other
+    /// dumps in this module use `.chars().next().unwrap_or(' ')`,
+    /// which silently drops trailing codepoints of multi-codepoint
+    /// graphemes (emoji with VS16 / skin-tone modifiers, ZWJ
+    /// sequences, regional-indicator pairs). `Cell::symbol()`
+    /// returns `" "` for both pre-fill cells and wide-glyph trailing
+    /// cells, so a single `push_str` covers every shape.
+    fn dump_buffer(buf: &ratatui::buffer::Buffer) -> String {
+        let mut out =
+            String::with_capacity((buf.area.width as usize + 1) * buf.area.height as usize);
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn render_long_label_truncates_without_panic() {
+        // ratatui's `List` truncates (not wraps) when a label exceeds
+        // the column count. Pin that: a 200-char label in a 20-column
+        // backend must not push the help-row or description out of
+        // their layout slots.
+        let backend = TestBackend::new(20, 12);
+        let mut terminal = Terminal::new(backend).expect("backend");
+        let s = ListScreenState::new();
+        let long_label: String = "X".repeat(200);
+        let rows = [ListRowData {
+            label: Cow::Owned(long_label.clone()),
+            description: Cow::Borrowed("desc-A"),
+        }];
+        let verbs = [VerbHint {
+            letter: 'a',
+            label: "add",
+        }];
+        let view = ListScreenView {
+            title: "Demo",
+            rows: &rows,
+            verbs: &verbs,
+            move_mode_supported: false,
+        };
+        terminal
+            .draw(|frame| render(&s, &view, frame.area(), frame))
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let dump = dump_buffer(&buf);
+        assert!(dump.contains("Demo"), "title missing:\n{dump}");
+        assert!(dump.contains("a add"), "help row missing:\n{dump}");
+        assert!(
+            dump.contains("desc-A"),
+            "description missing (long label pushed it off?):\n{dump}",
+        );
+        // Pin both the cursor placement and a meaningful run of
+        // the long label (the 20-col backend leaves room for at least
+        // 13 X's after the 2-cell `▶ ` symbol; a regression that
+        // truncated the label to ~1 char would leave `▶ X` matching
+        // but this stronger run wouldn't).
+        assert!(
+            dump.contains("▶ XXXXXXXXXXXXX"),
+            "cursor + long-label run missing:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn render_wide_grapheme_label_preserves_cell_layout() {
+        // A 2-cell-wide CJK grapheme must render at its full cell
+        // width without breaking cursor placement or the row below.
+        // A regression that re-treats it as 1-cell-wide would
+        // truncate or overlap the description.
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).expect("backend");
+        let s = ListScreenState::new();
+        let rows = [ListRowData {
+            // U+4E2D (中) is canonical 2-cell width per unicode-width.
+            label: Cow::Borrowed("中文"),
+            description: Cow::Borrowed("cjk-desc"),
+        }];
+        let verbs = [VerbHint {
+            letter: 'a',
+            label: "add",
+        }];
+        let view = ListScreenView {
+            title: "Demo",
+            rows: &rows,
+            verbs: &verbs,
+            move_mode_supported: false,
+        };
+        terminal
+            .draw(|frame| render(&s, &view, frame.area(), frame))
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let dump = dump_buffer(&buf);
+        assert!(dump.contains("中"), "wide grapheme '中' missing:\n{dump}");
+        assert!(dump.contains("文"), "wide grapheme '文' missing:\n{dump}");
+        assert!(
+            dump.contains("cjk-desc"),
+            "description should still render below wide label:\n{dump}",
+        );
+        // Every wide grapheme must be followed by an empty or space
+        // trailing cell (`""` = ratatui convention; `" "` = buffer
+        // pre-fill). A 1-cell regression surfaces as a non-space
+        // trailing cell — overlap or layout compression.
+        let mut found_lead = 0_usize;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width.saturating_sub(1) {
+                let lead = buf[(x, y)].symbol();
+                if lead == "中" || lead == "文" {
+                    let trail = buf[(x + 1, y)].symbol();
+                    assert!(
+                        trail.is_empty() || trail == " ",
+                        "trailing cell after {lead:?} should be empty or space, got {trail:?}",
+                    );
+                    found_lead += 1;
+                }
+            }
+        }
+        // Double-paint regression (grapheme at two adjacent cells)
+        // would push this past 2.
+        assert_eq!(
+            found_lead, 2,
+            "expected exactly one '中' and one '文' in the buffer:\n{dump}",
+        );
+    }
+
+    #[test]
+    fn render_multi_verb_help_row_uses_middle_dot_separator() {
+        // Pin the `·` (U+00B7) separator between verb hints. Existing
+        // tests assert `dump.contains("a add")` but don't pin the
+        // separator — a regression to `,` or a dropped separator
+        // would still pass.
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).expect("backend");
+        let s = ListScreenState::new();
+        let rows = [ListRowData {
+            label: Cow::Borrowed("Only"),
+            description: Cow::Borrowed("desc"),
+        }];
+        let verbs = [
+            VerbHint {
+                letter: 'a',
+                label: "add",
+            },
+            VerbHint {
+                letter: 'd',
+                label: "delete",
+            },
+        ];
+        let view = ListScreenView {
+            title: "Demo",
+            rows: &rows,
+            verbs: &verbs,
+            move_mode_supported: false,
+        };
+        terminal
+            .draw(|frame| render(&s, &view, frame.area(), frame))
+            .expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let dump = dump_buffer(&buf);
+        assert!(
+            dump.contains("a add · d delete"),
+            "help row missing `·` separator between verbs:\n{dump}",
+        );
+    }
 }
