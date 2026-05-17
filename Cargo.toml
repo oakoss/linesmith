@@ -80,6 +80,10 @@ ureq = "3"
 # through the cargo harness.
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 insta = "1"
+# Chosen over wiremock: async-first wiremock drags tokio into the dev
+# graph; mockito wraps its own runtime behind a blocking API that pairs
+# cleanly with ureq's sync call().
+mockito = "1"
 toml = "1"
 # Round-trip-preserving TOML editor used by `linesmith config`'s
 # write-back path. `toml` 1.x doesn't re-export a public mutable
