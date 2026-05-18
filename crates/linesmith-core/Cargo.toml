@@ -30,7 +30,7 @@ workspace = true
 # per-crate (not via `[workspace.dependencies]`) so release-plz
 # updates the version pin automatically in lockstep with
 # linesmith-plugin's own version on each release.
-linesmith-plugin = { version = "0.1.2", path = "../linesmith-plugin" }
+linesmith-plugin = { version = "0.1.3", path = "../linesmith-plugin" }
 serde.workspace = true
 serde_json.workspace = true
 catppuccin.workspace = true

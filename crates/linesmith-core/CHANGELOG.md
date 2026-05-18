@@ -1,0 +1,42 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/),
+and this project adheres to [Semantic Versioning](https://semver.org/).
+
+## [0.1.3] - 2026-05-18
+
+### Bug Fixes
+
+- **cli:** Route logging macros through swappable LogSink([eb1df31](https://github.com/oakoss/linesmith/commit/eb1df31a458f72e82c2c6e6410109a2dcf63c7f9))
+- **data-context:** Clear cache on 401 so peers skip the fresh short-circuit([0aa20fe](https://github.com/oakoss/linesmith/commit/0aa20fea91929d4a366700e41f5acdc82166ac90))
+- **core:** Floor_to_grain panic safety + close jiff-migration gaps([2ce2f30](https://github.com/oakoss/linesmith/commit/2ce2f3016e43b4289322c6242decd2b5a49081ef))
+
+### Features
+
+- **core:** Per-thread sink overlay for test capture of lsm_warn!/lsm_error!([f30f11e](https://github.com/oakoss/linesmith/commit/f30f11e33be31628c9f4edb1a47dd9e492c11c4d))
+- **core:** Wire LayoutDecision emits at the five apply_layout sites([070ecb7](https://github.com/oakoss/linesmith/commit/070ecb710e85d6ea7dacb9e2d9903645213dd178))
+- **core:** LayoutObservers struct + render_with_observers rename([089c060](https://github.com/oakoss/linesmith/commit/089c06083edeedfc3608f7f257cdfa1e0a16810b))
+- **core:** LayoutDecision enum + variant constructors([2a23869](https://github.com/oakoss/linesmith/commit/2a2386962d4cca5284dd22906503535a63432324))
+- **core:** LineItem::Segment struct-variant refactor with id field([011be10](https://github.com/oakoss/linesmith/commit/011be10352485b54eca5c5cc51f3b946ec2d5e94))
+- **cli:** TUI instant-apply save model([4727269](https://github.com/oakoss/linesmith/commit/472726982c26bf1c639a9a77cd7e04707080cf5c))
+- **cli:** Items editor finishing slice (LinePicker + Space/m verbs)([f496b30](https://github.com/oakoss/linesmith/commit/f496b30aff045ac92b0a8b982bdf85462f01bf0d))
+- **segments:** Absolute-timestamp format for rate-limit reset segments([d53a5b8](https://github.com/oakoss/linesmith/commit/d53a5b8bd17ac6ec99f8785b778a7116cc086bd1))
+
+### Refactoring
+
+- **core:** Split resolve_proxy_from_env for testable warn paths([5d2e142](https://github.com/oakoss/linesmith/commit/5d2e14229b244dcdcd34b3b516fba9faa697aa48))
+- **core:** Separator-as-item layout([4ecbefd](https://github.com/oakoss/linesmith/commit/4ecbefd4ad39040085c11555d92054e9584ac089))
+- **core:** Finish jiff-migration cleanups (doc rot + dedupe helper)([370fbe4](https://github.com/oakoss/linesmith/commit/370fbe4c4cc527bb2318de2161eed8fdf186d892))
+- **repo:** Migrate chrono → jiff across the workspace([0be2835](https://github.com/oakoss/linesmith/commit/0be2835fd5f645e52f84b6429f43ce035170cb11))
+- **core:** Graduate input.rs + layout.rs to folder modules([9c36c8f](https://github.com/oakoss/linesmith/commit/9c36c8ffd45b08e8f4836301c8fee591370aabc8))
+- **segments:** Split builder.rs into a folder of named files([486797f](https://github.com/oakoss/linesmith/commit/486797f448959be504e6014eb6ff8eafecd2a307))
+- **data-context:** Graduate cascade/credentials/jsonl to folder modules([3935840](https://github.com/oakoss/linesmith/commit/39358407186605320a71c57bb418e94cdde1977f))
+- **env:** Preserve non-UTF-8 paths through CliEnv + EnvVarState([f667eb4](https://github.com/oakoss/linesmith/commit/f667eb4d4ae63f84a0b4a48916d91c83e5a16280))
+- **segments:** UsageWindow seam + workspace extras helper([c24ac59](https://github.com/oakoss/linesmith/commit/c24ac5922a530aeea74da84643da10dfa6db8ede))
+- **segments:** Graduate rate_limit/ to a folder([5378415](https://github.com/oakoss/linesmith/commit/5378415dc54c559d77abab6255f7e2ff5503585e))
+- **repo:** Rename errors.rs modules to singular error.rs([68c8153](https://github.com/oakoss/linesmith/commit/68c815306aa5b713802d22864a71cdb20ee8bf7d))
+- **repo:** Centralize lints in [workspace.lints]([dd40e0c](https://github.com/oakoss/linesmith/commit/dd40e0c71882c133592e5b0d581f25921886f083))
+- **plugins:** Consume plugin host types from origin([6199a33](https://github.com/oakoss/linesmith/commit/6199a33c8556649283427e94ea891cc370059375))
+- **plugins:** Extract linesmith-plugin from linesmith-core([291cd09](https://github.com/oakoss/linesmith/commit/291cd09b2d8df244d56bf9cfaedc7f9ca456967c))

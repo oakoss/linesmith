@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.3] - 2026-05-18
+
+### Bug Fixes
+
+- **tui:** Retry on EINTR + recoverable I/O blips in event loop([68f03c3](https://github.com/oakoss/linesmith/commit/68f03c360bbe495d3890347814151eb897bff5b8))
+- **cli:** Reject --check-config outside the render path([b27951f](https://github.com/oakoss/linesmith/commit/b27951f444891db9daf3a3da9ace3501bd774814))
+- **cli:** Route logging macros through swappable LogSink([eb1df31](https://github.com/oakoss/linesmith/commit/eb1df31a458f72e82c2c6e6410109a2dcf63c7f9))
+- **cli:** Filter non-Press key events to stop Windows double-fire([60abd53](https://github.com/oakoss/linesmith/commit/60abd53b4b721da5a7dfe4d0a74b0ef7eb2b2482))
+
+### Features
+
+- **core:** LayoutObservers struct + render_with_observers rename([089c060](https://github.com/oakoss/linesmith/commit/089c06083edeedfc3608f7f257cdfa1e0a16810b))
+- **core:** LineItem::Segment struct-variant refactor with id field([011be10](https://github.com/oakoss/linesmith/commit/011be10352485b54eca5c5cc51f3b946ec2d5e94))
+- **tui:** Honor CliEnv env and CLI color flags([d1d7ecb](https://github.com/oakoss/linesmith/commit/d1d7ecbf71a0288c27677f132503fa2bded58073))
+- **cli:** Install/uninstall Claude Code statusLine([01e6713](https://github.com/oakoss/linesmith/commit/01e6713f03bff0dae8331f45350aa01529f9b84a))
+- **cli:** TUI instant-apply save model([4727269](https://github.com/oakoss/linesmith/commit/472726982c26bf1c639a9a77cd7e04707080cf5c))
+- **cli:** Theme picker + user-theme discovery([237a17e](https://github.com/oakoss/linesmith/commit/237a17e17dcbf87756412529b0204cbf651bd8ea))
+- **cli:** EnvironmentWarning footer (NO_COLOR / palette / VSCode / tmux)([5dcd964](https://github.com/oakoss/linesmith/commit/5dcd964b28767d6967a06ab31572e64cdc5056e4))
+- **cli:** Items editor finishing slice (LinePicker + Space/m verbs)([f496b30](https://github.com/oakoss/linesmith/commit/f496b30aff045ac92b0a8b982bdf85462f01bf0d))
+- **cli:** Items editor raw value verb (r)([6782ed5](https://github.com/oakoss/linesmith/commit/6782ed53515b1e5a3031b85ff6fa4f68b3197df4))
+- **cli:** Items editor type picker (a/i verbs + arrows)([aeece9b](https://github.com/oakoss/linesmith/commit/aeece9b3a42ee36a8494a83e41c49d78ce0d6421))
+- **cli:** Items editor delete/clear/clone verbs([10098ac](https://github.com/oakoss/linesmith/commit/10098ac1e80fadec1c441fcf26f9b96ebbb85d20))
+- **cli:** Items editor screen with move-mode reorder([866f5dc](https://github.com/oakoss/linesmith/commit/866f5dc6702dbc9248311898187b8aa2f513e0b6))
+- **cli:** TOML write-back for linesmith config TUI([b9a539c](https://github.com/oakoss/linesmith/commit/b9a539cb66b26cd97dfea9227ed45e72fc8915ba))
+- **cli:** Live-preview header for linesmith config TUI([32cd241](https://github.com/oakoss/linesmith/commit/32cd2418f7711c7e3e0b59d4158f467fdb83dffb))
+- **cli:** Main menu screen + back-navigable placeholder([014ea83](https://github.com/oakoss/linesmith/commit/014ea83bd3cc0c73cb6efffd03629497b3f7a7e9))
+- **cli:** ListScreen widget for linesmith config TUI([c28d4b9](https://github.com/oakoss/linesmith/commit/c28d4b95e98c30d225cd6f5e8b7e1cf141b9e3d1))
+- **cli:** Linesmith config TUI boot([5e98461](https://github.com/oakoss/linesmith/commit/5e98461af342bb3574b806f0f21fdc377e2876be))
+
+### Refactoring
+
+- **cli:** Caller owns cursor on ListScreen MoveSwap([99d8941](https://github.com/oakoss/linesmith/commit/99d89412ea4636576fae7ad9dfde3629870f9e16))
+- **core:** Separator-as-item layout([4ecbefd](https://github.com/oakoss/linesmith/commit/4ecbefd4ad39040085c11555d92054e9584ac089))
+- **repo:** Migrate chrono → jiff across the workspace([0be2835](https://github.com/oakoss/linesmith/commit/0be2835fd5f645e52f84b6429f43ce035170cb11))
+- **env:** Preserve non-UTF-8 paths through CliEnv + EnvVarState([f667eb4](https://github.com/oakoss/linesmith/commit/f667eb4d4ae63f84a0b4a48916d91c83e5a16280))
+- **repo:** Centralize lints in [workspace.lints]([dd40e0c](https://github.com/oakoss/linesmith/commit/dd40e0c71882c133592e5b0d581f25921886f083))
+- **plugins:** Consume plugin host types from origin([6199a33](https://github.com/oakoss/linesmith/commit/6199a33c8556649283427e94ea891cc370059375))
+
 ## [0.1.2] - 2026-05-01
 
 ### Bug Fixes
