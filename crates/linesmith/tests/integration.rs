@@ -587,3 +587,172 @@ fn config_priority_override_flips_drop_order_under_pressure() {
     assert!(!rendered.contains("Claude"));
     assert!(rendered.contains("$1.23"));
 }
+
+// Rate-limit pipeline end-to-end: pins TOML config → Config::from_str →
+// build_segments → built_in_by_id → from_extras → render. A regression
+// where built_in_by_id drops the `extras` arg on one arm would leave knobs
+// silently inert: per-segment unit tests still pass, validate_keys still
+// passes, and the segment renders with defaults.
+
+fn ctx_with_endpoint_usage(
+    api_json: serde_json::Value,
+) -> linesmith_core::data_context::DataContext {
+    let api: linesmith_core::data_context::UsageApiResponse =
+        serde_json::from_value(api_json).expect("deserialize UsageApiResponse");
+    let status_ctx = linesmith_core::input::parse(include_bytes!("fixtures/claude_minimal.json"))
+        .expect("parse");
+    let ctx = linesmith_core::data_context::DataContext::new(status_ctx);
+    ctx.preseed_usage(Ok(linesmith_core::data_context::UsageData::Endpoint(
+        api.into_endpoint_usage(),
+    )))
+    .expect("preseed_usage: cell already populated");
+    ctx
+}
+
+fn render_rate_limit_line(
+    segments: &[linesmith_core::segments::LineItem],
+    ctx: &linesmith_core::data_context::DataContext,
+) -> String {
+    let mut warn = |_: &str| {};
+    let mut observers = linesmith_core::layout::LayoutObservers::new(&mut warn);
+    linesmith_core::layout::render_with_observers(
+        segments,
+        ctx,
+        200,
+        &mut observers,
+        linesmith_core::theme::default_theme(),
+        linesmith_core::theme::Capability::TrueColor,
+        false,
+    )
+}
+
+#[test]
+fn rate_limit_5h_and_7d_progress_format_renders_block_chars_end_to_end() {
+    // Threads `format = "progress"` through both percent-utilization
+    // arms of built_in_by_id. Per-arm positional assertions catch a
+    // one-arm extras-drop regression: line-wide `█`/`░` checks would
+    // pass if either arm rendered a bar while the other fell back to
+    // the percent default (`"7d: 30.0%"` is also a substring of a
+    // valid progress line).
+    let cfg = linesmith_core::config::Config::from_str(
+        r#"
+            [line]
+            segments = ["rate_limit_5h", "rate_limit_7d"]
+            [segments.rate_limit_5h]
+            format = "progress"
+            [segments.rate_limit_7d]
+            format = "progress"
+        "#,
+    )
+    .expect("parse");
+    let segments = linesmith_core::build_segments(Some(&cfg), None, |_| {});
+    let ctx = ctx_with_endpoint_usage(serde_json::json!({
+        "five_hour": { "utilization": 50.0 },
+        "seven_day": { "utilization": 30.0 },
+    }));
+    let line = render_rate_limit_line(&segments, &ctx);
+    let after_5h = line.split_once("5h: ").expect("5h label").1;
+    assert!(
+        after_5h.starts_with('█'),
+        "5h arm not in progress format: {line:?}"
+    );
+    let after_7d = line.split_once("7d: ").expect("7d label").1;
+    assert!(
+        after_7d.starts_with('█'),
+        "7d arm not in progress format: {line:?}"
+    );
+    assert!(
+        line.contains('░'),
+        "bar should not be fully filled: {line:?}"
+    );
+    assert!(
+        line.contains("50.0%"),
+        "5h trailing percent missing in {line:?}"
+    );
+    assert!(
+        line.contains("30.0%"),
+        "7d trailing percent missing in {line:?}"
+    );
+}
+
+#[test]
+fn rate_limit_5h_and_7d_reset_progress_format_renders_progress_bar_end_to_end() {
+    // The reset arms are separate from the utilization arms in
+    // built_in_by_id and from each other (5h_reset and 7d_reset are
+    // independent match arms). Per-arm positional assertions catch a
+    // one-arm extras-drop on either. Progress exercises format_reset's
+    // Progress branch via the spent-time fraction.
+    let cfg = linesmith_core::config::Config::from_str(
+        r#"
+            [line]
+            segments = ["rate_limit_5h_reset", "rate_limit_7d_reset"]
+            [segments.rate_limit_5h_reset]
+            format = "progress"
+            [segments.rate_limit_7d_reset]
+            format = "progress"
+        "#,
+    )
+    .expect("parse");
+    let segments = linesmith_core::build_segments(Some(&cfg), None, |_| {});
+    // Percent format rounds to 1 decimal, so microsecond drift between
+    // these `now()` calls and the segment's own `now()` reads as 0.0%
+    // — no slack needed (unlike the Duration format's minute-truncation).
+    let five_h_resets_at = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(2);
+    let seven_d_resets_at = jiff::Timestamp::now() + jiff::SignedDuration::from_hours(48);
+    let ctx = ctx_with_endpoint_usage(serde_json::json!({
+        "five_hour": {
+            "utilization": 50.0,
+            "resets_at": five_h_resets_at.to_string(),
+        },
+        "seven_day": {
+            "utilization": 30.0,
+            "resets_at": seven_d_resets_at.to_string(),
+        },
+    }));
+    let line = render_rate_limit_line(&segments, &ctx);
+    let after_5h = line.split_once("5h reset: ").expect("5h reset label").1;
+    assert!(
+        after_5h.starts_with('█'),
+        "5h_reset arm not in progress format: {line:?}"
+    );
+    let after_7d = line.split_once("7d reset: ").expect("7d reset label").1;
+    assert!(
+        after_7d.starts_with('█'),
+        "7d_reset arm not in progress format: {line:?}"
+    );
+    assert!(
+        line.contains('░'),
+        "bar should not be fully filled: {line:?}"
+    );
+}
+
+#[test]
+fn extra_usage_label_knob_applies_end_to_end() {
+    // extra_usage is its own arm in built_in_by_id (not under the
+    // rate_limit:: module). Pinning the label knob catches a dropped
+    // extras arg here that the rate-limit tests above would miss.
+    let cfg = linesmith_core::config::Config::from_str(
+        r#"
+            [line]
+            segments = ["extra_usage"]
+            [segments.extra_usage]
+            label = "overage"
+        "#,
+    )
+    .expect("parse");
+    let segments = linesmith_core::build_segments(Some(&cfg), None, |_| {});
+    let ctx = ctx_with_endpoint_usage(serde_json::json!({
+        "extra_usage": {
+            "is_enabled": true,
+            "monthly_limit": 100.0,
+            "used_credits": 40.0,
+            "currency": "USD",
+        },
+    }));
+    let line = render_rate_limit_line(&segments, &ctx);
+    assert!(line.contains("overage: $60.00"), "{line:?}");
+    assert!(
+        !line.contains("extra:"),
+        "default label leaked through: {line:?}"
+    );
+}
