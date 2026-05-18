@@ -1,0 +1,19 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/),
+and this project adheres to [Semantic Versioning](https://semver.org/).
+
+## [0.1.3] - 2026-05-18
+
+### Features
+
+- **cli:** TUI instant-apply save model([4727269](https://github.com/oakoss/linesmith/commit/472726982c26bf1c639a9a77cd7e04707080cf5c))
+
+### Refactoring
+
+- **repo:** Migrate chrono → jiff across the workspace([0be2835](https://github.com/oakoss/linesmith/commit/0be2835fd5f645e52f84b6429f43ce035170cb11))
+- **repo:** Rename errors.rs modules to singular error.rs([68c8153](https://github.com/oakoss/linesmith/commit/68c815306aa5b713802d22864a71cdb20ee8bf7d))
+- **repo:** Centralize lints in [workspace.lints]([dd40e0c](https://github.com/oakoss/linesmith/commit/dd40e0c71882c133592e5b0d581f25921886f083))
+- **plugins:** Consume plugin host types from origin([6199a33](https://github.com/oakoss/linesmith/commit/6199a33c8556649283427e94ea891cc370059375))

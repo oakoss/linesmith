@@ -22,12 +22,12 @@ workspace = true
 # on. Declared per-crate (not via `[workspace.dependencies]`) so
 # release-plz updates the version pin automatically in lockstep
 # with linesmith-core's own version on each release.
-linesmith-core = { version = "0.1.2", path = "../linesmith-core" }
+linesmith-core = { version = "0.1.3", path = "../linesmith-core" }
 # Rhai plugin host. Cli imports plugin types (`PluginError`,
 # `PluginRegistry`, `CompiledPlugin`, …) directly from the
 # originating crate rather than going through linesmith-core's
 # bridge facade — same release-plz auto-bump posture.
-linesmith-plugin = { version = "0.1.2", path = "../linesmith-plugin" }
+linesmith-plugin = { version = "0.1.3", path = "../linesmith-plugin" }
 serde.workspace = true
 serde_json.workspace = true
 catppuccin.workspace = true
