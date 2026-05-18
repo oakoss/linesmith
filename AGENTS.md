@@ -109,7 +109,7 @@ Beads (`bd`) tracks all implementation work. Issue prefix: `lsm-`.
 - **`bd close <id> --reason="..."`** when completing
 - **`bd remember "insight"`** for persistent knowledge across sessions (search with `bd memories <keyword>`)
 - **`bd prime`** for full workflow context and command reference
-- **Do NOT** use TodoWrite, TaskCreate, or markdown TODO lists; beads is the source of truth
+- **TodoWrite / TaskCreate** — fine for in-session progress tracking; mirror anything new into beads at session end (see "Session Completion").
 
 ## Rules
 
