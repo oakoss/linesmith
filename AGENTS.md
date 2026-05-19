@@ -131,7 +131,7 @@ One bead, one worktree, one branch — use the bare bead ID as the name:
 EnterWorktree(name: "lsm-hhb")
 ```
 
-Creates `.claude/worktrees/lsm-hhb/` on branch `worktree-lsm-hhb`. Short, scannable in `git worktree list`, maps back to `bd show lsm-hhb`. The bead title is the descriptor; don't repeat it in the name. For ad-hoc non-beaded work, use a short kebab descriptor (e.g., `worktree-workflow-docs`).
+Creates `.claude/worktrees/lsm-hhb/` on branch `worktree-lsm-hhb`. Short, scannable in `git worktree list`, maps back to `bd show lsm-hhb`. The bead title is the descriptor; don't repeat it in the name. For ad-hoc non-beaded work, use a short kebab descriptor **without** the `worktree-` prefix (e.g., `workflow-docs`, not `worktree-workflow-docs`) — the harness adds the prefix to the branch name automatically, so a `worktree-`-prefixed input produces `worktree-worktree-<name>`.
 
 From the shell, `claude --worktree <bd-id>` is the user-driven equivalent of `EnterWorktree(name: <bd-id>)` — same `.claude/worktrees/<bd-id>/` path, same `worktree-<bd-id>` branch.
 
@@ -204,7 +204,7 @@ Every change ships through the PR path — doc-only diffs included. `## Rules` (
 
 ### Cleanup safety
 
-Worktree auto-cleanup has documented data loss (anthropics/claude-code#46444, #48927, #38287, #51596, #27753). Treat the cleanup step as the most dangerous in the workflow — push or merge before deleting, and prefer the safer commands.
+Worktree auto-cleanup has documented data loss (anthropics/claude-code#46444, anthropics/claude-code#48927, anthropics/claude-code#38287, anthropics/claude-code#51596, anthropics/claude-code#27753). Treat the cleanup step as the most dangerous in the workflow — push or merge before deleting, and prefer the safer commands.
 
 - **Safest**: `bd worktree remove <name>` — checks for uncommitted changes, stashes, AND unpushed commits.
 - **Safe**: `git worktree remove <path>` and `claude rm <id>` — refuse to delete worktrees with uncommitted changes (don't catch stashes / unpushed commits).
