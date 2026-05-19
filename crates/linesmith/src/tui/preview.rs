@@ -25,7 +25,9 @@ use crate::config::Config;
 use crate::data_context::error::UsageError;
 use crate::data_context::DataContext;
 use crate::layout::render_to_runs;
-use crate::logging::CapturedSink;
+use std::time::{Duration, Instant};
+
+use crate::logging::{CapturedDrain, CapturedSink};
 use crate::segments::builder::build_lines;
 use crate::segments::LineItem;
 use crate::theme::{AnsiColor, Capability, Color, StyledRun, Theme};
@@ -105,9 +107,64 @@ pub(super) fn render_lines(
     // today; possible once v0.2 background plugins land) surface
     // on the next frame's render, not the one they fired during.
     if let Some(sink) = sink {
-        warnings.extend(sink.drain());
+        warnings.extend(format_captured_drain(
+            sink.drain_detailed(),
+            Instant::now(),
+            sink.capacity(),
+        ));
     }
     (rendered, warnings)
+}
+
+/// Format a [`CapturedDrain`] into the warnings-panel line list.
+/// Prepends a synthetic "(N earlier entries dropped)" notice when the
+/// buffer evicted older lines, then appends each entry's text with a
+/// `· Xs ago` suffix once the age crosses [`AGE_SUFFIX_THRESHOLD`].
+/// `now` is injected so the unit tests can pin both the threshold
+/// boundary and the suffix format without sleeping. `cap` is the
+/// sink's live capacity so the drop-notice reflects the actual limit
+/// even if a caller constructs a non-default sink.
+fn format_captured_drain(drain: CapturedDrain, now: Instant, cap: usize) -> Vec<String> {
+    let CapturedDrain { entries, dropped } = drain;
+    let mut out = Vec::with_capacity(entries.len() + usize::from(dropped > 0));
+    if dropped > 0 {
+        out.push(format!(
+            "[warn] ({dropped} earlier captured entries dropped — buffer cap {cap})",
+        ));
+    }
+    for entry in entries {
+        let age = now.saturating_duration_since(entry.at);
+        out.push(if age >= AGE_SUFFIX_THRESHOLD {
+            format!("{} · {} ago", entry.text, format_age(age))
+        } else {
+            entry.text
+        });
+    }
+    out
+}
+
+/// Suppress the age suffix while the entry is freshly emitted. Today's
+/// synchronous-render emits drain within microseconds of their `emit`
+/// timestamp, so every captured warning would otherwise carry a
+/// noisy `· 0s ago` tail. Set above the longest realistic render
+/// frame so the threshold trips only when the entry has genuinely
+/// been sitting un-drained — once v0.2 background emitters fire
+/// between draws.
+const AGE_SUFFIX_THRESHOLD: Duration = Duration::from_secs(2);
+
+/// Compact relative-age formatter. Resolution drops from seconds to
+/// minutes past 90s, and to hours past 90min — matches the precision
+/// a user actually cares about ("did this just happen, or is it
+/// stale") without printing "127s" for a 2-minute-old entry.
+fn format_age(age: Duration) -> String {
+    let secs = age.as_secs();
+    if secs < 90 {
+        format!("{secs}s")
+    } else if secs < 90 * 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}h", secs / 3600)
+    }
 }
 
 fn render_line(
@@ -587,5 +644,108 @@ mod tests {
             warnings.iter().any(|w| w.contains("my-plugin")),
             "expected plugin warning, got {warnings:?}",
         );
+    }
+
+    use crate::logging::{CapturedEntry, CAPTURED_SINK_DEFAULT_CAP};
+
+    #[test]
+    fn format_captured_drain_omits_age_suffix_below_threshold() {
+        // Synchronous-render path: emit and drain land in the same
+        // frame, so age is microseconds. The threshold gate must
+        // keep the entry text bare — otherwise every warning would
+        // carry a noisy `· 0s ago` tail under current emit timing.
+        let now = Instant::now();
+        let drain = CapturedDrain {
+            entries: vec![CapturedEntry {
+                at: now,
+                text: "[warn] fresh".to_string(),
+            }],
+            dropped: 0,
+        };
+        let out = format_captured_drain(drain, now, CAPTURED_SINK_DEFAULT_CAP);
+        assert_eq!(out, vec!["[warn] fresh".to_string()]);
+    }
+
+    #[test]
+    fn format_captured_drain_appends_age_suffix_exactly_at_threshold() {
+        // The age gate is `>= AGE_SUFFIX_THRESHOLD`. A refactor that
+        // flipped it to `>` would still pass the 0s/5s boundary
+        // tests; pinning exactly-at-threshold catches that swap.
+        let now = Instant::now();
+        let emitted_at = now
+            .checked_sub(AGE_SUFFIX_THRESHOLD)
+            .expect("Instant arithmetic underflow on a 2s offset");
+        let drain = CapturedDrain {
+            entries: vec![CapturedEntry {
+                at: emitted_at,
+                text: "[warn] boundary".to_string(),
+            }],
+            dropped: 0,
+        };
+        let out = format_captured_drain(drain, now, CAPTURED_SINK_DEFAULT_CAP);
+        assert_eq!(out, vec!["[warn] boundary · 2s ago".to_string()]);
+    }
+
+    #[test]
+    fn format_captured_drain_appends_age_suffix_above_threshold() {
+        // Once an entry has been sitting un-drained longer than
+        // AGE_SUFFIX_THRESHOLD (today only possible with a future
+        // background emitter), the suffix surfaces so the user
+        // knows the warning is stale.
+        let now = Instant::now();
+        let emitted_at = now
+            .checked_sub(Duration::from_secs(5))
+            .expect("Instant arithmetic underflow on a 5s offset");
+        let drain = CapturedDrain {
+            entries: vec![CapturedEntry {
+                at: emitted_at,
+                text: "[warn] stale".to_string(),
+            }],
+            dropped: 0,
+        };
+        let out = format_captured_drain(drain, now, CAPTURED_SINK_DEFAULT_CAP);
+        assert_eq!(out, vec!["[warn] stale · 5s ago".to_string()]);
+    }
+
+    #[test]
+    fn format_captured_drain_prepends_dropped_notice() {
+        // Eviction is invisible to the consumer unless the drain
+        // surfaces it. Pin both the prepend order (notice first,
+        // entries after) and that the notice mentions the cap so
+        // the user can tell whether to raise it.
+        let now = Instant::now();
+        let drain = CapturedDrain {
+            entries: vec![CapturedEntry {
+                at: now,
+                text: "[warn] survivor".to_string(),
+            }],
+            dropped: 3,
+        };
+        let out = format_captured_drain(drain, now, CAPTURED_SINK_DEFAULT_CAP);
+        assert_eq!(out.len(), 2);
+        assert!(
+            out[0].contains("3 earlier captured entries dropped"),
+            "got {out:?}",
+        );
+        assert!(
+            out[0].contains(&CAPTURED_SINK_DEFAULT_CAP.to_string()),
+            "notice must reference the cap, got {out:?}",
+        );
+        assert_eq!(out[1], "[warn] survivor");
+    }
+
+    #[test]
+    fn format_age_steps_down_resolution_with_age() {
+        // Resolution ladder: seconds → minutes at 90s → hours at
+        // 90min. Each boundary is a closed lower bound — the entry
+        // at the boundary uses the coarser unit. Catches an
+        // off-by-one in the comparison (`< 90` vs `<= 90`) that
+        // would print "90s" instead of "1m".
+        assert_eq!(format_age(Duration::from_secs(0)), "0s");
+        assert_eq!(format_age(Duration::from_secs(89)), "89s");
+        assert_eq!(format_age(Duration::from_secs(90)), "1m");
+        assert_eq!(format_age(Duration::from_secs(60 * 89)), "89m");
+        assert_eq!(format_age(Duration::from_secs(60 * 90)), "1h");
+        assert_eq!(format_age(Duration::from_secs(3600 * 5)), "5h");
     }
 }

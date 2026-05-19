@@ -29,10 +29,12 @@
 //! structured fields. Add those when a call site needs them.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::mem;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 /// Logger severity. Variants are ordered `Off < Warn < Debug` so a
 /// call fires when its own level is `<=` the configured level.
@@ -186,6 +188,40 @@ impl LogSink for StderrSink {
     }
 }
 
+/// Default cap for the [`CapturedSink`] inter-frame ring. Sized for a
+/// chatty render (one warn per segment across a multi-line config) plus
+/// burst headroom from future background emitters. Each entry is a
+/// short formatted string, so the worst-case memory at the cap is on
+/// the order of tens of KiB — small enough to be permanently allocated
+/// for the alt-screen lifetime.
+pub const CAPTURED_SINK_DEFAULT_CAP: usize = 256;
+
+/// One captured emission, tagged with the [`Instant`] it landed at the
+/// sink. Consumers that display the buffer over time (the TUI warnings
+/// panel once v0.2 background plugins can emit between draws) compute
+/// relative age against `Instant::now()` at render time; the monotonic
+/// clock means a host suspending mid-session doesn't show negative
+/// ages or jump backwards.
+///
+/// `text` carries the existing compact form (`[<tag>] <msg>`); the age
+/// is metadata, not embedded in the text, so non-temporal renderers
+/// (boot-failure stderr flush) can ignore the timestamp entirely.
+#[derive(Debug, Clone)]
+pub struct CapturedEntry {
+    pub at: Instant,
+    pub text: String,
+}
+
+/// Detailed drain result. Carries the entries plus a `dropped` count
+/// for emissions silently evicted by the bounded buffer since the
+/// previous drain, so the consumer can surface a "(N earlier entries
+/// dropped)" line instead of letting the loss go unnoticed.
+#[derive(Debug, Default)]
+pub struct CapturedDrain {
+    pub entries: Vec<CapturedEntry>,
+    pub dropped: usize,
+}
+
 /// Buffering sink that accumulates formatted entries for an
 /// interactive consumer to drain. The TUI installs one for the
 /// alt-screen lifetime so `lsm_warn!` / `lsm_error!` / `lsm_debug!`
@@ -195,19 +231,136 @@ impl LogSink for StderrSink {
 /// Captured format is `[<tag>] <msg>` — the surrounding UI prefixes
 /// each line with its own marker (e.g. `⚠`), so the `linesmith`
 /// prefix and colon would be redundant noise.
-#[derive(Debug, Default)]
+///
+/// The buffer is bounded at [`CAPTURED_SINK_DEFAULT_CAP`] with
+/// drop-oldest eviction and a counter exposed via [`Self::drain_detailed`].
+/// Today every emit happens during a synchronous render so drain
+/// follows within microseconds; once v0.2 background plugins emit
+/// between draws, the cap is what keeps a long-idle session from
+/// accumulating megabytes of unread diagnostics. The [`Self::emit_seq`]
+/// counter lets an idle event loop notice a new emission and trigger
+/// a redraw without polling the mutex on every tick.
+#[derive(Debug)]
 pub struct CapturedSink {
-    entries: Mutex<Vec<String>>,
+    entries: Mutex<VecDeque<CapturedEntry>>,
+    cap: usize,
+    /// Entries evicted since the last drain. Reset on every drain
+    /// (legacy `drain` routes through `drain_detailed` and so resets
+    /// it too) — only `drain_detailed` returns the count to the
+    /// consumer, so callers that need eviction visibility must use
+    /// it exclusively and not interleave with legacy `drain`.
+    ///
+    /// Updated under the `entries` mutex so a concurrent push's
+    /// eviction increment can't race the drain's reset.
+    dropped: AtomicUsize,
+    /// Lifetime emission counter — monotonically increments on every
+    /// `push`, never resets. Paired with `last_drain_seq` to drive the
+    /// TUI's rising-edge wake (see the `emit_seq` method doc for the
+    /// pre-draw / post-drain watermark math).
+    emit_seq: AtomicUsize,
+    /// Snapshot of `emit_seq` at the moment of the most recent drain.
+    /// Lets the event loop tell apart "in-frame emits the render
+    /// already drained and showed the user" from "background emits
+    /// that arrived during the draw but were not drained" — the
+    /// former bumps `emit_seq` AND `last_drain_seq` in lockstep, the
+    /// latter advances only `emit_seq`. The watermark advances to
+    /// `max(pre_draw_emit_seq, last_drain_seq)` so neither bites.
+    last_drain_seq: AtomicUsize,
+}
+
+impl Default for CapturedSink {
+    fn default() -> Self {
+        Self::with_capacity(CAPTURED_SINK_DEFAULT_CAP)
+    }
 }
 
 impl CapturedSink {
-    /// Take all currently-buffered entries, leaving the sink empty.
-    /// The TUI calls this between draws so each frame's warnings
-    /// reflect that frame's render only.
+    /// Construct a sink with an explicit cap. A `cap` of zero is
+    /// clamped to one — a literal zero-cap would drop every emission,
+    /// leaving the consumer with nothing but a rising `dropped` counter.
+    #[must_use]
+    pub fn with_capacity(cap: usize) -> Self {
+        let cap = cap.max(1);
+        Self {
+            entries: Mutex::new(VecDeque::with_capacity(cap.min(64))),
+            cap,
+            dropped: AtomicUsize::new(0),
+            emit_seq: AtomicUsize::new(0),
+            last_drain_seq: AtomicUsize::new(0),
+        }
+    }
+
+    /// Legacy text-only drain. Strips timestamps and dropped-count
+    /// metadata; used by callers (boot-failure stderr flush, the
+    /// `_test_capture_warns` helper) that only need the existing
+    /// `[<tag>] <msg>` strings. Resets the pending counter so an
+    /// event loop watching this sink stops requesting redraws.
     #[must_use]
     pub fn drain(&self) -> Vec<String> {
+        let detailed = self.drain_detailed();
+        detailed.entries.into_iter().map(|e| e.text).collect()
+    }
+
+    /// Structured drain. Returns every buffered entry with its
+    /// emission timestamp and the number of entries evicted by the
+    /// cap since the previous drain. Resets both counters.
+    ///
+    /// Counter resets happen while holding the `entries` mutex.
+    /// A concurrent emit serializes on the same lock, so its
+    /// increment is either fully observed by this drain (and
+    /// reflected in the returned counts) or strictly ordered
+    /// after the reset (and visible to the next drain) — never
+    /// silently clobbered.
+    #[must_use]
+    pub fn drain_detailed(&self) -> CapturedDrain {
         let mut g = self.entries.lock().unwrap_or_else(|p| p.into_inner());
-        mem::take(&mut *g)
+        let entries: Vec<CapturedEntry> = g.drain(..).collect();
+        // Stamp last_drain_seq with the emit_seq value at this exact
+        // moment so the event loop can tell drained-and-rendered
+        // emissions apart from background emissions that arrived
+        // after the drain. `emit_seq` is read under the mutex (same
+        // critical section as the push side) so the snapshot reflects
+        // every emit that contributed to the drained entries.
+        let seq_at_drain = self.emit_seq.load(Ordering::Acquire);
+        self.last_drain_seq.store(seq_at_drain, Ordering::Release);
+        let dropped = self.dropped.swap(0, Ordering::AcqRel);
+        CapturedDrain { entries, dropped }
+    }
+
+    /// Current cap. Lock-free read so consumers that render the
+    /// drop-notice ("(N earlier entries dropped — cap M)") pick up
+    /// the live value rather than baking in the `Default` constant.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
+    /// Monotonic lifetime emission counter. The TUI event loop drives
+    /// a rising-edge wake by comparing this against a watermark of
+    /// `max(pre_draw_emit_seq, last_drain_seq)`:
+    ///
+    /// - **Pre-draw snapshot** keeps background emissions that arrive
+    ///   *after* the in-frame drain on the unseen side of the watermark
+    ///   — the next idle tick redraws them.
+    /// - **`last_drain_seq`** lets in-frame emissions (the render
+    ///   itself emitting warnings while building the frame) advance
+    ///   the watermark — they were drained and shown to the user via
+    ///   the warnings panel, so they shouldn't re-trigger a redraw.
+    ///
+    /// Acquire-load pairs with the Release store in `push` so on
+    /// weakly-ordered architectures (ARM, RISC-V) the wake signal
+    /// doesn't lag a poll tick.
+    #[must_use]
+    pub fn emit_seq(&self) -> usize {
+        self.emit_seq.load(Ordering::Acquire)
+    }
+
+    /// `emit_seq` value at the moment of the most recent drain.
+    /// Always `<= emit_seq()`. See [`Self::emit_seq`] for how the
+    /// event loop combines the two into its watermark.
+    #[must_use]
+    pub fn last_drain_seq(&self) -> usize {
+        self.last_drain_seq.load(Ordering::Acquire)
     }
 
     /// Test helper: assert against the buffer without consuming it.
@@ -216,7 +369,23 @@ impl CapturedSink {
         self.entries
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .clone()
+            .iter()
+            .map(|e| e.text.clone())
+            .collect()
+    }
+
+    fn push(&self, text: String) {
+        let entry = CapturedEntry {
+            at: Instant::now(),
+            text,
+        };
+        let mut g = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        if g.len() == self.cap {
+            g.pop_front();
+            self.dropped.fetch_add(1, Ordering::Release);
+        }
+        g.push_back(entry);
+        self.emit_seq.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -227,17 +396,11 @@ impl LogSink for CapturedSink {
             Level::Warn => "warn",
             Level::Debug => "debug",
         };
-        self.entries
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(format!("[{tag}] {msg}"));
+        self.push(format!("[{tag}] {msg}"));
     }
 
     fn emit_error(&self, msg: &str) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(format!("[error] {msg}"));
+        self.push(format!("[error] {msg}"));
     }
 }
 
@@ -735,9 +898,9 @@ mod tests {
     #[test]
     fn emit_error_fires_at_every_level() {
         // emit_error bypasses the level gate at every setting, not
-        // just Off. Pin Off + Warn + Debug so a future "optimize
+        // only Off. Pin Off + Warn + Debug so a future "optimize
         // emit_error to share the emit() short-circuit" refactor
-        // breaks the Warn/Debug arms here, not just at Off.
+        // breaks the Warn/Debug arms here, not only at Off.
         let _g = lock();
         for l in [Level::Off, Level::Warn, Level::Debug] {
             set_level(l);
@@ -769,6 +932,140 @@ mod tests {
         // Drain consumes — second drain is empty.
         assert!(captured.drain().is_empty());
         set_level(DEFAULT_LEVEL);
+    }
+
+    #[test]
+    fn captured_sink_evicts_oldest_when_full_and_counts_drops() {
+        // Bounded ring contract: at cap, the next emit evicts the
+        // front entry and bumps the dropped counter. A regression
+        // that drops the *new* entry instead would leave the
+        // user staring at stale warnings while fresh ones vanish.
+        let captured = CapturedSink::with_capacity(2);
+        captured.emit(Level::Warn, "first");
+        captured.emit(Level::Warn, "second");
+        captured.emit(Level::Warn, "third");
+        let detailed = captured.drain_detailed();
+        let texts: Vec<String> = detailed.entries.iter().map(|e| e.text.clone()).collect();
+        assert_eq!(
+            texts,
+            vec!["[warn] second".to_string(), "[warn] third".to_string()],
+            "drop-oldest must evict 'first', keep latest two",
+        );
+        assert_eq!(detailed.dropped, 1, "exactly one entry evicted");
+    }
+
+    #[test]
+    fn captured_sink_legacy_drain_also_resets_dropped_counter() {
+        // Legacy `drain` delegates to `drain_detailed` and discards
+        // the count, but it still resets `dropped`. Pin this so a
+        // future refactor that inlines `drain` with its own pop
+        // doesn't silently leak the eviction count into the next
+        // detailed drain.
+        let captured = CapturedSink::with_capacity(1);
+        captured.emit(Level::Warn, "a");
+        captured.emit(Level::Warn, "b"); // evicts 'a' → dropped = 1
+        let _ = captured.drain();
+        captured.emit(Level::Warn, "c");
+        let detailed = captured.drain_detailed();
+        assert_eq!(detailed.dropped, 0);
+    }
+
+    #[test]
+    fn captured_sink_dropped_counter_resets_on_detailed_drain() {
+        // Detailed drain hands the eviction count to the consumer
+        // and zeroes it so the next drain only sees evictions that
+        // happened *since* the last detailed pull. Otherwise the
+        // counter would monotonically rise forever and the panel
+        // would keep showing "5 dropped" long after they were
+        // surfaced.
+        let captured = CapturedSink::with_capacity(1);
+        captured.emit(Level::Warn, "a");
+        captured.emit(Level::Warn, "b"); // evicts 'a'
+        let first = captured.drain_detailed();
+        assert_eq!(first.dropped, 1);
+        captured.emit(Level::Warn, "c");
+        let second = captured.drain_detailed();
+        assert_eq!(second.dropped, 0, "counter must reset between drains");
+    }
+
+    #[test]
+    fn captured_sink_with_capacity_clamps_zero_to_one() {
+        // A literal zero-cap would silently drop every emission —
+        // the consumer would see an empty `entries` and a rising
+        // `dropped` count with no payload. Clamp to one so the
+        // sink at least preserves the most recent entry.
+        let captured = CapturedSink::with_capacity(0);
+        captured.emit(Level::Warn, "only");
+        let detailed = captured.drain_detailed();
+        assert_eq!(detailed.entries.len(), 1);
+        assert_eq!(detailed.entries[0].text, "[warn] only");
+    }
+
+    #[test]
+    fn captured_sink_records_emit_timestamp() {
+        // Each entry stamps `Instant::now()` at emit so a renderer
+        // can show relative age. Two emits separated by `sleep`
+        // produce strictly increasing timestamps.
+        let captured = CapturedSink::default();
+        captured.emit(Level::Warn, "first");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        captured.emit(Level::Warn, "second");
+        let detailed = captured.drain_detailed();
+        assert_eq!(detailed.entries.len(), 2);
+        assert!(
+            detailed.entries[1].at > detailed.entries[0].at,
+            "second emit must have a later timestamp than the first",
+        );
+    }
+
+    #[test]
+    fn captured_sink_last_drain_seq_marks_in_frame_emits_as_seen() {
+        // The run_loop's watermark uses last_drain_seq to advance
+        // past in-frame emits the render already showed the user.
+        // Pin the contract: after a drain, last_drain_seq equals
+        // emit_seq, and a background emit landing after the drain
+        // does NOT advance last_drain_seq (so the watermark stays
+        // below cur_emit_seq and the next idle tick wakes).
+        let captured = CapturedSink::default();
+        assert_eq!(captured.last_drain_seq(), 0);
+        captured.emit(Level::Warn, "in-frame-a");
+        captured.emit(Level::Warn, "in-frame-b");
+        let _ = captured.drain_detailed();
+        assert_eq!(captured.last_drain_seq(), 2, "drain marks both as seen");
+        assert_eq!(captured.emit_seq(), 2);
+        captured.emit(Level::Warn, "background");
+        assert_eq!(
+            captured.last_drain_seq(),
+            2,
+            "post-drain emit must NOT advance last_drain_seq",
+        );
+        assert_eq!(captured.emit_seq(), 3, "but emit_seq advances");
+    }
+
+    #[test]
+    fn captured_sink_emit_seq_is_monotonic_across_drains() {
+        // The wake signal must NOT reset on drain — sampling
+        // post-drain would otherwise miss-mark emissions that
+        // arrived during the draw (between the in-frame drain and
+        // the loop's post-draw watermark update) as already-seen.
+        // Pin the monotonic contract so a future refactor that
+        // re-introduces a drain reset breaks here, not in the run-
+        // loop watermark.
+        let captured = CapturedSink::default();
+        assert_eq!(captured.emit_seq(), 0);
+        captured.emit(Level::Warn, "a");
+        captured.emit(Level::Warn, "b");
+        assert_eq!(captured.emit_seq(), 2);
+        let _ = captured.drain_detailed();
+        assert_eq!(captured.emit_seq(), 2, "drain must not reset emit_seq");
+        captured.emit(Level::Warn, "c");
+        assert_eq!(captured.emit_seq(), 3);
+        let _ = captured.drain();
+        assert_eq!(
+            captured.emit_seq(),
+            3,
+            "legacy drain must not reset emit_seq"
+        );
     }
 
     #[test]
