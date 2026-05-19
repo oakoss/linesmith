@@ -111,6 +111,110 @@ Beads (`bd`) tracks all implementation work. Issue prefix: `lsm-`.
 - **`bd prime`** for full workflow context and command reference
 - **TodoWrite / TaskCreate** — fine for in-session progress tracking; mirror anything new into beads at session end (see "Session Completion").
 
+## Worktree Workflow
+
+Background Claude Code sessions isolate code edits into a git worktree under `.claude/worktrees/` (the `worktree.bgIsolation` default). `.claude/settings.json` sets `worktree.baseRef = "head"` so worktrees carry unpushed local commits — no missing state when syncing back.
+
+### When the bgIsolation guard fires
+
+The harness only blocks code-file edits (Rust, JSON, TOML); markdown / doc-only edits pass through to the main checkout without triggering:
+
+> This background session hasn't isolated its changes yet. Call EnterWorktree first so edits land in a worktree instead of the shared checkout.
+
+Use `EnterWorktree(name: <bd-id>)` to satisfy the guard when it fires, and call it proactively for doc-only changes too — every commit ships through a PR (next section), and that needs a branch separate from `main`. The guard is a backstop, not the only reason to isolate.
+
+### Naming convention
+
+One bead, one worktree, one branch — use the bare bead ID as the name:
+
+```text
+EnterWorktree(name: "lsm-hhb")
+```
+
+Creates `.claude/worktrees/lsm-hhb/` on branch `worktree-lsm-hhb`. Short, scannable in `git worktree list`, maps back to `bd show lsm-hhb`. The bead title is the descriptor; don't repeat it in the name. For ad-hoc non-beaded work, use a short kebab descriptor (e.g., `worktree-workflow-docs`).
+
+From the shell, `claude --worktree <bd-id>` is the user-driven equivalent of `EnterWorktree(name: <bd-id>)` — same `.claude/worktrees/<bd-id>/` path, same `worktree-<bd-id>` branch.
+
+### Bd flow inside the worktree
+
+The bd database auto-shares across worktrees via git-common-dir discovery — every worktree sees the same DB as main without manual setup. The `.beads/issues.jsonl` file is per-checkout (it tracks per-branch on-disk state), so the close-then-commit pattern still produces clean diffs at merge time.
+
+Claim **inside** the worktree, not in main — keeps main's `.beads/issues.jsonl` clean and avoids a stale-staged-jsonl conflict at sync time. The atomic close-then-commit pattern from `## Task Tracking` applies; the worktree adds a push + PR step at the end.
+
+```bash
+# Inside the worktree:
+bd update lsm-xyz --claim
+# ... edit, test, review-cycle ...
+bd close lsm-xyz --reason="<one-line summary of what shipped>"
+# If `git status` shows .beads/issues.jsonl unchanged after bd close
+# (60s auto-export throttle hit), force the write:
+#   bd export -o .beads/issues.jsonl
+git add <files> .beads/issues.jsonl
+git commit -m "feat(scope): subject
+
+lsm-xyz"
+git push -u origin worktree-lsm-xyz
+
+# Open a PR; squash is the only merge method enabled on the repo:
+gh pr create --title "feat(scope): subject" --body "$(cat <<'EOF'
+## Summary
+- ...
+EOF
+)"
+
+# Wait for CI, then confirm Copilot has posted before merging:
+gh pr checks --watch               # blocks until CI Summary completes; does NOT wait for Copilot
+
+# Copilot review is async and non-blocking — poll until it has posted, OR open
+# the PR in a browser and confirm visually. Polling form:
+until gh pr view --json reviews -q \
+    '.reviews[] | select(.author.login | test("copilot"; "i"))' \
+    | grep -q .; do sleep 15; done
+
+gh pr view --comments              # read Copilot's review notes
+gh pr merge --squash               # remote branch auto-deletes (delete_branch_on_merge=true); local cleanup below
+```
+
+Exit the worktree via the Claude Code tool (`ExitWorktree(action: "keep")`) so the branch + dir stay on disk for cleanup. Then back in main:
+
+```bash
+git pull --ff-only origin main
+git fetch --prune origin           # prune the now-deleted remote tracking ref
+git worktree remove .claude/worktrees/lsm-xyz
+# Squash merge creates a new commit on main; the worktree branch is NOT an
+# ancestor of it, so `git branch -d` will refuse. Use -D after confirming the
+# PR landed (via `gh pr view <N> --json mergedAt` or the gh output above).
+git branch -D worktree-lsm-xyz
+```
+
+The PR path honors the repo's branch protection (`Changes must be made through a pull request`) and required `CI Summary` check — pushing straight to main bypasses both. Squash collapses any review-cycle iter-commits into one clean main commit; the squash commit body is built from concatenated commit messages (`squash_merge_commit_message: COMMIT_MESSAGES`), so the `lsm-xyz` footer in your worktree commit lands in the squash commit naturally — no PR-body workaround needed.
+
+**Don't pass `--auto` to `gh pr merge`** while the org ruleset has `copilot_code_review` enabled: Copilot review is a non-blocking _request_, not a required status check, so `--auto` will fire as soon as CI passes and may land before Copilot has posted its review. Manual merge after `gh pr view --comments` confirms both signals are in.
+
+If main moves while CI is running, the `strict_required_status_checks_policy` blocks merge until the PR branch is updated; run `gh pr update-branch` to refresh.
+
+Every change ships through the PR path — doc-only diffs included. `## Rules` ("Never push unless explicitly asked") and the org's `Changes must be made through a pull request` rule both apply uniformly.
+
+### Cleanup safety
+
+Worktree auto-cleanup has documented data loss (anthropics/claude-code#46444, #48927, #38287, #51596, #27753). Treat the cleanup step as the most dangerous in the workflow — push or merge before deleting, and prefer the safer commands.
+
+- **Safest**: `bd worktree remove <name>` — checks for uncommitted changes, stashes, AND unpushed commits.
+- **Safe**: `git worktree remove <path>` and `claude rm <id>` — refuse to delete worktrees with uncommitted changes (don't catch stashes / unpushed commits).
+- **Footgun**: `Ctrl+X` twice in agent view (`claude agents`) deletes Claude-created worktrees **including any uncommitted changes**. Avoid unless the worktree is genuinely clean.
+
+`bd worktree list` (or `git worktree list`) shows what's outstanding; `bd worktree info` inside a worktree confirms branch + bd state before removing.
+
+Spawned agents with `isolation: worktree` can drift onto main-repo files. Audit `git status` in BOTH the worktree AND the main repo before trusting that work is contained. The `isolation: worktree` frontmatter is also silently ignored in some invocations (anthropics/claude-code#50357) — don't rely on it as the sole safeguard.
+
+### Anti-patterns
+
+- **Kitchen-sink session.** One worktree, one bead, one PR. Reusing a worktree for unrelated tasks pollutes context and risks the cleanup step nuking work for the wrong reason. `/clear` and a fresh `EnterWorktree` for the next bead.
+- **`--auto` merge while Copilot review is enabled.** Copilot is a non-blocking review request — `gh pr merge --auto` will land the PR before Copilot has posted. Use manual `gh pr merge --squash` after reading `gh pr view --comments`.
+- **Trusting subagent `isolation: worktree` alone.** It's been observed to be silently ignored; combine with session-level `bgIsolation` and `git status` audits.
+- **Pre-commit / lefthook hooks that assume single working dir.** Hooks that write to `./tmp`, hardcode paths, or share lock files collide across worktrees. Audit `lefthook.yml` when adding hooks.
+- **Auto-merging external contributor PRs based on AI review alone.** Spoofed git identity has fooled AI reviewers into approving malicious PRs (manifold.security). Keep human approval for contributor PRs even if Copilot signs off; `--auto` is only safe on your own branches.
+
 ## Rules
 
 - **Never commit proactively.** Wait for the user's go-ahead.
