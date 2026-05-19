@@ -160,7 +160,7 @@ pub(super) fn run(
         return 1;
     }
 
-    let outcome = run_loop(model);
+    let outcome = run_loop(model, Arc::clone(&captured_sink));
 
     if let Err(err) = leave_terminal() {
         // Prefer surfacing the original outcome's exit code; restoring
@@ -168,14 +168,16 @@ pub(super) fn run(
         let _ = writeln!(stderr, "linesmith config: terminal restore: {err}");
     }
 
+    // Drain any leftover sink contents to stderr regardless of exit
+    // status: only the preview screen drains during a session, so a
+    // user who quits from main_menu without ever visiting preview
+    // would otherwise never see a theme-registry warning or an
+    // install-path lsm_warn that fired during boot.
+    flush_captured_to_stderr(&captured_sink, stderr);
+
     match outcome {
         Ok(()) => 0,
         Err(err) => {
-            // The event loop failed; surface anything macros emitted
-            // between the last successful frame drain and the failure
-            // point so the user sees the underlying diagnostic, not
-            // only the I/O error code.
-            flush_captured_to_stderr(&captured_sink, stderr);
             let _ = writeln!(stderr, "linesmith config: event loop: {err}");
             1
         }
@@ -197,10 +199,22 @@ pub(super) use crate::atomic::atomic_write;
 /// Lines come out prefixed with `linesmith config:` to match the
 /// other boot-path stderr writes (parse warnings, terminal setup
 /// errors). The captured `[<level>] <msg>` body is preserved as-is
-/// so the level tag is visible to the user.
+/// so the level tag is visible to the user. A prepended notice
+/// surfaces any entries the bounded ring evicted before drain so a
+/// degraded environment emitting more than the cap doesn't show only
+/// the last N lines with no hint that earlier ones existed.
 fn flush_captured_to_stderr(captured: &CapturedSink, stderr: &mut dyn Write) {
-    for entry in captured.drain() {
-        let _ = writeln!(stderr, "linesmith config: {entry}");
+    let drain = captured.drain_detailed();
+    if drain.dropped > 0 {
+        let _ = writeln!(
+            stderr,
+            "linesmith config: ({} earlier captured entries dropped — buffer cap {})",
+            drain.dropped,
+            captured.capacity(),
+        );
+    }
+    for entry in drain.entries {
+        let _ = writeln!(stderr, "linesmith config: {}", entry.text);
     }
 }
 
@@ -215,19 +229,47 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Event-poll → update → draw loop. The initial draw paints the
 /// screen once; subsequent draws fire only after `update` consumed
 /// an event, so an idle session doesn't repaint at 10 Hz.
-fn run_loop(mut model: Model) -> io::Result<()> {
+///
+/// The `captured_sink` argument drives an idle-arm wake when a
+/// background emitter pushes onto the sink between draws (v0.2
+/// plugin work). The watermark is `max(pre_draw_emit_seq,
+/// last_drain_seq)` so two opposing races both close:
+///
+/// - A *background* emit landing AFTER the in-frame drain raises
+///   `emit_seq` but not `last_drain_seq`; the pre-draw snapshot
+///   leaves the watermark below it, so the next idle tick wakes.
+/// - An *in-frame* emit (the render itself emitting a warning while
+///   building the frame) raises BOTH `emit_seq` and `last_drain_seq`
+///   in lockstep; the `max` advances the watermark past it so the
+///   warning — already shown to the user via the warnings panel —
+///   doesn't trigger an infinite redraw loop.
+///
+/// Screens that don't drain (non-preview) leave `last_drain_seq`
+/// stale, so the pre-draw snapshot alone advances the watermark:
+/// one wake per emission, no wake-storm.
+fn run_loop(mut model: Model, captured_sink: Arc<CapturedSink>) -> io::Result<()> {
     let backend = ratatui::backend::CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
+    let initial_snapshot = captured_sink.emit_seq();
     draw_with_retry(|op| terminal.draw(op).map(|_| ()), &model)?;
+    let mut watermark = initial_snapshot.max(captured_sink.last_drain_seq());
     loop {
-        let Some(event) = poll_event()? else {
+        let event_opt = poll_event()?;
+        let Some(event) = event_opt else {
+            let cur = captured_sink.emit_seq();
+            if cur > watermark {
+                draw_with_retry(|op| terminal.draw(op).map(|_| ()), &model)?;
+                watermark = cur.max(captured_sink.last_drain_seq());
+            }
             continue;
         };
         model = update(model, event);
         if model.quit {
             return Ok(());
         }
+        let snapshot = captured_sink.emit_seq();
         draw_with_retry(|op| terminal.draw(op).map(|_| ()), &model)?;
+        watermark = snapshot.max(captured_sink.last_drain_seq());
     }
 }
 
@@ -623,6 +665,38 @@ mod tests {
         let mut second = Vec::<u8>::new();
         flush_captured_to_stderr(&captured, &mut second);
         assert!(second.is_empty(), "second flush leaked: {second:?}");
+    }
+
+    #[test]
+    fn flush_captured_to_stderr_surfaces_dropped_count_on_overflow() {
+        // Pin the boot-path's drop-notice: when the bounded ring
+        // evicted older entries before flush, the user sees a single
+        // line acknowledging the loss so a chatty early-boot failure
+        // doesn't silently truncate to the tail.
+        use crate::logging::{Level, LogSink};
+
+        let _serial = crate::logging::_test_serial_lock();
+        let captured = CapturedSink::with_capacity(2);
+        captured.emit(Level::Warn, "first");
+        captured.emit(Level::Warn, "second");
+        captured.emit(Level::Warn, "third"); // evicts "first"
+        let mut stderr = Vec::<u8>::new();
+        flush_captured_to_stderr(&captured, &mut stderr);
+        let written = String::from_utf8(stderr).expect("utf8");
+        assert!(
+            written.contains("1 earlier captured entries dropped"),
+            "missing drop notice in {written:?}",
+        );
+        assert!(
+            written.contains("buffer cap 2"),
+            "notice must surface the live cap, got {written:?}",
+        );
+        assert!(written.contains("linesmith config: [warn] second"));
+        assert!(written.contains("linesmith config: [warn] third"));
+        assert!(
+            !written.contains("[warn] first"),
+            "evicted entry must not appear, got {written:?}",
+        );
     }
 
     #[test]
