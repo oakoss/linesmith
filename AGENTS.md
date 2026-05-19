@@ -165,11 +165,18 @@ EOF
 # Wait for CI, then confirm Copilot has posted before merging:
 gh pr checks --watch               # blocks until CI Summary completes; does NOT wait for Copilot
 
-# Copilot review is async and non-blocking — poll until it has posted, OR open
-# the PR in a browser and confirm visually. Polling form:
-until gh pr view --json reviews -q \
-    '.reviews[] | select(.author.login | test("copilot"; "i"))' \
-    | grep -q .; do sleep 15; done
+# Copilot review is async — poll up to 10m, or open the PR in a browser
+# to confirm visually. No GNU `timeout` dependency; exits 1 on timeout.
+deadline=$(($(date +%s) + 600))
+until gh pr view --json reviews \
+    -q '.reviews[] | select(.author.login | test("copilot"; "i"))' \
+    | grep -q .; do
+  (($(date +%s) < deadline)) || {
+    echo "Copilot review not detected within 10m; open the PR page to check before merging" >&2
+    exit 1
+  }
+  sleep 15
+done
 
 gh pr view --comments              # read Copilot's review notes
 gh pr merge --squash               # remote branch auto-deletes (delete_branch_on_merge=true); local cleanup below
