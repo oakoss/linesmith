@@ -22,6 +22,7 @@ mod list_screen;
 mod main_menu;
 mod placeholder;
 mod preview;
+mod property_screen;
 mod raw_value_editor;
 mod theme_picker;
 mod type_picker;
