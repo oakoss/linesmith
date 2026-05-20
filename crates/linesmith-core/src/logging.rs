@@ -33,7 +33,7 @@ use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::mem;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 /// Logger severity. Variants are ordered `Off < Warn < Debug` so a
@@ -145,13 +145,24 @@ pub fn is_enabled(at_least: Level) -> bool {
 ///
 /// `&self` (not `&mut self`) so a sink instance can be shared via
 /// `Arc<dyn LogSink>`. The `Send + Sync` bound is what `Arc<dyn _>`
-/// requires; today only the render thread emits, but the bound
-/// keeps the door open for future background plugin emitters
-/// without breaking the public surface. Concurrent emit/swap is
-/// not yet supported — a swap that races with an in-flight
-/// `current_sink()` clone can land an emission on the just-
-/// orphaned sink. See `lsm-wyph` follow-ups for the work to close
-/// that.
+/// requires and lets background plugin emitters share the slot
+/// safely with the render thread. The active-sink slot is an
+/// `RwLock`: emits take read locks (concurrent) and `install_sink`
+/// takes the write lock, which waits for in-flight emits to drain
+/// before swapping. This applies only to dispatches that go
+/// through [`emit`] / [`emit_error`] — a thread that holds its own
+/// `Arc<dyn LogSink>` (the prior returned by `install_sink`, or a
+/// future plugin handle) can still drive that sink directly after
+/// a swap.
+///
+/// Implementations must not call back into [`emit`] / [`emit_error`]
+/// or the `lsm_warn!` / `lsm_debug!` / `lsm_error!` macros from
+/// within their own `emit` / `emit_error`. The slot's read lock is
+/// held across the dispatch, and `std::sync::RwLock`'s reentrancy
+/// is platform-defined — a recursive read can deadlock against a
+/// pending `install_sink` on writer-preferring runtimes (musl,
+/// Windows SRW). lsm-261p tracks evaluating a fair RwLock so this
+/// invariant can relax.
 pub trait LogSink: Send + Sync {
     /// Emit a level-gated diagnostic. The caller has already
     /// confirmed the level is enabled — the sink writes
@@ -408,7 +419,20 @@ impl LogSink for CapturedSink {
 /// allocates and `Arc::new` is not const-stable, so the slot can't
 /// be a plain `static`. Init fires on first emission or first sink
 /// swap, whichever comes first.
-static SINK: OnceLock<Mutex<Arc<dyn LogSink>>> = OnceLock::new();
+///
+/// `RwLock` rather than `Mutex` so concurrent emits run without
+/// blocking each other — emits take the read lock for the duration of
+/// `sink.emit(...)`, `install_sink` takes the write lock and drains
+/// in-flight emits before swapping. Closes the race where the old
+/// `clone-the-Arc-then-emit` pattern let a concurrent install land
+/// an emission on the just-orphaned slot.
+///
+/// Reader/writer fairness is platform-dependent on `std::sync::RwLock`.
+/// Background emitters should not loop-emit without backoff: a
+/// sustained read-side load can delay a writer (install) on a
+/// reader-preferring runtime. See lsm-261p for the fair-RwLock
+/// follow-up that will make this bound explicit.
+static SINK: OnceLock<RwLock<Arc<dyn LogSink>>> = OnceLock::new();
 
 /// Test-only serialization helper. Tests that install a custom
 /// sink (or mutate `LEVEL`) must take this lock first — without
@@ -493,15 +517,8 @@ where
     (result, captured)
 }
 
-fn sink_slot() -> &'static Mutex<Arc<dyn LogSink>> {
-    SINK.get_or_init(|| Mutex::new(Arc::new(StderrSink)))
-}
-
-fn current_sink() -> Arc<dyn LogSink> {
-    sink_slot()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone()
+fn sink_slot() -> &'static RwLock<Arc<dyn LogSink>> {
+    SINK.get_or_init(|| RwLock::new(Arc::new(StderrSink)))
 }
 
 /// Replace the active sink and return the prior one. Use
@@ -509,8 +526,14 @@ fn current_sink() -> Arc<dyn LogSink> {
 /// `pub(crate)` because the only documented in-tree caller is
 /// `SinkGuard::install` itself. If a real out-of-crate embedder
 /// shows up, promote it back to `pub` then.
+///
+/// Takes the slot's write lock, which blocks until every in-flight
+/// `emit`/`emit_error` (each holding a read lock for its duration)
+/// returns. Wait is bounded per-emission but cumulative — on a
+/// reader-preferring `std::sync::RwLock` runtime, a sustained
+/// background-emit load can keep the swap pending.
 pub(crate) fn install_sink(new_sink: Arc<dyn LogSink>) -> Arc<dyn LogSink> {
-    let mut g = sink_slot().lock().unwrap_or_else(|p| p.into_inner());
+    let mut g = sink_slot().write().unwrap_or_else(|p| p.into_inner());
     mem::replace(&mut *g, new_sink)
 }
 
@@ -607,7 +630,8 @@ pub fn emit(lvl: Level, msg: &str) {
     if !is_enabled(lvl) {
         return;
     }
-    current_sink().emit(lvl, msg);
+    let guard = sink_slot().read().unwrap_or_else(|p| p.into_inner());
+    guard.emit(lvl, msg);
 }
 
 /// Emit a structural-failure diagnostic. Bypasses the level gate:
@@ -618,7 +642,8 @@ pub fn emit_error(msg: &str) {
     if with_thread_sink(|sink| sink.emit_error(msg)) {
         return;
     }
-    current_sink().emit_error(msg);
+    let guard = sink_slot().read().unwrap_or_else(|p| p.into_inner());
+    guard.emit_error(msg);
 }
 
 impl Level {
@@ -1098,6 +1123,165 @@ mod tests {
         // _middle_g dropped → outer is active again.
         emit(Level::Warn, "outer");
         assert_eq!(outer.snapshot(), vec!["[warn] outer".to_string()]);
+        set_level(DEFAULT_LEVEL);
+    }
+
+    #[test]
+    fn install_sink_blocks_until_in_flight_emit_completes_and_emission_lands_on_prior_sink() {
+        // Pin the lsm-67go race fix. Before the RwLock conversion,
+        // `current_sink` cloned the Arc and dropped the slot lock
+        // before calling `.emit()`, so `install_sink` could swap mid-emit
+        // and the emission landed on the just-orphaned sink. Now `emit`
+        // holds the read lock across the call; `install_sink` waits on
+        // the write lock.
+        //
+        // Two halves pinned:
+        //  - Install blocks while emit is in progress.
+        //  - Emission lands on the prior sink; the new sink stays empty
+        //    (a double-routing regression would fail this, not a call counter).
+        run_install_race_test(EmitKind::Warn);
+    }
+
+    #[test]
+    fn install_sink_blocks_until_in_flight_emit_error_completes() {
+        // Mirror of the warn-path race test for `emit_error`, which
+        // bypasses the level gate on a separate code path. A regression
+        // that reverted only `emit_error` would slip through the warn test.
+        //
+        // `set_level(Level::Off)` confirms the level-gate bypass still
+        // routes through the read-lock-held path.
+        run_install_race_test(EmitKind::Error);
+    }
+
+    #[derive(Clone, Copy)]
+    enum EmitKind {
+        Warn,
+        Error,
+    }
+
+    fn run_install_race_test(kind: EmitKind) {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Barrier;
+        use std::time::Duration;
+
+        struct BarrierSink {
+            inside: Arc<Barrier>,
+            release: Arc<Barrier>,
+            inner: Arc<CapturedSink>,
+        }
+        impl LogSink for BarrierSink {
+            fn emit(&self, lvl: Level, msg: &str) {
+                self.inside.wait();
+                self.release.wait();
+                self.inner.emit(lvl, msg);
+            }
+            fn emit_error(&self, msg: &str) {
+                self.inside.wait();
+                self.release.wait();
+                self.inner.emit_error(msg);
+            }
+        }
+
+        let _g = lock();
+        match kind {
+            EmitKind::Warn => set_level(Level::Warn),
+            EmitKind::Error => set_level(Level::Off),
+        }
+        let inside = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let prior_inner = Arc::new(CapturedSink::default());
+        let prior_sink: Arc<dyn LogSink> = Arc::new(BarrierSink {
+            inside: inside.clone(),
+            release: release.clone(),
+            inner: prior_inner.clone(),
+        });
+        // `SinkGuard` provides RAII restore so an assertion-induced
+        // panic still puts the pre-test sink back. A manual
+        // install_sink → assert → install_sink pair would skip the
+        // restore on panic and leave a `BarrierSink` installed for
+        // every subsequent test, hanging them at `inside.wait()`.
+        let _restore = SinkGuard::install(prior_sink);
+
+        let emit_handle = std::thread::spawn(move || match kind {
+            EmitKind::Warn => emit(Level::Warn, "racy"),
+            EmitKind::Error => emit_error("racy"),
+        });
+        inside.wait();
+
+        let new_captured = Arc::new(CapturedSink::default());
+        let new_sink: Arc<dyn LogSink> = new_captured.clone();
+        let install_done = Arc::new(AtomicBool::new(false));
+        let install_done_clone = install_done.clone();
+        let install_handle = std::thread::spawn(move || {
+            let prior = install_sink(new_sink);
+            install_done_clone.store(true, Ordering::Release);
+            prior
+        });
+
+        // RAII fire-once wrapper around `release.wait()`. If the
+        // pre-release assertion panics, Drop still hits the barrier
+        // so the parked emit thread unblocks instead of leaking
+        // until process exit.
+        struct ReleaseOnDrop {
+            release: Arc<Barrier>,
+            fired: std::cell::Cell<bool>,
+        }
+        impl ReleaseOnDrop {
+            fn fire(&self) {
+                if !self.fired.replace(true) {
+                    self.release.wait();
+                }
+            }
+        }
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.fire();
+            }
+        }
+        let release_guard = ReleaseOnDrop {
+            release: release.clone(),
+            fired: std::cell::Cell::new(false),
+        };
+
+        // Install must block while the emit holds the read lock.
+        // A regression to clone-then-emit would let install land in
+        // microseconds; 75ms is generous enough to distinguish.
+        std::thread::sleep(Duration::from_millis(75));
+        assert!(
+            !install_done.load(Ordering::Acquire),
+            "install_sink must block while {kind:?} emit is in progress",
+            kind = match kind {
+                EmitKind::Warn => "warn",
+                EmitKind::Error => "error",
+            },
+        );
+
+        release_guard.fire();
+        emit_handle.join().expect("emit thread");
+        let from_install = install_handle.join().expect("install thread");
+        assert!(install_done.load(Ordering::Acquire));
+
+        let expected = match kind {
+            EmitKind::Warn => "[warn] racy",
+            EmitKind::Error => "[error] racy",
+        };
+        assert_eq!(
+            prior_inner.snapshot(),
+            vec![expected.to_string()],
+            "emission must land on the prior sink",
+        );
+        assert!(
+            new_captured.snapshot().is_empty(),
+            "post-install sink must not see an emission issued before the swap, got {:?}",
+            new_captured.snapshot(),
+        );
+
+        // `from_install` holds the racing thread's prior (the
+        // `BarrierSink`). Drop explicitly so the slot's strong-count
+        // settles before `_restore` runs install_sink again — the
+        // new sink (`new_captured`) is currently in the slot; the
+        // guard's drop replaces it with the pre-test sink.
+        drop(from_install);
         set_level(DEFAULT_LEVEL);
     }
 
