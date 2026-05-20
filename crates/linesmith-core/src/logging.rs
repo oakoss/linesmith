@@ -1218,6 +1218,31 @@ mod tests {
             prior
         });
 
+        // RAII fire-once wrapper around `release.wait()`. If the
+        // pre-release assertion panics, Drop still hits the barrier
+        // so the parked emit thread unblocks instead of leaking
+        // until process exit.
+        struct ReleaseOnDrop {
+            release: Arc<Barrier>,
+            fired: std::cell::Cell<bool>,
+        }
+        impl ReleaseOnDrop {
+            fn fire(&self) {
+                if !self.fired.replace(true) {
+                    self.release.wait();
+                }
+            }
+        }
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.fire();
+            }
+        }
+        let release_guard = ReleaseOnDrop {
+            release: release.clone(),
+            fired: std::cell::Cell::new(false),
+        };
+
         // Install must block while the emit holds the read lock.
         // A regression to clone-then-emit would let install land in
         // microseconds; 75ms is generous enough to distinguish.
@@ -1231,7 +1256,7 @@ mod tests {
             },
         );
 
-        release.wait();
+        release_guard.fire();
         emit_handle.join().expect("emit thread");
         let from_install = install_handle.join().expect("install thread");
         assert!(install_done.load(Ordering::Acquire));
