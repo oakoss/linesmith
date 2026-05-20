@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.4] - 2026-05-20
+
+### Bug Fixes
+
+- **core:** Close LogSink emit/swap race with RwLock dispatch ([#9](https://github.com/oakoss/linesmith/pull/9))([77086fb](https://github.com/oakoss/linesmith/commit/77086fbb10c76a948bdb7adbb73bdf7fa00a25f9))
+- **core:** Bound CapturedSink ring + add inter-frame wake signal ([#8](https://github.com/oakoss/linesmith/pull/8))([3248bc9](https://github.com/oakoss/linesmith/commit/3248bc9ffba9910e6fac9ba5c83315e49128e41d))
+
 ## [0.1.3] - 2026-05-18
 
 ### Bug Fixes
