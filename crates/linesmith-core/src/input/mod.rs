@@ -46,9 +46,11 @@ pub struct StatusContext {
 
 /// `Tool::Other(s)` is intentionally NOT canonicalized: it compares
 /// unequal to a known variant even when `s.eq_ignore_ascii_case("claude")`.
-/// Construct runtime-supplied tool names through the parser at
-/// `normalizers::tool_from_str` (or `LINESMITH_TOOL`), which folds the
-/// known aliases into canonical variants before reaching `Other`.
+/// Supply runtime-detected tool names through the public entry points
+/// ([`parse_with_opts`] with [`ParseOpts::with_tool`], or the
+/// `LINESMITH_TOOL` env var) — the internal alias table folds known
+/// names into canonical variants before reaching `Other`, so direct
+/// `Tool::Other("claude")`-style construction is a contract violation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tool {
     ClaudeCode,

@@ -101,17 +101,18 @@ fn has_claude_signature(raw: &serde_json::Value) -> bool {
         .is_some_and(|cost| cost.contains_key("total_api_duration_ms"))
 }
 
-// Rules 1 and 5 both resolve to ClaudeCode today; the branch is kept
-// so adding Qwen/Codex/Copilot rules is a one-line edit, and the
-// rule-5 path emits a debug trace to distinguish "matched rule 1"
-// from "fell through to default" once real per-tool normalizers ship.
+// The positive Claude match and the Fallback both resolve to ClaudeCode
+// today; the branch is kept so adding Qwen/Codex/Copilot signatures is a
+// one-line edit. The Fallback arm emits a debug trace to distinguish
+// "matched a signature" from "fell through to default" once real
+// per-tool normalizers ship.
 #[allow(clippy::if_same_then_else)]
 fn detect_from_shape(raw: &serde_json::Value) -> Tool {
     if has_claude_signature(raw) {
-        Tool::ClaudeCode // rule 1
+        Tool::ClaudeCode
     } else {
         crate::lsm_debug!("tool detection: no shape signature matched; falling back to ClaudeCode");
-        Tool::ClaudeCode // rule 5 (Fallback)
+        Tool::ClaudeCode
     }
 }
 
