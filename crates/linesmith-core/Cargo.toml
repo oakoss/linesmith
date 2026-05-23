@@ -7,7 +7,7 @@ description = "Internal core engine for linesmith. No SemVer guarantee for direc
 # pattern as serde_derive / tokio-macros / clap_derive: the crate
 # exists on the registry to satisfy cargo's transitive-dep rule, not
 # to advertise a stable API.
-version.workspace = true
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -26,10 +26,9 @@ workspace = true
 # Rhai plugin host. Stays in core (not cli) so the `Segment` trait
 # adapter (`RhaiSegment`) and `DataContext` → `rhai::Map` mirror that
 # bridge plugin output back to domain types live alongside the
-# segment system that consumes them, per ADR-0018. Declared
-# per-crate (not via `[workspace.dependencies]`) so release-plz
-# updates the version pin automatically in lockstep with
-# linesmith-plugin's own version on each release.
+# segment system that consumes them, per ADR-0018. Declared per-crate
+# (not via `[workspace.dependencies]`) so release-plz updates the
+# version pin in place when linesmith-plugin's own version bumps.
 linesmith-plugin = { version = "0.1.3", path = "../linesmith-plugin" }
 serde.workspace = true
 serde_json.workspace = true
