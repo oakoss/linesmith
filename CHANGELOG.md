@@ -5,7 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.1.3] - 2026-05-18
+## [0.2.0] - 2026-05-22
+
+### Bug Fixes
+
+- **core:** Close LogSink emit/swap race with RwLock dispatch (#9)([77086fb](https://github.com/oakoss/linesmith/commit/77086fbb10c76a948bdb7adbb73bdf7fa00a25f9))
+- **core:** Bound CapturedSink ring + add inter-frame wake signal (#8)([3248bc9](https://github.com/oakoss/linesmith/commit/3248bc9ffba9910e6fac9ba5c83315e49128e41d))
+
+### Features
+
+- **core:** Split tool normalizers + ParseOpts entry point (#10) (**BREAKING**)([3c4c5ab](https://github.com/oakoss/linesmith/commit/3c4c5abe94bd504fe3ad66950d937858110493a5))
+- **tui:** PropertyScreen reusable widget([bd5c5a1](https://github.com/oakoss/linesmith/commit/bd5c5a19109554116bc27d16ad08f276174edc71))
+
+## [linesmith-v0.1.3] - 2026-05-18
 
 ### Bug Fixes
 
@@ -13,10 +25,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **cli:** Reject --check-config outside the render path([b27951f](https://github.com/oakoss/linesmith/commit/b27951f444891db9daf3a3da9ace3501bd774814))
 - **cli:** Route logging macros through swappable LogSink([eb1df31](https://github.com/oakoss/linesmith/commit/eb1df31a458f72e82c2c6e6410109a2dcf63c7f9))
 - **cli:** Filter non-Press key events to stop Windows double-fire([60abd53](https://github.com/oakoss/linesmith/commit/60abd53b4b721da5a7dfe4d0a74b0ef7eb2b2482))
+- **repo:** Cliff template emits blank line above first version heading([3dc71ea](https://github.com/oakoss/linesmith/commit/3dc71ea5c4b5cd0c3c75d046c7b05a0cce67be2a))
+- **data-context:** Clear cache on 401 so peers skip the fresh short-circuit([0aa20fe](https://github.com/oakoss/linesmith/commit/0aa20fea91929d4a366700e41f5acdc82166ac90))
+- **core:** Floor_to_grain panic safety + close jiff-migration gaps([2ce2f30](https://github.com/oakoss/linesmith/commit/2ce2f3016e43b4289322c6242decd2b5a49081ef))
 
 ### Features
 
+- **core:** Per-thread sink overlay for test capture of lsm_warn!/lsm_error!([f30f11e](https://github.com/oakoss/linesmith/commit/f30f11e33be31628c9f4edb1a47dd9e492c11c4d))
+- **core:** Wire LayoutDecision emits at the five apply_layout sites([070ecb7](https://github.com/oakoss/linesmith/commit/070ecb710e85d6ea7dacb9e2d9903645213dd178))
 - **core:** LayoutObservers struct + render_with_observers rename([089c060](https://github.com/oakoss/linesmith/commit/089c06083edeedfc3608f7f257cdfa1e0a16810b))
+- **core:** LayoutDecision enum + variant constructors([2a23869](https://github.com/oakoss/linesmith/commit/2a2386962d4cca5284dd22906503535a63432324))
 - **core:** LineItem::Segment struct-variant refactor with id field([011be10](https://github.com/oakoss/linesmith/commit/011be10352485b54eca5c5cc51f3b946ec2d5e94))
 - **tui:** Honor CliEnv env and CLI color flags([d1d7ecb](https://github.com/oakoss/linesmith/commit/d1d7ecbf71a0288c27677f132503fa2bded58073))
 - **cli:** Install/uninstall Claude Code statusLine([01e6713](https://github.com/oakoss/linesmith/commit/01e6713f03bff0dae8331f45350aa01529f9b84a))
@@ -33,17 +51,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **cli:** Main menu screen + back-navigable placeholder([014ea83](https://github.com/oakoss/linesmith/commit/014ea83bd3cc0c73cb6efffd03629497b3f7a7e9))
 - **cli:** ListScreen widget for linesmith config TUI([c28d4b9](https://github.com/oakoss/linesmith/commit/c28d4b95e98c30d225cd6f5e8b7e1cf141b9e3d1))
 - **cli:** Linesmith config TUI boot([5e98461](https://github.com/oakoss/linesmith/commit/5e98461af342bb3574b806f0f21fdc377e2876be))
+- **segments:** Absolute-timestamp format for rate-limit reset segments([d53a5b8](https://github.com/oakoss/linesmith/commit/d53a5b8bd17ac6ec99f8785b778a7116cc086bd1))
 
 ### Refactoring
 
+- **core:** Split resolve_proxy_from_env for testable warn paths([5d2e142](https://github.com/oakoss/linesmith/commit/5d2e14229b244dcdcd34b3b516fba9faa697aa48))
 - **cli:** Caller owns cursor on ListScreen MoveSwap([99d8941](https://github.com/oakoss/linesmith/commit/99d89412ea4636576fae7ad9dfde3629870f9e16))
 - **core:** Separator-as-item layout([4ecbefd](https://github.com/oakoss/linesmith/commit/4ecbefd4ad39040085c11555d92054e9584ac089))
+- **core:** Finish jiff-migration cleanups (doc rot + dedupe helper)([370fbe4](https://github.com/oakoss/linesmith/commit/370fbe4c4cc527bb2318de2161eed8fdf186d892))
 - **repo:** Migrate chrono → jiff across the workspace([0be2835](https://github.com/oakoss/linesmith/commit/0be2835fd5f645e52f84b6429f43ce035170cb11))
+- **core:** Graduate input.rs + layout.rs to folder modules([9c36c8f](https://github.com/oakoss/linesmith/commit/9c36c8ffd45b08e8f4836301c8fee591370aabc8))
+- **segments:** Split builder.rs into a folder of named files([486797f](https://github.com/oakoss/linesmith/commit/486797f448959be504e6014eb6ff8eafecd2a307))
+- **data-context:** Graduate cascade/credentials/jsonl to folder modules([3935840](https://github.com/oakoss/linesmith/commit/39358407186605320a71c57bb418e94cdde1977f))
 - **env:** Preserve non-UTF-8 paths through CliEnv + EnvVarState([f667eb4](https://github.com/oakoss/linesmith/commit/f667eb4d4ae63f84a0b4a48916d91c83e5a16280))
+- **segments:** UsageWindow seam + workspace extras helper([c24ac59](https://github.com/oakoss/linesmith/commit/c24ac5922a530aeea74da84643da10dfa6db8ede))
+- **segments:** Graduate rate_limit/ to a folder([5378415](https://github.com/oakoss/linesmith/commit/5378415dc54c559d77abab6255f7e2ff5503585e))
+- **repo:** Rename errors.rs modules to singular error.rs([68c8153](https://github.com/oakoss/linesmith/commit/68c815306aa5b713802d22864a71cdb20ee8bf7d))
 - **repo:** Centralize lints in [workspace.lints]([dd40e0c](https://github.com/oakoss/linesmith/commit/dd40e0c71882c133592e5b0d581f25921886f083))
 - **plugins:** Consume plugin host types from origin([6199a33](https://github.com/oakoss/linesmith/commit/6199a33c8556649283427e94ea891cc370059375))
+- **plugins:** Extract linesmith-plugin from linesmith-core([291cd09](https://github.com/oakoss/linesmith/commit/291cd09b2d8df244d56bf9cfaedc7f9ca456967c))
 
-## [0.1.2] - 2026-05-01
+## [linesmith-v0.1.2] - 2026-05-01
 
 ### Bug Fixes
 
@@ -51,6 +79,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **doctor:** Make cache-root check read-only + audit snapshot helpers([ff8c0d0](https://github.com/oakoss/linesmith/commit/ff8c0d07d81dcf6264dbc8078f43c70a7d9466c4))
 - **core:** Cfg-gate `~` to POSIX in needs_shell_quoting([8601a45](https://github.com/oakoss/linesmith/commit/8601a4586c234f2bff7f186a3e60feaa952d8a8a))
 - **core:** Correct Windows test failures in driver.rs([c8c213f](https://github.com/oakoss/linesmith/commit/c8c213fe423e93884cc82a4857d7f4728dff0f21))
+- **ci:** Use bare workspace version for dry-run tag([0a93c01](https://github.com/oakoss/linesmith/commit/0a93c017b311be8c911c03a996abd6d69ef0f436))
+- **ci:** Synthesize dry-run tag from current package version([2cf357c](https://github.com/oakoss/linesmith/commit/2cf357c1b9c2047dc4200ea3a883fc5232a1a98d))
+- **deps:** Bump gix from 0.82 to 0.83([f87897f](https://github.com/oakoss/linesmith/commit/f87897f91cba74e20fd27abf9b50664bc096c8dd))
 - **core:** Tolerate Windows MoveFileEx race losers in cascade persistence([abe697d](https://github.com/oakoss/linesmith/commit/abe697d8c614a2269382fe2e26d1410725a52012))
 - **core:** Gate KEYCHAIN_SERVICE to macOS so Ubuntu clippy passes([769e355](https://github.com/oakoss/linesmith/commit/769e355e70c043a72e4d620a0f61fff1c29755ec))
 - **core:** Tolerate null required leaves in parse_context_window([93506ac](https://github.com/oakoss/linesmith/commit/93506acca6f9cb475b9dc365d74156abf489d02f))
@@ -102,6 +133,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Features
 
+- **repo:** Add statusline-tee.sh for live-capture workflow([dcaf198](https://github.com/oakoss/linesmith/commit/dcaf1986462ad2556b043938800b32bbbcfa6231))
 - **segments:** Add per-turn tokens_{input,output,cached,total} segments([028caaf](https://github.com/oakoss/linesmith/commit/028caafb8b80672e29846aed313777008816420f))
 - **core:** Parse context_window.current_usage as Option<TurnUsage>([39dad87](https://github.com/oakoss/linesmith/commit/39dad87daaf03b01b00d1fe1a4b614d4fd6568d0))
 - **core:** JSONL fallback returns Ok(UsageData::Jsonl) on endpoint failure([cc690f0](https://github.com/oakoss/linesmith/commit/cc690f079222063e653f34bf107dcd0f0f14e548))
@@ -127,3 +159,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **segments:** Annotate remaining Ok(None) hide paths([24cf621](https://github.com/oakoss/linesmith/commit/24cf62111695ff4d22f7f711f5774e436b9e9b0d))
 - **core:** Route diagnostic writes through the crate logger([7b624a2](https://github.com/oakoss/linesmith/commit/7b624a24767d67beade8d727b23f5e35b810b0eb))
 - **segments:** Simplify FormatTemplate + harden ahead/behind tests([50cff4f](https://github.com/oakoss/linesmith/commit/50cff4fb1cf7fe860e1448eb8bbe7b29f6186daf))
+
+## [0.1.0] - 2026-04-20
+
+### Bug Fixes
+
+- **ci:** Add [profile.dist] inheriting from release so cargo-dist can build([1ab79e1](https://github.com/oakoss/linesmith/commit/1ab79e1fe6633925d2ed7ed53dad3f86a42e01e7))
+- **ci:** Symlink CHANGELOG.md into crate dir for release-plz path resolution([138a131](https://github.com/oakoss/linesmith/commit/138a13164073b07a3d33e44377a1b18f59b1d253))
+- **segments:** Strip control chars from RenderedSegment text([d4b1a78](https://github.com/oakoss/linesmith/commit/d4b1a7832c6708c016b209fd33b232ba72744174))
+
+### Features
+
+- **ci:** Wire cargo-dist + release-plz + git-cliff release pipeline([7c125e1](https://github.com/oakoss/linesmith/commit/7c125e11019f600706ac30972e10189f5279f15c))
+- **core:** Linesmith presets list + presets apply([da45cfc](https://github.com/oakoss/linesmith/commit/da45cfc3f97a9039ef165882531778b4c23b3f88))
+- **themes:** Style-string parser + per-segment style overrides([49a2baa](https://github.com/oakoss/linesmith/commit/49a2baa13558eeca0e3b2db1026cd3363c2d59e2))
+- **themes:** User theme TOML loading + themes list subcommand([64e470b](https://github.com/oakoss/linesmith/commit/64e470bde421b0e70f970bccdf92ee3305a64190))
+- **themes:** Catppuccin Latte/Frappé/Macchiato/Mocha flavors([4491063](https://github.com/oakoss/linesmith/commit/44910632aba948941d9154781276078e4bac5a56))
+- **config:** Warn on unknown keys in config.toml([fb9e9ea](https://github.com/oakoss/linesmith/commit/fb9e9ea78231937af221686b10b04a0a6dfec5a3))
+- **config:** Color policy precedence + claude_padding width factor([8421b9b](https://github.com/oakoss/linesmith/commit/8421b9bd0b8fb7e79b3a68151dfd2acf08787f64))
+- **themes:** Role-based theme engine with default + minimal built-ins([b622712](https://github.com/oakoss/linesmith/commit/b622712d90b9381d75412067092eff866731775a))
+- **core:** Load config.toml + CLI flags + per-segment overrides([938cfaf](https://github.com/oakoss/linesmith/commit/938cfafb04d9cf85d3fb18537761b2e0555dec90))
+- **core:** Add layout engine with priority truncation + width hints([beaa216](https://github.com/oakoss/linesmith/commit/beaa216616744342267e9b4ac933f2a4a61f0ac5))
+- **core:** Add rate_limit / cost / effort segments + chrono dep([f736607](https://github.com/oakoss/linesmith/commit/f73660799593dd52b6071bb775f973a739f8786a))
+- **core:** Expand StatusContext to v0.2 + add model and context_window segments([33939d6](https://github.com/oakoss/linesmith/commit/33939d637953e6d94dac038577171db5a79c5fea))
+- **core:** Scaffold Rust workspace with workspace-segment slice([5813b98](https://github.com/oakoss/linesmith/commit/5813b985ddb14a42ef5c00a76f86d37e30b99ae1))
+
+### Refactoring
+
+- **core:** Drop beads-ID from driver test-section comment([de5c25c](https://github.com/oakoss/linesmith/commit/de5c25c168e51fffb675d88e92ced092e0eb7d0e))
+- **core:** Extract cli driver + segment builder from lib.rs([a87659c](https://github.com/oakoss/linesmith/commit/a87659ceb8da9af1b551cdaa304ebecaedc2c9fb))
+- **core:** Extract cli_main so main.rs orchestration is testable([4e91d81](https://github.com/oakoss/linesmith/commit/4e91d816eeb529a518b90b08226290ee1be949b0))
+- **segments:** Return RenderResult so render errors propagate distinctly([af7a8a7](https://github.com/oakoss/linesmith/commit/af7a8a7cc715744a72bb504241547c3538f56865))
+- **segments:** Encapsulate RenderedSegment + add SegmentDefaults builders([9fd3b4e](https://github.com/oakoss/linesmith/commit/9fd3b4e4bf23b16e7a28e6db94290925fdd710d4))

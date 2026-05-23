@@ -41,7 +41,15 @@ permissions:
 on:
   push:
     tags:
-      - '**[0-9]+.[0-9]+.[0-9]+*'
+      # Bare workspace tags (manual releases such as v0.2.0) and the
+      # `linesmith` per-package tags release-plz creates for the
+      # dist-able binary. Library tags like `linesmith-core-v*` and
+      # `linesmith-plugin-v*` are intentionally excluded — cargo-dist
+      # rejects them (per `dist-workspace.toml`, only `cargo:crates/linesmith`
+      # is in the dist-able members list), and firing this workflow
+      # for them produces noisy red runs with no useful artifacts.
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+      - 'linesmith-v[0-9]+.[0-9]+.[0-9]+*'
   # Dry-run trigger surface (per ADR-0017). Builds all targets + generates
   # attestations as workflow artifacts without creating a GitHub Release,
   # publishing to crates.io, or touching the homebrew tap. Two paths:
@@ -94,17 +102,20 @@ jobs:
           name: cargo-dist-cache
           path: ~/.cargo/bin/dist
       # On push (real release) the tag is the pushed ref. On dispatch /
-      # pull_request (dry-run) we use the bare workspace version
-      # (e.g., `v0.1.2`) because cargo-dist's `dist build --tag=` does
+      # pull_request (dry-run) we use the dist-able crate's version
+      # (e.g., `v0.2.0`) because cargo-dist's `dist build --tag=` does
       # NOT accept SemVer prerelease suffixes — it strictly matches the
       # tag's version part against an actual workspace package version.
-      # `v0.1.2-dry-run-abc1234` is rejected with "× This workspace
+      # `v0.2.0-dry-run-abc1234` is rejected with "× This workspace
       # doesn't have anything for dist to Release!", even though
-      # `v0.1.2` resolves correctly. Multiple dispatch/PR runs share
-      # the same tag string; each workflow run has isolated artifact
-      # storage scoped by run ID, and the publishing-gate keeps these
-      # builds out of GitHub Releases. Unknown event_name exits
-      # non-zero rather than silently emitting a bad tag.
+      # `v0.2.0` resolves correctly. Source is `crates/linesmith/Cargo.toml`,
+      # the only dist-able member per `dist-workspace.toml`; the workspace
+      # root no longer carries a shared version field (crates have per-package
+      # versions so release-plz doesn't drag siblings across major-bump caret
+      # boundaries). Multiple dispatch/PR runs share the same tag string;
+      # each workflow run has isolated artifact storage scoped by run ID, and
+      # the publishing-gate keeps these builds out of GitHub Releases.
+      # Unknown event_name exits non-zero rather than silently emitting a bad tag.
       - id: compute-tag
         shell: bash
         run: |
@@ -113,9 +124,10 @@ jobs:
               tag="${{ github.ref_name }}"
               ;;
             workflow_dispatch | pull_request)
-              version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
+              manifest="crates/linesmith/Cargo.toml"
+              version=$(grep -m1 '^version' "${manifest}" | cut -d '"' -f2)
               if [ -z "${version}" ]; then
-                echo "::error::compute-tag: failed to read version from Cargo.toml" >&2
+                echo "::error::compute-tag: failed to read version from ${manifest}" >&2
                 exit 1
               fi
               tag="v${version}"
