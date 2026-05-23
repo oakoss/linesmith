@@ -1170,3 +1170,106 @@ fn version_typed_wrong_degrades_to_none() {
     let ctx = parse(bytes).expect("type-drift version must not fail the whole parse");
     assert!(ctx.version.is_none());
 }
+
+// --- parse_with_opts: tool round-trip -----------------------------------
+//
+// Anchors the contract that the Tool param flows from `dispatch` through
+// `claude::normalize` onto `StatusContext.tool` and any `ParseError::*`
+// variant. Without these, hardcoding `Tool::ClaudeCode` in the normalizer
+// would pass every other test.
+
+#[test]
+fn parse_default_equivalent_to_parse_with_opts_default() {
+    let json = br#"{"model":{"display_name":"X"},"workspace":{"project_dir":"/r"}}"#;
+    let lhs = parse(json).expect("parse ok");
+    let rhs = parse_with_opts(json, &ParseOpts::default()).expect("parse_with_opts ok");
+    assert_eq!(lhs.tool, rhs.tool);
+    assert_eq!(
+        lhs.model.unwrap().display_name,
+        rhs.model.unwrap().display_name
+    );
+}
+
+#[test]
+fn parse_with_opts_tool_override_stamps_status_context_tool() {
+    let json = br#"{}"#;
+    for tool in [
+        Tool::QwenCode,
+        Tool::CodexCli,
+        Tool::CopilotCli,
+        Tool::Other(std::borrow::Cow::Borrowed("gemini")),
+    ] {
+        let opts = ParseOpts::default().with_tool(tool.clone());
+        let ctx = parse_with_opts(json, &opts).expect("parse ok");
+        assert_eq!(ctx.tool, tool);
+    }
+}
+
+#[test]
+fn parse_with_opts_tool_override_stamps_parse_error_tool() {
+    // Negative `used_percentage` triggers `ParseError::InvalidValue`
+    // (ADR-0014 carve-out). The error's `tool` field must carry the
+    // override, not a hardcoded `Tool::ClaudeCode`.
+    let json = br#"{"context_window":{"used_percentage":-1}}"#;
+    let opts = ParseOpts::default().with_tool(Tool::CodexCli);
+    let err = parse_with_opts(json, &opts).expect_err("should fail on used_percentage < 0");
+    match err {
+        ParseError::InvalidValue { tool, .. } => assert_eq!(tool, Tool::CodexCli),
+        other => panic!("expected InvalidValue, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_with_opts_tool_override_stamps_type_mismatch_tool() {
+    // Non-object root triggers `ParseError::TypeMismatch` via
+    // `expect_object`; the error's `tool` field must carry the override.
+    let opts = ParseOpts::default().with_tool(Tool::QwenCode);
+    let err = parse_with_opts(b"[]", &opts).expect_err("array root should fail TypeMismatch");
+    match err {
+        ParseError::TypeMismatch { tool, .. } => assert_eq!(tool, Tool::QwenCode),
+        other => panic!("expected TypeMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn tool_display_renders_canonical_strings() {
+    // Pin the wire format. `ParseError::Display` interpolates `{tool}`
+    // at four call sites; a rename of any arm's literal would silently
+    // change every operator-facing error message.
+    assert_eq!(Tool::ClaudeCode.to_string(), "claude");
+    assert_eq!(Tool::QwenCode.to_string(), "qwen");
+    assert_eq!(Tool::CodexCli.to_string(), "codex");
+    assert_eq!(Tool::CopilotCli.to_string(), "copilot");
+    assert_eq!(
+        Tool::Other(std::borrow::Cow::Borrowed("gemini")).to_string(),
+        "gemini"
+    );
+}
+
+#[test]
+fn parse_error_type_mismatch_display_includes_tool_path_and_kinds() {
+    let opts = ParseOpts::default().with_tool(Tool::QwenCode);
+    let err = parse_with_opts(b"[]", &opts).expect_err("array root");
+    let msg = err.to_string();
+    assert!(msg.contains("qwen"), "tool name in message, got {msg:?}");
+    assert!(msg.contains("<root>"), "root path token, got {msg:?}");
+    assert!(msg.contains("object"), "expected type, got {msg:?}");
+    assert!(msg.contains("array"), "actual type, got {msg:?}");
+}
+
+#[test]
+fn parse_error_invalid_value_display_includes_tool_path_and_reason() {
+    let json = br#"{"context_window":{"used_percentage":-1}}"#;
+    let opts = ParseOpts::default().with_tool(Tool::CodexCli);
+    let err = parse_with_opts(json, &opts).expect_err("negative pct");
+    let msg = err.to_string();
+    assert!(msg.contains("codex"), "tool name in message, got {msg:?}");
+    assert!(
+        msg.contains("context_window.used_percentage"),
+        "json path in message, got {msg:?}"
+    );
+    assert!(
+        msg.contains("percentage must be"),
+        "reason in message, got {msg:?}"
+    );
+}

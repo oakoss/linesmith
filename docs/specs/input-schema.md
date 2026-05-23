@@ -283,13 +283,11 @@ trait Normalizer {
 }
 ```
 
-Concrete normalizers live in `crates/linesmith/src/input/normalizers/`:
+Concrete normalizers live in `crates/linesmith-core/src/input/normalizers/`:
 
-- `claude.rs`: primary, most complete
-- `qwen.rs`: leans on claude.rs; maps the ~5% differences
-- `codex.rs`: stub (activates when Codex ships statusLine API)
-- `copilot.rs`: stub
-- `other.rs`: best-effort fallback; populates what it can, leaves rest in `raw`
+- `claude.rs`: primary, most complete. Also the **Fallback** for tools whose detection rule is a stub today; the dispatcher passes the detected `Tool` through so the resulting `StatusContext` and any `ParseError` carry the right discriminator.
+- `qwen.rs`: doc-only stub. Qwen routes through the Fallback until a discriminator that survives CC 2.x's `version` emission materializes.
+- `other.rs`: doc-only stub covering `CodexCli`, `CopilotCli`, and `Tool::Other(_)`. Each gets its own file when detection lands; consolidating stubs avoids one empty file per tool today.
 
 ### Error path naming convention
 
@@ -383,17 +381,17 @@ Per [ADR-0014](../adrs/0014-best-effort-parse-with-segment-isolation.md), sub-fi
 
 ### Tool-level
 
-| Case                                               | Handling                                                                                                         |
-| -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `opts.tool = Some(CodexCli)` but payload is Claude | Use Codex normalizer anyway; most fields fail → `NormalizerError`. User asked for it; we don't second-guess.     |
-| `opts.tool = None`, env unset, heuristic works     | Detected tool used                                                                                               |
-| `opts.tool = None`, env set to invalid name        | Log warning, fall back to heuristic                                                                              |
-| `Tool::Other("gemini")` passed via `--tool`        | Dispatch to `other.rs`; identifier stored on the `Tool::Other` variant so logs show which name the user supplied |
+| Case                                               | Handling                                                                                                                                                                                                          |
+| -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `opts.tool = Some(CodexCli)` but payload is Claude | Route through the Fallback (Claude normalizer) while preserving `Tool::CodexCli` on `StatusContext.tool` and any `ParseError`.                                                                                    |
+| `opts.tool = None`, env unset, heuristic works     | Detected tool used                                                                                                                                                                                                |
+| `opts.tool = None`, env set to invalid name        | Route to `Tool::Other(Cow::Owned(trimmed))` so the operator-supplied name reaches downstream diagnostics; a warn-level log echoes the unknown alias so a typo'd `LINESMITH_TOOL` is visible at default verbosity. |
+| `Tool::Other("gemini")` passed via `--tool` or env | Dispatch through `other.rs` (currently routes to the Fallback); identifier stored on the `Tool::Other` variant so logs show which name the user supplied                                                          |
 
 ### Cross-tool normalization
 
-- Claude and Qwen share ~95% of schema; Qwen normalizer delegates to Claude normalizer for common fields and handles the deltas
-- When Codex and Copilot ship, their normalizers are new files, not modifications to Claude's
+- Claude and Qwen share ~95% of schema; the Qwen normalizer, once it exists, will delegate to the Claude normalizer for common fields and handle the deltas
+- When Codex and Copilot ship, their normalizers split out of `other.rs` into `codex.rs` and `copilot.rs` rather than modifying the Claude normalizer
 - The canonical model evolves via new optional fields; existing fields never break
 
 ## Testing strategy
