@@ -365,7 +365,12 @@ jobs:
       - name: Upload artifacts to release
         env:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
-          LATEST_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '' || '--latest' }}"
+          # Negation must be on the truthy branch — `&& '' || '--latest'`
+          # always falls through to `--latest` because the empty string is
+          # falsy in GitHub Actions expressions, so the `||` fires for
+          # both prerelease and stable. Flipping to `!(...) && '--latest'`
+          # puts the non-empty value on the truthy branch where it sticks.
+          LATEST_FLAG: "${{ !fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--latest' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
