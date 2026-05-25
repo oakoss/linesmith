@@ -326,3 +326,66 @@ GitHub's [token-permission docs](https://docs.github.com/en/actions/security-gui
 I did not find a cargo-dist issue specifically about Attest + fork PRs (`gh search issues "fork pull request attestation"` and "`fork PR pr-run-mode`" both returned zero hits). The combination is undocumented and unhandled in the current template.
 
 **Answer.** No fork-PR guard exists. Under `pr-run-mode = "upload"` with `github-attestations = true`, fork PRs would run `build-local-artifacts`, hit the Attest step, and fail with a permission error. Linesmith's `release.yml` does enable attestations (current `github-attestations` setting in `dist-workspace.toml` is on per the lsm-9ns commit context). Mitigations would be hand-edits — either an `if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository` guard on the Attest step, or `pull_request_target` (which carries its own injection-attack risk and is deliberately avoided across the surveyed corpus). Either route adds to the `allow-dirty = ["ci"]` maintenance burden documented in §2.
+
+## Addendum: release-plz vs Knope for per-package versioning (2026-05-23)
+
+The Rounds 1-3 above focused on the **PR-validation question** for the cargo-dist `release.yml` workflow (the trigger surface for binary builds) and drove [ADR-0017](../adrs/0017-release-workflow-pr-validation.md). A separate question — **which tool drives the version-bump + CHANGELOG + crates.io publish side of the pipeline** — surfaced in the v0.2.0 release cycle when release-plz failed to update internal dep-pin version strings at the major-bump boundary. This addendum captures the comparison that drove [ADR-0027](../adrs/0027-knope-for-release-automation.md).
+
+### The failure mode
+
+`feat(core)!: split tool normalizers` (commit 3c4c5ab) bumped `linesmith-core` from 0.1.3 → 0.2.0. Per ADR-0019 (`linesmith-core` published as scaffolding), `linesmith` (the binary) pins `linesmith-core` per-crate rather than via `[workspace.dependencies]`: `linesmith-core = { version = "0.1.3", path = "../linesmith-core" }`. release-plz computed the bump correctly and rewrote `crates/linesmith-core/Cargo.toml`'s `version` field, but **did not** rewrite the pinned version string in `crates/linesmith/Cargo.toml`. cargo's caret-version semantics under `0.x` rules then rejected the workspace: `^0.1.3` excludes `0.2.0` (different "major" series), and the workspace failed to resolve.
+
+The workaround that shipped (commit c1feace, `ci(release-plz): force workspace-version lockstep for major bumps`) added `version.workspace = true` to each crate's `[package]` block — making every crate share one version field. release-plz then bumped that single shared version, dragging `linesmith-plugin` (still at 0.1.x with no breaking change) up to 0.2.0 alongside `linesmith-core`. This defeats ADR-0019's per-package versioning invariant and broadcasts a SemVer-major change to `linesmith-plugin` consumers that didn't actually happen.
+
+### release-plz: known limitation, no fix in flight
+
+release-plz's `update_dependencies` config flag refreshes `Cargo.lock` but **not** pinned version strings in sibling `Cargo.toml` files. Issue [release-plz/release-plz#2199](https://github.com/release-plz/release-plz/issues/2199) tracks the gap; the upstream maintainer's position is that the cross-manifest rewrite is out of scope. The `release_commits` allowlist (currently `^(feat|fix|perf|refactor)` in linesmith's `release-plz.toml`) controls which commit types trigger releases, but doesn't address the dep-pin problem.
+
+No fork of release-plz carrying a local patch was found in the surveyed mature Rust workspaces (`tokio`, `serde`, `clap`, `ratatui`, `cargo-dist`, `uv`). The workaround in production is universally either (a) `version.workspace = true` lockstep, or (b) avoid `[package] version` pins on internal deps (declare via `[workspace.dependencies]` so a single bump cascades). Option (b) doesn't fit linesmith's ADR-0019 posture (linesmith-core and linesmith-plugin are scaffolding crates with per-package version semantics that ADR-0019 explicitly preserves).
+
+### Knope: the `dependency` field handles it natively
+
+Knope's `[packages.<name>] versioned_files` accepts entries shaped like `{ path = "consumer/Cargo.toml", dependency = "consumer-name" }`. Each such entry tells Knope: "when this package's version bumps, rewrite the version pin string in this consumer's manifest, searching the consumer's `[dependencies]` / `[dev-dependencies]` / `[workspace.dependencies]` tables for an entry matching this package name." The `convert-to-monorepo` recipe in Knope's docs lays out the exact shape for a multi-crate Cargo workspace with internal deps.
+
+The auto-detected config Knope emits for a hypothetical workspace where `something` depends on `something-else` (from Knope's `default-config.mdx`):
+
+```toml
+[packages.something-else]
+versioned_files = [
+    "member2/Cargo.toml",
+    "Cargo.lock",
+    { path = "Cargo.toml", dependency = "something-else" },
+    { path = "member1/Cargo.toml", dependency = "something-else" },
+]
+scopes = ["something-else"]
+```
+
+The `{ path = "member1/Cargo.toml", dependency = "something-else" }` entry is exactly the cross-manifest dep-pin rewrite release-plz lacks.
+
+### Other tools surveyed
+
+- **`cargo-smart-release`** — gitoxide's release tool, mature, conventional-commits-aware. Does not handle cross-manifest dep-pin rewrites by name; same gap as release-plz. No PR-based release-preview UX.
+- **`cargo-release`** — direct, dispatch-driven. Same gap. Plays well with cargo-dist (Knope's own pipeline uses cargo-release for the `cargo publish` step), but doesn't fix the dep-pin issue.
+- **`cargo-workspaces`** — Lerna-style workspace versioning for Cargo. Does support cascading internal dep updates, but the project has been less actively maintained than Knope (last 1.0 release 2024-09). No PR-based workflow.
+
+### Decision matrix
+
+| Concern                                  | release-plz                          | Knope                                                            | cargo-smart-release | cargo-workspaces   |
+| ---------------------------------------- | ------------------------------------ | ---------------------------------------------------------------- | ------------------- | ------------------ |
+| Per-package versioning                   | Yes (with caveats above)             | Yes (native)                                                     | Yes                 | Yes                |
+| Cross-manifest dep-pin updates by name   | **No** (#2199 unfixed)               | **Yes** (`dependency` field)                                     | No                  | Yes                |
+| PR-based release preview                 | Yes                                  | Yes (workflow recipe + bot mode)                                 | No (dispatch-only)  | No                 |
+| Conventional-commits version computation | Yes                                  | Yes                                                              | Yes                 | Yes                |
+| Changeset-file workflow                  | No                                   | Yes (`knope document-change`)                                    | No                  | No                 |
+| crates.io publish                        | Yes (built-in `release-plz publish`) | Delegated to `cargo release publish` (skips already-published)   | Yes                 | Yes                |
+| Maintainer activity (last release)       | active (multiple per month)          | active (`knope/v0.22.4` 2026-03-21)                              | active              | sporadic           |
+| External GitHub App dependency           | No                                   | Optional (`bot.releases = true`)                                 | No                  | No                 |
+| Surveyed production users                | many (uv, ratatui, etc.)             | Knope itself (monorepo), a handful of Rust projects on crates.io | gitoxide ecosystem  | cargo-bisect-rustc |
+
+### What this leaves open
+
+- **Knope's GH Release "latest" race during the cargo-dist build window.** Knope's `Release` step creates per-package GitHub Releases on release-PR merge (linesmith-core, linesmith-plugin, linesmith — all three if all bumped). cargo-dist's `release.yml` only fires for `linesmith/v*` tags and marks that release `--latest` after binaries upload (~10 min later). During the build window, GitHub's "latest" pointer briefly points at whichever library release Knope created last. Mitigation: doctor's `parse_three_part_version` strips per-package tag prefixes (this PR), so a transient `linesmith-core/v0.3.0` showing as `/releases/latest` doesn't WARN. Open question: whether to teach Knope to create library releases as drafts (set `assets = "marker"` on each) and have a follow-up workflow promote them, mirroring Knope's own `add_release_assets.yml` pattern. Punted for the initial migration; revisit if the brief race becomes user-visible.
+
+- **Empirical validation of Knope's per-package bump shape at the next major boundary.** ADR-0027 asserts Knope's `dependency` field structurally prevents the v0.2.0 failure mode. Confirmation requires a real release cycle with a breaking change to `linesmith-core` (or `linesmith-plugin`) flowing through. Tracked in ADR-0027 §Confirmation.
+
+- **Changeset-file adoption.** Conventional commits remain the primary release-impact signal; changesets are a supplement. Whether contributors actually reach for `knope document-change` when commit subjects are insufficient depends on the eventual contributor base — currently single-maintainer.

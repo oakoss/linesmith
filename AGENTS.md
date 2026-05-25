@@ -53,17 +53,25 @@ See `docs/README.md` for the full pipeline description and promotion rules.
 
 Managed by [mise](https://mise.jdx.dev/). Run `mise install` to get all tools.
 
-| Command          | Purpose                           |
-| ---------------- | --------------------------------- |
-| `mise run check` | All checks (fmt + lint + Rust)    |
-| `mise run test`  | All tests                         |
-| `mise run bench` | All benchmarks                    |
-| `mise run fmt`   | Format non-Rust files (prettier)  |
-| `mise run lint`  | Lint markdown (markdownlint-cli2) |
-| `cargo fmt`      | Format Rust                       |
-| `cargo clippy`   | Rust linting                      |
+| Command                           | Purpose                                     |
+| --------------------------------- | ------------------------------------------- |
+| `mise run check`                  | All checks (fmt + lint + Rust)              |
+| `mise run test`                   | All tests                                   |
+| `mise run bench`                  | All benchmarks                              |
+| `mise run fmt`                    | Format non-Rust files (prettier)            |
+| `mise run lint`                   | Lint markdown (markdownlint-cli2)           |
+| `cargo fmt`                       | Format Rust                                 |
+| `cargo clippy`                    | Rust linting                                |
+| `knope document-change`           | Author a changeset file under `.changeset/` |
+| `knope prepare-release --dry-run` | Preview the next release PR's diff locally  |
 
 Git hooks installed via `lefthook install`. `pre-commit` runs fmt/lint on staged files; `commit-msg` verifies conventional commit format via `cog`.
+
+### Releases
+
+Knope drives release automation per [ADR-0027](docs/adrs/0027-knope-for-release-automation.md) — per-crate versioning, per-crate CHANGELOG, cross-manifest dep-pin updates by name. Release-PR merge fires `knope-release.yml` (tags + crates.io publish); the `linesmith/v*` tag push then fires cargo-dist's `release.yml` for binary builds. Full contract in `docs/specs/release-process.md`; day-of-release steps in `docs/ops/release-runbook.md`.
+
+Drop a changeset file via `knope document-change` when the conventional-commit subject doesn't fully capture release impact (e.g. a `refactor:` that's actually breaking, or a `feat:` whose per-package effect isn't obvious from the scope). Conventional commits remain the primary signal; changesets supplement.
 
 ## Non-Interactive Shell Commands
 
@@ -239,7 +247,7 @@ Conventional commits: `type(scope): short description`
 
 **Types:** `docs`, `chore`, `feat`, `fix`, `refactor`, `test`, `perf`, `ci`
 
-**Scopes (indicative):** `ideas`, `adr`, `spec`, `docs`, `readme`, `config`, `beads`, `core`, `plugins`, `themes`, `segments`, `ci`, `repo`
+**Scopes (indicative):** `ideas`, `adr`, `spec`, `docs`, `readme`, `config`, `beads`, `core`, `plugins`, `themes`, `segments`, `cli`, `tui`, `doctor`, `ci`, `repo`. Scopes that bump a published crate are pinned in `knope.toml`'s `[packages.*]` blocks (`core` → linesmith-core, `plugins` → linesmith-plugin, `cli`/`tui`/`segments`/`themes`/`config`/`doctor` → linesmith). Doc / meta scopes (`adr`, `spec`, `docs`, `readme`, `ideas`, `beads`, `ci`, `repo`) pair with non-bumping commit types (`docs`/`chore`/`ci`/`test`) and aren't claimed by any package.
 
 Beads issue references go in the commit footer as a bare `lsm-xyz`, not in the subject line. Commits not tied to a beads issue (meta / workflow / CI / version bumps) have **no** footer — don't invent one.
 

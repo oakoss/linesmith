@@ -5,6 +5,7 @@ node = "26.1.0"
 "npm:markdownlint-cli2" = "0.22.1"
 lefthook = "2.1.6"
 "cargo:cocogitto" = "7"
+"cargo:knope" = "0.22.4"
 shellcheck = "0.11.0"
 hyperfine = "1.20.0"
 

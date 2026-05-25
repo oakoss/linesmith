@@ -1,0 +1,160 @@
+name: Knope Release
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip_release:
+        description: 'Skip `knope release` (use when tags already exist from a prior run; runs publish only)'
+        type: boolean
+        default: false
+
+# Zero default permissions; each job declares the minimum it needs.
+permissions: {}
+
+jobs:
+  # `knope release` tags each bumped package and creates per-package
+  # GitHub Releases. The `linesmith/v*` tag push triggers cargo-dist's
+  # release.yml, which uploads binaries to the existing release.
+  release:
+    name: Tag + create GitHub releases
+    # `release` is the branch knope-prepare.yml pushes to; restricting
+    # the head_ref keeps generic PR merges from firing this workflow.
+    # `workflow_dispatch` is the re-run escape hatch; `skip_release`
+    # lets the operator skip past a "release already exists" error from
+    # a partial-publish recovery.
+    if: |
+      (github.head_ref == 'release' && github.event.pull_request.merged == true) ||
+      (github.event_name == 'workflow_dispatch' && inputs.skip_release != true)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # push tags + create GitHub Releases
+    concurrency:
+      group: knope-release
+      cancel-in-progress: false
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        with:
+          egress-policy: audit
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          client-id: ${{ secrets.BOT_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Install Knope
+        uses: knope-dev/action@19617851f9f13ab2f27a05989c55efb18aca3675 # v2.1.2
+        with:
+          version: 0.22.4
+
+      # Mirrors the publish job's dispatch-ref guard. Without this, a
+      # `gh workflow run --ref <feature-branch>` would tag + create
+      # GitHub Releases from a non-main commit before publish's later
+      # guard could reject it, leaving stale tags to clean up by hand.
+      - name: Reject non-main dispatch
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::knope-release.yml dispatch must target refs/heads/main; got ${{ github.ref }}" >&2
+          exit 1
+
+      - name: Create tags + GitHub Releases
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: knope release --verbose
+
+  # crates.io publish runs only after Knope has tagged. cargo's
+  # leaf-first publish order (since 1.90) sequences linesmith-plugin →
+  # linesmith-core → linesmith automatically; ADR-0019's "linesmith-core
+  # as scaffolding" posture depends on this.
+  publish:
+    name: Publish to crates.io
+    needs: [release]
+    # `always() && (success || skipped)` keeps publish running on a
+    # `skip_release=true` dispatch (publish-only recovery) while still
+    # blocking on a genuine `release` job failure — never publish to
+    # crates.io after Knope crashed mid-tag.
+    if: |
+      always() &&
+      (needs.release.result == 'success' || needs.release.result == 'skipped') &&
+      ((github.head_ref == 'release' && github.event.pull_request.merged == true) || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # `id-token: write` mints the OIDC crates.io token per release-process
+    # spec §Crates.io publishing. Trusted-publisher entries name this
+    # workflow with no environment requirement, so the workflow ID alone
+    # is sufficient identity.
+    permissions:
+      id-token: write
+      contents: read
+    # Distinct from the `release` job's group so a dispatch fired during
+    # a PR-merge run serializes on `cargo release publish` rather than
+    # racing it.
+    concurrency:
+      group: knope-release-publish
+      cancel-in-progress: false
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+
+      - name: Mint crates.io OIDC token
+        id: auth
+        uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
+
+      # `cargo publish --workspace` has no `--skip-existing`, so a
+      # single-package release cycle errors when it reaches the unchanged
+      # siblings. `cargo release publish` skips already-published members
+      # and publishes the rest leaf-first (same pattern as Knope's own
+      # publish_crates.yml). Version is pinned so a future upstream
+      # behavior change in the skip path surfaces in PR review rather
+      # than breaking partial-publish recovery silently. Renovate keeps
+      # the pin current.
+      - name: Install cargo-release
+        run: cargo install cargo-release --version 1.1.2 --locked
+
+      # `cargo release publish` doesn't forward `--locked` to its
+      # underlying `cargo publish` invocations, so a stale Cargo.lock
+      # from a Knope `versioned_files` miss could resolve a different
+      # dep graph than the release-PR-reviewed state. Fail here before
+      # an irreversible publish.
+      - name: Verify lockfile matches manifests
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      # Dispatch-ref guard for workflow_dispatch. The pull_request:closed
+      # path is gated separately by `github.head_ref == 'release'`, so
+      # `github.ref` here only matters on the dispatch path.
+      - name: Reject non-main dispatch
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::knope-release.yml dispatch must target refs/heads/main; got ${{ github.ref }}" >&2
+          exit 1
+
+      # `main,HEAD` covers both checkouts: `main` for workflow_dispatch,
+      # `HEAD` for the detached pull_request:closed merge ref (without
+      # which cargo-release 1.1.2 errors "cannot release from branch
+      # `HEAD`").
+      - name: Publish bumped crates to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo release publish --workspace --execute --no-confirm --allow-branch 'main,HEAD'

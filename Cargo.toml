@@ -3,9 +3,8 @@ resolver = "2"
 members = ["crates/linesmith-core", "crates/linesmith-plugin", "crates/linesmith"]
 
 [workspace.package]
-# Crate versions are per-package so release-plz can bump them independently
-# based on their own commits, without dragging non-changing siblings across
-# major boundaries via a shared `version.workspace = true`.
+# No shared `version` field — crates version per-package per ADR-0027
+# so siblings don't drag across major boundaries on a Knope bump.
 edition = "2021"
 rust-version = "1.91"
 license = "MIT"
@@ -18,11 +17,11 @@ keywords = ["statusline", "claude-code", "claude", "cli", "ai"]
 categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
-# Internal workspace deps (linesmith-core, linesmith-plugin) live in
-# each consumer's per-crate `[dependencies]` block, not here, so
-# release-plz updates the version pin in place alongside the bump
-# of the depended-on crate. `[workspace.dependencies]` stays focused
-# on shared third-party version centralization.
+# Internal deps (linesmith-core, linesmith-plugin) live in each
+# consumer's per-crate `[dependencies]` rather than here, so Knope can
+# rewrite the pin string in place when the depended-on crate bumps
+# (via `dependency = "<name>"` entries in knope.toml's `versioned_files`).
+# This block stays focused on shared third-party versions.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 catppuccin = "2"

@@ -1030,17 +1030,20 @@ fn sanitize_tag(s: &str) -> String {
 
 /// Best-effort `vMAJOR.MINOR.PATCH[-pre][+build]` parser. `None` for
 /// any input that doesn't yield three numeric segments. Strips a
-/// single leading `v` (GitHub's convention) and truncates the patch
-/// segment at the first non-digit so `1.2.3-rc1` parses as `(1,2,3)`.
+/// single leading `v` (GitHub's convention), truncates the patch
+/// segment at the first non-digit so `1.2.3-rc1` parses as `(1,2,3)`,
+/// and routes through `strip_package_prefix` so per-package tag forms
+/// (`linesmith/v*`, legacy `linesmith-v*`) from `/releases/latest`
+/// parse cleanly per ADR-0027.
 ///
 /// Pre-release suffixes are silently dropped: `1.2.3-rc1` and `1.2.3`
-/// compare equal as a result. The `Ord` derive on `(u32, u32, u32)`
-/// does NOT respect semver pre-release ordering; this is intentional
-/// for the `linesmith doctor` use case (we want to know if the user
-/// is broadly behind, not whether their `-rc1` predates the published
-/// stable). A future need for full semver semantics should add the
-/// `semver` crate rather than extending this helper.
+/// compare equal. The `Ord` derive on `(u32, u32, u32)` does NOT
+/// respect semver pre-release ordering — intentional for `linesmith
+/// doctor` (we want to know if the user is broadly behind, not whether
+/// their `-rc1` predates the published stable). A future need for full
+/// semver semantics should pull in the `semver` crate.
 fn parse_three_part_version(s: &str) -> Option<(u32, u32, u32)> {
+    let s = strip_package_prefix(s);
     let s = s.strip_prefix('v').unwrap_or(s);
     let mut parts = s.splitn(3, '.');
     let major: u32 = parts.next()?.parse().ok()?;
@@ -1055,4 +1058,28 @@ fn parse_three_part_version(s: &str) -> Option<(u32, u32, u32)> {
     }
     let patch: u32 = patch_str.parse().ok()?;
     Some((major, minor, patch))
+}
+
+/// Strip the binary-package prefix from a GitHub release tag — Knope's
+/// `linesmith/v<ver>` (ADR-0027) or release-plz's legacy
+/// `linesmith-v<ver>`. Returns the input unchanged on no match.
+///
+/// Library-package tags (`linesmith-core/v*`, `linesmith-plugin/v*`,
+/// and their legacy `-v` variants) are deliberately NOT normalized:
+/// comparing a library version against the binary's `CARGO_PKG_VERSION`
+/// would produce a misleading "Newer binary available" WARN when only
+/// a library bumped. They fall through to the `parse_three_part_version`
+/// None branch and surface as `ParseError` — non-actionable but not a
+/// false update prompt. Per-package fetch-time filtering is tracked in
+/// lsm-ghxy.
+fn strip_package_prefix(s: &str) -> &str {
+    if let Some(rest) = s.strip_prefix("linesmith/") {
+        return rest;
+    }
+    if let Some(rest) = s.strip_prefix("linesmith-") {
+        if rest.starts_with('v') && rest[1..].starts_with(|c: char| c.is_ascii_digit()) {
+            return rest;
+        }
+    }
+    s
 }
