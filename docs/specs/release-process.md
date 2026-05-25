@@ -1,13 +1,13 @@
 # Release Process
 
 - Status: draft
-- Version: 0.1
-- Last updated: 2026-04-19
-- Driving ADRs: [ADR-0001](../adrs/0001-use-rust-for-runtime.md), [ADR-0007](../adrs/0007-cargo-dist-distribution.md)
+- Version: 0.2
+- Last updated: 2026-05-23
+- Driving ADRs: [ADR-0001](../adrs/0001-use-rust-for-runtime.md), [ADR-0007](../adrs/0007-cargo-dist-distribution.md), [ADR-0019](../adrs/0019-publish-linesmith-core-as-scaffolding-from-v0-1.md), [ADR-0027](../adrs/0027-knope-for-release-automation.md)
 
 ## Overview
 
-This spec defines how linesmith versions are cut, built, packaged, signed (or deliberately not), and distributed. The release pipeline is `cargo-dist` (binaries, installers, Homebrew formula) + `release-plz` (version bumps, CHANGELOG, crates.io publish), running as two chained GitHub Actions workflows: `release-plz.yml` opens release PRs and tags+publishes on merge, and `release.yml` fires on the pushed tag to build binaries. A maintainer cuts a release by merging the release PR; everything after is automation.
+This spec defines how linesmith versions are cut, built, packaged, signed (or deliberately not), and distributed. The release pipeline is `cargo-dist` (binaries, installers, Homebrew formula) + `Knope` (per-package version bumps, per-crate CHANGELOG, internal dep-pin updates, GitHub Release creation) + `cargo release publish` (crates.io publish, leaf-first ordering, skips already-published versions). It runs as three chained GitHub Actions workflows: `knope-prepare.yml` opens release PRs on push to main, `knope-release.yml` tags + creates per-package GitHub Releases + publishes to crates.io on release-PR merge, and `release.yml` fires on the `linesmith/v*` tag push to build binaries and upload them to the existing release. A maintainer cuts a release by merging the release PR; everything after is automation.
 
 > **Naming note.** Upstream renamed `cargo-dist` to `dist` (see [ADR-0007](../adrs/0007-cargo-dist-distribution.md)); this spec says `cargo-dist` throughout to match widely-referenced ecosystem documentation. They're the same tool. When the rename lands everywhere in third-party tutorials, the spec will revise.
 
@@ -19,8 +19,8 @@ Out of scope: user-facing install instructions (those belong in the README); mir
 
 ### Functional
 
-- Version tags use semver: `vMAJOR.MINOR.PATCH` (e.g., `v0.1.0`, `v0.2.0-rc.1`)
-- `release-plz` manages version bumps and CHANGELOG entries from Conventional Commits
+- Version tags use semver, per-package format: `<crate>/vMAJOR.MINOR.PATCH` (e.g., `linesmith/v0.2.0`, `linesmith-core/v0.2.0`, `linesmith-plugin/v0.1.3`, `linesmith/v0.2.0-rc.1`). Bare `vMAJOR.MINOR.PATCH` tags (`v0.2.0`) are accepted by `release.yml` only for backward compatibility with the manual v0.2.0 unblock; Knope produces only the per-package form going forward.
+- `Knope` manages per-package version bumps + per-crate CHANGELOG entries from Conventional Commits and changeset files
 - `cargo-dist` builds binaries for the platform matrix on tag-push
 - `cargo-dist` generates a shell installer (`curl | sh`), a PowerShell installer (`irm | iex`), and a Homebrew formula
 - `cargo install linesmith` remains automatically available for Rust-toolchain users (no extra configuration)
@@ -42,19 +42,31 @@ Out of scope: user-facing install instructions (those belong in the README); mir
 
 ### Tag format and semver posture
 
+Per-package format produced by Knope (ADR-0027):
+
 ```text
-v{MAJOR}.{MINOR}.{PATCH}[-{PRERELEASE}]
+{crate}/v{MAJOR}.{MINOR}.{PATCH}[-{PRERELEASE}]
 ```
 
 Examples:
 
 ```text
-v0.1.0         first public release
-v0.1.1         bug-fix patch of v0.1.0
-v0.2.0-rc.1    pre-release candidate
-v0.2.0         cut from rc.1
-v1.0.0         first stable public API promise
+linesmith/v0.1.0           first public release of the binary
+linesmith/v0.1.1           bug-fix patch
+linesmith-core/v0.2.0      breaking change in the core scaffolding crate
+linesmith-plugin/v0.1.3    additive change in the plugin host crate
+linesmith/v0.2.0-rc.1      pre-release candidate
+linesmith/v1.0.0           first stable public API promise
 ```
+
+Legacy formats still recognized by `release.yml`'s tag filter for backward compatibility (Knope emits neither):
+
+```text
+v0.2.0                     bare workspace tag from the manual v0.2.0 unblock
+linesmith-v0.1.3           release-plz's per-package format (pre-Knope)
+```
+
+The `doctor` self-update probe normalizes all four forms (`{crate}/v*`, `{crate}-v*`, bare `v*`, plain `*`) when it fetches `/releases/latest`. See `crates/linesmith/src/doctor/snapshot.rs::strip_package_prefix`.
 
 Semver posture:
 
@@ -126,37 +138,59 @@ Rust-toolchain required. Compiles from source; users pay the ~60-90s compile tim
 
 ### CHANGELOG contract
 
-- Format: [Keep a Changelog](https://keepachangelog.com/) structure, written by `git-cliff` from Conventional Commits
-- Generation: `release-plz` invokes `git-cliff` on PR creation; the maintainer reviews and merges
-- Commit types mapped:
-  - `feat` → Added
-  - `fix` → Fixed
-  - `perf` → Performance
-  - `refactor` → Changed (internal-only)
-  - `docs`, `chore`, `test`, `ci` → omitted from user-facing CHANGELOG (visible in git log)
-- Beads footer (bare `lsm-xyz`) is preserved in the CHANGELOG entry as a linked reference
-- Breaking changes flagged via `!` in commit subject (e.g., `feat(api)!: rename render ctx`) are hoisted to a "⚠ BREAKING" subsection and force a minor bump
+- Format: [Keep a Changelog](https://keepachangelog.com/) structure, written by Knope's `PrepareRelease` step from Conventional Commits + changeset files
+- Generation: `knope-prepare.yml` runs `knope prepare-release` on every push to `main`. Knope walks every conventional commit since each package's last `<pkg>/v*` tag plus every changeset file under `.changeset/`, computes the appropriate bump per package, writes the new version into each `versioned_files` entry, prepends an entry to the package's CHANGELOG, deletes consumed changeset files, then opens/updates the `release` PR. The maintainer reviews and merges.
+- Per-package CHANGELOGs:
+  - `CHANGELOG.md` (root) — `linesmith` binary
+  - `crates/linesmith-core/CHANGELOG.md` — `linesmith-core` scaffolding crate
+  - `crates/linesmith-plugin/CHANGELOG.md` — `linesmith-plugin` scaffolding crate
+- Commit types Knope treats as bump triggers per default: `feat`, `fix`, `perf`. `docs`/`chore`/`test`/`ci` are visible in git log and PR diffs but don't bump a version and don't appear in the user-facing CHANGELOG. (Knope's `extra_changelog_sections` knob could surface `docs` per-crate if desired; currently unconfigured.)
+- Beads footer (bare `lsm-xyz`) lands in the squash-merge commit and is reachable via `git log`. It is NOT preserved in the CHANGELOG (Knope's PrepareRelease consumes only the commit subject + breaking-change flag).
+- Scope routing per `knope.toml`'s `[packages.<name>] scopes` field:
+  - `feat(core): X` / `fix(core): X` → bumps `linesmith-core` only
+  - `feat(plugins): X` → bumps `linesmith-plugin` only
+  - `feat(cli|tui|segments|themes|config|doctor): X` → bumps `linesmith` only
+  - `feat: X` (no scope) → bumps every package per Knope's "no scope = all packages" semantics
+  - `feat(repo|ci|adr|spec|docs|readme|ideas|beads): X` → routed nowhere (intentional: those scopes pair with non-bumping commit types in normal use)
+- Breaking changes flagged via `!` in commit subject (e.g., `feat(core)!: rename Segment trait`) hoist to a `### Breaking changes` subsection in the relevant package's CHANGELOG and force a minor bump pre-1.0 / major post-1.0.
 
-`cliff.toml` in the repo root defines the template.
+Changeset files (`.changeset/*.md`) supplement conventional commits when a single PR's commit subject can't fully express its release impact. The format:
 
-### release-plz vs cargo-dist split
+```markdown
+---
+linesmith-core: minor
+---
 
-Two workflows are required because `release-plz` creates the tag (which `cargo-dist` then reacts to):
+Rename Segment trait's render() method to compose(). Existing plugin
+scripts continue to work via a deprecation shim that emits a
+linesmith-warn on load; the shim is removed in linesmith-core 0.3.
+```
 
-| Concern                        | Owner         | Workflow          | Fires on                               |
-| ------------------------------ | ------------- | ----------------- | -------------------------------------- |
-| Version bump in `Cargo.toml`   | `release-plz` | `release-plz.yml` | Push to `main` with releasable commits |
-| CHANGELOG entry generation     | `release-plz` | `release-plz.yml` | Same                                   |
-| Release PR open                | `release-plz` | `release-plz.yml` | Same                                   |
-| Git tag on release PR merge    | `release-plz` | `release-plz.yml` | Release PR merge                       |
-| `cargo publish` (crates.io)    | `release-plz` | `release-plz.yml` | Release PR merge (after tag push)      |
-| Multi-platform binary builds   | `cargo-dist`  | `release.yml`     | Tag push (from the step above)         |
-| GitHub Release + artifacts     | `cargo-dist`  | `release.yml`     | Tag push                               |
-| Shell / PowerShell installers  | `cargo-dist`  | `release.yml`     | Tag push                               |
-| Homebrew formula update + push | `cargo-dist`  | `release.yml`     | Tag push                               |
-| Build attestations (SLSA)      | `cargo-dist`  | `release.yml`     | Tag push                               |
+Run `knope document-change` to scaffold the file interactively. Knope deletes consumed changeset files on the next `PrepareRelease` run.
 
-`release-plz` is the conductor, living in `release-plz.yml`; `cargo-dist` is the specialist, living in `release.yml`. The handoff is the git tag: `release-plz.yml` pushes it on release-PR merge, and that tag push triggers `release.yml`. If `release-plz publish` fails before tagging, `release.yml` never starts and no binaries ship.
+### Knope + cargo-dist split
+
+Three workflows are required because Knope creates the release PR + tags + GitHub Releases, then cargo-dist reacts to the binary's tag:
+
+| Concern                             | Owner         | Workflow            | Fires on                               |
+| ----------------------------------- | ------------- | ------------------- | -------------------------------------- |
+| Per-package version bumps           | Knope         | `knope-prepare.yml` | Push to `main` with releasable commits |
+| Internal dep-pin updates by name    | Knope         | `knope-prepare.yml` | Same                                   |
+| Per-crate CHANGELOG entries         | Knope         | `knope-prepare.yml` | Same                                   |
+| Changeset file consumption          | Knope         | `knope-prepare.yml` | Same                                   |
+| Release PR open + force-update      | Knope         | `knope-prepare.yml` | Same                                   |
+| Git tags `<crate>/v<version>`       | Knope         | `knope-release.yml` | Release PR merge                       |
+| Per-package GitHub Releases         | Knope         | `knope-release.yml` | Release PR merge                       |
+| `cargo release publish --workspace` | cargo-release | `knope-release.yml` | Release PR merge (after tags)          |
+| Multi-platform binary builds        | cargo-dist    | `release.yml`       | `linesmith/v*` tag push                |
+| Upload binaries to existing release | cargo-dist    | `release.yml`       | Same                                   |
+| Shell / PowerShell installers       | cargo-dist    | `release.yml`       | Same                                   |
+| Homebrew formula update + push      | cargo-dist    | `release.yml`       | Same                                   |
+| Build attestations (SLSA)           | cargo-dist    | `release.yml`       | Same                                   |
+
+Knope is the conductor (lives in `knope-prepare.yml` for PR prep and `knope-release.yml` for tag/release/publish); cargo-dist is the binary specialist (lives in `release.yml`). The handoff is the `linesmith/v<ver>` git tag: `knope-release.yml` pushes it via `knope release`, that tag push triggers `release.yml`, and the cargo-dist `host` job uploads binaries to the GitHub Release Knope already created (`gh release upload` + `gh release edit --draft=false --latest`).
+
+If `knope release` fails before tagging, `release.yml` never starts and no binaries ship. If `cargo release publish` fails (transient registry error, dependency-ordering issue), it can be re-run via `knope-release.yml`'s `workflow_dispatch` trigger — the tagged release on GitHub stays as-is; `cargo-release` skips already-published versions on retry.
 
 ### Release profile
 
@@ -208,13 +242,13 @@ This validates the SLSA attestation attached during the release.
 
 ### Crates.io publishing
 
-`linesmith` crate on crates.io — single crate published (not a workspace). Published via OIDC trusted publishing:
+Three crates published per ADR-0019: `linesmith` (binary), `linesmith-core` (scaffolding), `linesmith-plugin` (scaffolding). Published via OIDC trusted publishing in leaf-first order:
 
-- One-time: configure `oakoss/linesmith` as a trusted publisher in the `linesmith` crates.io settings page (see <https://crates.io/docs/trusted-publishing>)
-- Per-release: `release-plz` uses the workflow's OIDC token to request a short-lived crates.io token and runs `cargo publish`
-- No `CARGO_REGISTRY_TOKEN` secret in the repo
+- One-time: configure `oakoss/linesmith` as a trusted publisher in each crate's settings page on crates.io. The trusted-publisher entries name `knope-release.yml` as the workflow and leave the environment field empty — no GitHub Environment is provisioned for this repo, so the workflow ID alone is the identity crates.io accepts.
+- Per-release: `knope-release.yml`'s `publish` job mints a short-lived crates.io token via `rust-lang/crates-io-auth-action` (consumes the workflow's OIDC token) and runs `cargo release publish --workspace --execute --no-confirm`. `cargo-release` checks each member against crates.io and skips crates already at their target version — load-bearing for single-package release cycles where only `linesmith-core` or `linesmith-plugin` bumped (bare `cargo publish --workspace` errors on the unchanged siblings since cargo has no `--skip-existing` flag).
+- No `CARGO_REGISTRY_TOKEN` secret in the repo.
 
-The crates.io description, README snippet, and keywords are sourced from `Cargo.toml`'s `[package]` metadata. License: `MIT`.
+Each crate's crates.io description, README snippet, and keywords are sourced from its `Cargo.toml`'s `[package]` metadata (the library crates ship their own descriptions disclaiming SemVer stability, per ADR-0019). License: `MIT`.
 
 ### Homebrew tap
 
@@ -255,29 +289,31 @@ Day-of-release steps for a maintainer:
    - `mise run bench` — no >10% regression against the previous release's benches
    - `cargo audit` — no new advisories
    - `linesmith doctor --plain` on a clean checkout — passes
-2. **Review the `release-plz` PR** that's been open on `main`. Verify the CHANGELOG entry reads correctly and the version bump matches the user-visible change shape.
-3. **Merge the `release-plz` PR.** This triggers `release-plz`'s second pass: it tags the commit `v{VERSION}` and pushes the tag.
-4. **Watch the Actions workflow.** The tag-push fires `release.yml`, which:
-   a. Runs `release-plz publish` → `cargo publish` (crates.io).
-   b. Runs `cargo-dist` matrix across all seven target triples.
-   c. Generates installers + Homebrew formula.
-   d. Attests build provenance.
-   e. Pushes the Homebrew formula to `oakoss/homebrew-tap`.
-   f. Creates the GitHub Release with artifacts + CHANGELOG excerpt.
+2. **Review the Knope release PR** that's open against `main` (branch: `release`, label: usually none — Knope doesn't set one by default). Verify each package's bump shape is correct (a `feat(core)` commit should bump only `linesmith-core`; an unscoped `feat:` bumps all three) and each per-package CHANGELOG entry reads correctly.
+3. **Merge the release PR** with the squash strategy (the repo's only enabled merge method). On merge, `knope-release.yml` fires and:
+   1. Runs `knope release` — tags each bumped package as `<crate>/v<version>` and creates a per-package GitHub Release with CHANGELOG-derived notes.
+   2. Runs `cargo release publish --workspace --execute --no-confirm --allow-branch 'main,HEAD'` via OIDC trusted publishing — publishes bumped crates in leaf-first order, skipping any whose version is already on crates.io. `HEAD` in the branch allowlist covers the `pull_request:closed` checkout's detached-merge-ref shape; `main` covers `workflow_dispatch` recovery runs.
+4. **Watch the cargo-dist workflow.** The `linesmith/v<version>` tag push fires `release.yml`, which:
+   1. Runs the `plan` job to compute the 6-target matrix.
+   2. Cross-compiles the binary on each target with `fail-fast: false`.
+   3. Generates shell/PowerShell installers and aggregate `sha256.sum`.
+   4. Uploads binaries + installers to the existing `linesmith/v<version>` GitHub Release Knope created (`gh release upload`), then marks it `--draft=false --latest` (`gh release edit`).
+   5. Pushes the Homebrew formula to `oakoss/homebrew-tap` (skipped on prereleases).
+   6. Generates SLSA attestations for every artifact via `actions/attest-build-provenance`.
 5. **Verify artifacts** (10-minute budget):
-   - Pull the macOS `aarch64-apple-darwin` binary from the release, run `linesmith --version`, confirm the version string matches the tag
-   - Run `linesmith doctor --plain` on the downloaded binary, confirm all-PASS
-   - Verify `brew install oakoss/tap/linesmith` on a fresh macOS VM (or container)
-   - Verify `cargo install linesmith` from a fresh Rust install
-6. **Announce.** Draft a short post — release notes excerpt + install one-liner for each platform — and publish to the announcement channels (README "Release Log" section + any social channels).
+   - Pull the macOS `aarch64-apple-darwin` binary from the `linesmith/v<version>` release, run `linesmith --version`, confirm the version string matches the tag.
+   - Run `linesmith doctor --plain` on the downloaded binary, confirm all-PASS.
+   - Verify `brew install oakoss/tap/linesmith` on a fresh macOS VM (or container).
+   - Verify `cargo install linesmith` from a fresh Rust install.
+6. **Announce.** The GitHub Release body is auto-populated by Knope (CHANGELOG-derived) + cargo-dist (install snippets + download table). Optionally add a narrative post to the README "Release Log" section.
 
-If step 4 fails partway through, see §Edge cases §Rollback.
+If step 3 or 4 fails partway through, see §Edge cases §Rollback. `knope-release.yml`'s `workflow_dispatch` trigger lets you re-run the release step (the `if:` guard checks `(github.head_ref == 'release' && github.event.pull_request.merged == true) || github.event_name == 'workflow_dispatch'`).
 
 ### Workflow structure
 
-Two workflow files, chained via the git-tag event:
+Three workflow files, chained via release-PR merge + git-tag events:
 
-**`.github/workflows/release-plz.yml`** — runs on push to `main` and via `workflow_dispatch`. Creates release PRs, and on release-PR merge, tags + publishes to crates.io:
+**`.github/workflows/knope-prepare.yml`** — runs on push to `main` and via `workflow_dispatch`. Opens / force-updates the release PR:
 
 ```text
 on:
@@ -286,19 +322,52 @@ on:
   workflow_dispatch:
 
 jobs:
-  release-plz:
-    # Opens release PRs with version bump + CHANGELOG when commits accumulate.
-    # On release-PR merge: creates the v{VERSION} tag, pushes it, then runs
-    # `cargo publish` via OIDC trusted publishing. The tag push is what fires
-    # release.yml below.
+  prepare-release:
+    if: github.event.head_commit.author.email != 'linesmith-bot[bot]@users.noreply.github.com'
+    # Author-identity guard skips the bot's own prepare-release commits
+    # so the merge back to main doesn't re-fire. Mints a GitHub App
+    # installation token (BOT_CLIENT_ID / BOT_PRIVATE_KEY) and runs:
+    #   1. `knope prepare-release --verbose` (allow_empty = true) —
+    #      stages version bumps, dep-pin rewrites, CHANGELOG entries,
+    #      and deletes consumed changesets. No-op when nothing's due.
+    #   2. `git diff --quiet HEAD || knope publish-release-pr` —
+    #      commits to `release`, force-pushes, opens/updates the PR.
 ```
 
-**`.github/workflows/release.yml`** — runs on tag push (from release-plz.yml), via `workflow_dispatch` for manual dry-runs, and via path-filtered `pull_request:` for auto-validation of release-infra changes (per [ADR-0017](../adrs/0017-release-workflow-pr-validation.md)):
+**`.github/workflows/knope-release.yml`** — runs when the `release` PR closes targeting `main` (via the head_ref guard) and via `workflow_dispatch` for re-runs:
+
+```text
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  release:
+    if: (github.head_ref == 'release' && github.event.pull_request.merged == true) || github.event_name == 'workflow_dispatch'
+    # `knope release --verbose` tags each bumped package as
+    # `<crate>/v<version>` and creates per-package GitHub Releases
+    # with CHANGELOG-derived notes.
+  publish:
+    needs: [release]
+    if: <same guard plus always() && (success || skipped)>
+    permissions:
+      id-token: write
+      contents: read
+    # OIDC crates.io token via rust-lang/crates-io-auth-action, then
+    # `cargo release publish --workspace --execute --no-confirm`
+    # (skips already-published members; leaf-first ordering).
+```
+
+**`.github/workflows/release.yml`** — runs on `linesmith/v*` tag push (from `knope-release.yml`), via `workflow_dispatch` for manual dry-runs, and via path-filtered `pull_request:` for auto-validation of release-infra changes (per [ADR-0017](../adrs/0017-release-workflow-pr-validation.md)):
 
 ```text
 on:
   push:
-    tags: ['v*.*.*']
+    tags:
+      - 'linesmith/v[0-9]+.[0-9]+.[0-9]+*'
+      - 'v[0-9]+.[0-9]+.[0-9]+*'           # legacy v* tags from the v0.2.0 unblock
   workflow_dispatch:
   pull_request:
     paths:
@@ -309,42 +378,50 @@ on:
       - 'Cargo.lock'
 
 jobs:
-  cargo-dist-plan:
+  plan:
     # Runs `dist plan` to validate the release matrix before building.
-  cargo-dist-build:
-    needs: cargo-dist-plan
+  build-local-artifacts:
+    needs: plan
     strategy:
-      matrix: <7 target triples>
-      fail-fast: false   # lets successful legs finish and upload artifacts even on sibling failure
-    # Cross-compiles per target. Each matrix leg uploads its binary as an artifact.
-  cargo-dist-global-publish:
-    needs: cargo-dist-build
-    # Generates installers, Homebrew formula, GitHub Release with all artifacts.
-    # A matrix-level failure still blocks this job (standard `needs:` semantics);
-    # see §Edge cases for the recovery path when one target fails.
-  attest:
-    needs: cargo-dist-build
-    # Runs actions/attest-build-provenance on every artifact successfully built.
+      matrix: <6 target triples per dist-workspace.toml>
+      fail-fast: false   # lets successful legs finish even on sibling failure
+    # Cross-compiles per target + emits SLSA attestation in-step.
+  build-global-artifacts:
+    needs: build-local-artifacts
+    # Generates shell/PowerShell installers + aggregate sha256.sum.
+  host:
+    needs: [plan, build-local-artifacts, build-global-artifacts]
+    # Upload to existing release (Knope created it on release-PR merge):
+    #   gh release upload "$TAG" artifacts/*
+    #   gh release edit "$TAG" --draft=false $PRERELEASE_FLAG $LATEST_FLAG
+    # Falls back to `gh release create` for bare `v*` tags (legacy path).
+  publish-homebrew-formula:
+    needs: [plan, host]
+    # Pushes Formula/linesmith.rb to oakoss/homebrew-tap (skipped on prereleases).
 ```
 
-The tag-push handoff from `release-plz.yml` to `release.yml` is the coupling point. If `release-plz publish` fails (e.g., crates.io rejects the upload), no tag is pushed, and `release.yml` never starts — so binaries can't get ahead of the published crate.
+The `linesmith/v<version>` tag push from `knope-release.yml` is the coupling point with cargo-dist. If `knope release` fails before tagging, `release.yml` never starts and no binaries ship. If `cargo release publish` (in `knope-release.yml`'s `publish` job) fails, binaries can still ship for the linesmith tag — the partial state is acceptable because `cargo install linesmith` from crates.io is a separate distribution channel from the cargo-dist GitHub Release artifacts (`curl | sh`, brew, powershell). Re-run via `workflow_dispatch`; `cargo-release` skips crates already published.
 
 ### Pre-release workflow
 
-Pre-release tags (`vX.Y.Z-rc.N`, `-alpha.N`, `-beta.N`) skip Homebrew formula pushes and don't publish to crates.io by default. They do produce GitHub Release artifacts with all seven target binaries, so testers can install via:
+Pre-release tags (`linesmith/vX.Y.Z-rc.N`, `-alpha.N`, `-beta.N`) skip Homebrew formula pushes and skip the `--latest` flag on the GitHub Release edit. They DO publish to crates.io as prereleases per cargo's standard semver prerelease semantics (`linesmith = "0.2.0-rc.1"` resolves; bare `linesmith = "0.2"` skips it).
+
+Cutting a pre-release without going through the normal Knope flow: tag the commit manually as `git tag -a linesmith/v0.2.0-rc.1 -m "v0.2.0-rc.1" && git push origin linesmith/v0.2.0-rc.1`. cargo-dist's `release.yml` picks up the tag, builds binaries, and creates a GitHub Release (since Knope didn't create one). The `host` job's fallback path (`gh release create` when `gh release view` 404s) handles this case.
+
+Testers install via:
 
 ```sh
-curl -LsSf https://github.com/oakoss/linesmith/releases/download/v0.2.0-rc.1/linesmith-installer.sh | sh
+curl -LsSf https://github.com/oakoss/linesmith/releases/download/linesmith/v0.2.0-rc.1/linesmith-installer.sh | sh
 ```
 
-`cargo install linesmith --git https://github.com/oakoss/linesmith --tag v0.2.0-rc.1` also works for Rust-toolchain pre-release testers.
+`cargo install linesmith --git https://github.com/oakoss/linesmith --tag linesmith/v0.2.0-rc.1` also works for Rust-toolchain pre-release testers.
 
 ### Dry-run workflow
 
 `release.yml` exposes two dry-run paths beyond tag-push (per [ADR-0017](../adrs/0017-release-workflow-pr-validation.md)):
 
 1. **`workflow_dispatch`** — maintainer-triggered from any branch. Use for ad-hoc validation when you want the full matrix before cutting a tag.
-2. **`pull_request` (paths-filtered)** — auto-fires when a PR touches release-infra files (`release.yml`, `dist-workspace.toml`, `Cargo.toml`, `crates/*/Cargo.toml`, `Cargo.lock`). Catches cross-compile breakage from cargo-update / release-plz auto-bumps / dependabot before merge. SHA is the PR head, not the merge SHA. Filter excludes `release-plz.toml` and `release-plz.yml` (false coverage — release.yml's matrix doesn't run release-plz). Concurrency cancellation: superseded PR runs cancel automatically.
+2. **`pull_request` (paths-filtered)** — auto-fires when a PR touches release-infra files (`release.yml`, `dist-workspace.toml`, `Cargo.toml`, `crates/*/Cargo.toml`, `Cargo.lock`). Catches cross-compile breakage from cargo-update / Knope dep-pin updates / dependabot before merge. SHA is the PR head, not the merge SHA. Filter excludes `knope.toml`, `knope-prepare.yml`, and `knope-release.yml` (false coverage — release.yml's matrix doesn't run Knope's code paths). Concurrency cancellation: superseded PR runs cancel automatically.
 
 Either path:
 
@@ -358,38 +435,38 @@ Either path:
 
 Dry-run runs touch only GitHub Actions artifact storage — no crates.io version slot consumed, no GitHub Release created, no Homebrew formula pushed.
 
-cargo-dist 0.31's `--allow-dirty` flag is boolean and covers only "CI scripts out of date" — already permanently allowed via `dist-workspace.toml`'s `allow-dirty = ["ci"]`, so no per-dispatch toggle is needed. Source-tree-dirty dispatch isn't a concept in 0.31; CI checkouts are always clean. `release-plz.yml`'s `cargo publish` step has no dry-run path either, so pipeline-validating crates.io changes still require a local `cargo publish --dry-run` or a real `v0.0.x` patch release.
+cargo-dist 0.31's `--allow-dirty` flag is boolean and covers only "CI scripts out of date" — already permanently allowed via `dist-workspace.toml`'s `allow-dirty = ["ci"]`, so no per-dispatch toggle is needed. Source-tree-dirty dispatch isn't a concept in 0.31; CI checkouts are always clean. `knope-release.yml`'s `cargo release publish` step has no dry-run path either, so pipeline-validating crates.io changes still require a local `cargo release publish --dry-run` or a real `linesmith/v0.0.x` patch release. Knope itself exposes `knope prepare-release --dry-run` (locally) which writes the version bumps + CHANGELOG entries to the working tree without committing — useful for previewing what the next release PR would contain.
 
 ## Edge cases
 
-| Case                                                          | Handling                                                                                                                                                                                                                                                                                                                                                                          |
-| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `release-plz` fails to publish to crates.io (transient 5xx)   | Workflow re-run-able; `cargo-dist` gated on successful crates.io step, so no orphaned artifacts                                                                                                                                                                                                                                                                                   |
-| `cargo-dist` fails on one target (e.g., ARM Linux OOM)        | `cargo-dist-global-publish` blocks because it `needs: cargo-dist-build` (whole matrix). With `fail-fast: false`, successful legs finish and upload their binaries as workflow artifacts. Re-run the failed leg from the Actions UI, which resumes the chain and lets `global-publish` finish. No GitHub Release, installers, or formula update ships until every target completes |
-| Crates.io publish succeeds but `cargo-dist` fails entirely    | Partial release: `cargo install linesmith` works but curl/brew/powershell installers have no artifacts. Rerun failed jobs; do NOT yank. Pin a tracker issue noting the asymmetry until binaries catch up                                                                                                                                                                          |
-| Homebrew formula push fails (auth, rate-limit, repo conflict) | Binary + shell-installer releases succeed; brew users see "formula not found"; formula re-pushed via manual re-run                                                                                                                                                                                                                                                                |
-| Tag pushed to a commit that's not on main                     | `release-plz` rejects with "tag not on main"; workflow exits 1; manual cleanup: `git push --delete origin v{VERSION}` + retag                                                                                                                                                                                                                                                     |
-| Tag pushed without a release-plz PR                           | `release-plz publish` detects missing CHANGELOG entry and fails; workflow aborts before crates.io publish                                                                                                                                                                                                                                                                         |
-| Need to yank a release from crates.io                         | `cargo yank --vers X.Y.Z` locally; no workflow involved; GitHub Release stays but add a "⚠ Yanked" note in the release body                                                                                                                                                                                                                                                       |
-| Critical CVE mid-release-cycle                                | Cut a new patch release (`v0.1.N+1`) with the fix; don't try to edit the existing release's artifacts                                                                                                                                                                                                                                                                             |
-| Secret leak (e.g., OIDC config)                               | Rotate immediately via crates.io + GitHub settings; new releases use rotated identity; old tags stay as-is                                                                                                                                                                                                                                                                        |
-| Contributor pushes a tag without permission                   | Branch protection + `release.yml` require `secrets.GITHUB_TOKEN` permissions that only repo admins hold                                                                                                                                                                                                                                                                           |
-| Accidental `v1.0.0` tag before we're ready                    | Delete the tag both locally and on origin; force-push is not needed (tag isn't a branch); `release.yml` is re-idempotent on retag                                                                                                                                                                                                                                                 |
-| GitHub Actions outage                                         | Wait; `release-plz` PR stays open; re-merge when Actions is healthy                                                                                                                                                                                                                                                                                                               |
-| `oakoss/homebrew-tap` repo deleted or renamed                 | cargo-dist push fails with 404; recreate repo with the same name; re-run the failed workflow step                                                                                                                                                                                                                                                                                 |
-| Binary size regresses >5% vs previous release                 | `cargo bloat` step annotates the workflow run (not a gate). Maintainer reviews; regression may be intentional                                                                                                                                                                                                                                                                     |
-| CI runner architecture unavailable (ARM Linux runner outage)  | That platform's binary is missing from the release body; post-outage re-run fills it in                                                                                                                                                                                                                                                                                           |
-| First-time tap setup when oakoss/homebrew-tap is empty        | First `cargo-dist` run creates `Formula/linesmith.rb` and pushes; no manual bootstrap needed                                                                                                                                                                                                                                                                                      |
+| Case                                                          | Handling                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cargo release publish` fails (transient 5xx)                 | Re-run `knope-release.yml` via `workflow_dispatch`. `cargo-release` skips already-published versions; failed crate retries on the same OIDC token. Note: cargo-dist already ran (binaries are live for the linesmith tag) — accept the brief asymmetry between crates.io and the GitHub Release until publish succeeds                      |
+| `cargo-dist` fails on one target (e.g., ARM Linux OOM)        | `host` blocks because it `needs: build-local-artifacts` (whole matrix). With `fail-fast: false`, successful legs finish and upload their binaries as workflow artifacts. Re-run the failed leg from the Actions UI, which resumes the chain and lets `host` finish. The release on GitHub stays in draft state until every target completes |
+| Crates.io publish succeeds but `cargo-dist` fails entirely    | Partial release: `cargo install linesmith` works but curl/brew/powershell installers have no artifacts. Re-run `release.yml` via `workflow_dispatch` against the `linesmith/v<ver>` tag; do NOT yank crates.io. Pin a tracker issue noting the asymmetry until binaries catch up                                                            |
+| Homebrew formula push fails (auth, rate-limit, repo conflict) | Binary + shell-installer releases succeed; brew users see "formula not found"; formula re-pushed via manual re-run                                                                                                                                                                                                                          |
+| `knope release` fails on tag push (e.g., tag already exists)  | Workflow exits 1; manual cleanup: delete the partially-created tag on origin (`git push --delete origin <pkg>/v<ver>`), fix the underlying issue, re-run `knope-release.yml` via `workflow_dispatch`                                                                                                                                        |
+| Tag pushed without a release PR                               | Possible if a maintainer pushes `linesmith/v*` by hand (pre-release path). cargo-dist's `host` job's fallback (`gh release view` → `gh release create`) covers this — Knope didn't create a release, so cargo-dist creates one with auto-extracted CHANGELOG body                                                                           |
+| Need to yank a release from crates.io                         | `cargo yank --vers X.Y.Z -p <crate>` locally; no workflow involved; GitHub Release stays but add a "⚠ Yanked" note in the release body                                                                                                                                                                                                      |
+| Critical CVE mid-release-cycle                                | Cut a new patch release (`linesmith/v0.1.N+1`) with the fix; don't try to edit the existing release's artifacts                                                                                                                                                                                                                             |
+| Secret leak (e.g., OIDC config)                               | Rotate immediately via crates.io + GitHub settings; new releases use rotated identity; old tags stay as-is                                                                                                                                                                                                                                  |
+| Contributor pushes a tag without permission                   | Branch protection on `main` + `knope-release.yml` / `release.yml` `permissions:` blocks; only `BOT_CLIENT_ID` / `BOT_PRIVATE_KEY` and OIDC-minted tokens hold the writes                                                                                                                                                                    |
+| Accidental `linesmith/v1.0.0` tag before we're ready          | Delete the tag both locally and on origin; force-push is not needed (tag isn't a branch); `release.yml` is re-idempotent on retag (host job's `gh release view` check returns the existing release)                                                                                                                                         |
+| GitHub Actions outage                                         | Wait; Knope release PR stays open; re-merge when Actions is healthy                                                                                                                                                                                                                                                                         |
+| `oakoss/homebrew-tap` repo deleted or renamed                 | cargo-dist push fails with 404; recreate repo with the same name; re-run the failed workflow step                                                                                                                                                                                                                                           |
+| Binary size regresses >5% vs previous release                 | `cargo bloat` step annotates the workflow run (not a gate). Maintainer reviews; regression may be intentional                                                                                                                                                                                                                               |
+| CI runner architecture unavailable (ARM Linux runner outage)  | That platform's binary is missing from the release body; post-outage re-run fills it in                                                                                                                                                                                                                                                     |
+| First-time tap setup when oakoss/homebrew-tap is empty        | First `cargo-dist` run creates `Formula/linesmith.rb` and pushes; no manual bootstrap needed                                                                                                                                                                                                                                                |
 
 ### Rollback
 
 A failed release is rolled back by:
 
-1. Delete the tag locally (`git tag -d v{VERSION}`) and on origin (`git push --delete origin v{VERSION}`).
-2. If crates.io was already published, run `cargo yank --vers {VERSION}`.
+1. Delete the affected tags locally and on origin. Per-package tags require per-package deletion: `git tag -d linesmith/v{VERSION} && git push --delete origin linesmith/v{VERSION}` (repeat for each bumped package's tag if Knope created multiple).
+2. If crates.io was already published, run `cargo yank --vers {VERSION} -p <crate>` per affected crate.
 3. If a Homebrew formula was pushed, revert the commit on `oakoss/homebrew-tap`.
-4. If a GitHub Release was created, delete it from the releases page.
-5. Fix the underlying issue, push a new tag (`v{VERSION+1}` if crates.io published; otherwise re-use `v{VERSION}`).
+4. If GitHub Releases were created, delete each from the releases page (per-package release pages exist when Knope creates more than one in the same cycle).
+5. Fix the underlying issue, then either re-run `knope-release.yml` via `workflow_dispatch` (preferred, idempotent against existing crates.io versions) or cut a fresh patch release (`linesmith/v{VERSION+1}` if crates.io published; re-use `linesmith/v{VERSION}` otherwise).
 
 Rule: never force-push over an existing tag that made it to crates.io. Users may have `Cargo.lock`ed against it.
 
@@ -400,7 +477,7 @@ Follows `AGENTS.md`: workflow changes are tested via dry-run dispatches; pipelin
 ### Workflow tests
 
 - Auto-triggered dry-run on every PR that touches `release.yml`, `dist-workspace.toml`, `Cargo.toml`, `crates/*/Cargo.toml`, or `Cargo.lock` (paths-filtered `pull_request:` trigger per ADR-0017)
-- Manual `workflow_dispatch` dry-run for PRs that touch other release-adjacent files not in the auto-trigger (`release-plz.toml`, `release-plz.yml`, `ci.yml`, `audit.yml`, `codeql.yml`, etc.) — release-plz.toml is intentionally excluded from auto-trigger because release.yml's matrix doesn't run release-plz code (false coverage)
+- Manual `workflow_dispatch` dry-run for PRs that touch other release-adjacent files not in the auto-trigger (`knope.toml`, `knope-prepare.yml`, `knope-release.yml`, `ci.yml`, `audit.yml`, `codeql.yml`, etc.) — Knope's config files are intentionally excluded from auto-trigger because `release.yml`'s matrix doesn't run Knope's code paths (false coverage)
 - Matrix-level tests: the cross-compile step runs on every PR (covered by the existing `check` workflow; release.yml reuses the same build matrix)
 - Attestation verification: post-release, a `verify.yml` workflow downloads the released binary, runs `gh attestation verify`, asserts PASS
 
@@ -429,10 +506,11 @@ Criterion benchmarks run pre-release (`mise run bench`). A >10% regression again
 - **APT / DEB / Snap / Nix.** Community demand signals; none planned for v0.1. A tap-style approach (third-party repo we publish to) is cheaper than first-party `.deb` maintenance.
 - **Windows MSI / Chocolatey.** PowerShell installer covers casual Windows users; MSI installers and Chocolatey packaging are nice-to-haves if demand emerges.
 - **Reproducible builds across runners.** Same commit + same `cargo-dist` version + same runner image → byte-identical binaries. Different runner OS versions (Ubuntu 22.04 vs 24.04) may drift. Pin runner versions to reduce this drift.
-- **Automated release notes curation.** git-cliff produces a CHANGELOG; the "what's new for humans" blurb at the top of the release body is still manual. A future `release-notes.md` template + GPT-generated draft could speed this up; v0.1 stays manual.
+- **Automated release notes curation.** Knope produces per-package CHANGELOGs from conventional commits + changeset files; the "what's new for humans" narrative blurb at the top of the release body is still manual. A future `release-notes.md` template + GPT-generated draft could speed this up; v0.2 stays manual.
 - **Crates.io alternative registries.** For users behind corporate firewalls, a public alternative (like cargo's `--registry` flag) may matter. Defer — users with that constraint tend to know how to work around it.
 
 ## Change log
 
 - 2026-04-19: initial draft (v0.1). Defines semver posture (pre-1.0 minor-for-breaking), the 7-target platform matrix (macOS/Linux/Windows × x86_64/aarch64 + linux-musl), four installer methods (shell, PowerShell, Homebrew, cargo install), release-plz/cargo-dist responsibility split, release profile settings (matches ADR-0007), supply-chain posture (OIDC trusted publishing, SLSA attestations, pinned action SHAs, `cargo-auditable`), unsigned-binary posture for v0.1, day-of-release runbook, rollback steps, and edge cases. Closes lsm-9sa under epic lsm-c2i.
 - 2026-04-19: license changed from `MIT OR Apache-2.0` to `MIT` to match the repo `LICENSE` swap (MPL-2.0 → MIT). Closes lsm-c2c.
+- 2026-05-23: v0.2 — Knope migration per ADR-0027. Replaces release-plz with `knope-prepare.yml` (release PR creation) + `knope-release.yml` (tag, GitHub Release, `cargo release publish --workspace`). Adds changeset workflow (`knope document-change`). Per-package tag format `<crate>/v<version>` replaces the bare `v<version>` workspace tag and the release-plz `<crate>-v<version>` per-package form. `release.yml` hand-edits: tag filter widened to include both formats during the transition; host job's GitHub Release creation replaced with `gh release upload --clobber` + `gh release edit --draft=false --latest` to attach to the Knope-created release. `cliff.toml` retired (Knope generates per-crate CHANGELOGs internally). Doctor self-update parse fix lands alongside (handles `<pkg>/v*` and `<pkg>-v*` prefix forms). Closes lsm-llij.

@@ -23,12 +23,10 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-# Rhai plugin host. Stays in core (not cli) so the `Segment` trait
-# adapter (`RhaiSegment`) and `DataContext` → `rhai::Map` mirror that
-# bridge plugin output back to domain types live alongside the
-# segment system that consumes them, per ADR-0018. Declared per-crate
-# (not via `[workspace.dependencies]`) so release-plz updates the
-# version pin in place when linesmith-plugin's own version bumps.
+# Rhai plugin host lives in core (not cli) per ADR-0018 so the
+# `RhaiSegment` adapter + `DataContext` ↔ `rhai::Map` bridge sit
+# alongside the segment system that consumes them. Per-crate pin
+# (not workspace) for the Knope-rewrite rationale in root Cargo.toml.
 linesmith-plugin = { version = "0.1.3", path = "../linesmith-plugin" }
 serde.workspace = true
 serde_json.workspace = true

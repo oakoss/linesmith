@@ -53,6 +53,13 @@ jobs:
       - name: Schema drift check
         run: mise run schema:check
 
+      # Parses knope.toml + verifies workflow references resolve, so
+      # schema drift (typo'd fields, wrong `dependency` strings, broken
+      # `scopes` arrays) surfaces on the PR rather than crashing the
+      # next push-to-main mid-job.
+      - name: Validate knope.toml
+        run: knope --validate
+
   tests:
     name: Tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

@@ -7322,12 +7322,110 @@ segments = ["model", { type = "git_branch", merge = true }]
     }
 
     #[test]
+    fn classify_update_response_strips_knope_binary_prefix() {
+        // Knope's `linesmith/v<ver>` (ADR-0027) is the binary tag the
+        // probe must compare against `CARGO_PKG_VERSION`.
+        let body = br#"{"tag_name":"linesmith/v0.2.0"}"#;
+        match classify_update_response(body, "0.2.0") {
+            DoctorUpdateProbe::Latest => {}
+            other => panic!("expected Latest for linesmith/v0.2.0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_update_response_strips_release_plz_legacy_binary_prefix() {
+        // release-plz's `linesmith-v<ver>` format from v0.1.2 through
+        // v0.2.0 stays reachable via /releases/latest until those tags
+        // age out. Local `0.2.0` ahead of remote `0.1.3` must land on
+        // Latest specifically — a comparison-direction regression
+        // would flip this to Newer.
+        let body = br#"{"tag_name":"linesmith-v0.1.3"}"#;
+        match classify_update_response(body, "0.2.0") {
+            DoctorUpdateProbe::Latest => {}
+            other => panic!("expected Latest (local 0.2.0 ahead of remote 0.1.3), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_update_response_rejects_legacy_prefix_without_version_digits() {
+        // Without the digit guard, `linesmith-vNEXT` etc. would hand
+        // `parse_three_part_version` a `v<garbage>` suffix — fails
+        // harmlessly today but could invent a `(0, 0, 0)` reading from
+        // `v0-anything` under a future refactor.
+        for tag in ["linesmith-v", "linesmith-vNEXT", "linesmith-vabc.1.2"] {
+            let body = format!(r#"{{"tag_name":"{tag}"}}"#);
+            match classify_update_response(body.as_bytes(), "1.2.3") {
+                DoctorUpdateProbe::ParseError { .. } => {}
+                other => panic!("expected ParseError for {tag}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_update_response_rejects_library_package_tags() {
+        // /releases/latest can return a library tag when a library
+        // bumped without a matching binary release. Stripping those
+        // and comparing against `CARGO_PKG_VERSION` would mis-report
+        // "Newer linesmith available"; the prefix-strip is scoped to
+        // the binary only. Library tags fall through to ParseError
+        // — non-actionable but not misleading. Full per-package
+        // awareness is tracked in lsm-ghxy.
+        for tag in [
+            "linesmith-core/v0.3.0",
+            "linesmith-plugin/v0.2.0",
+            "linesmith-core-v0.2.0",
+            "linesmith-plugin-v0.1.3",
+        ] {
+            let body = format!(r#"{{"tag_name":"{tag}"}}"#);
+            match classify_update_response(body.as_bytes(), "0.2.0") {
+                DoctorUpdateProbe::ParseError { message } => {
+                    assert!(
+                        message.contains(tag),
+                        "diagnostic should name the offending tag: {message}"
+                    );
+                }
+                other => panic!("expected ParseError for library tag {tag}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_update_response_treats_prefixed_higher_version_as_newer() {
+        // Pin the comparison-after-strip path: `linesmith/v0.3.0` parses
+        // as `(0,3,0)` and reads Newer than `0.2.0`. Earlier code landed
+        // in the both-unparseable branch and returned Newer on string
+        // inequality alone — same result for the wrong reason.
+        let body = br#"{"tag_name":"linesmith/v0.3.0"}"#;
+        match classify_update_response(body, "0.2.0") {
+            DoctorUpdateProbe::Newer { latest } => {
+                assert_eq!(latest, "linesmith/v0.3.0");
+            }
+            other => panic!("expected Newer with linesmith/v0.3.0, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_update_response_does_not_false_strip_unrecognized_prefix() {
+        // `image-v` doesn't match either prefix anchor, so it falls
+        // through to `(None, Some(_))` and surfaces a ParseError naming
+        // the offending tag.
+        let body = br#"{"tag_name":"image-v"}"#;
+        match classify_update_response(body, "1.2.3") {
+            DoctorUpdateProbe::ParseError { message } => {
+                assert!(
+                    message.contains("image-v"),
+                    "diagnostic should name the offending tag: {message}"
+                );
+            }
+            other => panic!("expected ParseError for unrecognized prefix, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn classify_update_response_returns_parse_error_when_remote_unparseable_but_local_parses() {
-        // Mixed-parseability path: comparing local semver against an
-        // unparseable remote tag (`v1.foo.0`, `nightly`) is undefined.
-        // Earlier code fell back to string equality, which silently
-        // produced an unverified Newer claim or — when string-equal —
-        // a Latest PASS the comparator never validated. Spec WARN
+        // Mixed-parseability is undefined. Earlier code fell back to
+        // string equality, which silently produced an unverified Newer
+        // claim or a Latest PASS the comparator never validated. WARN
         // with a clear "couldn't compare" diagnostic instead.
         let body = br#"{"tag_name":"nightly-build-2026-04-30"}"#;
         match classify_update_response(body, "1.2.3") {

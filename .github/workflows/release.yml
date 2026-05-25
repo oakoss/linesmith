@@ -41,15 +41,14 @@ permissions:
 on:
   push:
     tags:
-      # Bare workspace tags (manual releases such as v0.2.0) and the
-      # `linesmith` per-package tags release-plz creates for the
-      # dist-able binary. Library tags like `linesmith-core-v*` and
-      # `linesmith-plugin-v*` are intentionally excluded — cargo-dist
-      # rejects them (per `dist-workspace.toml`, only `cargo:crates/linesmith`
-      # is in the dist-able members list), and firing this workflow
-      # for them produces noisy red runs with no useful artifacts.
+      # Knope's per-package format (`<crate>/v<ver>`) restricted to the
+      # dist-able `linesmith` binary per ADR-0027. Library tags
+      # (`linesmith-core/v*`, `linesmith-plugin/v*`) are excluded because
+      # cargo-dist rejects them and would produce noisy red runs with no
+      # artifacts. Bare `v*` covers the legacy v0.2.0 manual-unblock tag
+      # until that release cycle ages out.
+      - 'linesmith/v[0-9]+.[0-9]+.[0-9]+*'
       - 'v[0-9]+.[0-9]+.[0-9]+*'
-      - 'linesmith-v[0-9]+.[0-9]+.[0-9]+*'
   # Dry-run trigger surface (per ADR-0017). Builds all targets + generates
   # attestations as workflow artifacts without creating a GitHub Release,
   # publishing to crates.io, or touching the homebrew tap. Two paths:
@@ -101,21 +100,15 @@ jobs:
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/dist
-      # On push (real release) the tag is the pushed ref. On dispatch /
-      # pull_request (dry-run) we use the dist-able crate's version
-      # (e.g., `v0.2.0`) because cargo-dist's `dist build --tag=` does
-      # NOT accept SemVer prerelease suffixes — it strictly matches the
-      # tag's version part against an actual workspace package version.
-      # `v0.2.0-dry-run-abc1234` is rejected with "× This workspace
-      # doesn't have anything for dist to Release!", even though
-      # `v0.2.0` resolves correctly. Source is `crates/linesmith/Cargo.toml`,
-      # the only dist-able member per `dist-workspace.toml`; the workspace
-      # root no longer carries a shared version field (crates have per-package
-      # versions so release-plz doesn't drag siblings across major-bump caret
-      # boundaries). Multiple dispatch/PR runs share the same tag string;
-      # each workflow run has isolated artifact storage scoped by run ID, and
-      # the publishing-gate keeps these builds out of GitHub Releases.
-      # Unknown event_name exits non-zero rather than silently emitting a bad tag.
+      # On push the tag is the pushed ref (`linesmith/v<version>` per
+      # ADR-0027). On dispatch / pull_request (dry-run) we synthesize
+      # the same shape from `crates/linesmith/Cargo.toml` — `dist build
+      # --tag=` strictly matches the tag's version part against an
+      # actual workspace package version and rejects synthetic suffixes
+      # like `v0.2.0-dry-run-abc1234`. Multiple dispatch/PR runs share
+      # the same tag string; isolated artifact storage per run plus the
+      # publishing gate keeps these out of GitHub Releases. Unknown
+      # event_name exits non-zero rather than emitting a bad tag.
       - id: compute-tag
         shell: bash
         run: |
@@ -125,12 +118,15 @@ jobs:
               ;;
             workflow_dispatch | pull_request)
               manifest="crates/linesmith/Cargo.toml"
-              version=$(grep -m1 '^version' "${manifest}" | cut -d '"' -f2)
+              # Regex requires double-quoted `version = "..."`; any
+              # other shape yields empty output and trips the guard
+              # below rather than producing a `linesmith/v<garbage>` tag.
+              version=$(grep -m1 -E '^version = "[^"]+"' "${manifest}" | cut -d '"' -f2)
               if [ -z "${version}" ]; then
                 echo "::error::compute-tag: failed to read version from ${manifest}" >&2
                 exit 1
               fi
-              tag="v${version}"
+              tag="linesmith/v${version}"
               ;;
             *)
               echo "::error::compute-tag: unsupported event_name '${{ github.event_name }}'. Update release.yml to handle this trigger." >&2
@@ -356,17 +352,72 @@ jobs:
         run: |
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
-      - name: Create GitHub Release
+      # Knope already created the `linesmith/v<ver>` GitHub Release in
+      # knope-release.yml. cargo-dist uploads artifacts and overwrites
+      # the body with `ANNOUNCEMENT_BODY` (install snippets + download
+      # table Knope's body lacks). `--latest` overrides any auto-latest
+      # assignment GitHub gave to library releases Knope created in the
+      # same workflow.
+      #
+      # Bare `v*` tags (v0.2.0 manual unblock) have no Knope-created
+      # release; the `gh release view` probe falls back to `gh release
+      # create` with the asset-verification loop applied symmetrically.
+      - name: Upload artifacts to release
         env:
           PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
+          LATEST_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '' || '--latest' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
+          TAG: "${{ needs.plan.outputs.tag }}"
         run: |
-          # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          set -euo pipefail
+          # Propagate failures out of $(...) substitutions so a transient
+          # `gh release view` error can't silently yield empty assets
+          # and mark every artifact as missing.
+          shopt -s inherit_errexit
+          echo "$ANNOUNCEMENT_BODY" > "$RUNNER_TEMP/notes.txt"
 
-          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          # Name-based (not count-based) to tolerate stale assets from
+          # prior failed runs whose targets/suffixes have since changed.
+          verify_assets_present() {
+            local tag="$1"
+            local assets name
+            assets=$(gh release view "$tag" --json assets -q '.assets[].name' | sort)
+            for f in artifacts/*; do
+              name=$(basename "$f")
+              if ! grep -qxF "$name" <<<"$assets"; then
+                echo "::error::asset $name missing from release $tag after upload" >&2
+                exit 1
+              fi
+            done
+          }
+
+          # Probe distinguishes "release exists" (Knope path) from "no
+          # release yet" (legacy bare-`v*` path). Order matters:
+          # `2>&1 >/dev/null` routes stderr to the workflow log first
+          # (so auth/network failures surface visibly), then suppresses
+          # stdout (the release JSON we don't want to see).
+          if gh release view "$TAG" --json id 2>&1 >/dev/null; then
+            # `--clobber` makes the upload idempotent on workflow_dispatch
+            # recovery after a partial upload.
+            gh release upload "$TAG" artifacts/* --clobber
+            verify_assets_present "$TAG"
+            # Overwrite Knope's CHANGELOG body with cargo-dist's
+            # announcement (install snippets + download table). Diffing
+            # the swap into the log surfaces drift between Knope's and
+            # cargo-dist's CHANGELOG extractors.
+            gh release view "$TAG" --json body -q .body > "$RUNNER_TEMP/knope_notes.txt"
+            diff -u "$RUNNER_TEMP/knope_notes.txt" "$RUNNER_TEMP/notes.txt" || true
+            # shellcheck disable=SC2086 # flags intentionally word-split
+            gh release edit "$TAG" --draft=false $PRERELEASE_FLAG $LATEST_FLAG --notes-file "$RUNNER_TEMP/notes.txt"
+          else
+            # Legacy bare `v*` path — no Knope-created release at this
+            # tag, so create one matching Knope-path semantics.
+            # shellcheck disable=SC2086
+            gh release create "$TAG" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG $LATEST_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+            verify_assets_present "$TAG"
+          fi
 
   publish-homebrew-formula:
     needs:

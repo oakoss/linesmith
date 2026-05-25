@@ -1,8 +1,5 @@
 branch_whitelist = ["main"]
 
-[changelog]
-path = "CHANGELOG.md"
-
 [commit_types]
 docs = { changelog_title = "Documentation" }
 chore = { changelog_title = "Chores" }

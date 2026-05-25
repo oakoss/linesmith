@@ -1,0 +1,109 @@
+# Knope release automation per ADR-0027. See docs/specs/release-process.md
+# for the full contract and docs/ops/release-runbook.md for the day-of
+# flow. Tag format is `<package>/v<version>` (e.g. `linesmith/v0.2.0`);
+# migration from release-plz's `<package>-v<version>` format requires
+# one-time per-package tag creation per the runbook's §Knope migration tags.
+
+[packages.linesmith-core]
+versioned_files = [
+  "crates/linesmith-core/Cargo.toml",
+  "Cargo.lock",
+  { path = "crates/linesmith/Cargo.toml", dependency = "linesmith-core" },
+]
+changelog = "crates/linesmith-core/CHANGELOG.md"
+# Unscoped feat/fix commits cascade to every package per Knope's default.
+scopes = ["core"]
+
+[packages.linesmith-plugin]
+versioned_files = [
+  "crates/linesmith-plugin/Cargo.toml",
+  "Cargo.lock",
+  # Both consumers pin linesmith-plugin: linesmith-core (bridge facade)
+  # and linesmith (direct import per ADR-0020).
+  { path = "crates/linesmith-core/Cargo.toml", dependency = "linesmith-plugin" },
+  { path = "crates/linesmith/Cargo.toml", dependency = "linesmith-plugin" },
+]
+changelog = "crates/linesmith-plugin/CHANGELOG.md"
+scopes = ["plugins"]
+
+[packages.linesmith]
+versioned_files = [
+  "crates/linesmith/Cargo.toml",
+  "Cargo.lock",
+]
+changelog = "CHANGELOG.md"
+# User-visible scopes that bump the binary. `core` / `plugins` route to
+# their own crates and only refresh the dep-pin here. Doc/meta scopes
+# (`adr`, `spec`, `docs`, `readme`, `ideas`, `beads`, `ci`, `repo`) pair
+# with non-bumping commit types and aren't claimed by any package.
+scopes = [
+  "cli",
+  "tui",
+  "segments",
+  "themes",
+  "config",
+  "doctor",
+]
+
+[github]
+owner = "oakoss"
+repo = "linesmith"
+
+# Two-workflow split per Knope's preview-release-PR recipe: `prepare-release`
+# stages bumps + CHANGELOG entries; `publish-release-pr` commits/pushes/opens
+# the PR. knope-prepare.yml runs them back-to-back with a `git diff --quiet`
+# gate so a no-op push lands green instead of erroring with "no commits
+# between main and release".
+
+[[workflows]]
+name = "prepare-release"
+
+[[workflows.steps]]
+type = "PrepareRelease"
+allow_empty = true
+
+[[workflows]]
+name = "publish-release-pr"
+
+[[workflows.steps]]
+type = "Command"
+command = "git switch -c release"
+
+[[workflows.steps]]
+type = "Command"
+command = "git commit -m \"chore: prepare release\""
+
+[[workflows.steps]]
+type = "Command"
+command = "git push --force --set-upstream origin release"
+
+[[workflows.steps]]
+type = "CreatePullRequest"
+base = "main"
+
+# `$version` / `$changelog` template variables are rejected in
+# multi-package mode (Knope errors with `variables::too_many_packages`),
+# so the templates stay static — reviewers read the PR diff for shape.
+[workflows.steps.title]
+template = "chore: prepare release"
+
+[workflows.steps.body]
+template = "Automated release PR by Knope. Merging tags each bumped package and triggers cargo-dist's binary build for `linesmith`. Review the per-package CHANGELOG entries in the diff to confirm the bump shape is correct."
+
+[[workflows]]
+name = "release"
+
+# Creates per-package tags + GitHub Releases with CHANGELOG-derived
+# notes. Only `linesmith/v*` triggers cargo-dist's release.yml; library
+# tags ship CHANGELOG-only releases since neither library crate has a
+# binary target.
+[[workflows.steps]]
+type = "Release"
+
+[[workflows]]
+name = "document-change"
+
+# `knope document-change` drafts a `.changeset/*.md` file; PrepareRelease
+# consumes and deletes it on the next release cycle.
+[[workflows.steps]]
+type = "CreateChangeFile"
