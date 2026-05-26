@@ -1,33 +1,191 @@
 name: Knope Release
 
+# Combined prepare + release + publish pipeline. Previously split across
+# knope-prepare.yml (push: main trigger) and knope-release.yml
+# (pull_request: closed trigger). The split caused a race when a release
+# PR merged: both workflows fired on the same event sequence, knope-prepare
+# could read tag state BEFORE knope-release had created the new tag, then
+# re-claim already-released commits into a phantom follow-on release PR.
+#
+# Combined shape: one `pull_request_target: closed` trigger, three
+# mutually-exclusive jobs that switch on the merged PR's head ref. No
+# race possible — only one path runs per merge. `workflow_dispatch`
+# provides operator escape hatches for recovery and the edge case where
+# a commit lands on main without going through a PR.
+
+# `pull_request_target` (not `pull_request`) so the workflow can mint
+# the bot's GitHub App token on merged fork PRs. `pull_request` strips
+# secrets when the PR head is on a fork, which would break prepare for
+# any external contribution. Safe here because we only react to
+# `closed + merged == true` (maintainer-approved merge) and the
+# checkout default is the base branch (main), not the PR head — we
+# never execute contributor code with elevated perms.
 on:
-  pull_request:
+  pull_request_target:
     types: [closed]
     branches: [main]
   workflow_dispatch:
     inputs:
-      skip_release:
-        description: 'Skip `knope release` (use when tags already exist from a prior run; runs publish only)'
-        type: boolean
-        default: false
+      mode:
+        description: 'prepare | release (default; tag + publish) | publish (skip tag, publish only — recovery for partial runs)'
+        type: choice
+        options: [prepare, release, publish]
+        default: release
 
 # Zero default permissions; each job declares the minimum it needs.
 permissions: {}
 
+# Footgun reminder for future edits: `inputs.<name>` is unset (empty
+# string) on non-dispatch events. Conditions like `inputs.mode != 'prepare'`
+# evaluate to true on PR events because `'' != 'prepare'`. Always pair
+# `inputs.*` checks with `github.event_name == 'workflow_dispatch'`.
+
 jobs:
+  # knope prepare-release walks tags + conventional commits since each
+  # package's last <pkg>/v* tag, bumps versioned files, prepends CHANGELOG
+  # entries, and opens/updates the `release` PR.
+  prepare:
+    name: Prepare release PR
+    # Fires on any merged non-release PR. The two-part head filter
+    # excludes ONLY our own `release` branch (which the release job
+    # handles); a fork PR coincidentally named `release` still gets
+    # picked up here because its head.repo.full_name is different
+    # from this repo. Without the repo-comparison part, a fork PR
+    # named `release` would fall through both prepare (filtered out
+    # by name) and release (filtered out by repo) — its commit
+    # would land on main without driving a release-prep run.
+    if: |
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.merged == true &&
+       !(github.event.pull_request.head.ref == 'release' &&
+         github.event.pull_request.head.repo.full_name == github.repository)) ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'prepare')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # push the release branch
+      pull-requests: write # open and update the release PR
+    # Shares the `knope-release` group with the release + publish jobs.
+    # If a fix/feat PR merges while a release PR's release job is
+    # mid-tagging, the prepare job for the fix PR queues behind the
+    # release-job's tag creation — without the shared lock, prepare
+    # would walk stale tag state and re-claim the in-flight release's
+    # commits into a phantom follow-on release PR (same failure mode
+    # the workflow-combine eliminates for the same-event case).
+    concurrency:
+      group: knope-release
+      cancel-in-progress: false
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        with:
+          egress-policy: audit
+
+      # Symmetric with the release + publish jobs' guards: a
+      # `gh workflow run knope-release.yml --ref <branch> -f mode=prepare`
+      # would otherwise let Knope compute "changes since last tag" off
+      # a non-main commit and push to `release` from the wrong base.
+      - name: Reject non-main dispatch
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::knope-release.yml dispatch must target refs/heads/main; got ${{ github.ref }}" >&2
+          exit 1
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          client-id: ${{ secrets.BOT_CLIENT_ID }}
+          private-key: ${{ secrets.BOT_PRIVATE_KEY }}
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Pin to the specific merge commit on `pull_request_target`
+          # events, falling back to `main` for `workflow_dispatch`.
+          # Plain `ref: main` would resolve to whatever `main` points
+          # to at checkout time — if a second PR merges between this
+          # workflow firing and this step running, the checkout would
+          # land on the wrong SHA and Knope would walk tags + commits
+          # the maintainer didn't intend to include in this run.
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.merge_commit_sha || 'main' }}
+          # PrepareRelease walks every tag + conventional commit since
+          # the last release.
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "linesmith-bot[bot]"
+          git config user.email "linesmith-bot[bot]@users.noreply.github.com"
+
+      - name: Install Knope
+        uses: knope-dev/action@19617851f9f13ab2f27a05989c55efb18aca3675 # v2.1.2
+        with:
+          version: 0.22.4
+
+      # Knope reads `<pkg>/v<ver>` tags to compute "what's changed since
+      # the last release"; all three packages must have at least one. A
+      # core/plugin-only first release without its migration tag would
+      # otherwise scan the entire repo history for that package's
+      # changelog. One-time setup: docs/ops/release-runbook.md §Knope
+      # migration tags.
+      - name: Verify migration tags exist
+        run: |
+          missing=()
+          for pkg in linesmith linesmith-core linesmith-plugin; do
+            if ! git tag --list "${pkg}/v*" | grep -q .; then
+              missing+=("${pkg}")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing migration tag(s): ${missing[*]} — run docs/ops/release-runbook.md §Knope migration tags before enabling this workflow." >&2
+            exit 1
+          fi
+
+      # Two-step invocation mirrors knope.toml's workflow split:
+      # `prepare-release` stages bumps with `allow_empty = true`, then a
+      # `git diff --quiet` gate decides whether `publish-release-pr` runs.
+      # No-op pushes land as green runs without a spurious PR; real Knope
+      # errors still fail the job loudly.
+      - name: Run knope prepare-release
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: knope prepare-release --verbose
+
+      - name: Publish release PR (skip on no-op)
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          if git diff --quiet HEAD; then
+            echo "PrepareRelease found no releasable changes; skipping PR publish."
+            exit 0
+          fi
+          knope publish-release-pr --verbose
+
   # `knope release` tags each bumped package and creates per-package
   # GitHub Releases. The `linesmith/v*` tag push triggers cargo-dist's
   # release.yml, which uploads binaries to the existing release.
   release:
     name: Tag + create GitHub releases
-    # `release` is the branch knope-prepare.yml pushes to; restricting
-    # the head_ref keeps generic PR merges from firing this workflow.
-    # `workflow_dispatch` is the re-run escape hatch; `skip_release`
-    # lets the operator skip past a "release already exists" error from
-    # a partial-publish recovery.
+    # `release` is the branch the prepare job pushes to; restricting
+    # the merged PR's head ref keeps generic PR merges from firing
+    # this job. The `head.repo.full_name == github.repository` guard
+    # is load-bearing under `pull_request_target`: a fork can name
+    # its source branch anything (including `release`), so
+    # `head.ref == 'release'` alone would match a coincidentally-
+    # named fork branch and mint the bot's token to tag commits the
+    # maintainer didn't intend to release. The prepare job has a
+    # complementary `!(head.ref == 'release' && head.repo == ours)`
+    # filter so fork PRs (including a fork branch named `release`)
+    # still drive release prep — only our own `release` branch is
+    # excluded, since that's what THIS job handles.
     if: |
-      (github.head_ref == 'release' && github.event.pull_request.merged == true) ||
-      (github.event_name == 'workflow_dispatch' && inputs.skip_release != true)
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.merged == true &&
+       github.event.pull_request.head.ref == 'release' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'release')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -41,6 +199,16 @@ jobs:
         with:
           egress-policy: audit
 
+      # Dispatch-ref guard runs before setup so a `gh workflow run
+      # --ref <feature-branch>` mistake fails fast — otherwise we'd
+      # tag + create GitHub Releases off a non-main commit before
+      # the guard could fire, leaving stale tags to clean up by hand.
+      - name: Reject non-main dispatch
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::knope-release.yml dispatch must target refs/heads/main; got ${{ github.ref }}" >&2
+          exit 1
+
       - name: Generate GitHub App token
         id: app-token
         uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
@@ -51,6 +219,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          # See prepare job's checkout for the rationale: pin to the
+          # PR's merge commit on `pull_request_target` events so a
+          # later merge can't shift the SHA between trigger and
+          # checkout, falling back to `main` for `workflow_dispatch`.
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.merge_commit_sha || 'main' }}
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
@@ -59,50 +232,51 @@ jobs:
         with:
           version: 0.22.4
 
-      # Mirrors the publish job's dispatch-ref guard. Without this, a
-      # `gh workflow run --ref <feature-branch>` would tag + create
-      # GitHub Releases from a non-main commit before publish's later
-      # guard could reject it, leaving stale tags to clean up by hand.
-      - name: Reject non-main dispatch
-        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
-        run: |
-          echo "::error::knope-release.yml dispatch must target refs/heads/main; got ${{ github.ref }}" >&2
-          exit 1
-
       - name: Create tags + GitHub Releases
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
         run: knope release --verbose
 
-  # crates.io publish runs only after Knope has tagged. cargo's
-  # leaf-first publish order (since 1.90) sequences linesmith-plugin →
-  # linesmith-core → linesmith automatically; ADR-0019's "linesmith-core
-  # as scaffolding" posture depends on this.
+  # crates.io publish runs only after Knope has tagged (or when an
+  # operator dispatches mode=publish to recover from a partial-publish
+  # failure where tags already exist). cargo's leaf-first publish order
+  # (since 1.90) sequences linesmith-plugin → linesmith-core → linesmith
+  # automatically; ADR-0019's "linesmith-core as scaffolding" posture
+  # depends on this.
   publish:
     name: Publish to crates.io
     needs: [release]
     # `always() && (success || skipped)` keeps publish running on a
-    # `skip_release=true` dispatch (publish-only recovery) while still
-    # blocking on a genuine `release` job failure — never publish to
-    # crates.io after Knope crashed mid-tag.
+    # `mode=publish` dispatch (publish-only recovery, where release is
+    # deliberately skipped) while still blocking on a genuine `release`
+    # job failure — never publish to crates.io after Knope crashed
+    # mid-tag.
     if: |
       always() &&
       (needs.release.result == 'success' || needs.release.result == 'skipped') &&
-      ((github.head_ref == 'release' && github.event.pull_request.merged == true) || github.event_name == 'workflow_dispatch')
+      ((github.event_name == 'pull_request_target' &&
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.head.ref == 'release' &&
+        github.event.pull_request.head.repo.full_name == github.repository) ||
+       (github.event_name == 'workflow_dispatch' &&
+        (inputs.mode == 'release' || inputs.mode == 'publish')))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # `id-token: write` mints the OIDC crates.io token per release-process
     # spec §Crates.io publishing. Trusted-publisher entries name this
-    # workflow with no environment requirement, so the workflow ID alone
-    # is sufficient identity.
+    # workflow (knope-release.yml) with no environment requirement, so
+    # the workflow filename alone is sufficient identity.
     permissions:
       id-token: write
       contents: read
-    # Distinct from the `release` job's group so a dispatch fired during
-    # a PR-merge run serializes on `cargo release publish` rather than
-    # racing it.
+    # Shares the `knope-release` group with the `release` job so a
+    # `mode=publish` recovery dispatch fired mid-PR-merge can't run
+    # `cargo release publish --workspace` against partially-tagged
+    # state. Skipped jobs (publish's `if:` false on prepare-mode
+    # dispatches, release's `if:` false on publish-mode dispatches)
+    # don't acquire the group lock, so the normal flows aren't slowed.
     concurrency:
-      group: knope-release-publish
+      group: knope-release
       cancel-in-progress: false
     steps:
       - name: Harden Runner
@@ -110,9 +284,24 @@ jobs:
         with:
           egress-policy: audit
 
+      # Dispatch-ref guard runs before the expensive setup steps below
+      # so a `gh workflow run --ref <branch>` mistake fails fast instead
+      # of burning a runner on checkout + cargo-install. The
+      # `pull_request_target: closed` path is gated separately by
+      # `head.ref == 'release'` in the job-level `if:`.
+      - name: Reject non-main dispatch
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::knope-release.yml dispatch must target refs/heads/main; got ${{ github.ref }}" >&2
+          exit 1
+
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          # See prepare job's checkout for the rationale: pin to the
+          # PR's merge commit on `pull_request_target` events,
+          # falling back to `main` for `workflow_dispatch`.
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.merge_commit_sha || 'main' }}
           persist-credentials: false
 
       - name: Setup Rust
@@ -141,19 +330,13 @@ jobs:
       - name: Verify lockfile matches manifests
         run: cargo metadata --locked --format-version 1 > /dev/null
 
-      # Dispatch-ref guard for workflow_dispatch. The pull_request:closed
-      # path is gated separately by `github.head_ref == 'release'`, so
-      # `github.ref` here only matters on the dispatch path.
-      - name: Reject non-main dispatch
-        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
-        run: |
-          echo "::error::knope-release.yml dispatch must target refs/heads/main; got ${{ github.ref }}" >&2
-          exit 1
-
-      # `main,HEAD` covers both checkouts: `main` for workflow_dispatch,
-      # `HEAD` for the detached pull_request:closed merge ref (without
-      # which cargo-release 1.1.2 errors "cannot release from branch
-      # `HEAD`").
+      # `--allow-branch 'main,HEAD'`: both entries are load-bearing.
+      # `actions/checkout` with `ref: <SHA>` (the `pull_request_target`
+      # path of the ternary above — `merge_commit_sha` is a SHA, not a
+      # ref name) detaches HEAD, and cargo-release 1.1.2 reads that as
+      # branch `HEAD`. The `workflow_dispatch` path passes the literal
+      # `'main'` ref name, so the checkout lands on the `main` branch.
+      # Allowing both keeps cargo-release happy on either trigger.
       - name: Publish bumped crates to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

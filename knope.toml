@@ -49,11 +49,14 @@ scopes = [
 owner = "oakoss"
 repo = "linesmith"
 
-# Two-workflow split per Knope's preview-release-PR recipe: `prepare-release`
-# stages bumps + CHANGELOG entries; `publish-release-pr` commits/pushes/opens
-# the PR. knope-prepare.yml runs them back-to-back with a `git diff --quiet`
-# gate so a no-op push lands green instead of erroring with "no commits
-# between main and release".
+# Two knope workflows per the preview-release-PR recipe:
+# `prepare-release` stages bumps + CHANGELOG entries; `publish-release-pr`
+# commits/pushes/opens the PR. They run back-to-back in the `prepare` job
+# of `.github/workflows/knope-release.yml` with a `git diff --quiet` gate
+# between them — no-op merges land green instead of erroring with "no
+# commits between main and release". All three GitHub Actions jobs
+# (prepare + release + publish) live in knope-release.yml so the prepare
+# and release paths can't race on the same merge event.
 
 [[workflows]]
 name = "prepare-release"

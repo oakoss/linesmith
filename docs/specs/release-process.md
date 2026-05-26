@@ -2,12 +2,12 @@
 
 - Status: draft
 - Version: 0.2
-- Last updated: 2026-05-23
+- Last updated: 2026-05-26
 - Driving ADRs: [ADR-0001](../adrs/0001-use-rust-for-runtime.md), [ADR-0007](../adrs/0007-cargo-dist-distribution.md), [ADR-0019](../adrs/0019-publish-linesmith-core-as-scaffolding-from-v0-1.md), [ADR-0027](../adrs/0027-knope-for-release-automation.md)
 
 ## Overview
 
-This spec defines how linesmith versions are cut, built, packaged, signed (or deliberately not), and distributed. The release pipeline is `cargo-dist` (binaries, installers, Homebrew formula) + `Knope` (per-package version bumps, per-crate CHANGELOG, internal dep-pin updates, GitHub Release creation) + `cargo release publish` (crates.io publish, leaf-first ordering, skips already-published versions). It runs as three chained GitHub Actions workflows: `knope-prepare.yml` opens release PRs on push to main, `knope-release.yml` tags + creates per-package GitHub Releases + publishes to crates.io on release-PR merge, and `release.yml` fires on the `linesmith/v*` tag push to build binaries and upload them to the existing release. A maintainer cuts a release by merging the release PR; everything after is automation.
+This spec defines how linesmith versions are cut, built, packaged, signed (or deliberately not), and distributed. The release pipeline is `cargo-dist` (binaries, installers, Homebrew formula) + `Knope` (per-package version bumps, per-crate CHANGELOG, internal dep-pin updates, GitHub Release creation) + `cargo release publish` (crates.io publish, leaf-first ordering, skips already-published versions). It runs as two chained GitHub Actions workflows: `knope-release.yml` hosts three mutually-exclusive jobs (`prepare`, `release`, `publish`) gated on the merged PR's head ref — `prepare` opens the release PR when a feature/fix PR merges to main, `release` + `publish` tag bumped packages and publish to crates.io when the release PR merges; `release.yml` (cargo-dist) fires separately on the `linesmith/v*` tag push to build binaries and upload them to the existing release. A maintainer cuts a release by merging the release PR; everything after is automation.
 
 > **Naming note.** Upstream renamed `cargo-dist` to `dist` (see [ADR-0007](../adrs/0007-cargo-dist-distribution.md)); this spec says `cargo-dist` throughout to match widely-referenced ecosystem documentation. They're the same tool. When the rename lands everywhere in third-party tutorials, the spec will revise.
 
@@ -139,7 +139,7 @@ Rust-toolchain required. Compiles from source; users pay the ~60-90s compile tim
 ### CHANGELOG contract
 
 - Format: Knope's `PrepareRelease` default — `## <version> (<date>)` headers, `### <Section>` subheadings (Features / Fixes / Refactoring / etc.), one bullet per commit with the conventional-commit scope **bolded** and a SHA link. Follows Keep-a-Changelog structure except headers use bare semver (not bracketed `[X.Y.Z]`) so Knope's `parse_title` can find prior sections and insert with proper Markdown spacing. Driven by Conventional Commits + changeset files.
-- Generation: `knope-prepare.yml` runs `knope prepare-release` on every push to `main`. Knope walks every conventional commit since each package's last `<pkg>/v*` tag plus every changeset file under `.changeset/`, computes the appropriate bump per package, writes the new version into each `versioned_files` entry, prepends an entry to the package's CHANGELOG, deletes consumed changeset files, then opens/updates the `release` PR. The maintainer reviews and merges.
+- Generation: `knope-release.yml`'s `prepare` job runs `knope prepare-release` on each non-release PR merge to `main` (filtered by `head.ref != 'release'` on the `pull_request_target: closed` event, plus `workflow_dispatch` with `mode=prepare` as an operator escape hatch). Knope walks every conventional commit since each package's last `<pkg>/v*` tag plus every changeset file under `.changeset/`, computes the appropriate bump per package, writes the new version into each `versioned_files` entry, prepends an entry to the package's CHANGELOG, deletes consumed changeset files, then opens/updates the `release` PR. The maintainer reviews and merges.
 - Per-package CHANGELOGs:
   - `CHANGELOG.md` (root) — `linesmith` binary
   - `crates/linesmith-core/CHANGELOG.md` — `linesmith-core` scaffolding crate
@@ -170,27 +170,27 @@ Run `knope document-change` to scaffold the file interactively. Knope deletes co
 
 ### Knope + cargo-dist split
 
-Three workflows are required because Knope creates the release PR + tags + GitHub Releases, then cargo-dist reacts to the binary's tag:
+Two GitHub Actions workflows are required because Knope creates the release PR + tags + GitHub Releases, then cargo-dist reacts to the binary's tag:
 
-| Concern                             | Owner         | Workflow            | Fires on                               |
-| ----------------------------------- | ------------- | ------------------- | -------------------------------------- |
-| Per-package version bumps           | Knope         | `knope-prepare.yml` | Push to `main` with releasable commits |
-| Internal dep-pin updates by name    | Knope         | `knope-prepare.yml` | Same                                   |
-| Per-crate CHANGELOG entries         | Knope         | `knope-prepare.yml` | Same                                   |
-| Changeset file consumption          | Knope         | `knope-prepare.yml` | Same                                   |
-| Release PR open + force-update      | Knope         | `knope-prepare.yml` | Same                                   |
-| Git tags `<crate>/v<version>`       | Knope         | `knope-release.yml` | Release PR merge                       |
-| Per-package GitHub Releases         | Knope         | `knope-release.yml` | Release PR merge                       |
-| `cargo release publish --workspace` | cargo-release | `knope-release.yml` | Release PR merge (after tags)          |
-| Multi-platform binary builds        | cargo-dist    | `release.yml`       | `linesmith/v*` tag push                |
-| Upload binaries to existing release | cargo-dist    | `release.yml`       | Same                                   |
-| Shell / PowerShell installers       | cargo-dist    | `release.yml`       | Same                                   |
-| Homebrew formula update + push      | cargo-dist    | `release.yml`       | Same                                   |
-| Build attestations (SLSA)           | cargo-dist    | `release.yml`       | Same                                   |
+| Concern                             | Owner         | Workflow                            | Fires on                         |
+| ----------------------------------- | ------------- | ----------------------------------- | -------------------------------- |
+| Per-package version bumps           | Knope         | `knope-release.yml` (`prepare` job) | Non-`release` PR merge to `main` |
+| Internal dep-pin updates by name    | Knope         | `knope-release.yml` (`prepare` job) | Same                             |
+| Per-crate CHANGELOG entries         | Knope         | `knope-release.yml` (`prepare` job) | Same                             |
+| Changeset file consumption          | Knope         | `knope-release.yml` (`prepare` job) | Same                             |
+| Release PR open + force-update      | Knope         | `knope-release.yml` (`prepare` job) | Same                             |
+| Git tags `<crate>/v<version>`       | Knope         | `knope-release.yml`                 | Release PR merge                 |
+| Per-package GitHub Releases         | Knope         | `knope-release.yml`                 | Release PR merge                 |
+| `cargo release publish --workspace` | cargo-release | `knope-release.yml`                 | Release PR merge (after tags)    |
+| Multi-platform binary builds        | cargo-dist    | `release.yml`                       | `linesmith/v*` tag push          |
+| Upload binaries to existing release | cargo-dist    | `release.yml`                       | Same                             |
+| Shell / PowerShell installers       | cargo-dist    | `release.yml`                       | Same                             |
+| Homebrew formula update + push      | cargo-dist    | `release.yml`                       | Same                             |
+| Build attestations (SLSA)           | cargo-dist    | `release.yml`                       | Same                             |
 
-Knope is the conductor (lives in `knope-prepare.yml` for PR prep and `knope-release.yml` for tag/release/publish); cargo-dist is the binary specialist (lives in `release.yml`). The handoff is the `linesmith/v<ver>` git tag: `knope-release.yml` pushes it via `knope release`, that tag push triggers `release.yml`, and the cargo-dist `host` job uploads binaries to the GitHub Release Knope already created (`gh release upload` + `gh release edit --draft=false --latest`).
+Knope is the conductor (lives in `knope-release.yml` — three jobs: `prepare`, `release`, `publish`); cargo-dist is the binary specialist (lives in `release.yml`). The handoff is the `linesmith/v<ver>` git tag: `knope-release.yml` pushes it via `knope release`, that tag push triggers `release.yml`, and the cargo-dist `host` job uploads binaries to the GitHub Release Knope already created (`gh release upload` + `gh release edit --draft=false --latest`).
 
-If `knope release` fails before tagging, `release.yml` never starts and no binaries ship. If `cargo release publish` fails (transient registry error, dependency-ordering issue), it can be re-run via `knope-release.yml`'s `workflow_dispatch` trigger — the tagged release on GitHub stays as-is; `cargo-release` skips already-published versions on retry.
+If `knope release` fails before tagging, `release.yml` never starts and no binaries ship. If `cargo release publish` fails (transient registry error, dependency-ordering issue), it can be re-run via `knope-release.yml`'s `workflow_dispatch` trigger with `mode=publish` (the default `mode=release` would attempt to re-tag) — the tagged release on GitHub stays as-is; `cargo-release` skips already-published versions on retry.
 
 ### Release profile
 
@@ -292,7 +292,7 @@ Day-of-release steps for a maintainer:
 2. **Review the Knope release PR** that's open against `main` (branch: `release`, label: usually none — Knope doesn't set one by default). Verify each package's bump shape is correct (a `feat(core)` commit should bump only `linesmith-core`; an unscoped `feat:` bumps all three) and each per-package CHANGELOG entry reads correctly.
 3. **Merge the release PR** with the squash strategy (the repo's only enabled merge method). On merge, `knope-release.yml` fires and:
    1. Runs `knope release` — tags each bumped package as `<crate>/v<version>` and creates a per-package GitHub Release with CHANGELOG-derived notes.
-   2. Runs `cargo release publish --workspace --execute --no-confirm --allow-branch 'main,HEAD'` via OIDC trusted publishing — publishes bumped crates in leaf-first order, skipping any whose version is already on crates.io. `HEAD` in the branch allowlist covers the `pull_request:closed` checkout's detached-merge-ref shape; `main` covers `workflow_dispatch` recovery runs.
+   2. Runs `cargo release publish --workspace --execute --no-confirm --allow-branch 'main,HEAD'` via OIDC trusted publishing — publishes bumped crates in leaf-first order, skipping any whose version is already on crates.io. Both allowlist entries are load-bearing: the `pull_request_target` path pins `ref:` to `merge_commit_sha` (a SHA), so `actions/checkout` detaches HEAD and cargo-release sees the branch as `HEAD`; the `workflow_dispatch` path passes the literal `'main'` ref name, so the checkout lands on the `main` branch.
 4. **Watch the cargo-dist workflow.** The `linesmith/v<version>` tag push fires `release.yml`, which:
    1. Runs the `plan` job to compute the 6-target matrix.
    2. Cross-compiles the binary on each target with `fail-fast: false`.
@@ -307,51 +307,60 @@ Day-of-release steps for a maintainer:
    - Verify `cargo install linesmith` from a fresh Rust install.
 6. **Announce.** The GitHub Release body is auto-populated by Knope (CHANGELOG-derived) + cargo-dist (install snippets + download table). Optionally add a narrative post to the README "Release Log" section.
 
-If step 3 or 4 fails partway through, see §Edge cases §Rollback. `knope-release.yml`'s `workflow_dispatch` trigger lets you re-run the release step (the `if:` guard checks `(github.head_ref == 'release' && github.event.pull_request.merged == true) || github.event_name == 'workflow_dispatch'`).
+If step 3 or 4 fails partway through, see §Edge cases §Rollback. `knope-release.yml`'s `workflow_dispatch` trigger lets you re-run any of the three jobs via the `mode` input — `mode=release` (default) reruns tag + crates.io publish; `mode=publish` skips tagging and reruns crates.io only (recovery when tags already exist); `mode=prepare` reruns the release-PR open/update step.
 
 ### Workflow structure
 
-Three workflow files, chained via release-PR merge + git-tag events:
+Two workflow files, chained via release-PR merge + git-tag events:
 
-**`.github/workflows/knope-prepare.yml`** — runs on push to `main` and via `workflow_dispatch`. Opens / force-updates the release PR:
+**`.github/workflows/knope-release.yml`** — single combined workflow with three mutually-exclusive jobs gated on the merged PR's head ref. Runs only on `pull_request_target: closed` events (and `workflow_dispatch` for operator escape). Combined into one file in 2026-05 to eliminate a race where two split-file workflows could both fire on the release-PR squash, with the prepare path reading tag state before the release path had created the new tag (see Change log entry):
 
 ```text
 on:
-  push:
+  pull_request_target:
+    types: [closed]
     branches: [main]
   workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [prepare, release, publish]
+        default: release
 
 jobs:
-  prepare-release:
-    if: github.event.head_commit.author.email != 'linesmith-bot[bot]@users.noreply.github.com'
-    # Author-identity guard skips the bot's own prepare-release commits
-    # so the merge back to main doesn't re-fire. Mints a GitHub App
-    # installation token (BOT_CLIENT_ID / BOT_PRIVATE_KEY) and runs:
+  prepare:
+    if: |
+      (github.event_name == 'pull_request_target' && github.event.pull_request.merged == true &&
+       !(github.event.pull_request.head.ref == 'release' &&
+         github.event.pull_request.head.repo.full_name == github.repository)) ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'prepare')
+    concurrency: { group: knope-release, cancel-in-progress: false }
+    # Mints a GitHub App installation token (BOT_CLIENT_ID / BOT_PRIVATE_KEY)
+    # and runs:
     #   1. `knope prepare-release --verbose` (allow_empty = true) —
     #      stages version bumps, dep-pin rewrites, CHANGELOG entries,
     #      and deletes consumed changesets. No-op when nothing's due.
     #   2. `git diff --quiet HEAD || knope publish-release-pr` —
     #      commits to `release`, force-pushes, opens/updates the PR.
-```
-
-**`.github/workflows/knope-release.yml`** — runs when the `release` PR closes targeting `main` (via the head_ref guard) and via `workflow_dispatch` for re-runs:
-
-```text
-on:
-  pull_request:
-    types: [closed]
-    branches: [main]
-  workflow_dispatch:
-
-jobs:
   release:
-    if: (github.head_ref == 'release' && github.event.pull_request.merged == true) || github.event_name == 'workflow_dispatch'
+    if: |
+      (github.event_name == 'pull_request_target' && github.event.pull_request.merged == true &&
+       github.event.pull_request.head.ref == 'release' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'workflow_dispatch' && inputs.mode == 'release')
+    concurrency: { group: knope-release, cancel-in-progress: false }
     # `knope release --verbose` tags each bumped package as
     # `<crate>/v<version>` and creates per-package GitHub Releases
     # with CHANGELOG-derived notes.
   publish:
     needs: [release]
-    if: <same guard plus always() && (success || skipped)>
+    if: |
+      always() && (needs.release.result == 'success' || needs.release.result == 'skipped') &&
+      ((github.event_name == 'pull_request_target' && github.event.pull_request.merged == true &&
+        github.event.pull_request.head.ref == 'release' &&
+        github.event.pull_request.head.repo.full_name == github.repository) ||
+       (github.event_name == 'workflow_dispatch' && (inputs.mode == 'release' || inputs.mode == 'publish')))
+    concurrency: { group: knope-release, cancel-in-progress: false }
     permissions:
       id-token: write
       contents: read
@@ -359,6 +368,10 @@ jobs:
     # `cargo release publish --workspace --execute --no-confirm`
     # (skips already-published members; leaf-first ordering).
 ```
+
+The `head.repo.full_name == github.repository` guard on the release + publish jobs is load-bearing under `pull_request_target`: a fork can name its source branch `release`, so the `head.ref == 'release'` check alone would match a coincidentally-named fork branch and mint the bot's token to tag commits the maintainer didn't intend to release. The prepare job intentionally omits this guard so fork PRs CAN drive release prep (the bot still has to merge the resulting release PR — human review remains in the loop).
+
+All three jobs share the `knope-release` concurrency group with `cancel-in-progress: false` so a fix/feat PR merging while a release PR is mid-tagging queues its prepare run behind the in-flight release-job, preventing prepare from reading stale tag state.
 
 **`.github/workflows/release.yml`** — runs on `linesmith/v*` tag push (from `knope-release.yml`), via `workflow_dispatch` for manual dry-runs, and via path-filtered `pull_request:` for auto-validation of release-infra changes (per [ADR-0017](../adrs/0017-release-workflow-pr-validation.md)):
 
@@ -421,7 +434,7 @@ curl -LsSf https://github.com/oakoss/linesmith/releases/download/linesmith/v0.2.
 `release.yml` exposes two dry-run paths beyond tag-push (per [ADR-0017](../adrs/0017-release-workflow-pr-validation.md)):
 
 1. **`workflow_dispatch`** — maintainer-triggered from any branch. Use for ad-hoc validation when you want the full matrix before cutting a tag.
-2. **`pull_request` (paths-filtered)** — auto-fires when a PR touches release-infra files (`release.yml`, `dist-workspace.toml`, `Cargo.toml`, `crates/*/Cargo.toml`, `Cargo.lock`). Catches cross-compile breakage from cargo-update / Knope dep-pin updates / dependabot before merge. SHA is the PR head, not the merge SHA. Filter excludes `knope.toml`, `knope-prepare.yml`, and `knope-release.yml` (false coverage — release.yml's matrix doesn't run Knope's code paths). Concurrency cancellation: superseded PR runs cancel automatically.
+2. **`pull_request` (paths-filtered)** — auto-fires when a PR touches release-infra files (`release.yml`, `dist-workspace.toml`, `Cargo.toml`, `crates/*/Cargo.toml`, `Cargo.lock`). Catches cross-compile breakage from cargo-update / Knope dep-pin updates / dependabot before merge. SHA is the PR head, not the merge SHA. Filter excludes `knope.toml` and `knope-release.yml` (false coverage — release.yml's matrix doesn't run Knope's code paths). Concurrency cancellation: superseded PR runs cancel automatically.
 
 Either path:
 
@@ -477,7 +490,7 @@ Follows `AGENTS.md`: workflow changes are tested via dry-run dispatches; pipelin
 ### Workflow tests
 
 - Auto-triggered dry-run on every PR that touches `release.yml`, `dist-workspace.toml`, `Cargo.toml`, `crates/*/Cargo.toml`, or `Cargo.lock` (paths-filtered `pull_request:` trigger per ADR-0017)
-- Manual `workflow_dispatch` dry-run for PRs that touch other release-adjacent files not in the auto-trigger (`knope.toml`, `knope-prepare.yml`, `knope-release.yml`, `ci.yml`, `audit.yml`, `codeql.yml`, etc.) — Knope's config files are intentionally excluded from auto-trigger because `release.yml`'s matrix doesn't run Knope's code paths (false coverage)
+- Manual `workflow_dispatch` dry-run for PRs that touch other release-adjacent files not in the auto-trigger (`knope.toml`, `knope-release.yml`, `ci.yml`, `audit.yml`, `codeql.yml`, etc.) — Knope's config files are intentionally excluded from auto-trigger because `release.yml`'s matrix doesn't run Knope's code paths (false coverage)
 - Matrix-level tests: the cross-compile step runs on every PR (covered by the existing `check` workflow; release.yml reuses the same build matrix)
 - Attestation verification: post-release, a `verify.yml` workflow downloads the released binary, runs `gh attestation verify`, asserts PASS
 
@@ -513,4 +526,5 @@ Criterion benchmarks run pre-release (`mise run bench`). A >10% regression again
 
 - 2026-04-19: initial draft (v0.1). Defines semver posture (pre-1.0 minor-for-breaking), the 7-target platform matrix (macOS/Linux/Windows × x86_64/aarch64 + linux-musl), four installer methods (shell, PowerShell, Homebrew, cargo install), release-plz/cargo-dist responsibility split, release profile settings (matches ADR-0007), supply-chain posture (OIDC trusted publishing, SLSA attestations, pinned action SHAs, `cargo-auditable`), unsigned-binary posture for v0.1, day-of-release runbook, rollback steps, and edge cases. Closes lsm-9sa under epic lsm-c2i.
 - 2026-04-19: license changed from `MIT OR Apache-2.0` to `MIT` to match the repo `LICENSE` swap (MPL-2.0 → MIT). Closes lsm-c2c.
+- 2026-05-26: Combine `knope-prepare.yml` and `knope-release.yml` into a single `knope-release.yml` with three mutually-exclusive jobs (`prepare`, `release`, `publish`) gated on the merged PR's head ref (`lsm-aqdk`). The 2026-05-23 split caused a race when a release PR merged: the squash-merge emitted both a `push: main` event (which fired `knope-prepare.yml`) and a `pull_request: closed` event (which fired `knope-release.yml`), and `knope-prepare` won the queue ahead of `knope-release` creating the new `<pkg>/v*` tag, so prepare's tag-walk saw the previous release as the latest tag and re-claimed the just-released commits into a phantom follow-on release PR (hit during the 0.2.1 ship). Combined shape eliminates the race architecturally — one workflow file, `pull_request_target: closed` trigger, jobs differentiated by `head.ref == 'release'` vs `head.ref != 'release'`. `pull_request_target` (not plain `pull_request`) so the workflow can mint the bot's GitHub App token on merged fork PRs — `pull_request` strips secrets when the PR head is on a fork, which the old `push: main` trigger sidestepped because `push` events run post-merge with secrets available. Safe to use `pull_request_target` here because we only react to `closed + merged == true` (maintainer-approved merge) and check out the base branch (main), never the PR head — no untrusted-contributor code runs with elevated perms. The `workflow_dispatch` input changed from boolean `skip_release` to a `mode` choice (`prepare` | `release` | `publish`); operator escape hatches for all three jobs explicitly accessible. crates.io Trusted Publisher allowlist unaffected (filename `knope-release.yml` retained). No ADR change — ADR-0027's decision (use Knope) stands; only the GitHub Actions wiring is refined.
 - 2026-05-23: v0.2 — Knope migration per ADR-0027. Replaces release-plz with `knope-prepare.yml` (release PR creation) + `knope-release.yml` (tag, GitHub Release, `cargo release publish --workspace`). Adds changeset workflow (`knope document-change`). Per-package tag format `<crate>/v<version>` replaces the bare `v<version>` workspace tag and the release-plz `<crate>-v<version>` per-package form. `release.yml` hand-edits: tag filter widened to include both formats during the transition; host job's GitHub Release creation replaced with `gh release upload --clobber` + `gh release edit --draft=false --latest` to attach to the Knope-created release. `cliff.toml` retired (Knope generates per-crate CHANGELOGs internally). Doctor self-update parse fix lands alongside (handles `<pkg>/v*` and `<pkg>-v*` prefix forms). Closes lsm-llij.
