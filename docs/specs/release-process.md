@@ -138,7 +138,7 @@ Rust-toolchain required. Compiles from source; users pay the ~60-90s compile tim
 
 ### CHANGELOG contract
 
-- Format: [Keep a Changelog](https://keepachangelog.com/) structure, written by Knope's `PrepareRelease` step from Conventional Commits + changeset files
+- Format: Knope's `PrepareRelease` default — `## <version> (<date>)` headers, `### <Section>` subheadings (Features / Fixes / Refactoring / etc.), one bullet per commit with the conventional-commit scope **bolded** and a SHA link. Follows Keep-a-Changelog structure except headers use bare semver (not bracketed `[X.Y.Z]`) so Knope's `parse_title` can find prior sections and insert with proper Markdown spacing. Driven by Conventional Commits + changeset files.
 - Generation: `knope-prepare.yml` runs `knope prepare-release` on every push to `main`. Knope walks every conventional commit since each package's last `<pkg>/v*` tag plus every changeset file under `.changeset/`, computes the appropriate bump per package, writes the new version into each `versioned_files` entry, prepends an entry to the package's CHANGELOG, deletes consumed changeset files, then opens/updates the `release` PR. The maintainer reviews and merges.
 - Per-package CHANGELOGs:
   - `CHANGELOG.md` (root) — `linesmith` binary
