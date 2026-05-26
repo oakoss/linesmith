@@ -170,7 +170,7 @@ Run `knope document-change` to scaffold the file interactively. Knope deletes co
 
 ### Knope + cargo-dist split
 
-Three workflows are required because Knope creates the release PR + tags + GitHub Releases, then cargo-dist reacts to the binary's tag:
+Two GitHub Actions workflows are required because Knope creates the release PR + tags + GitHub Releases, then cargo-dist reacts to the binary's tag:
 
 | Concern                             | Owner         | Workflow                            | Fires on                         |
 | ----------------------------------- | ------------- | ----------------------------------- | -------------------------------- |
