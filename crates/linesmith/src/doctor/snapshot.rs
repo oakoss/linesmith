@@ -1082,8 +1082,12 @@ pub(super) fn classify_update_response_inner(
             return None;
         };
         let Some(parsed) = parse_binary_release_tag(tag) else {
+            // {tag:?} routes through Debug so a tampered `tag_name`
+            // (control bytes decoded out of `` escapes by
+            // serde_json) can't paint terminal output via the debug
+            // log channel.
             linesmith_core::lsm_debug!(
-                "doctor.probe: entry {idx} skipped — `{tag}` is not a linesmith binary release tag"
+                "doctor.probe: entry {idx} skipped — {tag:?} is not a linesmith binary release tag"
             );
             return None;
         };
@@ -1093,7 +1097,7 @@ pub(super) fn classify_update_response_inner(
         return DoctorUpdateProbe::NoBinaryRelease { scanned };
     };
     linesmith_core::lsm_debug!(
-        "doctor.probe: matched upstream tag `{tag_name}` ({}.{}.{}) — comparing against local {}.{}.{}",
+        "doctor.probe: matched upstream tag {tag_name:?} ({}.{}.{}) — comparing against local {}.{}.{}",
         remote.0,
         remote.1,
         remote.2,
