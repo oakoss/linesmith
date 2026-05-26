@@ -732,14 +732,18 @@ pub enum DoctorUpdateProbe {
     /// `/releases` returned a well-formed array but no entry's
     /// `tag_name` parsed as a linesmith binary release (Knope's
     /// `linesmith/v*`, release-plz's legacy `linesmith-v*`, or the
-    /// pre-monorepo bare `v*`). Most likely cause: many library
-    /// (`linesmith-core/v*`, `linesmith-plugin/v*`) bumps shipped
-    /// between binary releases and pushed the binary tag off the
-    /// first page. `scanned` carries how many entries were inspected;
-    /// `scanned == 0` is the degenerate case of an empty `/releases`
-    /// array (e.g. a freshly-created repo with no published
-    /// releases), distinguished from `scanned > 0` (library tags or
-    /// other non-binary entries filled the page).
+    /// pre-monorepo bare `v*`). `scanned` is the actual array length
+    /// (`<= snapshot::UPDATE_PROBE_PAGE_SIZE`); the renderer reads
+    /// it as a three-state axis:
+    ///
+    /// - `scanned == 0` — empty `/releases` (freshly-created repo
+    ///   with no published releases)
+    /// - `0 < scanned < page_size` — partial page; all published
+    ///   releases were inspected and none was binary. Bumping the
+    ///   page size can't help.
+    /// - `scanned >= page_size` — full page; the binary tag may
+    ///   exist beyond the first page (library releases pushed it
+    ///   off). The hint surfaces the page-size knob to maintainers.
     NoBinaryRelease { scanned: usize },
 }
 
@@ -2739,23 +2743,29 @@ fn check_self_update_available(probe: &DoctorUpdateProbe) -> CheckResult {
             "GitHub releases API may have changed shape; file a linesmith bug if this persists",
         ),
         DoctorUpdateProbe::NoBinaryRelease { scanned } => {
-            let label = if *scanned == 0 {
-                format!(
-                    "GitHub /releases is empty (running v{})",
-                    env!("CARGO_PKG_VERSION")
+            let page_size = snapshot::UPDATE_PROBE_PAGE_SIZE;
+            let version = env!("CARGO_PKG_VERSION");
+            let (label, hint) = if *scanned == 0 {
+                (
+                    format!("GitHub /releases is empty (running v{version})"),
+                    "no published releases on GitHub yet; check https://github.com/oakoss/linesmith/releases".to_string(),
+                )
+            } else if *scanned < page_size {
+                // Partial page: all published releases fit on one page
+                // and none of them parsed as a binary tag. Bumping
+                // UPDATE_PROBE_PAGE_SIZE wouldn't help — there's nothing
+                // past the page to find.
+                (
+                    format!("No linesmith binary release among the {scanned} published GitHub releases (running v{version})"),
+                    "all published releases are non-binary; check https://github.com/oakoss/linesmith/releases".to_string(),
                 )
             } else {
-                format!(
-                    "No linesmith binary release found in the {scanned} most recent GitHub releases (running v{})",
-                    env!("CARGO_PKG_VERSION")
-                )
-            };
-            let hint = if *scanned == 0 {
-                "no published releases on GitHub yet; check https://github.com/oakoss/linesmith/releases".to_string()
-            } else {
-                format!(
-                    "check https://github.com/oakoss/linesmith/releases for the latest binary release (maintainers: bump UPDATE_PROBE_PAGE_SIZE, currently {}, if library releases are pushing binary tags off the first page)",
-                    snapshot::UPDATE_PROBE_PAGE_SIZE,
+                // Full page (>= page_size entries): the binary tag may
+                // have been pushed off the first page by library
+                // releases. Maintainers can bump UPDATE_PROBE_PAGE_SIZE.
+                (
+                    format!("No linesmith binary release in the {scanned} most recent GitHub releases (running v{version})"),
+                    format!("check https://github.com/oakoss/linesmith/releases for the latest binary release (maintainers: bump UPDATE_PROBE_PAGE_SIZE, currently {page_size}, if library releases are pushing binary tags off the first page)"),
                 )
             };
             CheckResult::warn("self.update_available", label, hint)
@@ -3872,6 +3882,39 @@ mod tests {
         assert!(
             !hint.contains("UPDATE_PROBE_PAGE_SIZE"),
             "scanned==0 hint must NOT mention the page-size knob (it can't help): {hint:?}"
+        );
+    }
+
+    #[test]
+    fn self_update_available_warns_distinctly_on_partial_page() {
+        // `0 < scanned < UPDATE_PROBE_PAGE_SIZE`: the repo has fewer
+        // releases than the page can hold, so the binary tag isn't
+        // hidden behind pagination — it doesn't exist among the
+        // published releases. Bumping the page size can't help; the
+        // renderer must drop that pointer and frame it as "all
+        // published releases are non-binary".
+        // Compile-time tripwire: if a future bumper drops the page
+        // size to 5 or below, `scanned=5` would become a full-page
+        // case and this test would exercise the wrong renderer branch.
+        const _: () = assert!(snapshot::UPDATE_PROBE_PAGE_SIZE > 5);
+        let mut env = DoctorEnv::healthy();
+        env.update_probe = DoctorUpdateProbe::NoBinaryRelease { scanned: 5 };
+        let r = build_report(&env);
+        let u = find_check(&r, "self.update_available");
+        assert_eq!(u.severity(), Severity::Warn);
+        assert!(
+            u.label().contains("among the 5 published"),
+            "partial-page label should frame as all published, not 'most recent': {}",
+            u.label()
+        );
+        let hint = u.hint().expect("NoBinaryRelease must carry a hint");
+        assert!(
+            !hint.contains("UPDATE_PROBE_PAGE_SIZE"),
+            "partial-page hint must NOT mention the page-size knob (it can't help): {hint:?}"
+        );
+        assert!(
+            hint.contains("github.com/oakoss/linesmith/releases"),
+            "partial-page hint should point at the releases URL: {hint:?}"
         );
     }
 

@@ -813,9 +813,12 @@ fn collect_unexpected_endpoint_keys(value: &serde_json::Value) -> Vec<String> {
 }
 
 /// How many entries to request from `/releases`. The first page is
-/// expected to contain at least one linesmith binary release; the
-/// `NoBinaryRelease` outcome carries this number so the WARN hint
-/// can point a future bumper at the right knob.
+/// expected to contain at least one linesmith binary release. The
+/// `NoBinaryRelease` outcome carries the array length GitHub returned
+/// (which is `<= UPDATE_PROBE_PAGE_SIZE` — fewer entries exist if the
+/// repo has fewer than `per_page` releases total). The WARN hint
+/// surfaces this constant by name so a future bumper sees the right
+/// knob.
 pub(super) const UPDATE_PROBE_PAGE_SIZE: usize = 30;
 
 /// GitHub releases endpoint for the canonical linesmith repo. Pinned
