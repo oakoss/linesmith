@@ -812,29 +812,43 @@ fn collect_unexpected_endpoint_keys(value: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+/// How many entries to request from `/releases`. The first page is
+/// expected to contain at least one linesmith binary release; the
+/// `NoBinaryRelease` outcome carries this number so the WARN hint
+/// can point a future bumper at the right knob.
+pub(super) const UPDATE_PROBE_PAGE_SIZE: usize = 30;
+
 /// GitHub releases endpoint for the canonical linesmith repo. Pinned
 /// here (rather than read from a config knob) because it's part of
 /// the doctor's contract: every install of `linesmith` checks the
-/// same upstream coordinate.
-const GITHUB_RELEASES_LATEST_URL: &str =
-    "https://api.github.com/repos/oakoss/linesmith/releases/latest";
+/// same upstream coordinate. Uses `/releases?per_page=N` (rather than
+/// `/releases/latest`) because Knope produces per-package GitHub
+/// Releases (`linesmith-core/v*`, `linesmith-plugin/v*`,
+/// `linesmith/v*`) and `/latest` can resolve to a library tag whose
+/// version is unrelated to the binary's `CARGO_PKG_VERSION` — see
+/// ADR-0027. The `per_page` literal must equal
+/// `UPDATE_PROBE_PAGE_SIZE`; the `releases_url_pins_repo_endpoint_and_page_size`
+/// test pins them along with the repo coordinate and endpoint shape.
+pub(super) const GITHUB_RELEASES_URL: &str =
+    "https://api.github.com/repos/oakoss/linesmith/releases?per_page=30";
 
 /// Spec §Timing: ~2s timeout for the network probe so doctor's
 /// total budget stays within the published worst case.
 const UPDATE_PROBE_TIMEOUT_SECS: u64 = 2;
 
-/// Cap on the GitHub response body. The `/releases/latest` payload
-/// bundles full release notes + every asset's metadata, so a current
-/// response runs ~41 KiB (measured 2026-04-30 via `gh api
-/// repos/oakoss/linesmith/releases/latest | wc -c`). 256 KiB keeps
+/// Cap on the GitHub response body. Each release in the `/releases`
+/// array bundles full notes + every asset's metadata (~41 KiB
+/// measured 2026-04-30 via `gh api repos/oakoss/linesmith/releases/latest
+/// | wc -c`), so a 30-entry page lands around 1.2 MiB. 4 MiB keeps
 /// the MITM/OOM protection rationale from `MAX_RESPONSE_BYTES` and
-/// leaves ~6× growth headroom; an earlier 32 KiB cap truncated the
-/// live response mid-JSON and surfaced as a spurious ParseError
-/// WARN. Truncation is now distinguished from short bodies (see the
+/// leaves ~3× headroom for releases that ship long-form notes; an
+/// earlier 32 KiB cap (single-release era) truncated the live
+/// response mid-JSON and surfaced as a spurious ParseError WARN.
+/// Truncation is distinguished from short bodies (see the
 /// `take(N + 1)` + `body.len() > N` check in `snapshot_update_probe`)
 /// so a future cap-tuner gets a clear "bump UPDATE_PROBE_MAX_BYTES"
 /// signal instead of a misleading parse error.
-const UPDATE_PROBE_MAX_BYTES: u64 = 256 * 1024;
+pub(super) const UPDATE_PROBE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Fire one GET against the GitHub releases API and classify the
 /// outcome per spec §Self. Always-run (no skip path); transport
@@ -856,7 +870,7 @@ pub(super) fn snapshot_update_probe() -> DoctorUpdateProbe {
     let user_agent = format!("linesmith/{}", env!("CARGO_PKG_VERSION"));
 
     let result = agent
-        .get(GITHUB_RELEASES_LATEST_URL)
+        .get(GITHUB_RELEASES_URL)
         .config()
         .timeout_global(Some(Duration::from_secs(UPDATE_PROBE_TIMEOUT_SECS)))
         .build()
@@ -935,10 +949,25 @@ pub(super) fn classify_update_response(body: &[u8], current_version: &str) -> Do
     classify_update_response_inner(body, current_version, false)
 }
 
-/// Pure classifier for the GitHub releases response. Comparison is
+/// Pure classifier for the GitHub releases response. Expects the
+/// top-level JSON value to be the array shape returned by
+/// `/releases?per_page=N` (reverse-chronological by `created_at`),
+/// filters to entries whose `tag_name` parses as a linesmith binary
+/// release, and compares the most recent such entry against
+/// `current_version` (normally `CARGO_PKG_VERSION`). Comparison is
 /// "newer" iff the parsed upstream version-tuple is strictly greater
-/// than the local one (`current_version`, normally
-/// `CARGO_PKG_VERSION`).
+/// than the local one.
+///
+/// Library-package tags (`linesmith-core/v*`, `linesmith-plugin/v*`,
+/// and their legacy `linesmith-{core,plugin}-v*` forms) are silently
+/// skipped by the filter — `parse_binary_release_tag` returns `None`
+/// for them, so the comparator only ever sees binary tags. Each skip
+/// is logged at `Level::Debug` via `lsm_debug!` so `LINESMITH_LOG=debug`
+/// surfaces what was rejected and why. When the page contains no
+/// parseable binary tag, the outcome is `NoBinaryRelease`,
+/// distinguishing "no linesmith binary in the recent N releases"
+/// from "couldn't reach GitHub" (`TransportError`) and "GitHub
+/// returned an unexpected shape" (`ParseError`).
 ///
 /// `truncated` is `true` when the reader hit `UPDATE_PROBE_MAX_BYTES
 /// + 1` bytes, meaning the upstream response was larger than the cap
@@ -969,6 +998,13 @@ pub(super) fn classify_update_response_inner(
             ),
         };
     }
+    // Validate CARGO_PKG_VERSION before the array walk so a malformed
+    // local version surfaces regardless of upstream outcome.
+    let Some(local) = parse_three_part_version(current_version) else {
+        return DoctorUpdateProbe::ParseError {
+            message: format!("local version {current_version} unparseable as MAJOR.MINOR.PATCH"),
+        };
+    };
     let value: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
@@ -977,44 +1013,113 @@ pub(super) fn classify_update_response_inner(
             }
         }
     };
-    let Some(tag_name) = value.get("tag_name").and_then(|v| v.as_str()) else {
+    let Some(entries) = value.as_array() else {
         return DoctorUpdateProbe::ParseError {
-            message: "response missing `tag_name` field".to_string(),
+            message: format!(
+                "response was not a JSON array (got {})",
+                json_shape_name(&value)
+            ),
         };
     };
-    let safe_tag = sanitize_tag(tag_name);
-    let local = parse_three_part_version(current_version);
-    let remote = parse_three_part_version(tag_name);
-    match (remote, local) {
-        // Both parse: numeric semver compare.
-        (Some(r), Some(l)) if r > l => DoctorUpdateProbe::Newer { latest: safe_tag },
-        (Some(_), Some(_)) => DoctorUpdateProbe::Latest,
-        // Local couldn't parse: treat as ParseError on our own build
-        // (CARGO_PKG_VERSION came out malformed somehow). Surface it
-        // as a probe ParseError so the WARN points at a real
-        // diagnosis instead of silently passing.
-        (Some(_), None) => DoctorUpdateProbe::ParseError {
-            message: format!("local version {current_version} unparseable as MAJOR.MINOR.PATCH"),
-        },
-        // Remote parsed-shape disagrees with local — we can't compare
-        // semantically. Past versions of this code fell back to string
-        // equality here, which silently downgraded to PASS or invented
-        // a `Newer` claim from a tag the comparator never validated.
-        // Spec WARN with a clear "couldn't compare" diagnostic instead.
-        (None, Some(_)) => DoctorUpdateProbe::ParseError {
-            message: format!("remote tag {safe_tag} unparseable as MAJOR.MINOR.PATCH"),
-        },
-        // Neither parsed (e.g. both sides date-based or monorepo-
-        // prefixed). String equality is the only meaningful comparator
-        // we can offer; the Newer branch surfaces the upstream tag
-        // verbatim so the user can decide.
-        (None, None) => {
-            if tag_name == current_version || tag_name.strip_prefix('v') == Some(current_version) {
-                DoctorUpdateProbe::Latest
-            } else {
-                DoctorUpdateProbe::Newer { latest: safe_tag }
+    let scanned = entries.len();
+    let chosen = entries.iter().enumerate().find_map(|(idx, entry)| {
+        // The old `/releases/latest` endpoint excluded drafts and
+        // prereleases; the new `/releases` list does not. Skip them
+        // explicitly so doctor doesn't tell stable-build users to
+        // upgrade to an RC tag they can't `brew upgrade` to.
+        //
+        // Match on the raw Value so a schema regression (`draft: 42`,
+        // `prerelease: "true"`) is visible in the debug log rather
+        // than silently coerced into "stable release". Both fields
+        // skip on unknown-shape because `find_map` short-circuits on
+        // the first satisfier — a wrongly-typed flag on an index-0
+        // entry would otherwise win against later stable entries and
+        // ship as "Newer <tag> — run brew upgrade" pointing at a tag
+        // brew can't install.
+        match entry.get("draft") {
+            None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(false)) => {}
+            Some(serde_json::Value::Bool(true)) => {
+                linesmith_core::lsm_debug!(
+                    "doctor.probe: entry {idx} skipped — draft release"
+                );
+                return None;
+            }
+            Some(other) => {
+                linesmith_core::lsm_debug!(
+                    "doctor.probe: entry {idx} skipped — `draft` field is {}, not bool (conservative skip)",
+                    json_shape_name(other)
+                );
+                return None;
             }
         }
+        match entry.get("prerelease") {
+            None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(false)) => {}
+            Some(serde_json::Value::Bool(true)) => {
+                linesmith_core::lsm_debug!(
+                    "doctor.probe: entry {idx} skipped — prerelease"
+                );
+                return None;
+            }
+            Some(other) => {
+                linesmith_core::lsm_debug!(
+                    "doctor.probe: entry {idx} skipped — `prerelease` field is {}, not bool (conservative skip)",
+                    json_shape_name(other)
+                );
+                return None;
+            }
+        }
+        let Some(tag_value) = entry.get("tag_name") else {
+            linesmith_core::lsm_debug!(
+                "doctor.probe: entry {idx} skipped — no `tag_name` field"
+            );
+            return None;
+        };
+        let Some(tag) = tag_value.as_str() else {
+            linesmith_core::lsm_debug!(
+                "doctor.probe: entry {idx} skipped — `tag_name` is {}, not a string",
+                json_shape_name(tag_value)
+            );
+            return None;
+        };
+        let Some(parsed) = parse_binary_release_tag(tag) else {
+            linesmith_core::lsm_debug!(
+                "doctor.probe: entry {idx} skipped — `{tag}` is not a linesmith binary release tag"
+            );
+            return None;
+        };
+        Some((tag, parsed))
+    });
+    let Some((tag_name, remote)) = chosen else {
+        return DoctorUpdateProbe::NoBinaryRelease { scanned };
+    };
+    linesmith_core::lsm_debug!(
+        "doctor.probe: matched upstream tag `{tag_name}` ({}.{}.{}) — comparing against local {}.{}.{}",
+        remote.0,
+        remote.1,
+        remote.2,
+        local.0,
+        local.1,
+        local.2,
+    );
+    let safe_tag = sanitize_tag(tag_name);
+    if remote > local {
+        DoctorUpdateProbe::Newer { latest: safe_tag }
+    } else {
+        DoctorUpdateProbe::Latest
+    }
+}
+
+/// Name of a serde_json `Value`'s top-level shape, for diagnostic
+/// messages. Returning a static string keeps the diagnostic short and
+/// avoids leaking body fragments.
+fn json_shape_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 
@@ -1030,11 +1135,8 @@ fn sanitize_tag(s: &str) -> String {
 
 /// Best-effort `vMAJOR.MINOR.PATCH[-pre][+build]` parser. `None` for
 /// any input that doesn't yield three numeric segments. Strips a
-/// single leading `v` (GitHub's convention), truncates the patch
-/// segment at the first non-digit so `1.2.3-rc1` parses as `(1,2,3)`,
-/// and routes through `strip_package_prefix` so per-package tag forms
-/// (`linesmith/v*`, legacy `linesmith-v*`) from `/releases/latest`
-/// parse cleanly per ADR-0027.
+/// single leading `v` (GitHub's convention) and truncates the patch
+/// segment at the first non-digit so `1.2.3-rc1` parses as `(1,2,3)`.
 ///
 /// Pre-release suffixes are silently dropped: `1.2.3-rc1` and `1.2.3`
 /// compare equal. The `Ord` derive on `(u32, u32, u32)` does NOT
@@ -1042,8 +1144,9 @@ fn sanitize_tag(s: &str) -> String {
 /// doctor` (we want to know if the user is broadly behind, not whether
 /// their `-rc1` predates the published stable). A future need for full
 /// semver semantics should pull in the `semver` crate.
+///
+/// The binary-tag filter predicate lives in [`parse_binary_release_tag`].
 fn parse_three_part_version(s: &str) -> Option<(u32, u32, u32)> {
-    let s = strip_package_prefix(s);
     let s = s.strip_prefix('v').unwrap_or(s);
     let mut parts = s.splitn(3, '.');
     let major: u32 = parts.next()?.parse().ok()?;
@@ -1060,26 +1163,60 @@ fn parse_three_part_version(s: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
+/// Filter predicate for the array-walking classifier: parse `s` as a
+/// linesmith **binary** release tag, returning the version tuple iff
+/// the input matches one of the three recognized binary forms:
+///
+/// - Knope's `linesmith/v<ver>` (ADR-0027)
+/// - release-plz's legacy `linesmith-v<digit>...`
+/// - Pre-monorepo bare `v<digit>...`
+///
+/// `None` MUST mean "not a linesmith binary release" — library tags
+/// (`linesmith-core/v*`, `linesmith-plugin/v*`, and their legacy
+/// `-v` variants) and any other tag shape land here. Returning `Some`
+/// for a library tag would cause `classify_update_response_inner` to
+/// mis-classify library bumps as binary updates.
+fn parse_binary_release_tag(s: &str) -> Option<(u32, u32, u32)> {
+    parse_three_part_version(strip_binary_package_prefix(s)?)
+}
+
 /// Strip the binary-package prefix from a GitHub release tag — Knope's
-/// `linesmith/v<ver>` (ADR-0027) or release-plz's legacy
-/// `linesmith-v<ver>`. Returns the input unchanged on no match.
+/// `linesmith/v<ver>` (ADR-0027), release-plz's legacy
+/// `linesmith-v<digit>...`, or the pre-monorepo bare `v<digit>...`.
+/// Returns `None` for any input that isn't a recognized binary tag
+/// shape; the array-walking classifier uses that as the skip signal.
 ///
 /// Library-package tags (`linesmith-core/v*`, `linesmith-plugin/v*`,
-/// and their legacy `-v` variants) are deliberately NOT normalized:
+/// and their legacy `-v` variants) deliberately return `None`:
 /// comparing a library version against the binary's `CARGO_PKG_VERSION`
 /// would produce a misleading "Newer binary available" WARN when only
-/// a library bumped. They fall through to the `parse_three_part_version`
-/// None branch and surface as `ParseError` — non-actionable but not a
-/// false update prompt. Per-package fetch-time filtering is tracked in
-/// lsm-ghxy.
-fn strip_package_prefix(s: &str) -> &str {
+/// a library bumped.
+///
+/// **Adding a new binary package**: if a second `linesmith` binary ever
+/// ships (e.g. `linesmith-tui/v*`), its prefix must be added here.
+/// Otherwise its releases silently classify as `NoBinaryRelease` and
+/// the doctor reports "no linesmith binary release found" even when
+/// the new binary's tag sits at the head of `/releases`.
+fn strip_binary_package_prefix(s: &str) -> Option<&str> {
+    // All three branches gate on `v<digit>...` so an attacker-controlled
+    // `linesmith/anything` or `linesmith/1.2.3` can't bypass the predicate
+    // if `parse_three_part_version` ever gets relaxed to accept non-`v`
+    // inputs. The two `linesmith` branches early-return on mismatch so a
+    // `linesmith/notes` tag doesn't fall through to the bare-`v` arm.
     if let Some(rest) = s.strip_prefix("linesmith/") {
-        return rest;
+        if rest.starts_with('v') && rest[1..].starts_with(|c: char| c.is_ascii_digit()) {
+            return Some(rest);
+        }
+        return None;
     }
     if let Some(rest) = s.strip_prefix("linesmith-") {
         if rest.starts_with('v') && rest[1..].starts_with(|c: char| c.is_ascii_digit()) {
-            return rest;
+            return Some(rest);
         }
+        return None;
     }
-    s
+    if s.starts_with('v') && s[1..].starts_with(|c: char| c.is_ascii_digit()) {
+        return Some(s);
+    }
+    None
 }

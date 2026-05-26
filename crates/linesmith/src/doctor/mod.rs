@@ -703,7 +703,7 @@ pub struct GitContextSummary {
 /// Outcome of probing the GitHub releases API for the latest
 /// linesmith release. Per spec §Self the severity mapping is
 /// `Latest` → PASS and every other variant → WARN; never FAIL, so an
-/// offline doctor run still exits 0. The four-variant split lets the
+/// offline doctor run still exits 0. The five-variant split lets the
 /// renderer pick a hint targeted at the actual failure mode rather
 /// than a generic "couldn't check upstream".
 #[derive(Debug, Clone)]
@@ -729,6 +729,18 @@ pub enum DoctorUpdateProbe {
     /// API shape changed" rather than "no network". `message` is
     /// clamped the same way as `TransportError`.
     ParseError { message: String },
+    /// `/releases` returned a well-formed array but no entry's
+    /// `tag_name` parsed as a linesmith binary release (Knope's
+    /// `linesmith/v*`, release-plz's legacy `linesmith-v*`, or the
+    /// pre-monorepo bare `v*`). Most likely cause: many library
+    /// (`linesmith-core/v*`, `linesmith-plugin/v*`) bumps shipped
+    /// between binary releases and pushed the binary tag off the
+    /// first page. `scanned` carries how many entries were inspected;
+    /// `scanned == 0` is the degenerate case of an empty `/releases`
+    /// array (e.g. a freshly-created repo with no published
+    /// releases), distinguished from `scanned > 0` (library tags or
+    /// other non-binary entries filled the page).
+    NoBinaryRelease { scanned: usize },
 }
 
 /// Outcome of attempting to read + parse the resolved config file.
@@ -2726,6 +2738,28 @@ fn check_self_update_available(probe: &DoctorUpdateProbe) -> CheckResult {
             format!("GitHub releases response unrecognized: {message}"),
             "GitHub releases API may have changed shape; file a linesmith bug if this persists",
         ),
+        DoctorUpdateProbe::NoBinaryRelease { scanned } => {
+            let label = if *scanned == 0 {
+                format!(
+                    "GitHub /releases is empty (running v{})",
+                    env!("CARGO_PKG_VERSION")
+                )
+            } else {
+                format!(
+                    "No linesmith binary release found in the {scanned} most recent GitHub releases (running v{})",
+                    env!("CARGO_PKG_VERSION")
+                )
+            };
+            let hint = if *scanned == 0 {
+                "no published releases on GitHub yet; check https://github.com/oakoss/linesmith/releases".to_string()
+            } else {
+                format!(
+                    "check https://github.com/oakoss/linesmith/releases for the latest binary release (maintainers: bump UPDATE_PROBE_PAGE_SIZE, currently {}, if library releases are pushing binary tags off the first page)",
+                    snapshot::UPDATE_PROBE_PAGE_SIZE,
+                )
+            };
+            CheckResult::warn("self.update_available", label, hint)
+        }
     }
 }
 
@@ -3262,6 +3296,12 @@ mod tests {
         };
         envs.push(("self.update_parse_error", env));
 
+        let mut env = DoctorEnv::healthy();
+        env.update_probe = DoctorUpdateProbe::NoBinaryRelease {
+            scanned: snapshot::UPDATE_PROBE_PAGE_SIZE,
+        };
+        envs.push(("self.update_no_binary_release", env));
+
         // --- Self/binary_integrity WARN label ---
         let mut env = DoctorEnv::healthy();
         env.binary_build_sha = None;
@@ -3775,6 +3815,63 @@ mod tests {
             u.hint().is_some_and(|h| h.contains("file a linesmith bug")),
             "parse-error hint should point at filing a bug: {:?}",
             u.hint()
+        );
+    }
+
+    #[test]
+    fn self_update_available_warns_on_no_binary_release() {
+        let scanned = snapshot::UPDATE_PROBE_PAGE_SIZE;
+        let mut env = DoctorEnv::healthy();
+        env.update_probe = DoctorUpdateProbe::NoBinaryRelease { scanned };
+        let r = build_report(&env);
+        let u = find_check(&r, "self.update_available");
+        assert_eq!(u.severity(), Severity::Warn);
+        assert!(
+            u.label().contains(&scanned.to_string()),
+            "label should surface the scanned count: {}",
+            u.label()
+        );
+        assert!(
+            u.label().contains(env!("CARGO_PKG_VERSION")),
+            "label should surface the running version so users can sanity-check: {}",
+            u.label()
+        );
+        let hint = u.hint().expect("NoBinaryRelease must carry a hint");
+        assert!(
+            hint.contains("github.com/oakoss/linesmith/releases"),
+            "hint must lead with the user-actionable releases URL: {hint:?}"
+        );
+        assert!(
+            hint.contains("UPDATE_PROBE_PAGE_SIZE") && hint.contains(&scanned.to_string()),
+            "hint must name the page-size knob and surface its current value: {hint:?}"
+        );
+        assert_eq!(
+            r.exit_code(),
+            0,
+            "no-binary-release WARN must not promote exit code"
+        );
+    }
+
+    #[test]
+    fn self_update_available_warns_distinctly_when_releases_is_empty() {
+        // `scanned == 0` is the degenerate case — an empty /releases
+        // array means the repo has no published releases yet, not that
+        // library tags pushed the binary off the first page. Pointing
+        // users at the page-size knob would be misleading; the renderer
+        // must drop that pointer and lead with "no published releases yet".
+        let mut env = DoctorEnv::healthy();
+        env.update_probe = DoctorUpdateProbe::NoBinaryRelease { scanned: 0 };
+        let r = build_report(&env);
+        let u = find_check(&r, "self.update_available");
+        assert_eq!(u.severity(), Severity::Warn);
+        let hint = u.hint().expect("NoBinaryRelease must carry a hint");
+        assert!(
+            hint.contains("no published releases"),
+            "scanned==0 hint should lead with the empty-releases framing: {hint:?}"
+        );
+        assert!(
+            !hint.contains("UPDATE_PROBE_PAGE_SIZE"),
+            "scanned==0 hint must NOT mention the page-size knob (it can't help): {hint:?}"
         );
     }
 
@@ -7259,7 +7356,7 @@ segments = ["model", { type = "git_branch", merge = true }]
 
     #[test]
     fn classify_update_response_returns_latest_when_tag_matches_local() {
-        let body = br#"{"tag_name":"v1.2.3","name":"linesmith 1.2.3"}"#;
+        let body = br#"[{"tag_name":"v1.2.3","name":"linesmith 1.2.3"}]"#;
         match classify_update_response(body, "1.2.3") {
             DoctorUpdateProbe::Latest => {}
             other => panic!("expected Latest, got {other:?}"),
@@ -7270,7 +7367,7 @@ segments = ["model", { type = "git_branch", merge = true }]
     fn classify_update_response_returns_latest_when_local_is_newer() {
         // Dev pull from main, ahead of the latest published release
         // (local 1.3.0 vs published 1.2.3).
-        let body = br#"{"tag_name":"v1.2.3"}"#;
+        let body = br#"[{"tag_name":"v1.2.3"}]"#;
         match classify_update_response(body, "1.3.0") {
             DoctorUpdateProbe::Latest => {}
             other => panic!("expected Latest (local newer), got {other:?}"),
@@ -7279,7 +7376,7 @@ segments = ["model", { type = "git_branch", merge = true }]
 
     #[test]
     fn classify_update_response_returns_newer_when_remote_is_higher() {
-        let body = br#"{"tag_name":"v2.0.0"}"#;
+        let body = br#"[{"tag_name":"v2.0.0"}]"#;
         match classify_update_response(body, "1.2.3") {
             DoctorUpdateProbe::Newer { latest } => {
                 assert_eq!(latest, "v2.0.0", "tag_name preserved verbatim");
@@ -7300,13 +7397,135 @@ segments = ["model", { type = "git_branch", merge = true }]
     }
 
     #[test]
-    fn classify_update_response_returns_parse_error_when_tag_name_missing() {
-        let body = br#"{"name":"some release"}"#;
+    fn classify_update_response_returns_parse_error_when_body_is_not_array() {
+        // `/releases/latest` used to return a single object; this test
+        // pins the array-shape requirement of the new probe so a
+        // mis-aimed URL (or a GitHub API regression) doesn't silently
+        // misclassify a single-object body.
+        let body = br#"{"tag_name":"v1.2.3"}"#;
         match classify_update_response(body, "1.2.3") {
             DoctorUpdateProbe::ParseError { message } => {
-                assert!(message.contains("tag_name"), "diagnostic: {message}");
+                assert!(
+                    message.contains("JSON array"),
+                    "diagnostic should explain the expected shape: {message}"
+                );
             }
-            other => panic!("expected ParseError for missing tag_name, got {other:?}"),
+            other => panic!("expected ParseError for non-array body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_update_response_names_top_level_shape_in_not_array_diagnostic() {
+        // The diagnostic must name the offending JSON shape so a future
+        // `json_shape_name` regression (e.g. returning "unknown" for every
+        // input) doesn't reduce every wrong-shape probe to the same
+        // generic error. Captive-portal proxies and API regressions
+        // surface very differently — preserving the shape name lets a
+        // user instantly distinguish them.
+        for (body, shape) in [
+            (b"{}" as &[u8], "object"),
+            (br#""x""# as &[u8], "string"),
+            (b"42" as &[u8], "number"),
+            (b"null" as &[u8], "null"),
+            (b"true" as &[u8], "boolean"),
+        ] {
+            match classify_update_response(body, "1.2.3") {
+                DoctorUpdateProbe::ParseError { message } => {
+                    assert!(
+                        message.contains(shape),
+                        "diagnostic should name `{shape}` shape: {message}"
+                    );
+                    assert!(
+                        message.contains("JSON array"),
+                        "diagnostic should still explain the expected shape: {message}"
+                    );
+                }
+                other => panic!("expected ParseError for {body:?} ({shape}), got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_update_response_skips_prerelease_and_draft_entries() {
+        // The old `/releases/latest` endpoint excluded prereleases and
+        // drafts; the new `/releases` list does not. Without explicit
+        // filtering, doctor would tell stable-build users to upgrade to
+        // an RC tag they can't `brew upgrade` to. This test pins that
+        // both flags route the entry to the skip path even when its
+        // `tag_name` parses as a higher binary version.
+        let body = br#"[
+            {"tag_name":"linesmith/v0.4.0-rc1","prerelease":true},
+            {"tag_name":"linesmith/v0.4.0-draft","draft":true},
+            {"tag_name":"linesmith/v0.2.5"}
+        ]"#;
+        match classify_update_response(body, "0.2.0") {
+            DoctorUpdateProbe::Newer { latest } => {
+                assert_eq!(
+                    latest, "linesmith/v0.2.5",
+                    "prerelease/draft entries must be skipped even when they parse as a higher version"
+                );
+            }
+            other => panic!("expected Newer with linesmith/v0.2.5, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_update_response_conservatively_skips_non_bool_prerelease() {
+        // A `prerelease` field of the wrong JSON type (string, number)
+        // is a schema regression. Default: SKIP — losing one stable
+        // upgrade notification beats recommending an RC tag.
+        let body = br#"[
+            {"tag_name":"linesmith/v0.4.0-rc1","prerelease":"true"},
+            {"tag_name":"linesmith/v0.4.0-rc2","prerelease":42},
+            {"tag_name":"linesmith/v0.2.5"}
+        ]"#;
+        match classify_update_response(body, "0.2.0") {
+            DoctorUpdateProbe::Newer { latest } => {
+                assert_eq!(
+                    latest, "linesmith/v0.2.5",
+                    "non-bool `prerelease` must conservatively route to skip"
+                );
+            }
+            other => panic!("expected Newer with linesmith/v0.2.5, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_update_response_conservatively_skips_non_bool_draft() {
+        // Symmetric with `prerelease`: a non-bool `draft` schema
+        // regression also skips. `find_map` short-circuits on the
+        // first satisfier, so a wrongly-typed `draft` flag on an
+        // index-0 entry would otherwise win against a later stable
+        // entry and ship as "Newer linesmith/v9.9.9 — run brew upgrade"
+        // pointing at an unreleased draft tag brew can't install.
+        let body = br#"[
+            {"tag_name":"linesmith/v9.9.9","draft":"true"},
+            {"tag_name":"linesmith/v0.2.5"}
+        ]"#;
+        match classify_update_response(body, "0.2.0") {
+            DoctorUpdateProbe::Newer { latest } => {
+                assert_eq!(
+                    latest, "linesmith/v0.2.5",
+                    "non-bool `draft` must skip the index-0 draft entry so the stable v0.2.5 entry wins"
+                );
+            }
+            other => panic!("expected Newer with linesmith/v0.2.5, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_update_response_skips_array_entries_with_missing_tag_name() {
+        // Entries without `tag_name` (e.g. malformed draft releases)
+        // are filtered like any non-binary entry — the classifier
+        // continues to the next entry. A 1-entry array with no
+        // tag_name surfaces as NoBinaryRelease (not ParseError) so
+        // one weird entry doesn't gate the whole probe.
+        let body = br#"[{"name":"some release"}]"#;
+        match classify_update_response(body, "1.2.3") {
+            DoctorUpdateProbe::NoBinaryRelease { scanned } => {
+                assert_eq!(scanned, 1, "scanned count should reflect array length");
+            }
+            other => panic!("expected NoBinaryRelease for tag_name-less entry, got {other:?}"),
         }
     }
 
@@ -7314,7 +7533,7 @@ segments = ["model", { type = "git_branch", merge = true }]
     fn classify_update_response_strips_v_prefix_for_comparison() {
         // GitHub conventionally uses `v1.2.3`; CARGO_PKG_VERSION never
         // does. Equality must hold after the parser strips the `v`.
-        let body = br#"{"tag_name":"v0.1.1"}"#;
+        let body = br#"[{"tag_name":"v0.1.1"}]"#;
         match classify_update_response(body, "0.1.1") {
             DoctorUpdateProbe::Latest => {}
             other => panic!("expected Latest after v-prefix strip, got {other:?}"),
@@ -7325,7 +7544,7 @@ segments = ["model", { type = "git_branch", merge = true }]
     fn classify_update_response_strips_knope_binary_prefix() {
         // Knope's `linesmith/v<ver>` (ADR-0027) is the binary tag the
         // probe must compare against `CARGO_PKG_VERSION`.
-        let body = br#"{"tag_name":"linesmith/v0.2.0"}"#;
+        let body = br#"[{"tag_name":"linesmith/v0.2.0"}]"#;
         match classify_update_response(body, "0.2.0") {
             DoctorUpdateProbe::Latest => {}
             other => panic!("expected Latest for linesmith/v0.2.0, got {other:?}"),
@@ -7335,11 +7554,11 @@ segments = ["model", { type = "git_branch", merge = true }]
     #[test]
     fn classify_update_response_strips_release_plz_legacy_binary_prefix() {
         // release-plz's `linesmith-v<ver>` format from v0.1.2 through
-        // v0.2.0 stays reachable via /releases/latest until those tags
-        // age out. Local `0.2.0` ahead of remote `0.1.3` must land on
+        // v0.2.0 stays reachable in `/releases` until those tags age
+        // out. Local `0.2.0` ahead of remote `0.1.3` must land on
         // Latest specifically — a comparison-direction regression
         // would flip this to Newer.
-        let body = br#"{"tag_name":"linesmith-v0.1.3"}"#;
+        let body = br#"[{"tag_name":"linesmith-v0.1.3"}]"#;
         match classify_update_response(body, "0.2.0") {
             DoctorUpdateProbe::Latest => {}
             other => panic!("expected Latest (local 0.2.0 ahead of remote 0.1.3), got {other:?}"),
@@ -7347,44 +7566,81 @@ segments = ["model", { type = "git_branch", merge = true }]
     }
 
     #[test]
-    fn classify_update_response_rejects_legacy_prefix_without_version_digits() {
-        // Without the digit guard, `linesmith-vNEXT` etc. would hand
-        // `parse_three_part_version` a `v<garbage>` suffix — fails
-        // harmlessly today but could invent a `(0, 0, 0)` reading from
-        // `v0-anything` under a future refactor.
-        for tag in ["linesmith-v", "linesmith-vNEXT", "linesmith-vabc.1.2"] {
-            let body = format!(r#"{{"tag_name":"{tag}"}}"#);
-            match classify_update_response(body.as_bytes(), "1.2.3") {
-                DoctorUpdateProbe::ParseError { .. } => {}
-                other => panic!("expected ParseError for {tag}, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn classify_update_response_rejects_library_package_tags() {
-        // /releases/latest can return a library tag when a library
-        // bumped without a matching binary release. Stripping those
-        // and comparing against `CARGO_PKG_VERSION` would mis-report
-        // "Newer linesmith available"; the prefix-strip is scoped to
-        // the binary only. Library tags fall through to ParseError
-        // — non-actionable but not misleading. Full per-package
-        // awareness is tracked in lsm-ghxy.
+    fn classify_update_response_filters_library_package_tags() {
+        // Library tags would mis-report "Newer linesmith available" if
+        // compared against CARGO_PKG_VERSION (which is the binary's
+        // version). `parse_binary_release_tag` returns None for these
+        // and the array walk silently skips them.
         for tag in [
             "linesmith-core/v0.3.0",
             "linesmith-plugin/v0.2.0",
             "linesmith-core-v0.2.0",
             "linesmith-plugin-v0.1.3",
         ] {
-            let body = format!(r#"{{"tag_name":"{tag}"}}"#);
+            let body = format!(r#"[{{"tag_name":"{tag}"}}]"#);
             match classify_update_response(body.as_bytes(), "0.2.0") {
-                DoctorUpdateProbe::ParseError { message } => {
-                    assert!(
-                        message.contains(tag),
-                        "diagnostic should name the offending tag: {message}"
-                    );
+                DoctorUpdateProbe::NoBinaryRelease { scanned } => {
+                    assert_eq!(scanned, 1, "scanned count for {tag}");
                 }
-                other => panic!("expected ParseError for library tag {tag}, got {other:?}"),
+                other => panic!("expected NoBinaryRelease for library tag {tag}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_update_response_filters_malformed_legacy_binary_prefix() {
+        // `linesmith-v` without a digit immediately after `v` is not a
+        // release-plz binary tag — the digit guard refuses it. Without
+        // the guard, `parse_three_part_version` would receive `v<garbage>`
+        // and could invent a `(0,0,0)` reading under a future refactor.
+        for tag in ["linesmith-v", "linesmith-vNEXT", "linesmith-vabc.1.2"] {
+            let body = format!(r#"[{{"tag_name":"{tag}"}}]"#);
+            match classify_update_response(body.as_bytes(), "1.2.3") {
+                DoctorUpdateProbe::NoBinaryRelease { scanned } => {
+                    assert_eq!(scanned, 1, "scanned count for {tag}");
+                }
+                other => panic!("expected NoBinaryRelease for malformed {tag}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_update_response_filters_knope_prefix_without_version_digits() {
+        // Mirror of the release-plz digit-guard test for Knope's
+        // `linesmith/` branch. Without the guard, `linesmith/anything`
+        // would return `Some("anything")` from `strip_binary_package_prefix`
+        // and only fail in `parse_three_part_version`; if that parser
+        // ever gets relaxed (e.g. accepts non-`v` semver), the predicate
+        // would silently start matching `linesmith/1.2.3-attacker-tag`.
+        for tag in [
+            "linesmith/",
+            "linesmith/notes",
+            "linesmith/foo-bar",
+            "linesmith/vNEXT",
+        ] {
+            let body = format!(r#"[{{"tag_name":"{tag}"}}]"#);
+            match classify_update_response(body.as_bytes(), "1.2.3") {
+                DoctorUpdateProbe::NoBinaryRelease { scanned } => {
+                    assert_eq!(scanned, 1, "scanned count for {tag}");
+                }
+                other => panic!("expected NoBinaryRelease for {tag}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_update_response_filters_foreign_and_non_semver_tags() {
+        // Foreign prefixes (e.g. `image-v`) and non-semver text are
+        // not linesmith tags at all. The predicate must not partially
+        // match — a future refactor that relaxed the prefix anchor
+        // could silently start treating `image-v1.2.3` as a binary.
+        for tag in ["image-v", "nightly-build-2026-04-30", "linesmith-stable"] {
+            let body = format!(r#"[{{"tag_name":"{tag}"}}]"#);
+            match classify_update_response(body.as_bytes(), "1.2.3") {
+                DoctorUpdateProbe::NoBinaryRelease { scanned } => {
+                    assert_eq!(scanned, 1, "scanned count for {tag}");
+                }
+                other => panic!("expected NoBinaryRelease for foreign tag {tag}, got {other:?}"),
             }
         }
     }
@@ -7392,10 +7648,10 @@ segments = ["model", { type = "git_branch", merge = true }]
     #[test]
     fn classify_update_response_treats_prefixed_higher_version_as_newer() {
         // Pin the comparison-after-strip path: `linesmith/v0.3.0` parses
-        // as `(0,3,0)` and reads Newer than `0.2.0`. Earlier code landed
-        // in the both-unparseable branch and returned Newer on string
-        // inequality alone — same result for the wrong reason.
-        let body = br#"{"tag_name":"linesmith/v0.3.0"}"#;
+        // as `(0,3,0)` and reads Newer than `0.2.0`. Earlier code (single-
+        // object era) landed in a string-equality fallback and returned
+        // Newer on inequality alone — same result for the wrong reason.
+        let body = br#"[{"tag_name":"linesmith/v0.3.0"}]"#;
         match classify_update_response(body, "0.2.0") {
             DoctorUpdateProbe::Newer { latest } => {
                 assert_eq!(latest, "linesmith/v0.3.0");
@@ -7405,66 +7661,166 @@ segments = ["model", { type = "git_branch", merge = true }]
     }
 
     #[test]
-    fn classify_update_response_does_not_false_strip_unrecognized_prefix() {
-        // `image-v` doesn't match either prefix anchor, so it falls
-        // through to `(None, Some(_))` and surfaces a ParseError naming
-        // the offending tag.
-        let body = br#"{"tag_name":"image-v"}"#;
-        match classify_update_response(body, "1.2.3") {
-            DoctorUpdateProbe::ParseError { message } => {
-                assert!(
-                    message.contains("image-v"),
-                    "diagnostic should name the offending tag: {message}"
-                );
-            }
-            other => panic!("expected ParseError for unrecognized prefix, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classify_update_response_returns_parse_error_when_remote_unparseable_but_local_parses() {
-        // Mixed-parseability is undefined. Earlier code fell back to
-        // string equality, which silently produced an unverified Newer
-        // claim or a Latest PASS the comparator never validated. WARN
-        // with a clear "couldn't compare" diagnostic instead.
-        let body = br#"{"tag_name":"nightly-build-2026-04-30"}"#;
-        match classify_update_response(body, "1.2.3") {
-            DoctorUpdateProbe::ParseError { message } => {
-                assert!(
-                    message.contains("nightly-build-2026-04-30"),
-                    "diagnostic should name the offending tag: {message}"
-                );
-                assert!(
-                    message.contains("MAJOR.MINOR.PATCH"),
-                    "diagnostic should explain the expected shape: {message}"
-                );
-            }
-            other => panic!("expected ParseError for unparseable remote tag, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classify_update_response_returns_newer_when_both_unparseable_and_unequal() {
-        // Monorepo / non-semver tags on both sides — string equality
-        // is the only meaningful comparator. Inequality falls to
-        // Newer with the verbatim tag so the user can decide.
-        let body = br#"{"tag_name":"linesmith-stable"}"#;
-        match classify_update_response(body, "nightly") {
+    fn classify_update_response_picks_first_binary_tag_skipping_library_tags() {
+        // GitHub returns `/releases` in reverse-chronological order, so
+        // the first binary tag the filter finds is the most recent one.
+        // Library tags shipped after the latest binary release sit at
+        // the head of the array — the filter must walk past them to
+        // pick the binary tag that follows.
+        let body = br#"[
+            {"tag_name":"linesmith-core/v0.3.0"},
+            {"tag_name":"linesmith-plugin/v0.3.0"},
+            {"tag_name":"linesmith/v0.2.5"},
+            {"tag_name":"linesmith/v0.2.4"}
+        ]"#;
+        match classify_update_response(body, "0.2.0") {
             DoctorUpdateProbe::Newer { latest } => {
-                assert_eq!(latest, "linesmith-stable");
+                assert_eq!(
+                    latest, "linesmith/v0.2.5",
+                    "must skip library tags and pick the most recent binary tag"
+                );
             }
-            other => panic!("expected Newer fallback for both-unparseable, got {other:?}"),
+            other => panic!("expected Newer with linesmith/v0.2.5, got {other:?}"),
         }
     }
 
     #[test]
-    fn classify_update_response_returns_latest_when_both_unparseable_and_equal() {
-        // String-equality fallback's PASS branch — both sides ship
-        // the same non-semver tag.
-        let body = br#"{"tag_name":"nightly"}"#;
-        match classify_update_response(body, "nightly") {
+    fn classify_update_response_walks_array_in_order_picking_first_match() {
+        // Pins the "first match wins" / "reverse-chronological" assumption.
+        // If a future refactor reordered entries (e.g. sorted by version)
+        // this test would catch the divergence.
+        let body = br#"[
+            {"tag_name":"linesmith/v0.3.0"},
+            {"tag_name":"linesmith/v0.2.0"},
+            {"tag_name":"linesmith/v0.1.0"}
+        ]"#;
+        match classify_update_response(body, "0.0.1") {
+            DoctorUpdateProbe::Newer { latest } => {
+                assert_eq!(latest, "linesmith/v0.3.0");
+            }
+            other => panic!("expected Newer with the first entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_update_response_picks_binary_tag_after_heterogeneous_non_binary_entries() {
+        // The filter must walk past every rejection category — a
+        // garbage tag, both library prefix forms (Knope `/v*` and
+        // release-plz `-v*`), and a missing-tag_name entry — to reach
+        // the binary tag that follows. Without this test, a future
+        // refactor that early-returns on the first parse miss (instead
+        // of `find_map`-ing through every entry) would silently turn
+        // this page into NoBinaryRelease.
+        let body = br#"[
+            {"tag_name":"nightly-build-2026-04-30"},
+            {"tag_name":"linesmith-core/v0.3.0"},
+            {"tag_name":"linesmith-plugin-v0.1.3"},
+            {"tag_name":"linesmith-plugin/v0.3.0"},
+            {"tag_name":"linesmith-core-v0.2.0"},
+            {"name":"draft release no tag"},
+            {"tag_name":"linesmith/v0.2.5"}
+        ]"#;
+        match classify_update_response(body, "0.2.0") {
+            DoctorUpdateProbe::Newer { latest } => {
+                assert_eq!(latest, "linesmith/v0.2.5");
+            }
+            other => panic!("expected Newer with linesmith/v0.2.5, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_update_response_skips_non_object_array_entries() {
+        // GitHub's `/releases` schema always returns objects, but a
+        // proxy or future API change could inject non-object entries.
+        // `entry.get("tag_name").and_then(as_str)` returns None on
+        // non-objects, so they silently skip; this test pins that
+        // behavior so a future swap to `entry.as_object().unwrap()`
+        // would fail a test instead of panicking in production.
+        let body = br#"[
+            null,
+            "stringly-typed-bogon",
+            42,
+            {"tag_name":"linesmith/v0.2.5"}
+        ]"#;
+        match classify_update_response(body, "0.2.0") {
+            DoctorUpdateProbe::Newer { latest } => {
+                assert_eq!(latest, "linesmith/v0.2.5");
+            }
+            other => panic!("expected Newer with linesmith/v0.2.5, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_update_response_skips_entries_with_non_string_tag_name() {
+        // `tag_name` exists but isn't a string (null, number, etc.) is
+        // a schema-shape anomaly — `entry.get("tag_name").as_str()`
+        // returns None and the entry silently skips. Without this test,
+        // a future swap to `to_string()` (which would turn null/42 into
+        // "null"/"42") would start matching nonsense.
+        let body = br#"[
+            {"tag_name":null},
+            {"tag_name":42},
+            {"tag_name":["nested","array"]},
+            {"tag_name":"linesmith/v0.2.5"}
+        ]"#;
+        match classify_update_response(body, "0.2.0") {
+            DoctorUpdateProbe::Newer { latest } => {
+                assert_eq!(latest, "linesmith/v0.2.5");
+            }
+            other => panic!("expected Newer with linesmith/v0.2.5, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_update_response_returns_latest_when_first_binary_in_mixed_array_equals_local() {
+        // The post-filter comparison must use the matched binary tag,
+        // not `entries.first()`. A future refactor that swapped
+        // `find_map` for `entries.first().and_then(...)` would compare
+        // against the library tag at index 0, silently producing
+        // Newer-or-Latest from a library-tag version number.
+        let body = br#"[
+            {"tag_name":"linesmith-core/v0.3.0"},
+            {"tag_name":"linesmith/v0.2.0"},
+            {"tag_name":"linesmith/v0.1.0"}
+        ]"#;
+        match classify_update_response(body, "0.2.0") {
             DoctorUpdateProbe::Latest => {}
-            other => panic!("expected Latest for both-unparseable + string-equal, got {other:?}"),
+            other => panic!(
+                "expected Latest (binary v0.2.0 equals local 0.2.0; library v0.3.0 must not drive the comparison), got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn classify_update_response_returns_no_binary_release_when_array_is_empty() {
+        // Empty array (e.g. a freshly-created repo with no published
+        // releases) surfaces NoBinaryRelease { scanned: 0 } rather than
+        // ParseError — the response shape is well-formed, with no
+        // entries to compare against.
+        let body = b"[]";
+        match classify_update_response(body, "0.2.0") {
+            DoctorUpdateProbe::NoBinaryRelease { scanned } => {
+                assert_eq!(scanned, 0);
+            }
+            other => panic!("expected NoBinaryRelease for empty array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_update_response_no_binary_release_carries_full_scanned_count() {
+        // The renderer hint surfaces `scanned` to point users at
+        // UPDATE_PROBE_PAGE_SIZE; the count must reflect the array
+        // length, not the index of the (missing) match.
+        let body = br#"[
+            {"tag_name":"linesmith-core/v0.3.0"},
+            {"tag_name":"linesmith-plugin/v0.3.0"},
+            {"tag_name":"linesmith-core/v0.2.0"}
+        ]"#;
+        match classify_update_response(body, "0.2.0") {
+            DoctorUpdateProbe::NoBinaryRelease { scanned } => {
+                assert_eq!(scanned, 3);
+            }
+            other => panic!("expected NoBinaryRelease {{ scanned: 3 }}, got {other:?}"),
         }
     }
 
@@ -7473,7 +7829,7 @@ segments = ["model", { type = "git_branch", merge = true }]
         // Defensive: if our own CARGO_PKG_VERSION came out malformed,
         // surface that as a probe ParseError rather than silently
         // PASSing on a bogus comparison.
-        let body = br#"{"tag_name":"v1.2.3"}"#;
+        let body = br#"[{"tag_name":"v1.2.3"}]"#;
         match classify_update_response(body, "not-a-version") {
             DoctorUpdateProbe::ParseError { message } => {
                 assert!(message.contains("not-a-version"), "diagnostic: {message}");
@@ -7517,7 +7873,7 @@ segments = ["model", { type = "git_branch", merge = true }]
         // `tag_name`; serde_json decodes `\u001b` and `\u0007` into
         // raw ESC and BEL bytes that would render straight to stdout
         // via the WARN line. sanitize_tag drops them before storing.
-        let body = br#"{"tag_name":"v9.9.9\u001b[2J\u0007hostile"}"#;
+        let body = br#"[{"tag_name":"v9.9.9\u001b[2J\u0007hostile"}]"#;
         match classify_update_response(body, "1.2.3") {
             DoctorUpdateProbe::Newer { latest } => {
                 assert!(!latest.contains('\x1b'), "ESC must be stripped: {latest:?}");
@@ -7535,12 +7891,13 @@ segments = ["model", { type = "git_branch", merge = true }]
     fn classify_update_response_caps_remote_tag_at_64_chars() {
         // Bounded length so a tag the size of the body cap can't
         // paint the user's terminal with screenfuls of "upgrade to ...".
-        // Use a non-semver shape (no dots) so the comparator falls
-        // through to the both-unparseable Newer branch where
-        // sanitize_tag actually applies.
-        let huge_tag: String = std::iter::repeat_n('x', 1000).collect();
-        let body = format!(r#"{{"tag_name":"{huge_tag}"}}"#);
-        match classify_update_response(body.as_bytes(), "nightly") {
+        // `parse_three_part_version` truncates the patch segment at the
+        // first non-digit, so `v9.9.9-<1000 xs>` parses as `(9,9,9)` and
+        // the full tag flows into sanitize_tag via the Newer return.
+        let huge_suffix: String = std::iter::repeat_n('x', 1000).collect();
+        let huge_tag = format!("v9.9.9-{huge_suffix}");
+        let body = format!(r#"[{{"tag_name":"{huge_tag}"}}]"#);
+        match classify_update_response(body.as_bytes(), "0.0.1") {
             DoctorUpdateProbe::Newer { latest } => {
                 assert!(
                     latest.chars().count() <= 64,
@@ -7555,14 +7912,15 @@ segments = ["model", { type = "git_branch", merge = true }]
     #[test]
     fn classify_update_response_handles_u32_overflow_in_remote_major() {
         // u32::MAX + 1 = 4294967296. parse_three_part_version returns
-        // None → mixed-parseability arm → ParseError, not a silent
-        // string-equality fallback.
-        let body = br#"{"tag_name":"4294967296.0.0"}"#;
+        // None on overflow, so the entry falls out of the binary-tag
+        // filter and a 1-entry array surfaces as NoBinaryRelease — no
+        // crash, no silent string-equality fallback.
+        let body = br#"[{"tag_name":"4294967296.0.0"}]"#;
         match classify_update_response(body, "1.2.3") {
-            DoctorUpdateProbe::ParseError { message } => {
-                assert!(message.contains("4294967296"), "diagnostic: {message}");
+            DoctorUpdateProbe::NoBinaryRelease { scanned } => {
+                assert_eq!(scanned, 1);
             }
-            other => panic!("expected ParseError for u32 overflow, got {other:?}"),
+            other => panic!("expected NoBinaryRelease for u32 overflow, got {other:?}"),
         }
     }
 
@@ -7570,7 +7928,7 @@ segments = ["model", { type = "git_branch", merge = true }]
     fn classify_update_response_handles_leading_zeros_as_equal() {
         // "v01.02.03" parses as (1, 2, 3) per u32::from_str's leading-
         // zero acceptance. Equal-tuple compare → Latest.
-        let body = br#"{"tag_name":"v01.02.03"}"#;
+        let body = br#"[{"tag_name":"v01.02.03"}]"#;
         match classify_update_response(body, "1.2.3") {
             DoctorUpdateProbe::Latest => {}
             other => panic!("expected Latest for leading-zero remote, got {other:?}"),
@@ -7579,20 +7937,20 @@ segments = ["model", { type = "git_branch", merge = true }]
 
     #[test]
     fn classify_update_response_inner_returns_transport_error_when_body_truncated() {
-        // Regression test for the 32 KiB → 256 KiB cap bump. If the
-        // body cap is exhausted (truncation flag true), the result
-        // must be a TransportError with a "bump the cap" pointer —
-        // NOT a ParseError pointing the user at a "GitHub API shape
-        // changed" red herring (the original symptom that smoke
-        // testing the live binary surfaced). Without this guard, a
-        // future cap-tuner who lowers the constant introduces the
+        // Regression test for the cap bump (32 KiB → 256 KiB → 4 MiB).
+        // If the body cap is exhausted (truncation flag true), the
+        // result must be a TransportError with a "bump the cap"
+        // pointer — NOT a ParseError pointing the user at a "GitHub
+        // API shape changed" red herring (the original symptom that
+        // smoke testing the live binary surfaced). Without this guard,
+        // a future cap-tuner who lowers the constant introduces the
         // same silent misclassification all over again.
         //
         // The synthetic body must exceed `UPDATE_PROBE_MAX_BYTES` to
         // satisfy the `debug_assert!` linking `truncated` to body
         // length — caller can't claim "truncated" without actually
         // having overshot the cap.
-        let body = vec![b'x'; 256 * 1024 + 1];
+        let body = vec![b'x'; snapshot::UPDATE_PROBE_MAX_BYTES as usize + 1];
         match classify_update_response_inner(&body, "0.1.1", true) {
             DoctorUpdateProbe::TransportError { message } => {
                 assert!(
@@ -7602,5 +7960,27 @@ segments = ["model", { type = "git_branch", merge = true }]
             }
             other => panic!("expected TransportError on truncation, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn releases_url_pins_repo_endpoint_and_page_size() {
+        // The probe URL is part of the doctor's contract (snapshot.rs
+        // doc on GITHUB_RELEASES_URL). Three things can drift:
+        // - the repo coordinate (oakoss/linesmith) — a typo here ships
+        //   a broken probe
+        // - the endpoint (/releases) — switching to /releases/latest
+        //   would silently restore the original lsm-ghxy bug
+        // - the per_page literal — must equal UPDATE_PROBE_PAGE_SIZE
+        //   because the renderer hint quotes the constant
+        let url = super::snapshot::GITHUB_RELEASES_URL;
+        assert!(
+            url.contains("repos/oakoss/linesmith/releases?"),
+            "URL must hit the linesmith repo's /releases endpoint: {url}"
+        );
+        let page_needle = format!("per_page={UPDATE_PROBE_PAGE_SIZE}");
+        assert!(
+            url.contains(&page_needle),
+            "URL `{url}` should contain `{page_needle}`"
+        );
     }
 }
