@@ -8020,7 +8020,7 @@ segments = ["model", { type = "git_branch", merge = true }]
             url.contains("repos/oakoss/linesmith/releases?"),
             "URL must hit the linesmith repo's /releases endpoint: {url}"
         );
-        let page_needle = format!("per_page={UPDATE_PROBE_PAGE_SIZE}");
+        let page_needle = format!("per_page={}", snapshot::UPDATE_PROBE_PAGE_SIZE);
         assert!(
             url.contains(&page_needle),
             "URL `{url}` should contain `{page_needle}`"
