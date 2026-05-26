@@ -19,12 +19,13 @@ mints a GitHub App installation token on the fly.
 
 ## Normal release flow
 
-Every release lands by merging the Knope release PR. `knope-prepare.yml`
-opens / force-updates the PR automatically on every push to `main` that
-contains a releasable change (any `feat` / `fix` / `perf` matching a
-package's claimed scopes, or a non-empty changeset file under `.changeset/`).
-Pushes without releasable changes land as green no-op runs via the
-`git diff --quiet HEAD` gate between the two Knope invocations.
+Every release lands by merging the Knope release PR. `knope-release.yml` (`prepare` job)
+opens / force-updates the PR automatically on each non-`release` PR
+merge to `main` that contains a releasable change (any `feat` / `fix` /
+`perf` matching a package's claimed scopes, or a non-empty changeset
+file under `.changeset/`). PR merges without releasable changes land
+as green no-op runs via the `git diff --quiet HEAD` gate between the
+two Knope invocations.
 
 ### 1. Pre-flight (local)
 
@@ -54,7 +55,7 @@ against a healthy branch.
 
 ### 2. Review the Knope release PR
 
-`knope-prepare.yml` opens it against `main` (branch: `release`; no label by
+`knope-release.yml` (`prepare` job) opens it against `main` (branch: `release`; no label by
 default). Click in and verify:
 
 - **Per-package bumps** match the change shapes. Pre-1.0 rules: `feat` on a
@@ -77,9 +78,9 @@ default). Click in and verify:
   per-crate `Cargo.toml`s, per-crate `CHANGELOG.md`s, and any deleted
   `.changeset/*.md` files. Anything else is a red flag.
 
-If the version, dep-pin, or CHANGELOG is wrong, push a fix commit (or a
-changeset file via `knope document-change`) to `main`; `knope-prepare.yml`
-will update the PR on the next push.
+If the version, dep-pin, or CHANGELOG is wrong, open a fix PR (or a
+changeset PR via `knope document-change`); when that PR merges to
+`main`, `knope-release.yml`'s `prepare` job updates the release PR.
 
 ### 3. Merge
 
