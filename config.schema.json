@@ -86,6 +86,14 @@
         "never"
       ]
     },
+    "IconMode": {
+      "description": "Config-level icon rendering mode. Defaults to Nerd Font glyphs,\nmatching Starship; terminals without a Nerd Font may show boxes,\nso `doctor` surfaces the `[layout_options] icons = \"off\"` opt-out.",
+      "type": "string",
+      "enum": [
+        "nerdfont",
+        "off"
+      ]
+    },
     "LayoutMode": {
       "description": "Top-level `layout = \"...\"` selector. Defaults to `SingleLine`\n(preserves pre-multi-line config behavior). `MultiLine` instructs\nthe builder + render loop to consume `[line.N]` sub-tables.",
       "type": "string",
@@ -107,6 +115,9 @@
         },
         "color": {
           "$ref": "#/$defs/ColorPolicy"
+        },
+        "icons": {
+          "$ref": "#/$defs/IconMode"
         },
         "powerline_width": {
           "description": "Cell-count for the Nerd Font powerline chevron (U+E0B0). Only\n`1` (the default; matches modern Nerd Fonts at standard sizes)\nand `2` (some older builds / larger sizes) are meaningful.\nTakes effect only when a powerline separator is in use; setting\nit under `separator = \"space\"` is harmless but inert.",
@@ -192,6 +203,13 @@
       "description": "`[segments.<id>]` override block. Each typed field, when `Some`,\nreplaces the segment's built-in default. Any unrecognized keys land\nin [`extra`](Self::extra), which the segment builder forwards to\nplugin scripts as `ctx.config.<key>`. `style` is stored as a raw\nstring; the segment builder parses it at build time\nso parse errors emit warnings through the same callback that\nhandles unknown-ID and inverted-bounds diagnostics.\n\n`Eq` isn't derived because [`toml::Value`] holds `f64` and so is\n`PartialEq` only — `extra` propagates that constraint.",
       "type": "object",
       "properties": {
+        "icon": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "priority": {
           "type": [
             "integer",

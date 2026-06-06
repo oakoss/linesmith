@@ -88,7 +88,7 @@ impl Segment for ModelSegment {
     }
 
     fn defaults(&self) -> SegmentDefaults {
-        SegmentDefaults::with_priority(PRIORITY)
+        SegmentDefaults::with_priority(PRIORITY).with_icon("\u{2726}")
     }
 }
 

@@ -198,6 +198,11 @@ pub struct SegmentDefaults {
     /// Width bounds, if any. Construction enforces `min <= max`.
     pub width: Option<WidthBounds>,
 
+    /// Shipped icon prefix for this segment. The builder applies it
+    /// only when `[layout_options].icons = "nerdfont"`; per-segment
+    /// `icon = "..."` overrides it, and `icon = ""` disables it.
+    pub icon: Option<&'static str>,
+
     /// May this segment be truncated under width pressure before being
     /// dropped? Defaults to `false` — opt in for prose-like content
     /// (workspace name, branch name) where a partial value is more
@@ -535,7 +540,7 @@ Per [`docs/ideas/0001-feature-parity-matrix.md`](../ideas/0001-feature-parity-ma
 4. `cost`: session cost in USD
 5. `duration`: session duration
 6. `workspace`: directory / worktree hybrid
-7. `git_branch`: branch + dirty + ahead/behind (sub-composed). Two complementary compaction layers: per-marker `[segments.git_branch.dirty].hide_below_cells` and `[segments.git_branch.ahead_behind].hide_below_cells` knobs (user-preference layer; default `0` = never auto-hide; key on `rc.terminal_width` only — fire on narrow terminals), and engine-driven `shrink_to_fit` (layout-pressure layer; sheds dirty + ahead/behind to keep the `icon + label + head` prefix when neighboring segments pressure the line, regardless of terminal size — `head` is the branch name on a normal checkout, the short SHA on detached HEAD, or the symbolic-ref target on unborn HEAD). Generic end-ellipsis truncation isn't safe (the structured tail would be mangled), so `truncatable` stays `false` — under further pressure even after `shrink_to_fit`, the segment drops whole via priority.
+7. `git_branch`: branch + dirty + ahead/behind (sub-composed). Two complementary compaction layers: per-marker `[segments.git_branch.dirty].hide_below_cells` and `[segments.git_branch.ahead_behind].hide_below_cells` knobs (user-preference layer; default `0` = never auto-hide; key on `rc.terminal_width` only — fire on narrow terminals), and engine-driven `shrink_to_fit` (layout-pressure layer; sheds dirty + ahead/behind to keep the `label + head` prefix when neighboring segments pressure the line, regardless of terminal size — the generic icon wrapper prefixes the compact render afterward when enabled; `head` is the branch name on a normal checkout, the short SHA on detached HEAD, or the symbolic-ref target on unborn HEAD). Generic end-ellipsis truncation isn't safe (the structured tail would be mangled), so `truncatable` stays `false` — under further pressure even after `shrink_to_fit`, the segment drops whole via priority.
 8. `rate_limit_5h`: 5-hour percentage + resets-at countdown
 9. `rate_limit_7d`: 7-day percentage + resets-at countdown
 10. `rate_limit`: combined 5h/7d view; sub-composed from `rate_limit_5h` and `rate_limit_7d` with a tighter layout (users pick either the combined form or the individual segments, not both)
@@ -543,9 +548,25 @@ Per [`docs/ideas/0001-feature-parity-matrix.md`](../ideas/0001-feature-parity-ma
 
 Each has its own module in `crates/linesmith/src/segments/<id>.rs` with a small per-segment spec inline (doc comment).
 
-### Nerd Font glyphs
+### Icons and Nerd Font glyphs
 
-Segments that render Nerd Font glyphs (powerline separators, git icons, model badges) source codepoints from a `const ICONS: &[(&str, char)]` table generated at build time from [`nerd-fonts` glyphnames.json](https://github.com/ryanoasis/nerd-fonts/blob/master/glyphnames.json) via `build.rs`. Only the codepoints we actually render ship in the binary; see `crates/linesmith/build.rs`.
+`[layout_options].icons` controls shipped segment icon defaults. The default `nerdfont` mode prefixes segments whose `SegmentDefaults.icon` is set; `off` suppresses shipped defaults globally. A per-segment `icon = "..."` override always wins, including when global icons are off. `icon = ""` disables the icon for only that segment. Icons are applied by the generic override wrapper after segment render and `shrink_to_fit`, so the icon inherits the segment's style and preserves per-render right separators.
+
+Shipped defaults:
+
+| Segment                                      | Icon codepoint |
+| -------------------------------------------- | -------------- |
+| `version`                                    | `\u{f121}`     |
+| `model`                                      | `\u{2726}`     |
+| `context_bar`                                | `\u{f035b}`    |
+| `git_branch`                                 | `\u{f126}`     |
+| `workspace`                                  | `\u{f07b}`     |
+| `session_duration`                           | `\u{f252}`     |
+| `rate_limit_5h`                              | `\u{f017}`     |
+| `rate_limit_7d`                              | `\u{f073}`     |
+| `rate_limit_5h_reset`, `rate_limit_7d_reset` | `\u{21bb}`     |
+
+`cost`, `effort`, `tokens_*`, `vim`, `agent`, `output_style`, `context_window`, and `extra_usage` ship without default icons.
 
 ## Edge cases
 

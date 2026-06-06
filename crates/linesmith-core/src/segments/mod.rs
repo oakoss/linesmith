@@ -283,6 +283,7 @@ impl WidthBounds {
 pub struct SegmentDefaults {
     pub priority: u8,
     pub width: Option<WidthBounds>,
+    pub icon: Option<&'static str>,
     /// May the layout engine shrink this segment under width pressure
     /// before dropping it? Default `false` — only prose-like segments
     /// (workspace name, branch name) opt in. Numeric or structured
@@ -311,6 +312,13 @@ impl SegmentDefaults {
         self
     }
 
+    /// Chainable setter for a built-in icon default.
+    #[must_use]
+    pub fn with_icon(mut self, icon: &'static str) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
     /// Chainable setter for the truncate-before-drop opt-in.
     #[must_use]
     pub fn with_truncatable(mut self, truncatable: bool) -> Self {
@@ -324,6 +332,7 @@ impl Default for SegmentDefaults {
         Self {
             priority: 128,
             width: None,
+            icon: None,
             truncatable: false,
         }
     }
@@ -540,8 +549,8 @@ pub const BUILT_IN_SEGMENT_IDS: &[&str] = &[
 /// Construct a built-in segment by its config id. Unknown ids return
 /// `None` so config loaders can warn and skip. `extras` carries the
 /// `[segments.<id>]` TOML bag; rate-limit segments parse their knobs
-/// from it (`format`, `invert`, `compact`, `use_days`, `icon`,
-/// `label`, `stale_marker`, `progress_width`). Other built-ins
+/// from it (`format`, `invert`, `compact`, `use_days`, `label`,
+/// `stale_marker`, `progress_width`). Other built-ins
 /// currently ignore `extras`.
 ///
 /// Every arm in this `match` must have a corresponding entry in
@@ -604,6 +613,7 @@ pub struct OverriddenSegment {
     priority: Option<u8>,
     width: Option<WidthBounds>,
     user_style: Option<Style>,
+    user_icon: Option<String>,
 }
 
 impl OverriddenSegment {
@@ -614,6 +624,7 @@ impl OverriddenSegment {
             priority: None,
             width: None,
             user_style: None,
+            user_icon: None,
         }
     }
 
@@ -636,18 +647,55 @@ impl OverriddenSegment {
         self.user_style = Some(style);
         self
     }
+
+    #[must_use]
+    pub fn with_icon(mut self, icon: String) -> Self {
+        self.user_icon = Some(icon);
+        self
+    }
+
+    /// The icon to prepend, if one is set and non-empty. An empty
+    /// override means "no icon" (the disable form), so it never
+    /// produces a stray leading space regardless of how the wrapper
+    /// was constructed.
+    fn effective_icon(&self) -> Option<&str> {
+        self.user_icon.as_deref().filter(|i| !i.is_empty())
+    }
+
+    /// Cells the icon prefix (`icon` + one space) adds to the rendered
+    /// width. `shrink_to_fit` reserves this before delegating so the
+    /// prepended result still satisfies the layout engine's target.
+    fn icon_prefix_width(&self) -> u16 {
+        self.effective_icon()
+            .map_or(0, |icon| text_width(icon).saturating_add(1))
+    }
+
+    fn apply_render_overrides(&self, mut rendered: RenderedSegment) -> RenderedSegment {
+        if let Some(override_style) = &self.user_style {
+            let merged = merge_user_override(rendered.style(), override_style);
+            rendered = rendered.with_style(merged);
+        }
+        if let Some(icon) = self.effective_icon() {
+            // `from_parts` skips the sanitization `RenderedSegment::new`
+            // applies, so strip control chars here — a user-config icon
+            // is untrusted input that must not smuggle terminal escapes.
+            let new_text = sanitize_control_chars(format!("{icon} {}", rendered.text()));
+            let new_width = text_width(&new_text);
+            rendered = RenderedSegment::from_parts(
+                new_text,
+                new_width,
+                rendered.right_separator().cloned(),
+                rendered.style().clone(),
+            );
+        }
+        rendered
+    }
 }
 
 impl Segment for OverriddenSegment {
     fn render(&self, ctx: &DataContext, rc: &RenderContext) -> RenderResult {
         let result = self.inner.render(ctx, rc)?;
-        Ok(result.map(|r| match &self.user_style {
-            Some(override_style) => {
-                let merged = merge_user_override(r.style(), override_style);
-                r.with_style(merged)
-            }
-            None => r,
-        }))
+        Ok(result.map(|r| self.apply_render_overrides(r)))
     }
 
     fn shrink_to_fit(
@@ -656,14 +704,13 @@ impl Segment for OverriddenSegment {
         rc: &RenderContext,
         target: u16,
     ) -> Option<RenderedSegment> {
-        let inner = self.inner.shrink_to_fit(ctx, rc, target)?;
-        Some(match &self.user_style {
-            Some(override_style) => {
-                let merged = merge_user_override(inner.style(), override_style);
-                inner.with_style(merged)
-            }
-            None => inner,
-        })
+        // Reserve the icon prefix so the prepended result still fits
+        // `target`; if even the prefix won't fit, the segment can't be
+        // shown in compact form (the engine would reject the overflow
+        // and drop it whole).
+        let inner_target = target.checked_sub(self.icon_prefix_width())?;
+        let inner = self.inner.shrink_to_fit(ctx, rc, inner_target)?;
+        Some(self.apply_render_overrides(inner))
     }
 
     fn data_deps(&self) -> &'static [DataDep] {
@@ -1241,6 +1288,113 @@ mod layout_type_tests {
         assert!(wrapped
             .shrink_to_fit(&stub_ctx(), &stub_rc(), 100)
             .is_none());
+    }
+
+    #[test]
+    fn shrink_to_fit_reserves_icon_width_so_compact_form_fits_target() {
+        // The icon is prepended AFTER the inner compacts, so the wrapper
+        // reserves its width up front. Without that, a segment that fills
+        // its budget overflows once `"{icon} "` is added and the layout
+        // engine drops it instead of showing the compact form.
+        struct FillsTarget;
+        impl Segment for FillsTarget {
+            fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+                Ok(Some(RenderedSegment::new("full")))
+            }
+            fn shrink_to_fit(
+                &self,
+                _: &DataContext,
+                _: &RenderContext,
+                target: u16,
+            ) -> Option<RenderedSegment> {
+                Some(RenderedSegment::new("x".repeat(target as usize)))
+            }
+        }
+        let wrapped = OverriddenSegment::new(Box::new(FillsTarget)).with_icon("I".to_string());
+        let shrunk = wrapped
+            .shrink_to_fit(&stub_ctx(), &stub_rc(), 10)
+            .expect("compact form fits");
+        assert!(
+            shrunk.width <= 10,
+            "icon-prefixed compact render must fit target, got width {}",
+            shrunk.width
+        );
+        assert!(shrunk.text.starts_with("I "));
+        // When even the icon prefix can't fit, decline rather than overflow.
+        assert!(wrapped.shrink_to_fit(&stub_ctx(), &stub_rc(), 1).is_none());
+    }
+
+    #[test]
+    fn icon_override_strips_control_chars() {
+        // A user-config icon is untrusted input; the prepend goes through
+        // `from_parts` (no built-in sanitization), so control chars must
+        // be stripped here or a config could smuggle terminal escapes.
+        struct Plain;
+        impl Segment for Plain {
+            fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+                Ok(Some(RenderedSegment::new("text")))
+            }
+        }
+        let wrapped = OverriddenSegment::new(Box::new(Plain)).with_icon("\u{1b}[2Jx".to_string());
+        let r = wrapped
+            .render(&stub_ctx(), &stub_rc())
+            .unwrap()
+            .expect("visible");
+        assert!(
+            !r.text.contains('\u{1b}'),
+            "ESC must be stripped from icon, got {:?}",
+            r.text
+        );
+
+        // An empty override is the disable form: no icon, no leading space.
+        let disabled = OverriddenSegment::new(Box::new(Plain)).with_icon(String::new());
+        let d = disabled
+            .render(&stub_ctx(), &stub_rc())
+            .unwrap()
+            .expect("visible");
+        assert_eq!(d.text, "text");
+    }
+
+    #[test]
+    fn segments_declare_their_default_icons() {
+        // Guards the shipped DEFAULT_ICON codepoints, especially for
+        // git_branch and the rate_limit family whose `assemble`/`wrap`
+        // were reworked by the unify (icon now sourced via the generic
+        // wrapper, not the segment's own formatter).
+        use crate::segments::{
+            context_bar::ContextBarSegment,
+            git_branch::GitBranchSegment,
+            rate_limit::{
+                RateLimit5hResetSegment, RateLimit5hSegment, RateLimit7dResetSegment,
+                RateLimit7dSegment,
+            },
+            session_duration::SessionDurationSegment,
+        };
+        assert_eq!(
+            GitBranchSegment::default().defaults().icon,
+            Some("\u{f126}")
+        );
+        assert_eq!(
+            ContextBarSegment::default().defaults().icon,
+            Some("\u{f035b}")
+        );
+        assert_eq!(SessionDurationSegment.defaults().icon, Some("\u{f252}"));
+        assert_eq!(
+            RateLimit5hSegment::default().defaults().icon,
+            Some("\u{f017}")
+        );
+        assert_eq!(
+            RateLimit7dSegment::default().defaults().icon,
+            Some("\u{f073}")
+        );
+        assert_eq!(
+            RateLimit5hResetSegment::default().defaults().icon,
+            Some("\u{21bb}")
+        );
+        assert_eq!(
+            RateLimit7dResetSegment::default().defaults().icon,
+            Some("\u{21bb}")
+        );
     }
 
     fn stub_ctx() -> DataContext {

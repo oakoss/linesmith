@@ -1258,6 +1258,7 @@ const CONFIG_PARSES_ID: &str = "config.parses";
 const CONFIG_SEGMENTS_ID: &str = "config.segments_resolvable";
 const CONFIG_THEME_ID: &str = "config.theme_installed";
 const CONFIG_PLUGIN_DIRS_ID: &str = "config.plugin_dirs_readable";
+const CONFIG_ICONS_ID: &str = "config.icons_mode";
 
 fn config_category(env: &DoctorEnv) -> Category {
     // Spec §Cross-category short-circuits has a Config carve-out:
@@ -1276,11 +1277,12 @@ fn config_category(env: &DoctorEnv) -> Category {
     // The discovery check itself is independent — a missing file is
     // a WARN, not a propagating failure.
     let downstream_runs = matches!(snapshot.read, ConfigReadOutcome::Loaded { .. });
-    let (segments_check, theme_check, plugin_dirs_check) = if downstream_runs {
+    let (segments_check, theme_check, plugin_dirs_check, icons_check) = if downstream_runs {
         (
             check_config_segments(snapshot),
             check_config_theme(snapshot),
             check_config_plugin_dirs(snapshot),
+            check_config_icons(snapshot),
         )
     } else {
         let reason = "config not loaded";
@@ -1288,6 +1290,7 @@ fn config_category(env: &DoctorEnv) -> Category {
             CheckResult::skip(CONFIG_SEGMENTS_ID, "All referenced segments exist", reason),
             CheckResult::skip(CONFIG_THEME_ID, "Theme is installed", reason),
             CheckResult::skip(CONFIG_PLUGIN_DIRS_ID, "Plugin dirs are readable", reason),
+            CheckResult::skip(CONFIG_ICONS_ID, "Icon font guidance", reason),
         )
     };
 
@@ -1299,6 +1302,7 @@ fn config_category(env: &DoctorEnv) -> Category {
             segments_check,
             theme_check,
             plugin_dirs_check,
+            icons_check,
         ],
     )
 }
@@ -1555,6 +1559,28 @@ fn check_config_plugin_dirs(snapshot: &DoctorConfigSnapshot) -> CheckResult {
             snapshot.plugin_dirs.len(),
         ),
     )
+}
+
+fn check_config_icons(snapshot: &DoctorConfigSnapshot) -> CheckResult {
+    let ConfigReadOutcome::Loaded { config, .. } = &snapshot.read else {
+        return CheckResult::skip(CONFIG_ICONS_ID, "Icon font guidance", "config not loaded");
+    };
+
+    let icons = config
+        .layout_options
+        .as_ref()
+        .map(|lo| lo.icons)
+        .unwrap_or_default();
+    match icons {
+        crate::config::IconMode::NerdFont => CheckResult::pass(
+            CONFIG_ICONS_ID,
+            "Icons use Nerd Font glyphs; if boxes appear instead of glyphs, set `[layout_options] icons = \"off\"`",
+        ),
+        crate::config::IconMode::Off => CheckResult::pass(CONFIG_ICONS_ID, "Icons disabled"),
+        // `IconMode` is `#[non_exhaustive]` across the crate boundary, so
+        // a wildcard is required; a future mode passes benignly here.
+        _ => CheckResult::pass(CONFIG_ICONS_ID, "Icon mode recognized"),
+    }
 }
 
 const CLAUDE_BINARY_ID: &str = "claude.binary_found";
@@ -4147,8 +4173,9 @@ mod tests {
     fn config_category_emits_five_checks_in_spec_order() {
         // Spec §Config table: Config file discovered → Config parses
         // → All referenced segments exist → Theme is installed →
-        // Plugin dirs are readable. Order matters because the parse
-        // short-circuit propagates SKIPs downstream.
+        // Plugin dirs are readable → Icon font guidance. Order
+        // matters because the parse short-circuit propagates SKIPs
+        // downstream.
         let r = build_report(&DoctorEnv::healthy());
         let ids: Vec<_> = r
             .categories
@@ -4167,7 +4194,25 @@ mod tests {
                 "config.segments_resolvable",
                 "config.theme_installed",
                 "config.plugin_dirs_readable",
+                "config.icons_mode",
             ]
+        );
+    }
+
+    #[test]
+    fn config_icons_mode_emits_nerdfont_opt_out_hint() {
+        let r = build_report(&DoctorEnv::healthy());
+        let check = find_check(&r, CONFIG_ICONS_ID);
+        assert_eq!(check.severity(), Severity::Pass);
+        assert!(
+            check.label().contains("Nerd Font"),
+            "label should name Nerd Font mode: {}",
+            check.label(),
+        );
+        assert!(
+            check.label().contains("icons = \"off\""),
+            "hint should name the opt-out: {:?}",
+            check.label(),
         );
     }
 
@@ -4226,6 +4271,7 @@ mod tests {
             "config.segments_resolvable",
             "config.theme_installed",
             "config.plugin_dirs_readable",
+            "config.icons_mode",
         ] {
             assert_eq!(
                 find_check(&r, id).severity(),
@@ -4458,6 +4504,7 @@ mod tests {
             "config.segments_resolvable",
             "config.theme_installed",
             "config.plugin_dirs_readable",
+            "config.icons_mode",
         ] {
             assert_eq!(
                 find_check(&r, id).severity(),

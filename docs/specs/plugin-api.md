@@ -531,6 +531,15 @@ fn render(ctx) {
 }
 ```
 
+**`icon` is reserved.** It is a generic per-segment property (see
+[segment-system.md](segment-system.md) §Icons): the runtime prepends
+`[segments.<id>].icon` to every segment's output, plugin segments
+included, so a plugin gets an icon for free by setting `icon = "…"` with
+no `render` code. Because the runtime consumes it, `icon` is **not**
+forwarded in `ctx.config` — a plugin reading `ctx.config.icon` sees `()`.
+Plugins that need a glyph should rely on the reserved `icon` rather than
+defining their own key, and must not reuse `icon` for unrelated config.
+
 ### Script caching
 
 - AST is cached in memory for the lifetime of the process (no disk cache in v0.1)

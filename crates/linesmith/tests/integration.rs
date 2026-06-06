@@ -183,6 +183,8 @@ fn git_branch_renders_unborn_head_via_full_driver_path() {
     std::fs::write(
         config_dir.join("config.toml"),
         r#"
+            [layout_options]
+            icons = "off"
             [line]
             segments = ["git_branch"]
         "#,
@@ -263,6 +265,8 @@ fn renders_worktree_hybrid_with_real_linked_worktree() {
     let (env, _xdg) = cli_env_with_config(
         worktree_dir,
         r#"
+            [layout_options]
+            icons = "off"
             [line]
             segments = ["workspace"]
         "#,
@@ -328,6 +332,8 @@ fn git_branch_renders_per_worktree_branch_not_main() {
     let (env, _xdg) = cli_env_with_config(
         worktree_dir,
         r#"
+            [layout_options]
+            icons = "off"
             [line]
             segments = ["git_branch"]
         "#,
@@ -366,6 +372,8 @@ fn git_branch_hides_outside_repo() {
     std::fs::write(
         config_dir.join("config.toml"),
         r#"
+            [layout_options]
+            icons = "off"
             [line]
             segments = ["git_branch", "model"]
         "#,
@@ -393,6 +401,8 @@ fn config_reorders_and_filters_segments() {
     // Config picks only model + workspace, in that custom order.
     let cfg = linesmith_core::config::Config::from_str(
         r#"
+            [layout_options]
+            icons = "off"
             [line]
             segments = ["workspace", "model"]
         "#,

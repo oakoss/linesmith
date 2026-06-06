@@ -64,10 +64,27 @@ pub(super) fn apply_override(
     id: &str,
     inner: Box<dyn Segment>,
     ov: Option<&config::SegmentOverride>,
+    icons_mode: config::IconMode,
     warn: &mut impl FnMut(&str),
 ) -> Box<dyn Segment> {
-    let Some(ov) = ov else { return inner };
     let base_width = inner.defaults().width;
+    let default_icon = inner.defaults().icon;
+    let effective_icon = match ov.and_then(|ov| ov.icon.as_ref()) {
+        Some(icon) if icon.is_empty() => None,
+        Some(icon) => Some(icon.clone()),
+        None => match icons_mode {
+            config::IconMode::NerdFont => default_icon.map(String::from),
+            config::IconMode::Off => None,
+        },
+    };
+
+    let Some(ov) = ov else {
+        return match effective_icon {
+            Some(icon) => Box::new(OverriddenSegment::new(inner).with_icon(icon)),
+            None => inner,
+        };
+    };
+
     let mut wrapped = OverriddenSegment::new(inner);
     if let Some(p) = ov.priority {
         wrapped = wrapped.with_priority(p);
@@ -95,6 +112,9 @@ pub(super) fn apply_override(
             Ok(style) => wrapped = wrapped.with_user_style(style),
             Err(e) => warn(&format!("segments.{id}.style: {e}; ignoring override")),
         }
+    }
+    if let Some(icon) = effective_icon {
+        wrapped = wrapped.with_icon(icon);
     }
     Box::new(wrapped)
 }

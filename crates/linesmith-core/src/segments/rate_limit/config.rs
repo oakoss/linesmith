@@ -85,7 +85,6 @@ pub enum ExtraUsageFormat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CommonRateLimitConfig {
-    pub icon: String,
     pub label: String,
     pub stale_marker: String,
     pub progress_width: u16,
@@ -101,7 +100,6 @@ impl CommonRateLimitConfig {
     #[must_use]
     pub fn new(label: impl Into<String>) -> Self {
         Self {
-            icon: String::new(),
             label: label.into(),
             stale_marker: "~".into(),
             progress_width: 20,
@@ -110,7 +108,7 @@ impl CommonRateLimitConfig {
     }
 }
 
-/// Apply `[segments.<id>]` common overrides (`icon`, `label`,
+/// Apply `[segments.<id>]` common overrides (`label`,
 /// `stale_marker`, `progress_width`) onto `cfg`. Wrong-type values
 /// warn and leave the default; unknown keys are silently skipped
 /// here because `config::validate_keys` owns that diagnostic.
@@ -120,13 +118,6 @@ pub(crate) fn apply_common_extras(
     id: &str,
     warn: &mut impl FnMut(&str),
 ) {
-    if let Some(v) = extras.get("icon") {
-        if let Some(s) = v.as_str() {
-            cfg.icon = s.to_string();
-        } else {
-            warn(&format!("segments.{id}.icon: expected string; ignoring"));
-        }
-    }
     if let Some(v) = extras.get("label") {
         if let Some(s) = v.as_str() {
             cfg.label = s.to_string();

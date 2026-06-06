@@ -67,6 +67,7 @@ pub struct Config {
 #[schemars(extend("additionalProperties" = false))]
 pub struct LayoutOptions {
     pub color: ColorPolicy,
+    pub icons: IconMode,
     pub claude_padding: u16,
     /// Inter-segment separator. Stored as a raw string; the segment
     /// builder parses it into a [`crate::segments::Separator`] at
@@ -95,6 +96,18 @@ pub enum ColorPolicy {
     Auto,
     Always,
     Never,
+}
+
+/// Config-level icon rendering mode. Defaults to Nerd Font glyphs,
+/// matching Starship; terminals without a Nerd Font may show boxes,
+/// so `doctor` surfaces the `[layout_options] icons = "off"` opt-out.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum IconMode {
+    #[default]
+    NerdFont,
+    Off,
 }
 
 /// `[line]` section: ordered list of segment ids to render in
@@ -344,6 +357,7 @@ pub struct SegmentOverride {
     pub priority: Option<u8>,
     pub width: Option<WidthBoundsConfig>,
     pub style: Option<String>,
+    pub icon: Option<String>,
     /// Plugin-config bag: every TOML key under `[segments.<plugin-id>]`
     /// not matched by a typed field. Surfaced to the rhai script as
     /// `ctx.config.<key>` per `docs/specs/plugin-api.md` §ctx shape.
@@ -525,7 +539,13 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
 
 /// Fields under `[layout_options]`. `separator` is tolerated ahead
 /// of its implementation so forward-compat configs don't warn.
-const KNOWN_LAYOUT_OPTIONS: &[&str] = &["color", "claude_padding", "separator", "powerline_width"];
+const KNOWN_LAYOUT_OPTIONS: &[&str] = &[
+    "color",
+    "icons",
+    "claude_padding",
+    "separator",
+    "powerline_width",
+];
 
 /// Per-segment override schema. Returns `None` for segment ids we
 /// don't recognize so plugin segments (which own their own schema)
@@ -533,7 +553,7 @@ const KNOWN_LAYOUT_OPTIONS: &[&str] = &["color", "claude_padding", "separator", 
 /// rate-limit segments extend it with per-family knobs that
 /// `segments::rate_limit::format` reads from the TOML extras bag.
 fn segment_override_schema(id: &str) -> Option<&'static [&'static str]> {
-    const BUILT_IN_COMMON: &[&str] = &["priority", "width", "style", "visible_if"];
+    const BUILT_IN_COMMON: &[&str] = &["priority", "width", "style", "icon", "visible_if"];
     const RATE_LIMIT_COMMON: &[&str] = &[
         "priority",
         "width",
@@ -592,7 +612,7 @@ fn segment_override_schema(id: &str) -> Option<&'static [&'static str]> {
         "dirty",
         "ahead_behind",
     ];
-    const MODEL_SEGMENT: &[&str] = &["priority", "width", "style", "visible_if", "format"];
+    const MODEL_SEGMENT: &[&str] = &["priority", "width", "style", "icon", "visible_if", "format"];
     match id {
         "model" => Some(MODEL_SEGMENT),
         "workspace" | "cost" | "effort" | "context_window" => Some(BUILT_IN_COMMON),
@@ -936,6 +956,18 @@ mod tests {
             let c = Config::from_str(&src).expect("parse ok");
             assert_eq!(c.layout_options.map(|l| l.color), Some(expected));
         }
+    }
+
+    #[test]
+    fn layout_options_icons_accepts_modes_and_defaults_to_nerdfont() {
+        for (toml_val, expected) in [("nerdfont", IconMode::NerdFont), ("off", IconMode::Off)] {
+            let src = format!("[layout_options]\nicons = \"{toml_val}\"\n");
+            let c = Config::from_str(&src).expect("parse ok");
+            assert_eq!(c.layout_options.map(|l| l.icons), Some(expected));
+        }
+
+        let c = Config::from_str("[layout_options]\n").expect("parse ok");
+        assert_eq!(c.layout_options.map(|l| l.icons), Some(IconMode::NerdFont),);
     }
 
     // --- unknown-key validation ---
