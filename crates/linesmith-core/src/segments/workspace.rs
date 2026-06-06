@@ -51,7 +51,9 @@ impl Segment for WorkspaceSegment {
     }
 
     fn defaults(&self) -> SegmentDefaults {
-        SegmentDefaults::with_priority(PRIORITY).with_truncatable(true)
+        SegmentDefaults::with_priority(PRIORITY)
+            .with_icon("\u{f07b}")
+            .with_truncatable(true)
     }
 }
 

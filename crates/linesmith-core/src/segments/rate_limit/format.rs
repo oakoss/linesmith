@@ -34,7 +34,7 @@ impl ResetWindow {
 
 /// Render `rate_limit_5h` / `rate_limit_7d` from endpoint-sourced data:
 /// apply `invert`, clamp, and pick the percent/progress form, then wrap
-/// in label + icon. JSONL-sourced renders use [`format_jsonl_tokens`]
+/// in the configured label. JSONL-sourced renders use [`format_jsonl_tokens`]
 /// instead — the two shapes diverge in both unit (`%` vs compact tokens)
 /// and modifier support (`invert` / `progress` don't apply without a
 /// ceiling).
@@ -161,25 +161,15 @@ pub(crate) fn render_error(err: &UsageError, cfg: &CommonRateLimitConfig) -> Str
 fn wrap(value: &str, jsonl: bool, cfg: &CommonRateLimitConfig) -> String {
     let marker = if jsonl { cfg.stale_marker.as_str() } else { "" };
     let label_sep = if cfg.label.is_empty() { "" } else { ": " };
-    let icon_sep = if cfg.icon.is_empty() { "" } else { " " };
-    format!(
-        "{marker}{icon}{icon_sep}{label}{label_sep}{value}",
-        icon = cfg.icon,
-        label = cfg.label,
-    )
+    format!("{marker}{label}{label_sep}{value}", label = cfg.label,)
 }
 
-/// Label + icon wrap for error strings: the bracketed error body
+/// Label wrap for error strings: the bracketed error body
 /// replaces the value slot. Stale marker is never applied here — if
 /// we're rendering an error, the source is moot.
 fn wrap_label_only(body: &str, cfg: &CommonRateLimitConfig) -> String {
     let label_sep = if cfg.label.is_empty() { "" } else { ": " };
-    let icon_sep = if cfg.icon.is_empty() { "" } else { " " };
-    format!(
-        "{icon}{icon_sep}{label}{label_sep}{body}",
-        icon = cfg.icon,
-        label = cfg.label,
-    )
+    format!("{label}{label_sep}{body}", label = cfg.label,)
 }
 
 #[must_use]
@@ -393,14 +383,6 @@ mod tests {
         c.label = String::new();
         let s = format_percent(&bucket(22.0), PercentFormat::Percent, false, &c);
         assert_eq!(s, "22.0%");
-    }
-
-    #[test]
-    fn icon_renders_with_space_separator() {
-        let mut c = cfg();
-        c.icon = "⏱".into();
-        let s = format_percent(&bucket(22.0), PercentFormat::Percent, false, &c);
-        assert_eq!(s, "⏱ 5h: 22.0%");
     }
 
     #[test]

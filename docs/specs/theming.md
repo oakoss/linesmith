@@ -196,6 +196,8 @@ When a segment wants to render styled text, resolution runs this order:
 
 The user override wholesale-replaces visual fields (`role`, `fg`, `bold`, `italic`, `underline`, `dim`) — that's the documented "restyle the segment" semantic. `hyperlink` is the exception: it carries segment behavior (the link target) rather than appearance, and the user-style TOML syntax has no slot for it. The override therefore inherits the inner segment's `hyperlink`, so `[segments.X] color = "red"` repaints without silently stripping links.
 
+Generic segment icons are styled text, not separate theme slots. The builder applies `[segments.<id>] icon = "..."` or the shipped default icon after any user style override, so the icon inherits the same resolved role, foreground, decorations, and hyperlink preservation behavior as the segment text. `[layout_options].icons = "off"` suppresses shipped default icons globally; per-segment icon overrides still render, and `icon = ""` disables a segment's icon.
+
 ```text
 user config style?   ──► yes ──► use it
          │ no

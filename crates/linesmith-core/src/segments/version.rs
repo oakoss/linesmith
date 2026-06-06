@@ -69,7 +69,7 @@ impl Segment for VersionSegment {
     }
 
     fn defaults(&self) -> SegmentDefaults {
-        SegmentDefaults::with_priority(PRIORITY)
+        SegmentDefaults::with_priority(PRIORITY).with_icon("\u{f121}")
     }
 }
 

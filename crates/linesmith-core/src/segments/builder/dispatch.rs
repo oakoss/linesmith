@@ -9,7 +9,9 @@ use linesmith_plugin::{CompiledPlugin, PluginRegistry};
 use super::super::{
     built_in_by_id, LineItem, Segment, Separator, BUILT_IN_SEGMENT_IDS, DEFAULT_SEGMENT_IDS,
 };
-use super::layout::{resolve_layout_separator, single_line_entries, validated_numbered_lines};
+use super::layout::{
+    resolve_icon_mode, resolve_layout_separator, single_line_entries, validated_numbered_lines,
+};
 use super::plugins::{apply_override, bundle_plugins, toml_table_to_dynamic};
 use crate::config;
 use crate::plugins::RhaiSegment;
@@ -92,6 +94,7 @@ pub fn build_segments(
         {
             warn("layout = \"multi-line\" passed to build_segments (the single-line API); rendering line 1 only. Call build_lines to render every [line.N] sub-table.");
             let layout_separator = resolve_layout_separator(config, &mut warn);
+            let icon_mode = resolve_icon_mode(config);
             let mut plugin_bundle = bundle_plugins(plugins);
             let mut consumed = std::collections::HashSet::new();
             return build_one_line(
@@ -100,6 +103,7 @@ pub fn build_segments(
                 &mut plugin_bundle,
                 &mut consumed,
                 &layout_separator,
+                icon_mode,
                 &mut warn,
             );
         }
@@ -114,6 +118,7 @@ pub fn build_segments(
     }
 
     let layout_separator = resolve_layout_separator(config, &mut warn);
+    let icon_mode = resolve_icon_mode(config);
 
     let entries: Vec<config::LineEntry> = match configured_line {
         Some(l) => l.segments.clone(),
@@ -131,6 +136,7 @@ pub fn build_segments(
         &mut plugin_bundle,
         &mut consumed,
         &layout_separator,
+        icon_mode,
         &mut warn,
     )
 }
@@ -203,6 +209,7 @@ pub fn build_lines(
     };
 
     let layout_separator = resolve_layout_separator(config, &mut warn);
+    let icon_mode = resolve_icon_mode(config);
     let mut plugin_bundle = bundle_plugins(plugins);
     let mut consumed_plugins = std::collections::HashSet::<String>::new();
 
@@ -215,6 +222,7 @@ pub fn build_lines(
                 &mut plugin_bundle,
                 &mut consumed_plugins,
                 &layout_separator,
+                icon_mode,
                 &mut warn,
             )
         })
@@ -256,6 +264,7 @@ fn build_one_line(
     plugin_bundle: &mut Option<(HashMap<String, CompiledPlugin>, Arc<Engine>)>,
     consumed_plugins: &mut std::collections::HashSet<String>,
     layout_separator: &Separator,
+    icon_mode: config::IconMode,
     warn: &mut impl FnMut(&str),
 ) -> Vec<LineItem> {
     let mut seen = std::collections::HashSet::<String>::new();
@@ -344,7 +353,7 @@ fn build_one_line(
                     }
                     continue;
                 };
-                let seg = apply_override(id, inner, cfg_override, warn);
+                let seg = apply_override(id, inner, cfg_override, icon_mode, warn);
 
                 // Implicit interleave: when the previous item is a
                 // segment (no explicit separator between them) and

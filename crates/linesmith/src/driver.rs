@@ -1373,6 +1373,13 @@ mod tests {
         )
     }
 
+    fn run_cli_main_with_icons_off(stdin: &[u8], env: &CliEnv) -> (u8, String, String) {
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[layout_options]\nicons = \"off\"\n").unwrap();
+        run_cli_main(&["--config", path.to_str().unwrap()], stdin, env)
+    }
+
     // --- meta actions ---
 
     #[test]
@@ -1431,10 +1438,94 @@ mod tests {
             "model": { "display_name": "Claude Test" },
             "workspace": { "project_dir": "/home/dev/linesmith" }
         }"#;
-        let (code, stdout, stderr) = run_cli_main(&[], json, &CliEnv::for_tests());
+        let (code, stdout, stderr) = run_cli_main_with_icons_off(json, &CliEnv::for_tests());
         assert_eq!(code, 0);
         assert_eq!(stdout, "Claude Test linesmith\n");
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn default_config_renders_segments_with_nerdfont_glyphs() {
+        let json = br#"{
+            "version": "1.2.3",
+            "model": { "display_name": "Claude" },
+            "workspace": { "project_dir": "/home/dev/linesmith" }
+        }"#;
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[line]\nsegments = [\"model\", \"version\", \"workspace\"]\n",
+        )
+        .unwrap();
+        let (code, stdout, stderr) = run_cli_main(
+            &["--config", path.to_str().unwrap()],
+            json,
+            &CliEnv::for_tests(),
+        );
+        assert_eq!(code, 0, "stderr:\n{stderr}");
+        assert_eq!(
+            stdout,
+            "\u{2726} Claude \u{f121} v1.2.3 \u{f07b} linesmith\n"
+        );
+    }
+
+    #[test]
+    fn icons_off_suppresses_default_segment_glyphs() {
+        let json = br#"{
+            "version": "1.2.3",
+            "model": { "display_name": "Claude" },
+            "workspace": { "project_dir": "/home/dev/linesmith" }
+        }"#;
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+                [layout_options]
+                icons = "off"
+                [line]
+                segments = ["model", "version", "workspace"]
+            "#,
+        )
+        .unwrap();
+        let (code, stdout, stderr) = run_cli_main(
+            &["--config", path.to_str().unwrap()],
+            json,
+            &CliEnv::for_tests(),
+        );
+        assert_eq!(code, 0, "stderr:\n{stderr}");
+        assert_eq!(stdout, "Claude v1.2.3 linesmith\n");
+    }
+
+    #[test]
+    fn segment_icon_overrides_render_through_cli_main() {
+        let json = br#"{
+            "version": "1.2.3",
+            "model": { "display_name": "Claude" },
+            "workspace": { "project_dir": "/home/dev/linesmith" }
+        }"#;
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+                [line]
+                segments = ["model", "version", "workspace"]
+                [segments.model]
+                icon = "X"
+                [segments.version]
+                icon = ""
+            "#,
+        )
+        .unwrap();
+        let (code, stdout, stderr) = run_cli_main(
+            &["--config", path.to_str().unwrap()],
+            json,
+            &CliEnv::for_tests(),
+        );
+        assert_eq!(code, 0, "stderr:\n{stderr}");
+        assert_eq!(stdout, "X Claude v1.2.3 \u{f07b} linesmith\n");
     }
 
     #[test]
@@ -1488,7 +1579,11 @@ mod tests {
         // then discards `resolved` gets caught.
         let dir = tempdir();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[line]\nsegments = [\"workspace\", \"model\"]\n").unwrap();
+        std::fs::write(
+            &path,
+            "[layout_options]\nicons = \"off\"\n[line]\nsegments = [\"workspace\", \"model\"]\n",
+        )
+        .unwrap();
         let json = br#"{
             "model": { "display_name": "Claude" },
             "workspace": { "project_dir": "/home/dev/linesmith" }
@@ -1649,7 +1744,11 @@ mod tests {
         // must not double-emit for the same typo.
         let dir = tempdir();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "thme = \"oops\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "thme = \"oops\"\n[layout_options]\nicons = \"off\"\n",
+        )
+        .unwrap();
         let json = br#"{
             "model": { "display_name": "Claude" },
             "workspace": { "project_dir": "/home/dev/linesmith" }
@@ -1673,7 +1772,11 @@ mod tests {
         // no `--check-config` summary runs.
         let dir = tempdir();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "thme = \"oops\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "thme = \"oops\"\n[layout_options]\nicons = \"off\"\n",
+        )
+        .unwrap();
         let json = br#"{
             "model": { "display_name": "Claude" },
             "workspace": { "project_dir": "/home/dev/linesmith" }
@@ -1759,7 +1862,7 @@ mod tests {
             color_capability: Some(theme::Capability::Palette16),
             ..CliEnv::for_tests()
         };
-        let (code, stdout, _stderr) = run_cli_main(&[], json, &env);
+        let (code, stdout, _stderr) = run_cli_main_with_icons_off(json, &env);
         assert_eq!(code, 0);
         // Model (Primary → BrightMagenta = SGR 95) and workspace (Info →
         // BrightCyan = SGR 96) each get wrapped; plain text between them
@@ -1775,7 +1878,11 @@ mod tests {
         }"#;
         let dir = tempdir();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "theme = \"minimal\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "theme = \"minimal\"\n[layout_options]\nicons = \"off\"\n",
+        )
+        .unwrap();
 
         let env = CliEnv {
             color_capability: Some(theme::Capability::Palette16),
@@ -1806,6 +1913,8 @@ mod tests {
             &path,
             r#"
                 layout = "multi-line"
+                [layout_options]
+                icons = "off"
                 [line.1]
                 segments = ["model"]
                 [line.2]
@@ -1835,6 +1944,8 @@ mod tests {
             &path,
             r#"
                 layout = "multi-line"
+                [layout_options]
+                icons = "off"
                 [line.10]
                 segments = ["workspace"]
                 [line.2]
@@ -1864,6 +1975,8 @@ mod tests {
             &path,
             r#"
                 layout = "multi-line"
+                [layout_options]
+                icons = "off"
                 [line]
                 segments = ["model"]
             "#,
@@ -1892,6 +2005,8 @@ mod tests {
             &path,
             r#"
                 layout = "multi-line"
+                [layout_options]
+                icons = "off"
                 [line.1]
                 segments = ["model"]
                 [line.foo]
@@ -1923,6 +2038,8 @@ mod tests {
             &path,
             r#"
                 layout = "multi-line"
+                [layout_options]
+                icons = "off"
                 [line.1]
                 segments = ["model"]
                 [line.2]
@@ -1960,6 +2077,8 @@ mod tests {
             &path,
             r#"
                 layout = "multi-line"
+                [layout_options]
+                icons = "off"
                 [line.1]
                 segments = ["model"]
                 [line.2]
@@ -2025,7 +2144,11 @@ mod tests {
         }"#;
         let dir = tempdir();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "theme = \"nonexistent\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "theme = \"nonexistent\"\n[layout_options]\nicons = \"off\"\n",
+        )
+        .unwrap();
 
         let env = CliEnv {
             color_capability: Some(theme::Capability::None),
@@ -2053,7 +2176,11 @@ mod tests {
         }"#;
         let dir = tempdir();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "theme = \"catppuccin-mocha\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "theme = \"catppuccin-mocha\"\n[layout_options]\nicons = \"off\"\n",
+        )
+        .unwrap();
         let env = CliEnv {
             color_capability: Some(theme::Capability::TrueColor),
             ..CliEnv::for_tests()
@@ -2093,7 +2220,11 @@ mod tests {
         .unwrap();
 
         let cfg_dir = dir.path().join(".config/linesmith");
-        std::fs::write(cfg_dir.join("config.toml"), "theme = \"neon\"\n").unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "theme = \"neon\"\n[layout_options]\nicons = \"off\"\n",
+        )
+        .unwrap();
 
         let json = br#"{
             "model": { "display_name": "C" },
@@ -2120,7 +2251,11 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".config/linesmith/themes")).unwrap();
         let cfg_dir = dir.path().join(".config/linesmith");
         std::fs::create_dir_all(&cfg_dir).unwrap();
-        std::fs::write(cfg_dir.join("config.toml"), "theme = \"nonexistent\"\n").unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "theme = \"nonexistent\"\n[layout_options]\nicons = \"off\"\n",
+        )
+        .unwrap();
         let env = CliEnv {
             home: Some(dir.path().as_os_str().to_owned()),
             ..CliEnv::for_tests()
@@ -2141,6 +2276,13 @@ mod tests {
         let themes_dir = dir.path().join(".config/linesmith/themes");
         std::fs::create_dir_all(&themes_dir).unwrap();
         std::fs::write(themes_dir.join("broken.toml"), "not valid toml [[").unwrap();
+        let cfg_dir = dir.path().join(".config/linesmith");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "[layout_options]\nicons = \"off\"\n",
+        )
+        .unwrap();
         let env = CliEnv {
             home: Some(dir.path().as_os_str().to_owned()),
             ..CliEnv::for_tests()
@@ -2345,7 +2487,7 @@ mod tests {
             color_capability: Some(theme::Capability::None),
             ..CliEnv::for_tests()
         };
-        let (code, stdout, _stderr) = run_cli_main(&[], json, &env);
+        let (code, stdout, _stderr) = run_cli_main_with_icons_off(json, &env);
         assert_eq!(code, 0);
         assert_eq!(stdout, "C x\n");
     }
@@ -2409,6 +2551,7 @@ mod tests {
     fn layout_options_with_color(color: config::ColorPolicy) -> config::LayoutOptions {
         let mut opts = config::LayoutOptions::default();
         opts.color = color;
+        opts.icons = config::IconMode::Off;
         opts
     }
 
@@ -2536,7 +2679,11 @@ mod tests {
         }"#;
         let dir = tempdir();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[layout_options]\nclaude_padding = 10\n").unwrap();
+        std::fs::write(
+            &path,
+            "[layout_options]\nicons = \"off\"\nclaude_padding = 10\n",
+        )
+        .unwrap();
         let env = CliEnv {
             terminal_width: Some(20),
             ..CliEnv::for_tests()
@@ -2560,7 +2707,11 @@ mod tests {
         }"#;
         let dir = tempdir();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[layout_options]\nclaude_padding = 500\n").unwrap();
+        std::fs::write(
+            &path,
+            "[layout_options]\nicons = \"off\"\nclaude_padding = 500\n",
+        )
+        .unwrap();
         let env = CliEnv {
             terminal_width: Some(80),
             ..CliEnv::for_tests()
@@ -2582,7 +2733,11 @@ mod tests {
         }"#;
         let dir = tempdir();
         let path = dir.path().join("config.toml");
-        std::fs::write(&path, "[layout_options]\nclaude_padding = 0\n").unwrap();
+        std::fs::write(
+            &path,
+            "[layout_options]\nicons = \"off\"\nclaude_padding = 0\n",
+        )
+        .unwrap();
         let (code, stdout, _stderr) = run_cli_main(
             &["--config", path.to_str().unwrap()],
             json,
@@ -2609,7 +2764,14 @@ mod tests {
             color_capability: None,
             ..CliEnv::for_tests()
         };
-        let (code, stdout, _stderr) = run_cli_main(&["--no-color"], json, &env);
+        let dir = tempdir();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[layout_options]\nicons = \"off\"\n").unwrap();
+        let (code, stdout, _stderr) = run_cli_main(
+            &["--no-color", "--config", path.to_str().unwrap()],
+            json,
+            &env,
+        );
         assert_eq!(code, 0);
         assert_eq!(stdout, "Claude linesmith\n");
         assert!(!stdout.contains('\x1b'));

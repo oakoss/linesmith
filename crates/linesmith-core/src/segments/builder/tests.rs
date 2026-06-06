@@ -824,9 +824,16 @@ fn merge_width(min: Option<u16>, max: Option<u16>) -> WidthBounds {
         priority: None,
         width: Some(config::WidthBoundsConfig { min, max }),
         style: None,
+        icon: None,
         extra: BTreeMap::new(),
     };
-    let wrapped = apply_override("stub", Box::new(StubWithWidth), Some(&ov), &mut |_| {});
+    let wrapped = apply_override(
+        "stub",
+        Box::new(StubWithWidth),
+        Some(&ov),
+        config::IconMode::NerdFont,
+        &mut |_| {},
+    );
     wrapped.defaults().width.expect("width preserved")
 }
 
@@ -1001,6 +1008,120 @@ fn whitespace_only_style_string_is_noop_and_preserves_segment_declared_style() {
         .expect("render ok")
         .expect("visible");
     assert_eq!(rendered.style.role, Some(Role::Primary));
+}
+
+#[test]
+fn default_icon_renders_when_icons_mode_is_nerdfont() {
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model"]
+            [layout_options]
+            icons = "nerdfont"
+        "#,
+    )
+    .expect("parse");
+    let built = build_segments(Some(&cfg), None, |_| {});
+    let rendered = nth_segment(&built, 0)
+        .render(&model_ctx("Claude Sonnet 4.6"), &rc())
+        .expect("render ok")
+        .expect("visible");
+    assert_eq!(rendered.text(), "\u{2726} Claude Sonnet 4.6");
+}
+
+#[test]
+fn default_icon_renders_when_layout_options_are_absent() {
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model"]
+        "#,
+    )
+    .expect("parse");
+    let built = build_segments(Some(&cfg), None, |_| {});
+    let rendered = nth_segment(&built, 0)
+        .render(&model_ctx("Claude Sonnet 4.6"), &rc())
+        .expect("render ok")
+        .expect("visible");
+    assert_eq!(rendered.text(), "\u{2726} Claude Sonnet 4.6");
+}
+
+#[test]
+fn segment_icon_override_replaces_default() {
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model"]
+            [segments.model]
+            icon = "AI"
+        "#,
+    )
+    .expect("parse");
+    let built = build_segments(Some(&cfg), None, |_| {});
+    let rendered = nth_segment(&built, 0)
+        .render(&model_ctx("Claude Sonnet 4.6"), &rc())
+        .expect("render ok")
+        .expect("visible");
+    assert_eq!(rendered.text(), "AI Claude Sonnet 4.6");
+}
+
+#[test]
+fn empty_segment_icon_disables_default() {
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model"]
+            [segments.model]
+            icon = ""
+        "#,
+    )
+    .expect("parse");
+    let built = build_segments(Some(&cfg), None, |_| {});
+    let rendered = nth_segment(&built, 0)
+        .render(&model_ctx("Claude Sonnet 4.6"), &rc())
+        .expect("render ok")
+        .expect("visible");
+    assert_eq!(rendered.text(), "Claude Sonnet 4.6");
+}
+
+#[test]
+fn icons_off_suppresses_default_icon() {
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model"]
+            [layout_options]
+            icons = "off"
+        "#,
+    )
+    .expect("parse");
+    let built = build_segments(Some(&cfg), None, |_| {});
+    let rendered = nth_segment(&built, 0)
+        .render(&model_ctx("Claude Sonnet 4.6"), &rc())
+        .expect("render ok")
+        .expect("visible");
+    assert_eq!(rendered.text(), "Claude Sonnet 4.6");
+}
+
+#[test]
+fn segment_icon_override_renders_when_icons_off() {
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model"]
+            [layout_options]
+            icons = "off"
+            [segments.model]
+            icon = "AI"
+        "#,
+    )
+    .expect("parse");
+    let built = build_segments(Some(&cfg), None, |_| {});
+    let rendered = nth_segment(&built, 0)
+        .render(&model_ctx("Claude Sonnet 4.6"), &rc())
+        .expect("render ok")
+        .expect("visible");
+    assert_eq!(rendered.text(), "AI Claude Sonnet 4.6");
 }
 
 // --- plugin integration ----------------------------------------

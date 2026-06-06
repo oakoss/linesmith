@@ -36,7 +36,6 @@ const NO_UPSTREAM_MARKER: &str = "?";
 /// §Config schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Config {
-    pub(crate) icon: String,
     pub(crate) label: String,
     pub(crate) max_length: u16,
     pub(crate) truncation_marker: String,
@@ -107,7 +106,6 @@ impl FormatTemplate {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            icon: String::new(),
             label: String::new(),
             max_length: DEFAULT_MAX_BRANCH_LEN,
             truncation_marker: DEFAULT_TRUNCATION_MARKER.into(),
@@ -131,9 +129,6 @@ impl GitBranchSegment {
     ) -> Self {
         let mut cfg = Config::default();
 
-        if let Some(v) = extras.get("icon").and_then(|v| v.as_str()) {
-            cfg.icon = v.to_string();
-        }
         if let Some(v) = extras.get("label").and_then(|v| v.as_str()) {
             cfg.label = v.to_string();
         }
@@ -269,7 +264,7 @@ impl Segment for GitBranchSegment {
     }
 
     fn defaults(&self) -> SegmentDefaults {
-        SegmentDefaults::with_priority(PRIORITY)
+        SegmentDefaults::with_priority(PRIORITY).with_icon("\u{f126}")
     }
 
     fn render(&self, ctx: &DataContext, rc: &RenderContext) -> RenderResult {
@@ -320,9 +315,6 @@ impl Segment for GitBranchSegment {
 impl GitBranchSegment {
     fn assemble(&self, gc: &GitContext, rc: &RenderContext) -> String {
         let mut parts: Vec<String> = Vec::new();
-        if !self.cfg.icon.is_empty() {
-            parts.push(self.cfg.icon.clone());
-        }
         if !self.cfg.label.is_empty() {
             parts.push(self.cfg.label.clone());
         }
@@ -353,12 +345,9 @@ impl GitBranchSegment {
     /// ahead/behind) suppressed regardless of config. The compact
     /// fallback the engine asks for via `shrink_to_fit` under layout
     /// pressure: shed decoration, keep the signal-bearing prefix
-    /// (icon + label + head).
+    /// (label + head).
     fn assemble_compact(&self, gc: &GitContext) -> String {
         let mut parts: Vec<String> = Vec::new();
-        if !self.cfg.icon.is_empty() {
-            parts.push(self.cfg.icon.clone());
-        }
         if !self.cfg.label.is_empty() {
             parts.push(self.cfg.label.clone());
         }
@@ -1003,9 +992,8 @@ mod tests {
     }
 
     #[test]
-    fn applies_icon_and_label_when_configured() {
+    fn applies_label_when_configured() {
         let mut seg = GitBranchSegment::default();
-        seg.cfg.icon = ">>".into();
         seg.cfg.label = "branch:".into();
         let gc = GitContext::new(
             RepoKind::Main,
@@ -1016,7 +1004,7 @@ mod tests {
             .render(&ctx_with_git(Ok(Some(gc))), &rc())
             .unwrap()
             .expect("rendered");
-        assert_eq!(rendered.text(), ">> branch: main");
+        assert_eq!(rendered.text(), "branch: main");
     }
 
     #[test]
@@ -1030,9 +1018,8 @@ mod tests {
     }
 
     #[test]
-    fn from_extras_reads_icon_label_and_dirty_knobs() {
+    fn from_extras_reads_label_and_dirty_knobs() {
         let mut extras = BTreeMap::new();
-        extras.insert("icon".into(), toml::Value::String("".into()));
         extras.insert("label".into(), toml::Value::String("br".into()));
         extras.insert("max_length".into(), toml::Value::Integer(10));
         extras.insert("truncation_marker".into(), toml::Value::String("..".into()));
@@ -1048,7 +1035,6 @@ mod tests {
         let mut warnings = Vec::<String>::new();
         let seg = GitBranchSegment::from_extras(&extras, &mut |m| warnings.push(m.to_string()));
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
-        assert_eq!(seg.cfg.icon, "");
         assert_eq!(seg.cfg.label, "br");
         assert_eq!(seg.cfg.max_length, 10);
         assert_eq!(seg.cfg.truncation_marker, "..");
@@ -1319,22 +1305,15 @@ mod tests {
     }
 
     #[test]
-    fn shrink_to_fit_keeps_configured_icon_and_label_in_compact_form() {
-        // The compact form is `icon + label + head` (the
-        // signal-bearing prefix). Default config leaves icon and
-        // label empty, so the existing tests don't exercise the
-        // `if !cfg.icon.is_empty()` / `if !cfg.label.is_empty()`
-        // branches in `assemble_compact`. Configure both and confirm
-        // the prefix survives shedding the structured tail.
+    fn shrink_to_fit_keeps_configured_label_in_compact_form() {
         let mut seg = GitBranchSegment::default();
-        seg.cfg.icon = "@".into();
         seg.cfg.label = "br:".into();
         let dc = ctx_with_dirty_and_upstream(2, 1);
         let dummy_rc = RenderContext::new(80);
         let shrunk = seg
             .shrink_to_fit(&dc, &dummy_rc, 50)
             .expect("compact form fits");
-        assert_eq!(shrunk.text(), "@ br: main");
+        assert_eq!(shrunk.text(), "br: main");
     }
 
     #[test]

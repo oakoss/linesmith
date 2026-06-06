@@ -86,7 +86,7 @@ impl Segment for RateLimit7dSegment {
     }
 
     fn defaults(&self) -> SegmentDefaults {
-        SegmentDefaults::with_priority(PRIORITY)
+        SegmentDefaults::with_priority(PRIORITY).with_icon("\u{f073}")
     }
 }
 
@@ -177,7 +177,7 @@ impl Segment for RateLimit7dResetSegment {
     }
 
     fn defaults(&self) -> SegmentDefaults {
-        SegmentDefaults::with_priority(PRIORITY)
+        SegmentDefaults::with_priority(PRIORITY).with_icon("\u{21bb}")
     }
 }
 

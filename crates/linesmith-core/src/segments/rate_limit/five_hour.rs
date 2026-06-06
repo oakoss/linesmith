@@ -92,7 +92,7 @@ impl Segment for RateLimit5hSegment {
     }
 
     fn defaults(&self) -> SegmentDefaults {
-        SegmentDefaults::with_priority(PRIORITY)
+        SegmentDefaults::with_priority(PRIORITY).with_icon("\u{f017}")
     }
 }
 
@@ -184,7 +184,7 @@ impl Segment for RateLimit5hResetSegment {
     }
 
     fn defaults(&self) -> SegmentDefaults {
-        SegmentDefaults::with_priority(PRIORITY)
+        SegmentDefaults::with_priority(PRIORITY).with_icon("\u{21bb}")
     }
 }
 
@@ -432,7 +432,6 @@ mod tests {
         extras.insert("format".into(), toml::Value::String("progress".into()));
         extras.insert("invert".into(), toml::Value::Boolean(true));
         extras.insert("label".into(), toml::Value::String("five".into()));
-        extras.insert("icon".into(), toml::Value::String("⏱".into()));
         extras.insert("stale_marker".into(), toml::Value::String("*".into()));
         extras.insert("progress_width".into(), toml::Value::Integer(10));
         let mut warnings = Vec::new();
@@ -441,7 +440,6 @@ mod tests {
         assert_eq!(seg.format, PercentFormat::Progress);
         assert!(seg.invert);
         assert_eq!(seg.config.label, "five");
-        assert_eq!(seg.config.icon, "⏱");
         assert_eq!(seg.config.stale_marker, "*");
         assert_eq!(seg.config.progress_width, 10);
     }

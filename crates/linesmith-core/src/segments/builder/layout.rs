@@ -173,6 +173,16 @@ pub(super) fn resolve_layout_separator(
         .map(|s| parse_layout_separator(s, powerline_width, warn))
         .unwrap_or(Separator::Space)
 }
+
+/// Resolve the `[layout_options].icons` mode once for the whole
+/// config. Absence follows `LayoutOptions`' default.
+pub(super) fn resolve_icon_mode(config: Option<&config::Config>) -> config::IconMode {
+    config
+        .and_then(|c| c.layout_options.as_ref())
+        .map(|lo| lo.icons)
+        .unwrap_or_default()
+}
+
 /// Parse a `[layout_options].separator` string into a [`Separator`].
 ///
 /// - `"space"` → [`Separator::Space`]

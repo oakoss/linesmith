@@ -140,6 +140,12 @@ powerline_width = 1
 # Duplicated here so linesmith can factor it into width calculations.
 claude_padding = 0
 
+# Built-in segment icons. Default "nerdfont" follows Starship-style
+# glyphs; terminals without a Nerd Font may show boxes. Set "off" to
+# suppress shipped defaults. Per-segment `icon = "..."` still renders
+# in either mode; `icon = ""` disables that segment's icon.
+icons = "nerdfont"
+
 # Force-color override. "auto" honors NO_COLOR/FORCE_COLOR; "always" forces
 # color emission; "never" strips all color.
 color = "auto"
@@ -186,6 +192,10 @@ green = 50                # pct < green renders Role::Success
 yellow = 80               # green <= pct < yellow renders Role::Warning
 
 [segments.workspace]
+# Generic per-segment icon override (every segment accepts it). Omit to
+# use the shipped default in `[layout_options].icons = "nerdfont"` mode;
+# `icon = "<glyph>"` overrides it, `icon = ""` disables only this one.
+
 # Shorthand: hide the segment if this evaluates to false.
 # `()` is rhai's unit/null sentinel (matches plugin-api.md's ctx nullability).
 visible_if = "ctx.workspace.git_worktree != ()"

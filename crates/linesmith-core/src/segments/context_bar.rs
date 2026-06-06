@@ -207,7 +207,7 @@ impl Segment for ContextBarSegment {
     }
 
     fn defaults(&self) -> SegmentDefaults {
-        SegmentDefaults::with_priority(PRIORITY)
+        SegmentDefaults::with_priority(PRIORITY).with_icon("\u{f035b}")
     }
 }
 
