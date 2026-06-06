@@ -17,7 +17,7 @@ pre-commit:
       glob: '**/*.rs'
       # rustfmt (not `cargo fmt --all`) to scope to staged files and avoid
       # post-commit drift; edition derived because rustfmt ignores Cargo.toml.
-      run: rustfmt --edition "$(cargo metadata --no-deps --format-version 1 | jq -r '[.packages[].edition] | unique | .[0]')" {staged_files}
+      run: rustfmt --edition "$(cargo metadata --no-deps --format-version 1 | jq -er '[.packages[].edition] | unique | if length == 1 then .[0] else error("expected exactly one workspace edition") end')" {staged_files}
       stage_fixed: true
     lint-md:
       glob: '**/*.md'
