@@ -2,7 +2,7 @@
 
 A Rust status line tool for Claude Code (and other AI coding CLIs) with plugin API, role-based themes, and correctness-first context/rate-limit/worktree handling.
 
-**Status:** Bootstrap phase. Docs and tooling foundation complete; Rust scaffold pending.
+**Status:** Active development (v0.2.x). Segment system, role-based theming, TUI config editor, `doctor` diagnostics, rhai plugin runtime, and cargo-dist multi-platform builds all ship.
 
 > **AGENTS.md is the source of truth for AI agent instructions in this project.** `CLAUDE.md` contains only `@AGENTS.md` to import this file. Do not edit `CLAUDE.md` directly or duplicate content across both files. Agents that read `AGENTS.md` (Codex, OpenAI Codex CLI, Cursor, etc.) and Claude Code (via the `@` import) see the same content.
 
@@ -123,13 +123,28 @@ Beads (`bd`) tracks all implementation work. Issue prefix: `lsm-`.
 
 Background Claude Code sessions isolate code edits into a git worktree under `.claude/worktrees/` (the `worktree.bgIsolation` default). `.claude/settings.json` sets `worktree.baseRef = "head"` so worktrees carry unpushed local commits — no missing state when syncing back.
 
+### Worktree vs. plain branch
+
+Not every change needs a worktree. Pick by size and concurrency:
+
+- **Small, single-track change** (a doc fix, a one-liner, a tightly-scoped edit) — branch off `main` (`git switch -c <branch> main` creates it from `main` regardless of what's checked out; `git pull` first if `main` is stale), commit, push, PR. Worktree setup/cleanup overhead and the footguns below aren't worth it. Exception: a **background** session code-file edit (Rust/JSON/TOML) trips the bgIsolation guard regardless of size and is forced into a worktree; doc-only edits and interactive sessions branch freely.
+- **Big work item and/or parallel work** (a substantial bead, or several beads in flight at once) — use a worktree so isolated checkouts don't collide. The trigger is concurrency or churn across the checkout; the worktree-specific subsections below (Naming convention onward) cover that path.
+
+Either way every change ships through a PR (`main` is protected); the only choice is worktree vs. plain branch.
+
+On the plain-branch path:
+
+- **Name** the branch after the bead (`git switch -c lsm-xyz main`) for beaded work, or a short kebab descriptor (`git switch -c docs-branch-policy main`) for ad-hoc work. Unlike `EnterWorktree`, `git switch -c` takes your name verbatim — no `worktree-` prefix is added.
+- **Claim** the bead _after_ switching to the branch (`bd update lsm-xyz --claim`), so the `.beads/issues.jsonl` write lands on the branch, not `main`. Non-beaded changes (most doc fixes) skip the claim.
+- **Cleanup** is `git switch main && git branch -D <branch>` once the PR merges — no `git worktree remove`, so the plain-branch path skips this workflow's most dangerous step and its data-loss footguns.
+
 ### When the bgIsolation guard fires
 
 The harness only blocks code-file edits (Rust, JSON, TOML); markdown / doc-only edits pass through to the main checkout without triggering:
 
 > This background session hasn't isolated its changes yet. Call EnterWorktree first so edits land in a worktree instead of the shared checkout.
 
-Use `EnterWorktree(name: <bd-id>)` to satisfy the guard when it fires, and call it proactively for doc-only changes too — every commit ships through a PR (next section), and that needs a branch separate from `main`. The guard is a backstop, not the only reason to isolate.
+Use `EnterWorktree(name: <bd-id>)` to satisfy the guard when it fires (a code edit in a background session). The guard is a backstop for background isolation, not a mandate to worktree every edit — for small or doc-only changes that don't trip it, prefer a plain branch per **Worktree vs. plain branch** above.
 
 ### Naming convention
 
