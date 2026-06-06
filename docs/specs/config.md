@@ -192,10 +192,9 @@ green = 50                # pct < green renders Role::Success
 yellow = 80               # green <= pct < yellow renders Role::Warning
 
 [segments.workspace]
-# Generic per-segment icon override. Omit to use the shipped default
-# when `[layout_options].icons = "nerdfont"`; set an empty string to
-# disable only this segment's icon.
-icon = ""
+# Generic per-segment icon override (every segment accepts it). Omit to
+# use the shipped default in `[layout_options].icons = "nerdfont"` mode;
+# `icon = "<glyph>"` overrides it, `icon = ""` disables only this one.
 
 # Shorthand: hide the segment if this evaluates to false.
 # `()` is rhai's unit/null sentinel (matches plugin-api.md's ctx nullability).
