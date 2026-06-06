@@ -127,7 +127,7 @@ Background Claude Code sessions isolate code edits into a git worktree under `.c
 
 Not every change needs a worktree. Pick by size and concurrency:
 
-- **Small, single-track change** (a doc fix, a one-liner, a tightly-scoped edit) — branch off `main` (`git switch -c <branch> main` creates it from `main` regardless of what's checked out; `git pull` first if `main` is stale), commit, push, PR. Worktree setup/cleanup overhead and the footguns below aren't worth it. Exception: a **background** session code-file edit (Rust/JSON/TOML) trips the bgIsolation guard regardless of size and is forced into a worktree; doc-only edits and interactive sessions branch freely.
+- **Small, single-track change** (a doc fix, a one-liner, a tightly-scoped edit) — branch off `main` (`git switch -c <branch> main` creates it from `main` regardless of what's checked out; refresh `main` first if it's stale with `git switch main && git pull --ff-only`), commit, push, PR. Worktree setup/cleanup overhead and the footguns below aren't worth it. Exception: a **background** session code-file edit (Rust/JSON/TOML) trips the bgIsolation guard regardless of size and is forced into a worktree; doc-only edits and interactive sessions branch freely.
 - **Big work item and/or parallel work** (a substantial bead, or several beads in flight at once) — use a worktree so isolated checkouts don't collide. The trigger is concurrency or churn across the checkout; the worktree-specific subsections below (Naming convention onward) cover that path.
 
 Either way every change ships through a PR (`main` is protected); the only choice is worktree vs. plain branch.
