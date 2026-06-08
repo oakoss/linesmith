@@ -565,6 +565,9 @@ fn segment_override_schema(id: &str) -> Option<&'static [&'static str]> {
         "progress_width",
         "format",
     ];
+    // Shared progress-bar knobs (the s0vw unified renderer). `thresholds`
+    // / `threshold_color` only affect the usage percent/progress bars,
+    // so they live on `PERCENT_SEGMENT`, not the reset family.
     const PERCENT_SEGMENT: &[&str] = &[
         "priority",
         "width",
@@ -576,6 +579,12 @@ fn segment_override_schema(id: &str) -> Option<&'static [&'static str]> {
         "progress_width",
         "format",
         "invert",
+        "fill",
+        "brackets",
+        "dim_empty",
+        "threshold_color",
+        "thresholds",
+        "characters",
     ];
     const RESET_SEGMENT: &[&str] = &[
         "priority",
@@ -594,6 +603,12 @@ fn segment_override_schema(id: &str) -> Option<&'static [&'static str]> {
         "timezone",
         "hour_format",
         "locale",
+        // Bar geometry for `format = "progress"`; the reset bar is flat,
+        // so it omits `threshold_color`/`thresholds`.
+        "fill",
+        "brackets",
+        "dim_empty",
+        "characters",
     ];
     // Nested tables like `dirty` are validated shallowly per
     // `validate_segments_table` — their inner keys pass through
@@ -628,6 +643,7 @@ fn segment_override_schema(id: &str) -> Option<&'static [&'static str]> {
         "brackets",
         "percentage",
         "dim_empty",
+        "fill",
     ];
     match id {
         "model" => Some(MODEL_SEGMENT),
@@ -1339,6 +1355,59 @@ mod tests {
             "#,
         );
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn context_bar_allows_fill_key_without_warning() {
+        let warnings = collect_warnings(
+            r#"
+                [segments.context_bar]
+                fill = "eighth"
+            "#,
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn rate_limit_segments_allow_shared_bar_keys_without_warning() {
+        let warnings = collect_warnings(
+            r##"
+                [segments.rate_limit_5h]
+                format = "progress"
+                fill = "braille"
+                brackets = true
+                dim_empty = false
+                threshold_color = true
+
+                [segments.rate_limit_5h.thresholds]
+                green = 60
+                yellow = 90
+
+                [segments.rate_limit_5h.characters]
+                full = "#"
+
+                [segments.rate_limit_7d_reset]
+                format = "progress"
+                fill = "eighth"
+            "##,
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn rate_limit_reset_warns_on_threshold_color_which_does_not_apply() {
+        // Reset bars are flat; `threshold_color`/`thresholds` aren't on
+        // the reset allow-list, so a stray one surfaces via check-config.
+        let warnings = collect_warnings(
+            r#"
+                [segments.rate_limit_5h_reset]
+                threshold_color = true
+            "#,
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("threshold_color")),
+            "expected a warning: {warnings:?}"
+        );
     }
 
     #[test]

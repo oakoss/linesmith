@@ -19,6 +19,7 @@ pub mod extras;
 pub mod git_branch;
 pub mod model;
 pub mod output_style;
+pub mod progress_bar;
 pub mod rate_limit;
 pub mod session_duration;
 pub mod tokens;

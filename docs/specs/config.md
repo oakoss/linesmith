@@ -193,12 +193,19 @@ cells = 10                # bar width in terminal cells (default 10)
 brackets = true           # wrap the cells in characters.open/close
 percentage = true         # append ` NN%` (banker's-rounded to match context_window)
 dim_empty = true          # render the empty trough in a dim role, not the fill color
+# Sub-cell fill style (shared with the rate-limit progress bars):
+#   "half"    floor + ▓ when the fractional cell is >= half (default)
+#   "whole"   round to whole cells, no partial glyph
+#   "eighth"  smooth ▏▎▍▌▋▊▉ eighth-block ramp
+#   "braille" smooth braille ramp (swaps full/empty to ⣿/⠀)
+fill = "half"
 [segments.context_bar.thresholds]
 green = 50                # pct < green renders Role::Success
 yellow = 80               # green <= pct < yellow renders Role::Warning
 [segments.context_bar.characters]
 # Single-cell glyphs. open/close are the bracket delimiters (used only
-# when brackets = true); full/partial/empty are the bar cells.
+# when brackets = true); full/empty are the cells; partial is the
+# "half"-mode partial glyph. Explicit glyphs override the fill preset.
 open = "["
 close = "]"
 
@@ -219,6 +226,15 @@ visible_if = "ctx.workspace.git_worktree != ()"
 # [specs/plugin-api.md](plugin-api.md) §ctx shape and the `UsageData`
 # contract in [specs/data-fetching.md](data-fetching.md).
 visible_if = "ctx.usage.kind == \"ok\" && ctx.usage.data.five_hour.utilization > 50"
+# Shared progress-bar knobs (same renderer as context_bar). Percent and
+# progress formats escalate color green→yellow→red by usage (threshold_color
+# defaults on); set false for a flat Info color. fill/brackets/dim_empty/
+# characters mirror context_bar; progress_width is the cell count.
+threshold_color = true
+fill = "whole"            # rate-limit default: round to whole cells
+[segments.rate_limit_5h.thresholds]
+green = 50
+yellow = 80
 
 [segments.git_branch]
 # Sub-segments of a sub-composed segment can also be overridden.

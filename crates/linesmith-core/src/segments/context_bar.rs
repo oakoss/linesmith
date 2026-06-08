@@ -9,9 +9,9 @@ use std::collections::BTreeMap;
 
 use unicode_width::UnicodeWidthStr;
 
+use super::progress_bar::{self, BarChars as PbChars, BarStyle, FillMode, Thresholds};
 use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::DataContext;
-use crate::theme::{Role, Style, StyledRun};
 
 /// Drops earlier than `rate_limit_5h` (96) and `context_window` (32):
 /// the bar is redundant with the textual percentage, so it should
@@ -25,27 +25,15 @@ const DEFAULT_WIDTH: u16 = 10;
 const DEFAULT_GREEN_THRESHOLD: u8 = 50;
 const DEFAULT_YELLOW_THRESHOLD: u8 = 80;
 
-const DEFAULT_FULL: char = '█';
-const DEFAULT_PARTIAL: char = '▓';
-const DEFAULT_EMPTY: char = '░';
-const DEFAULT_OPEN: char = '[';
-const DEFAULT_CLOSE: char = ']';
-
 const DEFAULT_BRACKETS: bool = true;
 const DEFAULT_PERCENTAGE: bool = true;
 const DEFAULT_DIM_EMPTY: bool = true;
-
-/// Brackets and the dim trough render in [`Role::Muted`]: a neutral
-/// frame that stays legible without competing with the threshold-
-/// colored fill (the same role the powerline separator uses, chosen
-/// there for the same "visible but recessive" reason).
-const FRAME_ROLE: Role = Role::Muted;
-const DIM_ROLE: Role = Role::Muted;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Config {
     pub(crate) width: u16,
     pub(crate) thresholds: Thresholds,
+    pub(crate) fill: FillMode,
     pub(crate) chars: BarChars,
     /// Wrap the cells in `chars.open`/`chars.close`.
     pub(crate) brackets: bool,
@@ -57,37 +45,8 @@ pub(crate) struct Config {
     pub(crate) dim_empty: bool,
 }
 
-/// Threshold percentages for the green→yellow→red color ramp.
-/// `pct < green` → `Role::Success`; `green <= pct < yellow` →
-/// `Role::Warning`; `pct >= yellow` → `Role::Error`. Construction
-/// goes through `Self::new` which enforces `green <= yellow`, so the
-/// ramp is monotonic by type-system guarantee — no caller can mint
-/// inverted thresholds, even from inside the crate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Thresholds {
-    green: u8,
-    yellow: u8,
-}
-
-impl Thresholds {
-    /// `None` when `green > yellow` or either bound exceeds 100.
-    pub(crate) fn new(green: u8, yellow: u8) -> Option<Self> {
-        if green <= yellow && yellow <= 100 {
-            Some(Self { green, yellow })
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn green(self) -> u8 {
-        self.green
-    }
-
-    pub(crate) fn yellow(self) -> u8 {
-        self.yellow
-    }
-}
-
+/// User-facing glyph overrides. `partial` is the `Half`-mode partial
+/// cell; `full`/`empty` override the [`FillMode`] preset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BarChars {
     pub(crate) full: String,
@@ -103,12 +62,13 @@ impl Default for Config {
             width: DEFAULT_WIDTH,
             thresholds: Thresholds::new(DEFAULT_GREEN_THRESHOLD, DEFAULT_YELLOW_THRESHOLD)
                 .expect("DEFAULT_GREEN_THRESHOLD <= DEFAULT_YELLOW_THRESHOLD by construction"),
+            fill: FillMode::Half,
             chars: BarChars {
-                full: DEFAULT_FULL.to_string(),
-                partial: DEFAULT_PARTIAL.to_string(),
-                empty: DEFAULT_EMPTY.to_string(),
-                open: DEFAULT_OPEN.to_string(),
-                close: DEFAULT_CLOSE.to_string(),
+                full: progress_bar::DEFAULT_FULL.to_string(),
+                partial: progress_bar::DEFAULT_HALF.to_string(),
+                empty: progress_bar::DEFAULT_EMPTY.to_string(),
+                open: progress_bar::DEFAULT_OPEN.to_string(),
+                close: progress_bar::DEFAULT_CLOSE.to_string(),
             },
             brackets: DEFAULT_BRACKETS,
             percentage: DEFAULT_PERCENTAGE,
@@ -179,6 +139,23 @@ impl ContextBarSegment {
             }
         }
 
+        // Parse `fill` before `characters` so the preset's full/empty
+        // glyphs land first and an explicit `characters.full`/`.empty`
+        // still wins over them.
+        if let Some(v) = extras.get("fill") {
+            match v.as_str().and_then(FillMode::parse) {
+                Some(mode) => {
+                    cfg.fill = mode;
+                    let (full, empty) = mode.preset_chars();
+                    cfg.chars.full = full.to_string();
+                    cfg.chars.empty = empty.to_string();
+                }
+                None => warn(&format!(
+                    "segments.{ID}.fill: expected one of half|whole|eighth|braille; ignoring"
+                )),
+            }
+        }
+
         for (key, slot) in [
             ("brackets", &mut cfg.brackets),
             ("percentage", &mut cfg.percentage),
@@ -236,15 +213,15 @@ impl Segment for ContextBarSegment {
             crate::lsm_debug!("context_bar: used null; hiding");
             return Ok(None);
         };
-        // Round-ties-to-even to match the textual `context_window`
-        // segment's `{pct:.0}` formatting, which uses Rust's
-        // round-half-to-even (banker's). Plain `f32::round` rounds
-        // half-away-from-zero, which would diverge at exact halves
-        // (e.g. 50.5 → 51 vs format! → "50") and break the contract
-        // that text and bar agree at every boundary.
-        let pct = used.value().round_ties_even();
-        let role = role_for_pct(pct, self.cfg.thresholds);
-        Ok(Some(build_bar(pct, &self.cfg, role)))
+        // Round-ties-to-even so the bar geometry, color role, and the
+        // `{:.0}` percentage suffix all use the same integer pct — and
+        // that pct matches the textual `context_window` segment's
+        // `{:.0}` (also banker's), keeping the two in lockstep at every
+        // boundary.
+        let pct = f64::from(used.value().round_ties_even());
+        let role = self.cfg.thresholds.role_for(pct);
+        let spans = progress_bar::render_bar(pct, &self.cfg.bar_style(), role);
+        Ok(Some(RenderedSegment::from_spans(spans).with_role(role)))
     }
 
     fn defaults(&self) -> SegmentDefaults {
@@ -252,75 +229,34 @@ impl Segment for ContextBarSegment {
     }
 }
 
-fn role_for_pct(pct: f32, t: Thresholds) -> Role {
-    if pct < f32::from(t.green()) {
-        Role::Success
-    } else if pct < f32::from(t.yellow()) {
-        Role::Warning
-    } else {
-        Role::Error
+impl Config {
+    /// Project the user-facing config onto the shared [`BarStyle`].
+    fn bar_style(&self) -> BarStyle {
+        BarStyle {
+            width: self.width,
+            chars: PbChars {
+                full: self.chars.full.clone(),
+                empty: self.chars.empty.clone(),
+                open: self.chars.open.clone(),
+                close: self.chars.close.clone(),
+                partial: self.fill.partial(&self.chars.partial),
+            },
+            brackets: self.brackets,
+            percentage: self.percentage.then_some(0),
+            dim_empty: self.dim_empty,
+        }
     }
-}
-
-/// Full / partial / empty cell counts for `pct` across `width` cells.
-/// A partial block appears only when the fractional cell is at least
-/// half full and a whole cell isn't already there.
-fn bar_cells(pct: f32, width: u16) -> (usize, usize, usize) {
-    let cells = usize::from(width);
-    let filled = (f32::from(width) * pct / 100.0).clamp(0.0, f32::from(width));
-    let full = filled.floor() as usize;
-    let partial = if full < cells && filled.fract() >= 0.5 {
-        1
-    } else {
-        0
-    };
-    let empty = cells.saturating_sub(full).saturating_sub(partial);
-    (full, partial, empty)
-}
-
-/// Build the bar as styled spans: optional brackets in [`FRAME_ROLE`],
-/// filled cells in the threshold `role`, the trough in [`DIM_ROLE`]
-/// (or `role` when `dim_empty` is off), and an optional ` NN%` suffix
-/// in the threshold `role`. Adjacent same-style spans are coalesced by
-/// [`RenderedSegment::from_spans`]; `role` is the whole-segment
-/// fallback for the width-bound truncation path.
-fn build_bar(pct: f32, cfg: &Config, role: Role) -> RenderedSegment {
-    let (full, partial, empty) = bar_cells(pct, cfg.width);
-    let mut filled = cfg.chars.full.repeat(full);
-    filled.push_str(&cfg.chars.partial.repeat(partial));
-    let trough = cfg.chars.empty.repeat(empty);
-    let empty_role = if cfg.dim_empty { DIM_ROLE } else { role };
-
-    let mut spans: Vec<StyledRun> = Vec::with_capacity(5);
-    if cfg.brackets {
-        spans.push(StyledRun::new(
-            cfg.chars.open.clone(),
-            Style::role(FRAME_ROLE),
-        ));
-    }
-    if !filled.is_empty() {
-        spans.push(StyledRun::new(filled, Style::role(role)));
-    }
-    if !trough.is_empty() {
-        spans.push(StyledRun::new(trough, Style::role(empty_role)));
-    }
-    if cfg.brackets {
-        spans.push(StyledRun::new(
-            cfg.chars.close.clone(),
-            Style::role(FRAME_ROLE),
-        ));
-    }
-    if cfg.percentage {
-        spans.push(StyledRun::new(format!(" {pct:.0}%"), Style::role(role)));
-    }
-
-    RenderedSegment::from_spans(spans).with_role(role)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::progress_bar::{
+        DEFAULT_EMPTY, DEFAULT_FULL, DEFAULT_HALF as DEFAULT_PARTIAL, DEFAULT_OPEN, DIM_ROLE,
+        FRAME_ROLE,
+    };
     use super::*;
     use crate::input::{ContextWindow, ModelInfo, Percent, StatusContext, Tool, WorkspaceInfo};
+    use crate::theme::Role;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -933,6 +869,54 @@ mod tests {
         assert!(warnings
             .iter()
             .any(|w| w.contains("open") && w.contains("single-cell")));
+    }
+
+    #[test]
+    fn from_extras_parses_eighth_fill() {
+        let extras = BTreeMap::from([("fill".to_string(), toml::Value::String("eighth".into()))]);
+        let seg = ContextBarSegment::from_extras(&extras, &mut |_| {});
+        assert_eq!(seg.cfg.fill, FillMode::Eighth);
+    }
+
+    #[test]
+    fn braille_fill_swaps_full_and_empty_preset_glyphs() {
+        // `fill = "braille"` sets the braille full/blank preset before
+        // `characters.*` would override; with no override the bar uses
+        // ⣿/⠀ and the eighth-style sub-cell ramp.
+        let extras = BTreeMap::from([("fill".to_string(), toml::Value::String("braille".into()))]);
+        let seg = ContextBarSegment::from_extras(&extras, &mut |_| {});
+        assert_eq!(seg.cfg.fill, FillMode::Braille);
+        assert_eq!(seg.cfg.chars.full, "⣿");
+        assert_eq!(seg.cfg.chars.empty, "⠀");
+        let r = seg
+            .render(&ctx(Some(window(100.0, 200_000))), &rc())
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(r.text(), "[⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿] 100%");
+    }
+
+    #[test]
+    fn characters_override_wins_over_fill_preset() {
+        // An explicit `characters.full` overrides the braille preset
+        // because `fill` is parsed first.
+        let mut c = toml::value::Table::new();
+        c.insert("full".to_string(), toml::Value::String("#".into()));
+        let extras = BTreeMap::from([
+            ("fill".to_string(), toml::Value::String("braille".into())),
+            ("characters".to_string(), toml::Value::Table(c)),
+        ]);
+        let seg = ContextBarSegment::from_extras(&extras, &mut |_| {});
+        assert_eq!(seg.cfg.chars.full, "#");
+        assert_eq!(seg.cfg.chars.empty, "⠀");
+    }
+
+    #[test]
+    fn from_extras_warns_on_unknown_fill() {
+        let extras = BTreeMap::from([("fill".to_string(), toml::Value::String("rainbow".into()))]);
+        let mut warnings = vec![];
+        let seg = ContextBarSegment::from_extras(&extras, &mut |m| warnings.push(m.to_string()));
+        assert_eq!(seg.cfg.fill, FillMode::Half);
+        assert!(warnings.iter().any(|w| w.contains("fill")));
     }
 
     #[test]
