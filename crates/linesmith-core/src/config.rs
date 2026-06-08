@@ -613,9 +613,26 @@ fn segment_override_schema(id: &str) -> Option<&'static [&'static str]> {
         "ahead_behind",
     ];
     const MODEL_SEGMENT: &[&str] = &["priority", "width", "style", "icon", "visible_if", "format"];
+    // Nested `thresholds`/`characters` tables validate shallowly (inner
+    // keys pass through, like git_branch's `dirty`); their schemas live
+    // in `context_bar::from_extras`.
+    const CONTEXT_BAR_SEGMENT: &[&str] = &[
+        "priority",
+        "width",
+        "style",
+        "icon",
+        "visible_if",
+        "cells",
+        "thresholds",
+        "characters",
+        "brackets",
+        "percentage",
+        "dim_empty",
+    ];
     match id {
         "model" => Some(MODEL_SEGMENT),
         "workspace" | "cost" | "effort" | "context_window" => Some(BUILT_IN_COMMON),
+        "context_bar" => Some(CONTEXT_BAR_SEGMENT),
         "rate_limit_5h" | "rate_limit_7d" => Some(PERCENT_SEGMENT),
         "rate_limit_5h_reset" | "rate_limit_7d_reset" => Some(RESET_SEGMENT),
         "extra_usage" => Some(RATE_LIMIT_COMMON),
@@ -1300,6 +1317,44 @@ mod tests {
             "#,
         );
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn context_bar_allows_decoration_keys_without_warning() {
+        let warnings = collect_warnings(
+            r#"
+                [segments.context_bar]
+                cells = 8
+                brackets = false
+                percentage = true
+                dim_empty = false
+
+                [segments.context_bar.thresholds]
+                green = 40
+                yellow = 70
+
+                [segments.context_bar.characters]
+                open = "("
+                close = ")"
+            "#,
+        );
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn context_bar_warns_on_typoed_decoration_key() {
+        // A typo like `percentag` would otherwise be silently dropped by
+        // `from_extras`; the allow-list surfaces it via `check-config`.
+        let warnings = collect_warnings(
+            r#"
+                [segments.context_bar]
+                percentag = false
+            "#,
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("percentag")),
+            "expected a warning naming the typo: {warnings:?}"
+        );
     }
 
     #[test]

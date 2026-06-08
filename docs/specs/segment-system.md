@@ -146,30 +146,58 @@ pub struct SegmentError {
 
 ### RenderedSegment
 
-The output of a successful render.
+The output of a successful render. The common case is a single style
+over the whole segment (`text` + `style`); a segment that paints more
+than one color (a progress bar's filled cells vs its dim trough)
+attaches `spans` and the layout engine fans it into one `StyledRun`
+per span.
 
 ```rust
 pub struct RenderedSegment {
-    /// Runs of styled text. Multi-run allows inline color changes without
-    /// re-parsing ANSI.
-    pub runs: Vec<StyledRun>,
+    /// Rendered text. Authoritative for layout width regardless of how
+    /// many colors the segment paints.
+    pub(crate) text: String,
 
     /// Effective width in terminal cells (not bytes, not chars; grapheme-
     /// cluster aware, ignoring ANSI). Computed once at render time.
-    pub width: u16,
+    pub(crate) width: u16,
 
     /// Per-render override for the segment's right-edge separator.
     /// Replaces the inline `LineItem::Separator` at that one boundary
     /// when present. See §Line items and separators for the override
     /// precedence.
-    pub right_separator: Option<Separator>,
+    pub(crate) right_separator: Option<Separator>,
+
+    /// Whole-segment style: applied when `spans` is `None`, and the
+    /// fallback a width-bound truncation degrades to (truncation
+    /// rewrites `text`, so any spans no longer align and are dropped).
+    pub(crate) style: Style,
+
+    /// Optional intra-segment color spans. When `Some`, the engine
+    /// emits one `StyledRun` per span instead of a single whole-segment
+    /// run. `text`/`width` stay the concatenation, so layout math is
+    /// unaffected; `RenderedSegment::from_spans` enforces the agreement
+    /// and coalesces adjacent same-style spans.
+    pub(crate) spans: Option<Vec<StyledRun>>,
 }
 
 pub struct StyledRun {
-    pub text: String,
-    pub style: Style,
+    pub(crate) text: String,
+    pub(crate) style: Style,
 }
+```
 
+**Span composition with the segment wrapper.** A spanned segment still
+flows through `OverriddenSegment`: a per-segment `icon` is prepended as
+a leading span in the whole-segment `style` (so the existing spans keep
+their own colors), and a user `style` override — declared
+"wholesale-replaces" — flattens the spans back to a single run in the
+override style. A spanned segment that is `truncatable: false` and
+declines `shrink_to_fit` (the default) is dropped whole under pressure
+rather than text-rewritten, so its spans only ever degrade on the
+explicit `width.max` truncation path.
+
+```rust
 pub struct Style {
     pub role: Option<Role>,        // semantic role (e.g. "success"); preferred
     pub fg: Option<Color>,         // absolute color override (rare)
@@ -536,7 +564,7 @@ Per [`docs/ideas/0001-feature-parity-matrix.md`](../ideas/0001-feature-parity-ma
 
 1. `model`: model display_name. Default `format = "compact"` strips the trailing word "context" from `(X context)` parentheticals (`Opus 4.7 (1M context)` → `Opus 4.7 (1M)`); `format = "full"` renders Anthropic's wire value verbatim. The strip is gated on `Tool::ClaudeCode` since the suffix shape is Claude-specific; other tools (Qwen, Codex CLI, Copilot CLI) render verbatim regardless of `format`.
 2. `context_window`: percentage + size (e.g. `45% · 200k`)
-3. `context_bar`: visual bar, width configurable (4/6/8/10/12 cells)
+3. `context_bar`: visual bar, width configurable; renders `[████░░░░░░] 42%` by default — bracket delimiters, an inline percentage, and a dim trough (each toggleable; see `specs/config.md`). Multi-color via `RenderedSegment` spans (§RenderedSegment)
 4. `cost`: session cost in USD
 5. `duration`: session duration
 6. `workspace`: directory / worktree hybrid
@@ -641,3 +669,4 @@ Fixtures: lists of `(SegmentId, width, priority)` tuples.
 - 2026-05-05: v0.7. Separator-as-item refactor. Separators are now positional `LineItem::Separator` entries the builder produces from `[layout_options].separator`, not a `default_separator` field on `SegmentDefaults`. Strikes that field, the `with_default_separator` chainable, and the `apply_layout_separator` helper. The plugin per-render override path (`RenderedSegment::with_separator`) stays and beats the inline separator at that one boundary. Resolves the prior §Open questions "Separator ownership" item: the layout owns separators authoritatively. Drop logic now removes the adjacent separator with the segment (right-edge first, left-edge fallback when the segment was last in the line).
 - 2026-05-08: v0.8. Per [ADR-0024](../adrs/0024-per-boundary-separator-toml.md), `[line].segments` accepts a mixed array of bare strings and inline tables. Bare strings (`"model"`) keep parsing as before — string-only configs are byte-identical at the renderer. Inline tables (`{ type = "separator", character = " | " }`, `{ type = "model", merge = true }`) reach the builder as `config::LineEntry::Item`. The builder now walks `Vec<LineEntry>` instead of `Vec<&str>`: explicit `type = "separator"` entries materialize as `LineItem::Separator(...)` using the entry's `character` override or the global `[layout_options].separator` fallback; segment entries with `merge = true` suppress the boundary at their right edge (both implicit interleave AND any adjacent explicit separator entry). Adjacency invariants in §Line items and separators apply unchanged — leading/trailing/orphan separators are pruned at the renderer's adjacency pass.
 - 2026-05-13: v0.9. Per [ADR-0026](../adrs/0026-layout-decision-observability.md), the layout engine surfaces typed events at five decision sites. SemVer-breaking variant shape change: `LineItem::Segment(Box<dyn Segment>)` → `LineItem::Segment { id: Cow<'static, str>, segment: Box<dyn Segment> }` — migration recipe `LineItem::Segment(seg)` → `LineItem::Segment { id, segment: seg }` at every construction and pattern-match site. New `pub struct LayoutObservers<'a>` bundles `warn` (required) and `on_decision` (optional); engine entry points take `&mut LayoutObservers<'_>` instead of a bare `warn` callback. New `pub enum LayoutDecision` with five variants (`PriorityDrop`, `ShrinkApplied`, `ReflowApplied`, `WidthBoundUnderMinDrop`, `WidthBoundOverMaxTruncate`) — per-variant struct bodies are `#[non_exhaustive]` for field-additive forward-compat, the enum itself is NOT (so a future variant breaks every consumer's `match` at compile time, by design). Engine-only `pub(crate)` constructors `debug_assert!` width-relation invariants. The engine emits via `observers.emit_with(|| LayoutDecision::shrink_applied(id.clone(), from, to, target))` — lazy construction means the production-stdout path pays only one `Option::is_none()` check per decision site, zero allocations even when segment ids are `Cow::Owned`.
+- 2026-06-06: v0.10. `RenderedSegment` gains an optional `spans: Option<Vec<StyledRun>>` for intra-segment color. When set, the layout engine's `items_to_runs` fan-out emits one run per span (both the stdout ANSI path and the TUI preview flow through it); `text`/`width` stay the authoritative concatenation, so layout math is unchanged. `from_spans` builds and coalesces adjacent same-style spans; truncation drops spans and degrades to the whole-segment `style`. The wrapper composes: a per-segment `icon` prepends as a leading span, a user `style` override flattens spans. First consumer is `context_bar`, which now renders `[████░░░░░░] 42%` by default (bracket delimiters + inline percentage + dim trough, each toggleable via `[segments.context_bar]` `brackets`/`percentage`/`dim_empty` and `characters.open`/`characters.close`).

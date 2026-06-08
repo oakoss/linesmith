@@ -187,9 +187,20 @@ priority = 32             # higher = more likely to be dropped (255 first; 0 nev
 
 [segments.context_bar]
 cells = 10                # bar width in terminal cells (default 10)
+# Decoration toggles — all default ON so the shipped bar reads as one
+# widget: `[████░░░░░░] 42%` (the work-statusline / ccstatusline shape).
+# Set any to false to pare it back; all three off reproduces a bare bar.
+brackets = true           # wrap the cells in characters.open/close
+percentage = true         # append ` NN%` (banker's-rounded to match context_window)
+dim_empty = true          # render the empty trough in a dim role, not the fill color
 [segments.context_bar.thresholds]
 green = 50                # pct < green renders Role::Success
 yellow = 80               # green <= pct < yellow renders Role::Warning
+[segments.context_bar.characters]
+# Single-cell glyphs. open/close are the bracket delimiters (used only
+# when brackets = true); full/partial/empty are the bar cells.
+open = "["
+close = "]"
 
 [segments.workspace]
 # Generic per-segment icon override (every segment accepts it). Omit to

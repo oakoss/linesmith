@@ -490,26 +490,28 @@ fn render_items(
 /// `Separator::None` (text == "") is filtered here so consumers
 /// don't see empty-text runs.
 fn items_to_runs(items: &[LayoutItem<'_>]) -> Vec<StyledRun> {
-    items
-        .iter()
-        .filter_map(|item| match item {
-            LayoutItem::Segment(seg) => Some(StyledRun {
-                text: seg.rendered.text.clone(),
-                style: seg.rendered.style.clone(),
-            }),
+    let mut runs = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            // Empty-text segments emit nothing, mirroring the separator
+            // filter below — consumers never see a styled empty-text run.
+            LayoutItem::Segment(seg) => match seg.rendered.spans() {
+                Some(spans) => runs.extend(spans.iter().cloned()),
+                None if seg.rendered.text.is_empty() => {}
+                None => runs.push(StyledRun::new(
+                    seg.rendered.text.clone(),
+                    seg.rendered.style.clone(),
+                )),
+            },
             LayoutItem::Separator(sep) => {
                 let text = sep.text();
-                if text.is_empty() {
-                    None
-                } else {
-                    Some(StyledRun {
-                        text: text.to_string(),
-                        style: separator_style(sep),
-                    })
+                if !text.is_empty() {
+                    runs.push(StyledRun::new(text.to_string(), separator_style(sep)));
                 }
             }
-        })
-        .collect()
+        }
+    }
+    runs
 }
 
 /// Style for an inter-segment separator run. Plain separators carry
