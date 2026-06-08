@@ -67,11 +67,15 @@ impl Head {
 /// - `Clean` — no tracked modifications and no untracked files.
 /// - `Dirty(None)` — indicator mode: scan short-circuited on the
 ///   first dirty entry, so counts were not collected.
-/// - `Dirty(Some(counts))` — full-scan counts mode.
+/// - `Dirty(Some(counts))` — full-scan counts mode. Invariant: at
+///   least one category is non-zero. [`compute_dirty_counts`] collapses
+///   an all-zero tally to `Clean`, so `Dirty(Some(DirtyCounts::default()))`
+///   is not a state the scan produces; only a hand-built preseed can
+///   forge it.
 ///
-/// The two `Dirty` forms are distinct plugin-facing states so
-/// counts-mode renderers can tell "counts not yet computed" apart
-/// from "zero of this category."
+/// The two `Dirty` forms are kept distinct so a counts-mode renderer
+/// can tell "counts not collected" (indicator scan) apart from "zero
+/// of this category."
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DirtyState {
@@ -88,8 +92,6 @@ impl DirtyState {
     }
 }
 
-/// Per-category dirty counts. Populated only in counts mode;
-/// indicator-mode scans leave this absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DirtyCounts {
@@ -123,6 +125,11 @@ pub struct GitContext {
     pub head: Head,
 
     dirty: OnceCell<Arc<DirtyState>>,
+    /// Counts-mode dirty state. A cell of its own (not shared with
+    /// `dirty`) so an indicator-mode read can't poison a later
+    /// counts-mode read with a count-less `Dirty(None)`, regardless of
+    /// which segment renders first.
+    dirty_counts: OnceCell<Arc<DirtyState>>,
     upstream: OnceCell<Arc<Option<UpstreamState>>>,
     /// Kept for lazy dirty / upstream resolution. `gix::Repository`
     /// is `Send` (with the `parallel` feature) but not `Sync`; the
@@ -137,6 +144,7 @@ impl std::fmt::Debug for GitContext {
             .field("repo_path", &self.repo_path)
             .field("head", &self.head)
             .field("dirty", &self.dirty.get().map(|arc| &**arc))
+            .field("dirty_counts", &self.dirty_counts.get().map(|arc| &**arc))
             .field("upstream", &self.upstream.get().map(|arc| &**arc))
             .finish_non_exhaustive()
     }
@@ -155,17 +163,20 @@ impl GitContext {
             repo_path,
             head,
             dirty: OnceCell::new(),
+            dirty_counts: OnceCell::new(),
             upstream: OnceCell::new(),
             repo: None,
         }
     }
 
-    /// Dirty state, scanned lazily on first access. Returns
-    /// [`DirtyState::Clean`] when no repo handle is held.
+    /// Dirty state in indicator mode, scanned lazily on first access.
+    /// Returns [`DirtyState::Clean`] when no repo handle is held.
     ///
-    /// The scan covers untracked files and tracked modifications.
-    /// HEAD↔index (staged-only) changes are not detected because
-    /// gix 0.67 doesn't expose that comparison.
+    /// The scan short-circuits on the first dirty entry and yields
+    /// [`DirtyState::Dirty(None)`](DirtyState::Dirty) — it covers
+    /// untracked files and tracked modifications but never collects
+    /// per-category counts. Use [`Self::dirty_counts`] when the caller
+    /// needs the staged/unstaged/untracked breakdown.
     #[must_use]
     pub fn dirty(&self) -> Arc<DirtyState> {
         self.dirty
@@ -180,6 +191,42 @@ impl GitContext {
                 None => Arc::new(DirtyState::Clean),
             })
             .clone()
+    }
+
+    /// Dirty state in counts mode, scanned lazily on first access.
+    /// Returns [`DirtyState::Clean`] when no repo handle is held, and
+    /// otherwise [`DirtyState::Dirty(Some(counts))`](DirtyState::Dirty)
+    /// with a per-category file breakdown.
+    ///
+    /// Costlier than [`Self::dirty`]: the scan has no early-exit and
+    /// adds the HEAD↔index comparison so staged-only changes are
+    /// counted (available since gix 0.83's combined status iterator).
+    /// Cached in a dedicated cell, so calling both accessors runs two
+    /// scans — only counts-mode segments should reach for this one.
+    ///
+    /// The two accessors can legitimately disagree: a staged-only
+    /// change makes `dirty()` report `Clean` (early-exit path skips
+    /// the HEAD↔index diff) while `dirty_counts()` reports
+    /// `Dirty(Some { staged: 1, .. })`. Don't mix them expecting
+    /// agreement.
+    #[must_use]
+    pub fn dirty_counts(&self) -> Arc<DirtyState> {
+        self.dirty_counts
+            .get_or_init(|| match &self.repo {
+                Some(repo) => Arc::new(compute_dirty_counts(repo).unwrap_or_else(|err| {
+                    crate::lsm_warn!("git dirty counts scan failed: {err}");
+                    DirtyState::Clean
+                })),
+                None => Arc::new(DirtyState::Clean),
+            })
+            .clone()
+    }
+
+    /// Pre-populate the counts-mode `dirty_counts` OnceCell with an
+    /// explicit value, bypassing the real scan. Returns `Err` when the
+    /// cell was already populated.
+    pub fn preseed_dirty_counts_state(&self, value: DirtyState) -> Result<(), Arc<DirtyState>> {
+        self.dirty_counts.set(Arc::new(value))
     }
 
     /// Pre-populate the `upstream` OnceCell with an explicit value,
@@ -275,14 +322,18 @@ pub fn resolve_repo(cwd: &Path) -> Result<Option<GitContext>, GitError> {
         repo_path,
         head,
         dirty: OnceCell::new(),
+        dirty_counts: OnceCell::new(),
         upstream: OnceCell::new(),
         repo: Some(repo),
     }))
 }
 
 /// Indicator-mode dirty scan: short-circuits on the first status
-/// entry. Covers untracked + worktree-vs-index (unstaged). Misses
-/// HEAD↔index (staged-only) per gix 0.67's own TODO on `is_dirty`.
+/// entry. Covers untracked + worktree-vs-index (unstaged) only, since
+/// the early-exit `into_index_worktree_iter` skips the HEAD↔index
+/// comparison. Staged-only changes therefore don't flip the indicator;
+/// [`compute_dirty_counts`] does include them. Keeping indicator mode
+/// on the cheaper iterator preserves the <20ms cold-start budget.
 fn compute_dirty(repo: &gix::Repository) -> Result<DirtyState, Box<dyn std::error::Error>> {
     use gix::status::UntrackedFiles;
 
@@ -296,6 +347,62 @@ fn compute_dirty(repo: &gix::Repository) -> Result<DirtyState, Box<dyn std::erro
         }
     }
     Ok(DirtyState::Clean)
+}
+
+/// Counts-mode dirty scan: full status walk (no early-exit) over the
+/// combined HEAD↔index↔worktree iterator, tallying files per category.
+///
+/// - `TreeIndex` change → staged (HEAD differs from index)
+/// - `IndexWorktree::Modification` → unstaged (index differs from worktree)
+/// - `IndexWorktree::DirectoryContents` → untracked
+///
+/// A file staged AND further modified in the worktree counts toward
+/// both `staged` and `unstaged`, matching `git status`'s two-column
+/// view. Untracked directories collapse to one entry
+/// ([`UntrackedFiles::Collapsed`]) per `git-segments.md`.
+/// `index_worktree_rewrites(None)` disables rewrite tracking on the
+/// worktree side, so an unstaged rename surfaces as delete + add; a
+/// staged rename may still arrive as a single `TreeIndex` change, which
+/// counts as one staged file (matching `git status`'s `R` line).
+fn compute_dirty_counts(repo: &gix::Repository) -> Result<DirtyState, Box<dyn std::error::Error>> {
+    use gix::status::index_worktree::Item as IwItem;
+    use gix::status::Item;
+    use gix::status::UntrackedFiles;
+
+    let platform = repo
+        .status(gix::progress::Discard)?
+        .untracked_files(UntrackedFiles::Collapsed)
+        .index_worktree_rewrites(None);
+
+    let mut counts = DirtyCounts::default();
+    for item in platform.into_iter(Vec::new())? {
+        // Per-item errors are best-effort: a single unreadable entry
+        // skips that file rather than failing the whole scan closed to
+        // `Clean` (which would show a dirty repo as clean — the
+        // dangerous direction). Unlike the indicator path's
+        // short-circuit, a skip here undercounts, so leave a
+        // debug-gated breadcrumb for "count says 2 but I have 3".
+        let item = match item {
+            Ok(item) => item,
+            Err(err) => {
+                crate::lsm_debug!("git dirty counts: skipping unreadable status entry: {err}");
+                continue;
+            }
+        };
+        match item {
+            Item::TreeIndex(_) => counts.staged += 1,
+            Item::IndexWorktree(IwItem::Modification { .. }) => counts.unstaged += 1,
+            Item::IndexWorktree(IwItem::DirectoryContents { .. }) => counts.untracked += 1,
+            // Rewrites are disabled above; ignore defensively if one slips through.
+            Item::IndexWorktree(IwItem::Rewrite { .. }) => {}
+        }
+    }
+
+    if counts == DirtyCounts::default() {
+        Ok(DirtyState::Clean)
+    } else {
+        Ok(DirtyState::Dirty(Some(counts)))
+    }
 }
 
 /// Resolve the tracking branch for `head` and count its ahead/behind
@@ -699,6 +806,151 @@ mod tests {
         let path = fixture_with_commit(&tmp);
         let ctx = resolve_repo(path).expect("resolve").expect("some");
         assert_eq!(*ctx.dirty(), DirtyState::Clean);
+    }
+
+    #[test]
+    fn dirty_counts_is_clean_on_committed_repo_with_no_changes() {
+        let tmp = TempDir::new().expect("tmp");
+        let path = fixture_with_commit(&tmp);
+        let ctx = resolve_repo(path).expect("resolve").expect("some");
+        assert_eq!(*ctx.dirty_counts(), DirtyState::Clean);
+    }
+
+    #[test]
+    fn dirty_counts_counts_staged_file() {
+        use std::fs;
+        let tmp = TempDir::new().expect("tmp");
+        let path = fixture_with_commit(&tmp);
+        // A brand-new file added to the index differs from HEAD →
+        // staged. gix 0.83's HEAD↔index comparison is what makes this
+        // visible; gix 0.67 missed it.
+        fs::write(path.join("staged.txt"), "new").expect("write");
+        run_git(path, &["add", "staged.txt"]);
+        let ctx = resolve_repo(path).expect("resolve").expect("some");
+        assert_eq!(
+            *ctx.dirty_counts(),
+            DirtyState::Dirty(Some(DirtyCounts {
+                staged: 1,
+                unstaged: 0,
+                untracked: 0,
+            }))
+        );
+    }
+
+    #[test]
+    fn dirty_counts_counts_unstaged_file() {
+        use std::fs;
+        let tmp = TempDir::new().expect("tmp");
+        let path = fixture_with_commit(&tmp);
+        fs::write(path.join("tracked.txt"), "modified").expect("write");
+        let ctx = resolve_repo(path).expect("resolve").expect("some");
+        assert_eq!(
+            *ctx.dirty_counts(),
+            DirtyState::Dirty(Some(DirtyCounts {
+                staged: 0,
+                unstaged: 1,
+                untracked: 0,
+            }))
+        );
+    }
+
+    #[test]
+    fn dirty_counts_counts_untracked_file() {
+        use std::fs;
+        let tmp = TempDir::new().expect("tmp");
+        let path = fixture_with_commit(&tmp);
+        fs::write(path.join("new.txt"), "hello").expect("write");
+        let ctx = resolve_repo(path).expect("resolve").expect("some");
+        assert_eq!(
+            *ctx.dirty_counts(),
+            DirtyState::Dirty(Some(DirtyCounts {
+                staged: 0,
+                unstaged: 0,
+                untracked: 1,
+            }))
+        );
+    }
+
+    #[test]
+    fn dirty_counts_tallies_all_three_categories() {
+        use std::fs;
+        let tmp = TempDir::new().expect("tmp");
+        let path = fixture_with_commit(&tmp);
+        // Staged: a new file added to the index.
+        fs::write(path.join("staged.txt"), "s").expect("write");
+        run_git(path, &["add", "staged.txt"]);
+        // Unstaged: modify the committed tracked file without adding.
+        fs::write(path.join("tracked.txt"), "modified").expect("write");
+        // Untracked: a new file left out of the index.
+        fs::write(path.join("untracked.txt"), "u").expect("write");
+        let ctx = resolve_repo(path).expect("resolve").expect("some");
+        assert_eq!(
+            *ctx.dirty_counts(),
+            DirtyState::Dirty(Some(DirtyCounts {
+                staged: 1,
+                unstaged: 1,
+                untracked: 1,
+            }))
+        );
+    }
+
+    #[test]
+    fn dirty_counts_is_clean_when_no_gix_repo_held() {
+        let ctx = GitContext::new(
+            RepoKind::Main,
+            PathBuf::from("/tmp/.git"),
+            Head::Branch("main".into()),
+        );
+        assert_eq!(*ctx.dirty_counts(), DirtyState::Clean);
+    }
+
+    #[test]
+    fn dirty_counts_tallies_same_file_staged_and_modified_in_both_columns() {
+        use std::fs;
+        let tmp = TempDir::new().expect("tmp");
+        let path = fixture_with_commit(&tmp);
+        // Stage a change to the committed file, then modify it again in
+        // the worktree without re-adding: `git status` shows it in both
+        // columns (HEAD↔index AND index↔worktree). The combined scan
+        // must emit both items so the file counts toward staged + unstaged.
+        fs::write(path.join("tracked.txt"), "staged change").expect("write");
+        run_git(path, &["add", "tracked.txt"]);
+        fs::write(path.join("tracked.txt"), "further worktree change").expect("write");
+        let ctx = resolve_repo(path).expect("resolve").expect("some");
+        assert_eq!(
+            *ctx.dirty_counts(),
+            DirtyState::Dirty(Some(DirtyCounts {
+                staged: 1,
+                unstaged: 1,
+                untracked: 0,
+            }))
+        );
+    }
+
+    #[test]
+    fn dirty_and_dirty_counts_use_independent_cells() {
+        use std::fs;
+        let tmp = TempDir::new().expect("tmp");
+        let path = fixture_with_commit(&tmp);
+        // Staged-only change plus an untracked file: the untracked file
+        // is what the early-exit indicator scan catches.
+        fs::write(path.join("staged.txt"), "s").expect("write");
+        run_git(path, &["add", "staged.txt"]);
+        fs::write(path.join("untracked.txt"), "u").expect("write");
+        let ctx = resolve_repo(path).expect("resolve").expect("some");
+        // Indicator scan runs first and caches a count-less Dirty(None)
+        // in its own cell.
+        assert_eq!(*ctx.dirty(), DirtyState::Dirty(None));
+        // The counts cell must not inherit that count-less state — it
+        // runs its own full scan and sees the staged file too.
+        assert_eq!(
+            *ctx.dirty_counts(),
+            DirtyState::Dirty(Some(DirtyCounts {
+                staged: 1,
+                unstaged: 0,
+                untracked: 1,
+            }))
+        );
     }
 
     #[test]
