@@ -1,8 +1,8 @@
 # Git Segments
 
 - Status: draft
-- Version: 0.1.2
-- Last updated: 2026-04-21
+- Version: 0.1.3
+- Last updated: 2026-06-07
 - Driving ADRs: [ADR-0001](../adrs/0001-use-rust-for-runtime.md), [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md)
 
 ## Overview
@@ -224,12 +224,13 @@ Render output is a single `RenderedSegment` with multiple `StyledRun`s so each p
 
 ### Dirty detection strategy
 
-- Prefer `gix::Repository::status_platform()` with `.untracked_files(Untracked::Collapsed)` — it's the diffless fast path
-- Staged = index entries that differ from HEAD
-- Unstaged = index entries that differ from the working tree
-- Untracked = working-tree paths absent from the index and not `.gitignore`d
-- Abort the scan early (`gix` supports this) once `any` is determined in "indicator" mode — no need to count every file
-- In "counts" mode, full scan is required; consider a TTL cache in a later rev if users report slowness
+- Prefer `gix::Repository::status()` with `.untracked_files(Untracked::Collapsed)` — it's the diffless fast path
+- Staged = index entries that differ from HEAD (the `TreeIndex` items of gix's combined status iterator)
+- Unstaged = index entries that differ from the working tree (`IndexWorktree::Modification`)
+- Untracked = working-tree paths absent from the index and not `.gitignore`d (`IndexWorktree::DirectoryContents`)
+- "indicator" mode uses the cheaper `into_index_worktree_iter` and aborts on the first dirty entry — no HEAD↔index pass, so a staged-only change does not flip the indicator (acceptable: a staged change is almost always accompanied by an unstaged or untracked one, and skipping the tree-index diff protects the cold-start budget)
+- "counts" mode uses the combined `into_iter`, which adds the HEAD↔index diff so staged files are counted. A full scan is required (no early-exit); consider a TTL cache in a later rev if users report slowness
+- A file both staged and further modified in the working tree counts toward `staged` and `unstaged` (matching `git status`'s two-column view)
 
 ### Ahead/behind computation
 
@@ -340,6 +341,21 @@ Each fixture runs the full render pipeline (stdin → config → segment render 
 
 ## Change log
 
+- 2026-06-07 (v0.1.3): dirty `format = "counts"` shipped (lsm-hwm0).
+  `GitContext::dirty_counts()` runs a full combined `into_iter` scan and
+  tallies `DirtyCounts { staged, unstaged, untracked }`; staged
+  (HEAD↔index) detection that the earlier gix release missed is now
+  available under gix 0.83. The counts cell is separate from the
+  indicator `dirty()` cell so neither mode can poison the other
+  regardless of render order. `git_branch` renders the counts as
+  per-category color-coded spans (staged → `Success`, unstaged →
+  `Warning`, untracked → `Error`) via `RenderedSegment::from_spans`,
+  honoring `staged_icon`/`unstaged_icon`/`untracked_icon` and
+  `count_hide_zero` per §Config schema. Indicator mode keeps its
+  early-exit fast path and single-glyph rendering unchanged; the
+  HEAD↔index staged-only gap (lsm-387) is closed in counts mode but
+  kept open in indicator mode by design, since the tree-index diff would
+  exceed the cold-start budget.
 - 2026-04-21 (v0.1.2): ahead/behind counters shipped. `GitContext::upstream`
   resolves the tracking ref via
   `Reference::remote_tracking_ref_name(Direction::Fetch)`, computes an

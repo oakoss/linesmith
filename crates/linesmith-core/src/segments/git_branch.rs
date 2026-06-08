@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 
 use super::extras::parse_bool;
 use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
-use crate::data_context::{DataContext, DataDep, GitContext, Head, RepoKind};
-use crate::theme::Role;
+use crate::data_context::{DataContext, DataDep, DirtyState, GitContext, Head, RepoKind};
+use crate::theme::{Role, Style, StyledRun};
 
 #[derive(Default)]
 pub struct GitBranchSegment {
@@ -25,12 +25,26 @@ const PRIORITY: u8 = 48;
 
 const ID: &str = "git_branch";
 const DEFAULT_DIRTY_INDICATOR: &str = "*";
+const DEFAULT_STAGED_ICON: &str = "+";
+const DEFAULT_UNSTAGED_ICON: &str = "~";
+const DEFAULT_UNTRACKED_ICON: &str = "?";
 const DEFAULT_TRUNCATION_MARKER: &str = "…";
 const DEFAULT_SHORT_SHA_LEN: u8 = 7;
 const DEFAULT_MAX_BRANCH_LEN: u16 = 40;
 const DEFAULT_AHEAD_FORMAT: &str = "↑{n}";
 const DEFAULT_BEHIND_FORMAT: &str = "↓{n}";
 const NO_UPSTREAM_MARKER: &str = "?";
+
+/// How the dirty marker renders. `Hidden` from the spec maps onto
+/// `Config::dirty_enabled = false` rather than a variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum DirtyFormat {
+    /// A single glyph (`*`) when the tree is dirty.
+    #[default]
+    Indicator,
+    /// Per-category file counts (`+3 ~2 ?1`), each color-coded.
+    Counts,
+}
 
 /// Resolved runtime config. Defaults match `git-segments.md`
 /// §Config schema.
@@ -41,8 +55,15 @@ pub(crate) struct Config {
     pub(crate) truncation_marker: String,
     pub(crate) short_sha_length: u8,
     pub(crate) dirty_enabled: bool,
+    pub(crate) dirty_format: DirtyFormat,
     pub(crate) dirty_indicator: String,
     pub(crate) clean_indicator: String,
+    /// Counts-mode per-category prefixes (`+`/`~`/`?` by default).
+    pub(crate) staged_icon: String,
+    pub(crate) unstaged_icon: String,
+    pub(crate) untracked_icon: String,
+    /// In counts mode, drop a category whose count is zero.
+    pub(crate) count_hide_zero: bool,
     /// Hide the dirty marker when `rc.terminal_width` is below this
     /// threshold. `0` = never auto-hide.
     pub(crate) dirty_hide_below_cells: u16,
@@ -111,8 +132,13 @@ impl Default for Config {
             truncation_marker: DEFAULT_TRUNCATION_MARKER.into(),
             short_sha_length: DEFAULT_SHORT_SHA_LEN,
             dirty_enabled: true,
+            dirty_format: DirtyFormat::default(),
             dirty_indicator: DEFAULT_DIRTY_INDICATOR.into(),
             clean_indicator: String::new(),
+            staged_icon: DEFAULT_STAGED_ICON.into(),
+            unstaged_icon: DEFAULT_UNSTAGED_ICON.into(),
+            untracked_icon: DEFAULT_UNTRACKED_ICON.into(),
+            count_hide_zero: true,
             dirty_hide_below_cells: 0,
             ahead_behind: AheadBehindConfig::default(),
         }
@@ -121,8 +147,7 @@ impl Default for Config {
 
 impl GitBranchSegment {
     /// Parse the `[segments.git_branch]` extras bag. Unknown values
-    /// warn and fall back to defaults. `dirty.format = "counts"`
-    /// warns and falls back to "indicator".
+    /// warn and fall back to defaults.
     pub fn from_extras(
         extras: &BTreeMap<String, toml::Value>,
         warn: &mut impl FnMut(&str),
@@ -162,14 +187,9 @@ impl GitBranchSegment {
             }
             if let Some(fmt) = dirty_map.get("format").and_then(|v| v.as_str()) {
                 match fmt {
-                    "indicator" | "hidden" => {
-                        if fmt == "hidden" {
-                            cfg.dirty_enabled = false;
-                        }
-                    }
-                    "counts" => {
-                        warn("segments.git_branch.dirty.format=\"counts\" is not yet implemented; falling back to \"indicator\" (follow-up: lsm-kjj counts mode)");
-                    }
+                    "indicator" => cfg.dirty_format = DirtyFormat::Indicator,
+                    "counts" => cfg.dirty_format = DirtyFormat::Counts,
+                    "hidden" => cfg.dirty_enabled = false,
                     _ => warn(
                         "segments.git_branch.dirty.format: expected \"indicator\"|\"counts\"|\"hidden\"; ignoring",
                     ),
@@ -180,6 +200,18 @@ impl GitBranchSegment {
             }
             if let Some(v) = dirty_map.get("clean_indicator").and_then(|v| v.as_str()) {
                 cfg.clean_indicator = v.to_string();
+            }
+            if let Some(v) = dirty_map.get("staged_icon").and_then(|v| v.as_str()) {
+                cfg.staged_icon = v.to_string();
+            }
+            if let Some(v) = dirty_map.get("unstaged_icon").and_then(|v| v.as_str()) {
+                cfg.unstaged_icon = v.to_string();
+            }
+            if let Some(v) = dirty_map.get("untracked_icon").and_then(|v| v.as_str()) {
+                cfg.untracked_icon = v.to_string();
+            }
+            if let Some(v) = parse_bool(&dirty_map, "count_hide_zero", "git_branch.dirty", warn) {
+                cfg.count_hide_zero = v;
             }
             if let Some(v) = parse_hide_below_cells(&dirty_map, "git_branch.dirty", warn) {
                 cfg.dirty_hide_below_cells = v;
@@ -278,13 +310,7 @@ impl Segment for GitBranchSegment {
                 crate::lsm_debug!("git_branch: bare repo; hiding");
                 Ok(None)
             }
-            Ok(Some(gc)) => {
-                let text = self.assemble(gc, rc);
-                if text.is_empty() {
-                    return Ok(None);
-                }
-                Ok(Some(RenderedSegment::new(text).with_role(Role::Accent)))
-            }
+            Ok(Some(gc)) => Ok(self.assemble(gc, rc)),
         }
     }
 
@@ -303,42 +329,40 @@ impl Segment for GitBranchSegment {
             Ok(Some(gc)) if matches!(gc.repo_kind, RepoKind::Bare) => return None,
             Ok(Some(gc)) => gc,
         };
-        let text = self.assemble_compact(gc);
-        if text.is_empty() {
-            return None;
-        }
-        let rendered = RenderedSegment::new(text).with_role(Role::Accent);
+        let rendered = self.assemble_compact(gc)?;
         (rendered.width <= target).then_some(rendered)
     }
 }
 
 impl GitBranchSegment {
-    fn assemble(&self, gc: &GitContext, rc: &RenderContext) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        if !self.cfg.label.is_empty() {
-            parts.push(self.cfg.label.clone());
-        }
+    /// Build the rendered segment as ordered styled spans. Single-color
+    /// assemblies (indicator mode, ahead/behind) fold to one
+    /// whole-segment run via [`RenderedSegment::from_spans`]; counts
+    /// mode keeps per-category colors. Returns `None` when nothing
+    /// renders (every part suppressed).
+    fn assemble(&self, gc: &GitContext, rc: &RenderContext) -> Option<RenderedSegment> {
+        let mut spans: Vec<StyledRun> = Vec::new();
 
-        let head = self.render_head(&gc.head);
-        if !head.is_empty() {
-            parts.push(head);
-        }
+        self.push_prefix(&mut spans, gc);
 
         if self.cfg.dirty_enabled && !is_below_threshold(rc, self.cfg.dirty_hide_below_cells) {
-            if let Some(marker) = self.render_dirty(gc) {
-                parts.push(marker);
-            }
+            self.push_dirty(&mut spans, gc);
         }
 
         if self.cfg.ahead_behind.enabled
             && !is_below_threshold(rc, self.cfg.ahead_behind.hide_below_cells)
         {
             if let Some(marker) = self.render_ahead_behind(gc) {
-                parts.push(marker);
+                push_part(&mut spans, marker, Role::Accent);
             }
         }
 
-        parts.join(" ")
+        // `from_spans` leaves the whole-segment fallback style at
+        // default for multi-color assemblies; restore `Accent` so an
+        // icon prefix (which paints in the fallback style) and the
+        // truncation fallback match indicator mode's coloring.
+        let rendered = RenderedSegment::from_spans(spans).with_role(Role::Accent);
+        (!rendered.text().is_empty()).then_some(rendered)
     }
 
     /// `assemble` with both structured-tail markers (dirty,
@@ -346,16 +370,19 @@ impl GitBranchSegment {
     /// fallback the engine asks for via `shrink_to_fit` under layout
     /// pressure: shed decoration, keep the signal-bearing prefix
     /// (label + head).
-    fn assemble_compact(&self, gc: &GitContext) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        if !self.cfg.label.is_empty() {
-            parts.push(self.cfg.label.clone());
-        }
-        let head = self.render_head(&gc.head);
-        if !head.is_empty() {
-            parts.push(head);
-        }
-        parts.join(" ")
+    fn assemble_compact(&self, gc: &GitContext) -> Option<RenderedSegment> {
+        let mut spans: Vec<StyledRun> = Vec::new();
+        self.push_prefix(&mut spans, gc);
+        let rendered = RenderedSegment::from_spans(spans).with_role(Role::Accent);
+        (!rendered.text().is_empty()).then_some(rendered)
+    }
+
+    /// Push the always-present prefix — optional label then head, both
+    /// `Accent`. Shared by the full and compact assemblies so their
+    /// prefix shape can't drift.
+    fn push_prefix(&self, spans: &mut Vec<StyledRun>, gc: &GitContext) {
+        push_part(spans, self.cfg.label.clone(), Role::Accent);
+        push_part(spans, self.render_head(&gc.head), Role::Accent);
     }
 
     fn render_ahead_behind(&self, gc: &GitContext) -> Option<String> {
@@ -418,19 +445,84 @@ impl GitBranchSegment {
         }
     }
 
-    fn render_dirty(&self, gc: &GitContext) -> Option<String> {
-        if gc.dirty().is_dirty() {
-            if self.cfg.dirty_indicator.is_empty() {
-                None
-            } else {
-                Some(self.cfg.dirty_indicator.clone())
+    fn push_dirty(&self, spans: &mut Vec<StyledRun>, gc: &GitContext) {
+        match self.cfg.dirty_format {
+            DirtyFormat::Indicator => {
+                if let Some(marker) = self.render_dirty_indicator(gc) {
+                    push_part(spans, marker, Role::Accent);
+                }
             }
-        } else if self.cfg.clean_indicator.is_empty() {
-            None
-        } else {
-            Some(self.cfg.clean_indicator.clone())
+            DirtyFormat::Counts => self.push_dirty_counts(spans, gc),
         }
     }
+
+    /// Returns the dirty or clean indicator glyph, keyed off the
+    /// early-exit indicator scan (not counts).
+    fn render_dirty_indicator(&self, gc: &GitContext) -> Option<String> {
+        if gc.dirty().is_dirty() {
+            (!self.cfg.dirty_indicator.is_empty()).then(|| self.cfg.dirty_indicator.clone())
+        } else {
+            (!self.cfg.clean_indicator.is_empty()).then(|| self.cfg.clean_indicator.clone())
+        }
+    }
+
+    /// Counts-mode marker: one color-coded `{icon}{count}` span per
+    /// non-suppressed category (staged green, unstaged yellow,
+    /// untracked red). Clean trees fall back to the clean indicator.
+    fn push_dirty_counts(&self, spans: &mut Vec<StyledRun>, gc: &GitContext) {
+        match &*gc.dirty_counts() {
+            DirtyState::Dirty(Some(counts)) => {
+                self.push_count(spans, &self.cfg.staged_icon, counts.staged, Role::Success);
+                self.push_count(
+                    spans,
+                    &self.cfg.unstaged_icon,
+                    counts.unstaged,
+                    Role::Warning,
+                );
+                self.push_count(
+                    spans,
+                    &self.cfg.untracked_icon,
+                    counts.untracked,
+                    Role::Error,
+                );
+            }
+            // The counts accessor only yields `Dirty(Some)` or `Clean`;
+            // a preseeded count-less `Dirty(None)` degrades to the glyph
+            // (so counts mode falls back on `dirty_indicator` here).
+            DirtyState::Dirty(None) => {
+                if !self.cfg.dirty_indicator.is_empty() {
+                    push_part(spans, self.cfg.dirty_indicator.clone(), Role::Accent);
+                }
+            }
+            DirtyState::Clean => {
+                if !self.cfg.clean_indicator.is_empty() {
+                    push_part(spans, self.cfg.clean_indicator.clone(), Role::Accent);
+                }
+            }
+        }
+    }
+
+    fn push_count(&self, spans: &mut Vec<StyledRun>, icon: &str, count: u32, role: Role) {
+        if count == 0 && self.cfg.count_hide_zero {
+            return;
+        }
+        push_part(spans, format!("{icon}{count}"), role);
+    }
+}
+
+/// Append `text` as a styled span, prefixed with a space separator when
+/// the segment already has content. Empty `text` is a no-op. The
+/// separator takes [`Role::Accent`]; it carries no glyph, so its color
+/// is immaterial, and `from_spans` coalesces it into a same-role
+/// neighbor.
+fn push_part(spans: &mut Vec<StyledRun>, text: String, role: Role) {
+    if text.is_empty() {
+        return;
+    }
+    if !spans.is_empty() {
+        spans.push(StyledRun::new(" ", Style::role(Role::Accent)));
+    }
+    spans.push(StyledRun::new(text, Style::role(role)));
 }
 
 /// Middle-truncate `s` so its cell width fits `max`, inserting
@@ -497,7 +589,7 @@ fn truncate_middle(s: &str, max: u16, marker: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_context::{DirtyState, GitContext, Head, RepoKind, UpstreamState};
+    use crate::data_context::{DirtyCounts, DirtyState, GitContext, Head, RepoKind, UpstreamState};
     use crate::input::{ModelInfo, StatusContext, Tool, WorkspaceInfo};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -1045,7 +1137,7 @@ mod tests {
     }
 
     #[test]
-    fn from_extras_counts_mode_warns_and_falls_back_to_indicator() {
+    fn from_extras_counts_mode_enables_counts_format() {
         let mut extras = BTreeMap::new();
         let mut dirty = toml::value::Table::new();
         dirty.insert("format".into(), toml::Value::String("counts".into()));
@@ -1053,9 +1145,43 @@ mod tests {
 
         let mut warnings = Vec::<String>::new();
         let seg = GitBranchSegment::from_extras(&extras, &mut |m| warnings.push(m.to_string()));
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("counts"));
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert!(seg.cfg.dirty_enabled);
+        assert_eq!(seg.cfg.dirty_format, DirtyFormat::Counts);
+    }
+
+    #[test]
+    fn from_extras_unknown_format_warns_and_keeps_indicator_default() {
+        let mut extras = BTreeMap::new();
+        let mut dirty = toml::value::Table::new();
+        dirty.insert("format".into(), toml::Value::String("wobble".into()));
+        extras.insert("dirty".into(), toml::Value::Table(dirty));
+
+        let mut warnings = Vec::<String>::new();
+        let seg = GitBranchSegment::from_extras(&extras, &mut |m| warnings.push(m.to_string()));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("format"));
+        assert_eq!(seg.cfg.dirty_format, DirtyFormat::Indicator);
+    }
+
+    #[test]
+    fn from_extras_reads_counts_icons_and_count_hide_zero() {
+        let mut extras = BTreeMap::new();
+        let mut dirty = toml::value::Table::new();
+        dirty.insert("format".into(), toml::Value::String("counts".into()));
+        dirty.insert("staged_icon".into(), toml::Value::String("S".into()));
+        dirty.insert("unstaged_icon".into(), toml::Value::String("M".into()));
+        dirty.insert("untracked_icon".into(), toml::Value::String("U".into()));
+        dirty.insert("count_hide_zero".into(), toml::Value::Boolean(false));
+        extras.insert("dirty".into(), toml::Value::Table(dirty));
+
+        let mut warnings = Vec::<String>::new();
+        let seg = GitBranchSegment::from_extras(&extras, &mut |m| warnings.push(m.to_string()));
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(seg.cfg.staged_icon, "S");
+        assert_eq!(seg.cfg.unstaged_icon, "M");
+        assert_eq!(seg.cfg.untracked_icon, "U");
+        assert!(!seg.cfg.count_hide_zero);
     }
 
     #[test]
@@ -1081,6 +1207,217 @@ mod tests {
             assert_eq!(warnings.len(), 1, "{bad}: {warnings:?}");
             assert_eq!(seg.cfg.short_sha_length, DEFAULT_SHORT_SHA_LEN);
         }
+    }
+
+    // --- Counts-mode rendering ---
+
+    fn counts_seg() -> GitBranchSegment {
+        let mut seg = GitBranchSegment::default();
+        seg.cfg.dirty_format = DirtyFormat::Counts;
+        seg
+    }
+
+    fn ctx_with_dirty_counts(staged: u32, unstaged: u32, untracked: u32) -> DataContext {
+        let gc = GitContext::new(
+            RepoKind::Main,
+            PathBuf::from("/repo/.git"),
+            Head::Branch("main".into()),
+        );
+        gc.preseed_dirty_counts_state(DirtyState::Dirty(Some(DirtyCounts {
+            staged,
+            unstaged,
+            untracked,
+        })))
+        .expect("fresh counts cell");
+        let dc = DataContext::with_cwd(minimal_status(), None);
+        dc.preseed_git(Ok(Some(gc))).expect("seed");
+        dc
+    }
+
+    fn role_of(spans: &[StyledRun], text: &str) -> Option<Role> {
+        spans
+            .iter()
+            .find(|s| s.text() == text)
+            .and_then(|s| s.style().role)
+    }
+
+    #[test]
+    fn counts_mode_renders_all_three_categories_color_coded() {
+        let seg = counts_seg();
+        let dc = ctx_with_dirty_counts(3, 2, 1);
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("rendered");
+        assert_eq!(rendered.text(), "main +3 ~2 ?1");
+        let spans = rendered.spans().expect("multi-color spans");
+        assert_eq!(role_of(spans, "+3"), Some(Role::Success));
+        assert_eq!(role_of(spans, "~2"), Some(Role::Warning));
+        assert_eq!(role_of(spans, "?1"), Some(Role::Error));
+    }
+
+    #[test]
+    fn counts_mode_hides_zero_categories_by_default() {
+        let seg = counts_seg();
+        let dc = ctx_with_dirty_counts(0, 2, 0);
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("rendered");
+        assert_eq!(rendered.text(), "main ~2");
+    }
+
+    #[test]
+    fn counts_mode_shows_zeros_when_count_hide_zero_false() {
+        let mut seg = counts_seg();
+        seg.cfg.count_hide_zero = false;
+        let dc = ctx_with_dirty_counts(0, 2, 0);
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("rendered");
+        assert_eq!(rendered.text(), "main +0 ~2 ?0");
+    }
+
+    #[test]
+    fn counts_mode_clean_renders_branch_only_single_run() {
+        let seg = counts_seg();
+        let gc = GitContext::new(
+            RepoKind::Main,
+            PathBuf::from("/repo/.git"),
+            Head::Branch("main".into()),
+        );
+        gc.preseed_dirty_counts_state(DirtyState::Clean)
+            .expect("fresh counts cell");
+        let dc = DataContext::with_cwd(minimal_status(), None);
+        dc.preseed_git(Ok(Some(gc))).expect("seed");
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("rendered");
+        assert_eq!(rendered.text(), "main");
+        // Single-color assembly folds back to one whole-segment run.
+        assert!(rendered.spans().is_none());
+        assert_eq!(rendered.style().role, Some(Role::Accent));
+    }
+
+    #[test]
+    fn counts_mode_honors_custom_icons() {
+        let mut seg = counts_seg();
+        seg.cfg.staged_icon = "●".into();
+        seg.cfg.unstaged_icon = "✚".into();
+        seg.cfg.untracked_icon = "…".into();
+        let dc = ctx_with_dirty_counts(1, 1, 1);
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("rendered");
+        assert_eq!(rendered.text(), "main ●1 ✚1 …1");
+    }
+
+    #[test]
+    fn counts_mode_degrades_to_indicator_on_uncounted_dirty() {
+        // Defensive: a preseeded count-less Dirty(None) can't show
+        // counts, so it falls back to the single dirty glyph.
+        let seg = counts_seg();
+        let gc = GitContext::new(
+            RepoKind::Main,
+            PathBuf::from("/repo/.git"),
+            Head::Branch("main".into()),
+        );
+        gc.preseed_dirty_counts_state(DirtyState::Dirty(None))
+            .expect("fresh counts cell");
+        let dc = DataContext::with_cwd(minimal_status(), None);
+        dc.preseed_git(Ok(Some(gc))).expect("seed");
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("rendered");
+        assert_eq!(rendered.text(), "main *");
+    }
+
+    #[test]
+    fn counts_mode_combines_with_ahead_behind() {
+        let mut seg = counts_seg();
+        seg.cfg.dirty_format = DirtyFormat::Counts;
+        let gc = GitContext::new(
+            RepoKind::Main,
+            PathBuf::from("/repo/.git"),
+            Head::Branch("main".into()),
+        );
+        gc.preseed_dirty_counts_state(DirtyState::Dirty(Some(DirtyCounts {
+            staged: 1,
+            unstaged: 0,
+            untracked: 0,
+        })))
+        .expect("fresh counts cell");
+        gc.preseed_upstream(Some(UpstreamState {
+            ahead: 2,
+            behind: 0,
+            upstream_branch: "origin/main".into(),
+        }))
+        .expect("fresh upstream cell");
+        let dc = DataContext::with_cwd(minimal_status(), None);
+        dc.preseed_git(Ok(Some(gc))).expect("seed");
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("rendered");
+        assert_eq!(rendered.text(), "main +1 ↑2");
+        let spans = rendered.spans().expect("multi-color spans");
+        assert_eq!(role_of(spans, "+1"), Some(Role::Success));
+        // The ahead marker stays Accent; its leading separator coalesces
+        // into it, so the run reads " ↑2".
+        let ahead = spans
+            .iter()
+            .find(|s| s.text().contains('↑'))
+            .expect("ahead span");
+        assert_eq!(ahead.style().role, Some(Role::Accent));
+    }
+
+    #[test]
+    fn counts_mode_full_render_with_ahead_and_behind() {
+        // The realistic "everything on" statusline: counts + both
+        // tracking directions, in order.
+        let seg = counts_seg();
+        let gc = GitContext::new(
+            RepoKind::Main,
+            PathBuf::from("/repo/.git"),
+            Head::Branch("main".into()),
+        );
+        gc.preseed_dirty_counts_state(DirtyState::Dirty(Some(DirtyCounts {
+            staged: 1,
+            unstaged: 2,
+            untracked: 3,
+        })))
+        .expect("fresh counts cell");
+        gc.preseed_upstream(Some(UpstreamState {
+            ahead: 2,
+            behind: 1,
+            upstream_branch: "origin/main".into(),
+        }))
+        .expect("fresh upstream cell");
+        let dc = DataContext::with_cwd(minimal_status(), None);
+        dc.preseed_git(Ok(Some(gc))).expect("seed");
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("rendered");
+        assert_eq!(rendered.text(), "main +1 ~2 ?3 ↑2 ↓1");
+        let spans = rendered.spans().expect("multi-color spans");
+        assert_eq!(role_of(spans, "+1"), Some(Role::Success));
+        assert_eq!(role_of(spans, "~2"), Some(Role::Warning));
+        assert_eq!(role_of(spans, "?3"), Some(Role::Error));
+    }
+
+    #[test]
+    fn counts_mode_dirty_marker_hidden_below_threshold() {
+        // The width gate wraps the whole counts marker: below threshold
+        // the entire `+3 ~2 ?1` tail goes, not only the first category.
+        let mut seg = counts_seg();
+        seg.cfg.dirty_hide_below_cells = 50;
+        let dc = ctx_with_dirty_counts(3, 2, 1);
+        assert_eq!(render_at(&seg, 49, &dc), "main");
+        assert_eq!(render_at(&seg, 50, &dc), "main +3 ~2 ?1");
+    }
+
+    #[test]
+    fn counts_mode_empty_icon_renders_bare_count() {
+        // Unlike indicator mode (empty glyph suppresses), an empty
+        // counts icon yields a bare count rather than nothing.
+        let mut seg = counts_seg();
+        seg.cfg.staged_icon = String::new();
+        let dc = ctx_with_dirty_counts(3, 0, 0);
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("rendered");
+        assert_eq!(rendered.text(), "main 3");
+    }
+
+    #[test]
+    fn counts_mode_all_zero_dirty_some_renders_zeros_when_shown() {
+        // A real scan collapses all-zero to Clean, so this state only
+        // arrives via preseed; pin the renderer's trust-the-input
+        // behavior so `count_hide_zero = false` is unambiguous.
+        let mut seg = counts_seg();
+        seg.cfg.count_hide_zero = false;
+        let dc = ctx_with_dirty_counts(0, 0, 0);
+        let rendered = seg.render(&dc, &rc()).unwrap().expect("rendered");
+        assert_eq!(rendered.text(), "main +0 ~0 ?0");
     }
 
     // --- truncate_middle ---
