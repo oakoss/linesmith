@@ -15,7 +15,7 @@ use super::config::{
     apply_common_extras, parse_percent_format, parse_reset_format, CommonRateLimitConfig,
     PercentFormat, ResetFormat, PRIORITY,
 };
-use super::format::{format_jsonl_tokens, format_percent, format_reset, render_error, ResetWindow};
+use super::format::{format_jsonl_tokens, format_reset, render_error, render_percent, ResetWindow};
 use super::window::{resolve_seven_day_reset, UsageWindow, WindowResolution};
 use crate::data_context::{DataContext, DataDep};
 use crate::segments::extras::parse_bool;
@@ -63,22 +63,23 @@ impl RateLimit7dSegment {
 impl Segment for RateLimit7dSegment {
     fn render(&self, ctx: &DataContext, _rc: &RenderContext) -> RenderResult {
         let usage = ctx.usage();
-        let text = match &*usage {
+        let rendered = match &*usage {
             Ok(data) => match UsageWindow::SevenDay.resolve_percent(data) {
                 Ok(WindowResolution::Endpoint(bucket)) => {
-                    format_percent(bucket, self.format, self.invert, &self.config)
+                    render_percent(bucket, self.format, self.invert, &self.config)
                 }
                 Ok(WindowResolution::JsonlTokens(total)) => {
-                    format_jsonl_tokens(total, &self.config)
+                    RenderedSegment::new(format_jsonl_tokens(total, &self.config))
+                        .with_role(Role::Info)
                 }
                 Err(reason) => {
                     crate::lsm_debug!("rate_limit_7d: {reason}; hiding");
                     return Ok(None);
                 }
             },
-            Err(err) => render_error(err, &self.config),
+            Err(err) => RenderedSegment::new(render_error(err, &self.config)).with_role(Role::Info),
         };
-        Ok(Some(RenderedSegment::new(text).with_role(Role::Info)))
+        Ok(Some(rendered))
     }
 
     fn data_deps(&self) -> &'static [DataDep] {

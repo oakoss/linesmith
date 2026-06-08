@@ -14,6 +14,8 @@ use super::config::{
     ResetFormat, Timezone,
 };
 use crate::data_context::{CredentialError, ExtraUsage, JsonlError, UsageBucket, UsageError};
+use crate::segments::{progress_bar, RenderedSegment};
+use crate::theme::{Role, Style, StyledRun};
 
 /// Which rolling window a reset segment represents. Determines the
 /// denominator when [`ResetFormat::Progress`] computes elapsed %.
@@ -39,19 +41,56 @@ impl ResetWindow {
 /// and modifier support (`invert` / `progress` don't apply without a
 /// ceiling).
 #[must_use]
-pub(crate) fn format_percent(
+pub(crate) fn render_percent(
     bucket: &UsageBucket,
     format: PercentFormat,
     invert: bool,
     cfg: &CommonRateLimitConfig,
-) -> String {
+) -> RenderedSegment {
+    // Color always tracks raw usage, never the displayed value: under
+    // `invert` the bar/text show remaining %, but a 5%-used bucket
+    // ("95% remaining") is healthy and must read green, not red.
+    let role = cfg.role_for(f64::from(bucket.utilization.value()));
+    let shown = shown_pct(bucket, invert);
+    match format {
+        PercentFormat::Percent => {
+            RenderedSegment::new(wrap(&format!("{shown:.1}%"), false, cfg)).with_role(role)
+        }
+        PercentFormat::Progress => progress_segment(shown, role, cfg),
+    }
+}
+
+fn shown_pct(bucket: &UsageBucket, invert: bool) -> f64 {
     let raw = f64::from(bucket.utilization.value());
-    let shown = if invert { 100.0 - raw } else { raw };
-    let value = match format {
-        PercentFormat::Percent => format!("{shown:.1}%"),
-        PercentFormat::Progress => format_progress_bar(shown, cfg.progress_width),
-    };
-    wrap(&value, false, cfg)
+    if invert {
+        100.0 - raw
+    } else {
+        raw
+    }
+}
+
+/// `label: ` prefix for a progress bar's leading span. Endpoint-only
+/// (the stale marker applies to JSONL token renders, which never use a
+/// bar), so no marker here.
+fn label_prefix(cfg: &CommonRateLimitConfig) -> String {
+    if cfg.label.is_empty() {
+        String::new()
+    } else {
+        format!("{}: ", cfg.label)
+    }
+}
+
+/// Label span + the shared bar's spans, folded into one segment. The
+/// label takes the segment `role` so the whole indicator escalates
+/// color together; the bar supplies its own dim trough / frame spans.
+fn progress_segment(pct: f64, role: Role, cfg: &CommonRateLimitConfig) -> RenderedSegment {
+    let mut spans = Vec::with_capacity(6);
+    let prefix = label_prefix(cfg);
+    if !prefix.is_empty() {
+        spans.push(StyledRun::new(prefix, Style::role(role)));
+    }
+    spans.extend(progress_bar::render_bar(pct, &cfg.bar_style(), role));
+    RenderedSegment::from_spans(spans).with_role(role)
 }
 
 /// Render the JSONL-mode token total for `rate_limit_5h` / `rate_limit_7d`
@@ -85,7 +124,9 @@ pub(crate) fn format_reset(
         ResetFormat::Duration => format_duration_text(remaining, compact, use_days),
         ResetFormat::Absolute(absolute) => format_absolute_text(resets_at, absolute),
         ResetFormat::Progress => {
-            format_progress_bar(reset_progress_pct(remaining, window), cfg.progress_width)
+            // Flat (no threshold color): elapsed-time progress isn't a
+            // usage signal, but it shares the bar geometry/glyphs.
+            progress_bar::bar_text(reset_progress_pct(remaining, window), &cfg.bar_style())
         }
     };
     wrap(&value, jsonl, cfg)
@@ -170,24 +211,6 @@ fn wrap(value: &str, jsonl: bool, cfg: &CommonRateLimitConfig) -> String {
 fn wrap_label_only(body: &str, cfg: &CommonRateLimitConfig) -> String {
     let label_sep = if cfg.label.is_empty() { "" } else { ": " };
     format!("{label}{label_sep}{body}", label = cfg.label,)
-}
-
-#[must_use]
-pub(crate) fn format_progress_bar(pct: f64, width: u16) -> String {
-    // Progress-width 0 means "disabled" per spec §Edge cases; callers
-    // should have already fallen back to percent format, but defend
-    // here so a stray `progress_width = 0` config doesn't panic.
-    if width == 0 {
-        return format!("{pct:.1}%");
-    }
-    let clamped = pct.clamp(0.0, 100.0);
-    let filled = ((clamped / 100.0) * f64::from(width)).round() as usize;
-    let empty = usize::from(width).saturating_sub(filled);
-    format!(
-        "{filled_bar}{empty_bar} {clamped:.1}%",
-        filled_bar = "█".repeat(filled),
-        empty_bar = "░".repeat(empty),
-    )
 }
 
 /// Duration → text per spec §Config schema: `compact=true` collapses
@@ -336,23 +359,52 @@ mod tests {
 
     #[test]
     fn percent_format_rounds_to_one_decimal_with_label() {
-        let s = format_percent(&bucket(22.0), PercentFormat::Percent, false, &cfg());
-        assert_eq!(s, "5h: 22.0%");
+        let r = render_percent(&bucket(22.0), PercentFormat::Percent, false, &cfg());
+        assert_eq!(r.text(), "5h: 22.0%");
+        // Threshold color on by default: 22% is below green → Success.
+        assert_eq!(r.style().role, Some(Role::Success));
     }
 
     #[test]
-    fn percent_format_inverts_when_configured() {
-        let s = format_percent(&bucket(22.0), PercentFormat::Percent, true, &cfg());
-        assert_eq!(s, "5h: 78.0%");
+    fn percent_format_inverts_text_but_colors_by_raw_usage() {
+        // invert shows "78% remaining", but color tracks raw usage (22%
+        // used) → Success. The displayed value and the color intentionally
+        // disagree: the bar reads "healthy" green despite the high number.
+        let r = render_percent(&bucket(22.0), PercentFormat::Percent, true, &cfg());
+        assert_eq!(r.text(), "5h: 78.0%");
+        assert_eq!(r.style().role, Some(Role::Success));
+    }
+
+    #[test]
+    fn inverted_progress_colors_red_when_raw_usage_is_high() {
+        // 92% used, inverted to "8.0%" remaining: nearly-empty bar, red.
+        let r = render_percent(&bucket(92.0), PercentFormat::Progress, true, &cfg());
+        assert!(r.text().ends_with(" 8.0%"), "got {:?}", r.text());
+        assert_eq!(r.style().role, Some(Role::Error));
+    }
+
+    #[test]
+    fn percent_format_escalates_to_error_above_yellow() {
+        let r = render_percent(&bucket(92.0), PercentFormat::Percent, false, &cfg());
+        assert_eq!(r.text(), "5h: 92.0%");
+        assert_eq!(r.style().role, Some(Role::Error));
+    }
+
+    #[test]
+    fn threshold_color_off_keeps_flat_info() {
+        let mut c = cfg();
+        c.threshold_color = false;
+        let r = render_percent(&bucket(92.0), PercentFormat::Percent, false, &c);
+        assert_eq!(r.style().role, Some(Role::Info));
     }
 
     #[test]
     fn percent_format_progress_bar_at_50pct() {
-        let s = format_percent(&bucket(50.0), PercentFormat::Progress, false, &cfg());
-        assert!(s.starts_with("5h: "), "{s}");
-        assert!(s.contains("█"));
-        assert!(s.contains("░"));
-        assert!(s.ends_with("50.0%"), "{s}");
+        // Default rate-limit bar: Whole fill (round), 20 cells, one
+        // decimal. 50% → 10 full + 10 empty. Threshold color → Warning.
+        let r = render_percent(&bucket(50.0), PercentFormat::Progress, false, &cfg());
+        assert_eq!(r.text(), "5h: ██████████░░░░░░░░░░ 50.0%");
+        assert_eq!(r.style().role, Some(Role::Warning));
     }
 
     #[test]
@@ -381,8 +433,8 @@ mod tests {
     fn empty_label_drops_colon_separator() {
         let mut c = cfg();
         c.label = String::new();
-        let s = format_percent(&bucket(22.0), PercentFormat::Percent, false, &c);
-        assert_eq!(s, "22.0%");
+        let r = render_percent(&bucket(22.0), PercentFormat::Percent, false, &c);
+        assert_eq!(r.text(), "22.0%");
     }
 
     #[test]
@@ -437,20 +489,103 @@ mod tests {
 
     #[test]
     fn progress_bar_full_at_100pct() {
-        let s = format_progress_bar(100.0, 4);
-        assert_eq!(s, "████ 100.0%");
+        let mut c = cfg();
+        c.progress_width = 4;
+        let r = render_percent(&bucket(100.0), PercentFormat::Progress, false, &c);
+        assert_eq!(r.text(), "5h: ████ 100.0%");
+        assert_eq!(r.style().role, Some(Role::Error));
     }
 
     #[test]
     fn progress_bar_empty_at_zero() {
-        let s = format_progress_bar(0.0, 4);
-        assert_eq!(s, "░░░░ 0.0%");
+        let mut c = cfg();
+        c.progress_width = 4;
+        let r = render_percent(&bucket(0.0), PercentFormat::Progress, false, &c);
+        assert_eq!(r.text(), "5h: ░░░░ 0.0%");
+        assert_eq!(r.style().role, Some(Role::Success));
     }
 
     #[test]
-    fn progress_bar_zero_width_collapses_to_percent() {
-        let s = format_progress_bar(50.0, 0);
-        assert_eq!(s, "50.0%");
+    fn bar_text_reuses_shared_geometry_flat() {
+        // The reset-timer flat path: same Round geometry + one-decimal
+        // suffix, no color. 50% of 4 = 2 full + 2 empty.
+        let mut c = cfg();
+        c.progress_width = 4;
+        assert_eq!(progress_bar::bar_text(50.0, &c.bar_style()), "██░░ 50.0%");
+    }
+
+    fn span_pairs(r: &RenderedSegment) -> Vec<(String, Option<Role>)> {
+        r.spans()
+            .expect("progress render is spanned")
+            .iter()
+            .map(|s| (s.text().to_string(), s.style().role))
+            .collect()
+    }
+
+    #[test]
+    fn progress_spans_color_label_fill_dim_trough_and_percentage() {
+        use progress_bar::DIM_ROLE;
+        let mut c = cfg();
+        c.progress_width = 10;
+        // 50% → Warning. Label + fill share the role and coalesce; the
+        // trough dims; the percentage takes the role again.
+        let r = render_percent(&bucket(50.0), PercentFormat::Progress, false, &c);
+        assert_eq!(
+            span_pairs(&r),
+            vec![
+                ("5h: █████".to_string(), Some(Role::Warning)),
+                ("░░░░░".to_string(), Some(DIM_ROLE)),
+                (" 50.0%".to_string(), Some(Role::Warning)),
+            ]
+        );
+    }
+
+    #[test]
+    fn progress_brackets_wrap_cells_with_frame_role() {
+        use progress_bar::FRAME_ROLE;
+        let mut c = cfg();
+        c.progress_width = 10;
+        c.brackets = true;
+        let r = render_percent(&bucket(50.0), PercentFormat::Progress, false, &c);
+        assert_eq!(r.text(), "5h: [█████░░░░░] 50.0%");
+        let spans = span_pairs(&r);
+        // Open bracket is its own Muted span (label before it is Warning);
+        // the close bracket coalesces into the Muted trough.
+        assert!(spans
+            .iter()
+            .any(|(t, role)| t == "[" && *role == Some(FRAME_ROLE)));
+        assert!(spans
+            .iter()
+            .any(|(t, role)| t.ends_with(']') && *role == Some(FRAME_ROLE)));
+    }
+
+    #[test]
+    fn threshold_color_off_renders_fully_flat_progress_bar() {
+        // The documented opt-out restores the pre-s0vw flat bar: fill,
+        // trough, and percentage all share Info, so the spans coalesce
+        // and fold to a single-style segment (spans None) — fully flat.
+        let mut c = cfg();
+        c.progress_width = 10;
+        c.threshold_color = false;
+        let r = render_percent(&bucket(50.0), PercentFormat::Progress, false, &c);
+        assert_eq!(r.text(), "5h: █████░░░░░ 50.0%");
+        assert!(r.spans().is_none(), "flat bar should fold to no spans");
+        assert_eq!(r.style().role, Some(Role::Info));
+    }
+
+    #[test]
+    fn progress_eighth_fill_renders_ramp_glyph_through_rate_limit() {
+        // Exercises the rate-limit `fill`→`partial` wiring (distinct from
+        // context_bar's): 41.25% of 8 = 3.3 cells → 3 full + 2/8 ramp ▎.
+        let mut c = cfg();
+        c.progress_width = 8;
+        c.fill = progress_bar::FillMode::Eighth;
+        let r = render_percent(&bucket(41.25), PercentFormat::Progress, false, &c);
+        assert!(
+            r.text().contains('▎'),
+            "expected eighth ramp glyph: {:?}",
+            r.text()
+        );
     }
 
     #[test]
@@ -727,8 +862,8 @@ mod tests {
 
     #[test]
     fn format_reset_absolute_under_jsonl_keeps_stale_marker() {
-        // Pin that the JSONL stale-marker prefix lands on the
-        // absolute-time string, not just on duration text.
+        // JSONL stale-marker prefix applies to absolute-time strings,
+        // not only duration text.
         let mut cfg = cfg();
         cfg.stale_marker = "~".into();
         let resets_at = fixed_utc(2025, 7, 15, 19, 0);

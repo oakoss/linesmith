@@ -6,6 +6,10 @@
 
 use std::collections::BTreeMap;
 
+use crate::segments::progress_bar::{
+    self, is_single_cell, BarChars as PbChars, BarStyle, FillMode, Thresholds,
+};
+
 /// Sits between `model` (priority 64) and `effort` (priority 160) on
 /// the layout-engine priority scale. Layout drops numerically-largest
 /// priorities first under width pressure, so rate-limit segments
@@ -94,6 +98,27 @@ pub struct CommonRateLimitConfig {
     /// spec's "fall back to percent format" rule at
     /// `rate-limit-segments.md` §Edge cases is honored, not just warned.
     pub invalid_progress_width: bool,
+    /// Green→yellow→red ramp; `pub(crate)` because the public surface is
+    /// [`Self::bar_style`] / [`Self::role_for`], which reference the
+    /// crate-internal `progress_bar` types.
+    pub(crate) thresholds: Thresholds,
+    /// Escalate the segment's color by usage (green/yellow/red). On by
+    /// default — a flat usage indicator hides the signal users care
+    /// about. Set `false` for the pre-s0vw flat `Info`.
+    pub(crate) threshold_color: bool,
+    /// Sub-cell fill style for the progress bar. Default [`FillMode::Whole`]
+    /// (round to whole cells, no partial glyph — the historical shape).
+    pub(crate) fill: FillMode,
+    pub(crate) brackets: bool,
+    /// Render the progress bar's empty trough dim. Default on; forced
+    /// off when `threshold_color` is off, since the flat opt-out means
+    /// a fully flat `Info` bar.
+    pub(crate) dim_empty: bool,
+    pub(crate) full: String,
+    pub(crate) empty: String,
+    pub(crate) half: String,
+    pub(crate) open: String,
+    pub(crate) close: String,
 }
 
 impl CommonRateLimitConfig {
@@ -104,6 +129,46 @@ impl CommonRateLimitConfig {
             stale_marker: "~".into(),
             progress_width: 20,
             invalid_progress_width: false,
+            thresholds: Thresholds::new(50, 80).expect("50 <= 80"),
+            threshold_color: true,
+            fill: FillMode::Whole,
+            brackets: false,
+            dim_empty: true,
+            full: progress_bar::DEFAULT_FULL.to_string(),
+            empty: progress_bar::DEFAULT_EMPTY.to_string(),
+            half: progress_bar::DEFAULT_HALF.to_string(),
+            open: progress_bar::DEFAULT_OPEN.to_string(),
+            close: progress_bar::DEFAULT_CLOSE.to_string(),
+        }
+    }
+
+    /// Project the bar knobs onto the shared [`BarStyle`]. The inline
+    /// percentage is fixed at one decimal — the historical rate-limit
+    /// precision. The trough only dims when threshold color is on, so
+    /// `threshold_color = false` yields a fully flat `Info` bar — the
+    /// whole flat-opt-out rule lives here, beside `role_for`.
+    pub(crate) fn bar_style(&self) -> BarStyle {
+        BarStyle {
+            width: self.progress_width,
+            chars: PbChars {
+                full: self.full.clone(),
+                empty: self.empty.clone(),
+                open: self.open.clone(),
+                close: self.close.clone(),
+                partial: self.fill.partial(&self.half),
+            },
+            brackets: self.brackets,
+            percentage: Some(1),
+            dim_empty: self.dim_empty && self.threshold_color,
+        }
+    }
+
+    /// Role for `pct` when `threshold_color` is on, else flat [`Role::Info`].
+    pub(crate) fn role_for(&self, pct: f64) -> crate::theme::Role {
+        if self.threshold_color {
+            self.thresholds.role_for(pct)
+        } else {
+            crate::theme::Role::Info
         }
     }
 }
@@ -149,6 +214,94 @@ pub(crate) fn apply_common_extras(
                     u16::MAX,
                 ));
                 cfg.invalid_progress_width = true;
+            }
+        }
+    }
+    apply_bar_extras(cfg, extras, id, warn);
+}
+
+/// Apply shared progress-bar knobs onto `cfg`, mirroring context_bar's
+/// surface so both segments expose the same config keys.
+fn apply_bar_extras(
+    cfg: &mut CommonRateLimitConfig,
+    extras: &BTreeMap<String, toml::Value>,
+    id: &str,
+    warn: &mut impl FnMut(&str),
+) {
+    // `fill` first so its preset full/empty land before `characters.*`.
+    if let Some(v) = extras.get("fill") {
+        match v.as_str().and_then(FillMode::parse) {
+            Some(mode) => {
+                cfg.fill = mode;
+                let (full, empty) = mode.preset_chars();
+                cfg.full = full.to_string();
+                cfg.empty = empty.to_string();
+            }
+            None => warn(&format!(
+                "segments.{id}.fill: expected one of half|whole|eighth|braille; ignoring"
+            )),
+        }
+    }
+
+    if let Some(v) = extras.get("threshold_color") {
+        match v.as_bool() {
+            Some(b) => cfg.threshold_color = b,
+            None => warn(&format!(
+                "segments.{id}.threshold_color: expected boolean; ignoring"
+            )),
+        }
+    }
+    for (key, slot) in [
+        ("brackets", &mut cfg.brackets),
+        ("dim_empty", &mut cfg.dim_empty),
+    ] {
+        let Some(v) = extras.get(key) else { continue };
+        match v.as_bool() {
+            Some(b) => *slot = b,
+            None => warn(&format!("segments.{id}.{key}: expected boolean; ignoring")),
+        }
+    }
+
+    if let Some(t) = extras.get("thresholds").and_then(|v| v.as_table()) {
+        let parse_field = |field: &str, warn: &mut dyn FnMut(&str)| -> Option<u8> {
+            let v = t.get(field)?;
+            match v.as_integer().and_then(|n| u8::try_from(n).ok()) {
+                Some(n) if n <= 100 => Some(n),
+                _ => {
+                    warn(&format!(
+                        "segments.{id}.thresholds.{field}: expected 0..=100; ignoring"
+                    ));
+                    None
+                }
+            }
+        };
+        let green = parse_field("green", &mut |m| warn(m)).unwrap_or(cfg.thresholds.green());
+        let yellow = parse_field("yellow", &mut |m| warn(m)).unwrap_or(cfg.thresholds.yellow());
+        match Thresholds::new(green, yellow) {
+            Some(t) => cfg.thresholds = t,
+            None => warn(&format!(
+                "segments.{id}.thresholds: green ({green}) must be <= yellow ({yellow}); ignoring both"
+            )),
+        }
+    }
+
+    if let Some(c) = extras.get("characters").and_then(|v| v.as_table()) {
+        for (field, slot) in [
+            ("full", &mut cfg.full),
+            ("partial", &mut cfg.half),
+            ("empty", &mut cfg.empty),
+            ("open", &mut cfg.open),
+            ("close", &mut cfg.close),
+        ] {
+            let Some(v) = c.get(field) else { continue };
+            match v.as_str() {
+                Some(s) if is_single_cell(s) => *slot = s.to_string(),
+                Some(_) => warn(&format!(
+                    "segments.{id}.characters.{field}: expected a single-cell string; ignoring"
+                )),
+                None => warn(&format!(
+                    "segments.{id}.characters.{field}: expected string; ignoring"
+                )),
             }
         }
     }
@@ -318,6 +471,56 @@ mod tests {
         fn any_contains(&self, needle: &str) -> bool {
             self.msgs.iter().any(|m| m.contains(needle))
         }
+    }
+
+    #[test]
+    fn defaults_preserve_pre_s0vw_shape_but_enable_threshold_color() {
+        let cfg = CommonRateLimitConfig::new("5h");
+        assert_eq!(cfg.progress_width, 20);
+        assert_eq!(cfg.fill, FillMode::Whole);
+        assert!(!cfg.brackets);
+        assert!(cfg.threshold_color, "threshold color is on by default");
+        assert_eq!(cfg.thresholds, Thresholds::new(50, 80).unwrap());
+    }
+
+    #[test]
+    fn apply_bar_extras_parses_fill_brackets_threshold_and_thresholds() {
+        let mut t = toml::value::Table::new();
+        t.insert("green".to_string(), toml::Value::Integer(60));
+        t.insert("yellow".to_string(), toml::Value::Integer(90));
+        let e = extras(&[
+            ("fill", toml::Value::String("eighth".into())),
+            ("brackets", toml::Value::Boolean(true)),
+            ("threshold_color", toml::Value::Boolean(false)),
+            ("thresholds", toml::Value::Table(t)),
+        ]);
+        let mut cfg = CommonRateLimitConfig::new("5h");
+        let mut w = CapturedWarns::new();
+        apply_common_extras(&mut cfg, &e, "rate_limit_5h", &mut |m| w.push(m));
+        assert_eq!(cfg.fill, FillMode::Eighth);
+        assert!(cfg.brackets);
+        assert!(!cfg.threshold_color);
+        assert_eq!(cfg.thresholds, Thresholds::new(60, 90).unwrap());
+        assert!(w.msgs.is_empty(), "unexpected warnings: {:?}", w.msgs);
+    }
+
+    #[test]
+    fn apply_bar_extras_warns_on_bad_fill_and_inverted_thresholds() {
+        let mut t = toml::value::Table::new();
+        t.insert("green".to_string(), toml::Value::Integer(90));
+        t.insert("yellow".to_string(), toml::Value::Integer(50));
+        let e = extras(&[
+            ("fill", toml::Value::String("sparkle".into())),
+            ("thresholds", toml::Value::Table(t)),
+        ]);
+        let mut cfg = CommonRateLimitConfig::new("5h");
+        let mut w = CapturedWarns::new();
+        apply_common_extras(&mut cfg, &e, "rate_limit_5h", &mut |m| w.push(m));
+        // Bad fill and inverted ramp both rejected; defaults preserved.
+        assert_eq!(cfg.fill, FillMode::Whole);
+        assert_eq!(cfg.thresholds, Thresholds::new(50, 80).unwrap());
+        assert!(w.any_contains("fill"));
+        assert!(w.any_contains("must be <="));
     }
 
     #[test]

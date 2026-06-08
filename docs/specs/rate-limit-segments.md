@@ -119,7 +119,7 @@ fn data_deps(&self) -> &'static [DataDep] {
 
 Credentials are a dependency of `ctx.usage()`'s internal endpoint-fetch path, not of the segment. Declaring only `Usage` lets the runtime's lazy loader skip credential resolution on cache hits.
 
-The render snippets below use `Option<String>` shorthand to focus on the rate-limit-specific formatting logic. The real return type is `RenderResult` with `RenderedSegment { runs, width, right_separator }`; the string content becomes one `StyledRun` with the segment's configured `role` (see [theming.md](theming.md)).
+The render snippets below use `Option<String>` shorthand to focus on the rate-limit-specific formatting logic. The real return type is `RenderResult` with a `RenderedSegment`. The percent/progress segments escalate their color by usage (green→yellow→red, thresholds default 50/80) via the shared `progress_bar` renderer ([segment-system.md](segment-system.md) §RenderedSegment); set `threshold_color = false` for the pre-s0vw flat `Info`. The percent format is a single styled run in that role. The progress bar fans into spans: label + threshold-colored fill + dim trough + threshold-colored percentage. Reset and JSONL/error renders stay a single `Info` run.
 
 ### Render examples
 
@@ -194,7 +194,7 @@ fn render(&self, ctx: &DataContext) -> Option<String> {
 }
 ```
 
-`format_percent` applies `invert`, clamps to `[0, 100]`, picks `percent` or `progress` format, and wraps with `label` / `icon`. `format_jsonl_tokens` routes the raw token count through `format_tokens` (`420k` / `1.2M` compact form), prepends `stale_marker`, and wraps with `label` / `icon`. The `invert`, `format = "progress"`, and `progress_width` config keys are ignored in JSONL mode: no "used vs remaining" axis exists on a raw count without a ceiling, and a progress bar requires a 0-100 value.
+`render_percent` derives the threshold color from raw utilization, never the `invert`ed display value (a 5%-used "95% remaining" reads green, not red). It applies `invert` and clamps to `[0, 100]` for the displayed value, then renders `percent` text or the shared `progress_bar` (one decimal, `progress_width` cells, `fill`/`brackets`/`dim_empty`/`characters` knobs shared with context_bar). `format_jsonl_tokens` routes the raw token count through `format_tokens` (`420k` / `1.2M` compact form), prepends `stale_marker`, and wraps with `label` / `icon`. The `invert`, `format = "progress"`, and `progress_width` config keys are ignored in JSONL mode: no "used vs remaining" axis exists on a raw count without a ceiling, and a progress bar requires a 0-100 value. JSONL token renders stay flat `Info` (no percentage axis to threshold-color).
 
 #### `rate_limit_5h_reset` and `rate_limit_7d_reset`
 
