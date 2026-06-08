@@ -11,7 +11,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::{RenderContext, RenderResult, RenderedSegment, Segment, SegmentDefaults};
 use crate::data_context::DataContext;
-use crate::theme::Role;
+use crate::theme::{Role, Style, StyledRun};
 
 /// Drops earlier than `rate_limit_5h` (96) and `context_window` (32):
 /// the bar is redundant with the textual percentage, so it should
@@ -28,12 +28,33 @@ const DEFAULT_YELLOW_THRESHOLD: u8 = 80;
 const DEFAULT_FULL: char = '█';
 const DEFAULT_PARTIAL: char = '▓';
 const DEFAULT_EMPTY: char = '░';
+const DEFAULT_OPEN: char = '[';
+const DEFAULT_CLOSE: char = ']';
+
+const DEFAULT_BRACKETS: bool = true;
+const DEFAULT_PERCENTAGE: bool = true;
+const DEFAULT_DIM_EMPTY: bool = true;
+
+/// Brackets and the dim trough render in [`Role::Muted`]: a neutral
+/// frame that stays legible without competing with the threshold-
+/// colored fill (the same role the powerline separator uses, chosen
+/// there for the same "visible but recessive" reason).
+const FRAME_ROLE: Role = Role::Muted;
+const DIM_ROLE: Role = Role::Muted;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Config {
     pub(crate) width: u16,
     pub(crate) thresholds: Thresholds,
     pub(crate) chars: BarChars,
+    /// Wrap the cells in `chars.open`/`chars.close`.
+    pub(crate) brackets: bool,
+    /// Append ` NN%` after the bar, banker's-rounded to agree with the
+    /// textual `context_window` segment at every boundary.
+    pub(crate) percentage: bool,
+    /// Render the empty (trough) cells in [`DIM_ROLE`] instead of the
+    /// fill's threshold role.
+    pub(crate) dim_empty: bool,
 }
 
 /// Threshold percentages for the green→yellow→red color ramp.
@@ -72,6 +93,8 @@ pub(crate) struct BarChars {
     pub(crate) full: String,
     pub(crate) partial: String,
     pub(crate) empty: String,
+    pub(crate) open: String,
+    pub(crate) close: String,
 }
 
 impl Default for Config {
@@ -84,7 +107,12 @@ impl Default for Config {
                 full: DEFAULT_FULL.to_string(),
                 partial: DEFAULT_PARTIAL.to_string(),
                 empty: DEFAULT_EMPTY.to_string(),
+                open: DEFAULT_OPEN.to_string(),
+                close: DEFAULT_CLOSE.to_string(),
             },
+            brackets: DEFAULT_BRACKETS,
+            percentage: DEFAULT_PERCENTAGE,
+            dim_empty: DEFAULT_DIM_EMPTY,
         }
     }
 }
@@ -151,11 +179,25 @@ impl ContextBarSegment {
             }
         }
 
+        for (key, slot) in [
+            ("brackets", &mut cfg.brackets),
+            ("percentage", &mut cfg.percentage),
+            ("dim_empty", &mut cfg.dim_empty),
+        ] {
+            let Some(v) = extras.get(key) else { continue };
+            match v.as_bool() {
+                Some(b) => *slot = b,
+                None => warn(&format!("segments.{ID}.{key}: expected boolean; ignoring")),
+            }
+        }
+
         if let Some(c) = extras.get("characters").and_then(|v| v.as_table()) {
             for (field, slot) in [
                 ("full", &mut cfg.chars.full),
                 ("partial", &mut cfg.chars.partial),
                 ("empty", &mut cfg.chars.empty),
+                ("open", &mut cfg.chars.open),
+                ("close", &mut cfg.chars.close),
             ] {
                 let Some(v) = c.get(field) else { continue };
                 // `width(s) == 1` (not `<= 1`) is intentional: ZWJ
@@ -201,9 +243,8 @@ impl Segment for ContextBarSegment {
         // (e.g. 50.5 → 51 vs format! → "50") and break the contract
         // that text and bar agree at every boundary.
         let pct = used.value().round_ties_even();
-        let bar = render_bar(pct, &self.cfg);
         let role = role_for_pct(pct, self.cfg.thresholds);
-        Ok(Some(RenderedSegment::new(bar).with_role(role)))
+        Ok(Some(build_bar(pct, &self.cfg, role)))
     }
 
     fn defaults(&self) -> SegmentDefaults {
@@ -221,29 +262,59 @@ fn role_for_pct(pct: f32, t: Thresholds) -> Role {
     }
 }
 
-fn render_bar(pct: f32, cfg: &Config) -> String {
-    let width = usize::from(cfg.width);
-    let cells_filled = (f32::from(cfg.width) * pct / 100.0).clamp(0.0, f32::from(cfg.width));
-    let full = cells_filled.floor() as usize;
-    let frac = cells_filled - cells_filled.floor();
-    let partial = if full < width && frac >= 0.5 { 1 } else { 0 };
-    let empty = width.saturating_sub(full).saturating_sub(partial);
+/// Full / partial / empty cell counts for `pct` across `width` cells.
+/// A partial block appears only when the fractional cell is at least
+/// half full and a whole cell isn't already there.
+fn bar_cells(pct: f32, width: u16) -> (usize, usize, usize) {
+    let cells = usize::from(width);
+    let filled = (f32::from(width) * pct / 100.0).clamp(0.0, f32::from(width));
+    let full = filled.floor() as usize;
+    let partial = if full < cells && filled.fract() >= 0.5 {
+        1
+    } else {
+        0
+    };
+    let empty = cells.saturating_sub(full).saturating_sub(partial);
+    (full, partial, empty)
+}
 
-    let mut out = String::with_capacity(
-        full * cfg.chars.full.len()
-            + partial * cfg.chars.partial.len()
-            + empty * cfg.chars.empty.len(),
-    );
-    for _ in 0..full {
-        out.push_str(&cfg.chars.full);
+/// Build the bar as styled spans: optional brackets in [`FRAME_ROLE`],
+/// filled cells in the threshold `role`, the trough in [`DIM_ROLE`]
+/// (or `role` when `dim_empty` is off), and an optional ` NN%` suffix
+/// in the threshold `role`. Adjacent same-style spans are coalesced by
+/// [`RenderedSegment::from_spans`]; `role` is the whole-segment
+/// fallback for the width-bound truncation path.
+fn build_bar(pct: f32, cfg: &Config, role: Role) -> RenderedSegment {
+    let (full, partial, empty) = bar_cells(pct, cfg.width);
+    let mut filled = cfg.chars.full.repeat(full);
+    filled.push_str(&cfg.chars.partial.repeat(partial));
+    let trough = cfg.chars.empty.repeat(empty);
+    let empty_role = if cfg.dim_empty { DIM_ROLE } else { role };
+
+    let mut spans: Vec<StyledRun> = Vec::with_capacity(5);
+    if cfg.brackets {
+        spans.push(StyledRun::new(
+            cfg.chars.open.clone(),
+            Style::role(FRAME_ROLE),
+        ));
     }
-    for _ in 0..partial {
-        out.push_str(&cfg.chars.partial);
+    if !filled.is_empty() {
+        spans.push(StyledRun::new(filled, Style::role(role)));
     }
-    for _ in 0..empty {
-        out.push_str(&cfg.chars.empty);
+    if !trough.is_empty() {
+        spans.push(StyledRun::new(trough, Style::role(empty_role)));
     }
-    out
+    if cfg.brackets {
+        spans.push(StyledRun::new(
+            cfg.chars.close.clone(),
+            Style::role(FRAME_ROLE),
+        ));
+    }
+    if cfg.percentage {
+        spans.push(StyledRun::new(format!(" {pct:.0}%"), Style::role(role)));
+    }
+
+    RenderedSegment::from_spans(spans).with_role(role)
 }
 
 #[cfg(test)]
@@ -288,9 +359,26 @@ mod tests {
         }
     }
 
+    /// Default config with the three decoration toggles off, so
+    /// `render().text()` is exactly the bar cells. Geometry tests use
+    /// this to pin cell math without the brackets/percentage/dim that
+    /// the ON-by-default shape adds.
+    fn bare() -> ContextBarSegment {
+        strip_decoration(ContextBarSegment::default())
+    }
+
+    /// Turn off the decoration toggles on an already-built segment
+    /// (e.g. one from `from_extras`) so only the cells render.
+    fn strip_decoration(mut seg: ContextBarSegment) -> ContextBarSegment {
+        seg.cfg.brackets = false;
+        seg.cfg.percentage = false;
+        seg.cfg.dim_empty = false;
+        seg
+    }
+
     #[test]
     fn renders_zero_percent_as_all_empty() {
-        let r = ContextBarSegment::default()
+        let r = bare()
             .render(&ctx(Some(window(0.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
@@ -300,7 +388,7 @@ mod tests {
 
     #[test]
     fn renders_full_at_one_hundred() {
-        let r = ContextBarSegment::default()
+        let r = bare()
             .render(&ctx(Some(window(100.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
@@ -311,7 +399,7 @@ mod tests {
     #[test]
     fn renders_partial_block_when_fraction_geq_half() {
         // 45% of 10 cells = 4.5 → 4 full + 1 partial + 5 empty
-        let r = ContextBarSegment::default()
+        let r = bare()
             .render(&ctx(Some(window(45.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
@@ -321,7 +409,7 @@ mod tests {
     #[test]
     fn rounds_down_when_fraction_lt_half() {
         // 42% of 10 cells = 4.2 → 4 full + 0 partial + 6 empty
-        let r = ContextBarSegment::default()
+        let r = bare()
             .render(&ctx(Some(window(42.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
@@ -331,7 +419,7 @@ mod tests {
     #[test]
     fn renders_fifty_percent_at_threshold_boundary_yellow() {
         // pct >= green (50) → Warning; 50% of 10 = 5.0 → 5 full + 5 empty.
-        let r = ContextBarSegment::default()
+        let r = bare()
             .render(&ctx(Some(window(50.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
@@ -385,7 +473,7 @@ mod tests {
     #[test]
     fn rendered_width_matches_configured_cells_for_default_chars() {
         // Default chars are all single-cell, so cell-width == bar-width.
-        let r = ContextBarSegment::default()
+        let r = bare()
             .render(&ctx(Some(window(45.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
@@ -521,7 +609,7 @@ mod tests {
         c.insert("partial".to_string(), toml::Value::String("=".to_string()));
         c.insert("empty".to_string(), toml::Value::String("-".to_string()));
         let extras = BTreeMap::from([("characters".to_string(), toml::Value::Table(c))]);
-        let seg = ContextBarSegment::from_extras(&extras, &mut |_| {});
+        let seg = strip_decoration(ContextBarSegment::from_extras(&extras, &mut |_| {}));
         let r = seg
             .render(&ctx(Some(window(45.0, 200_000))), &rc())
             .unwrap()
@@ -532,7 +620,7 @@ mod tests {
     #[test]
     fn custom_width_changes_bar_length() {
         let extras = BTreeMap::from([("cells".to_string(), toml::Value::Integer(5))]);
-        let seg = ContextBarSegment::from_extras(&extras, &mut |_| {});
+        let seg = strip_decoration(ContextBarSegment::from_extras(&extras, &mut |_| {}));
         let r = seg
             .render(&ctx(Some(window(40.0, 200_000))), &rc())
             .unwrap()
@@ -556,7 +644,7 @@ mod tests {
     #[test]
     fn pct_is_rounded_so_high_fractional_paints_red_with_full_bar() {
         // 99.9 → rounds to 100; bar fully filled, role Error.
-        let r = ContextBarSegment::default()
+        let r = bare()
             .render(&ctx(Some(window(99.9, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
@@ -567,10 +655,10 @@ mod tests {
     #[test]
     fn frac_above_half_renders_partial_distinct_from_round() {
         // 47% of 10 cells = 4.7 → floor=4 + partial=1 = `████▓░░░░░`.
-        // If render_bar regressed to `round()` instead of `floor()`,
+        // If bar_cells regressed to `round()` instead of `floor()`,
         // the same input would produce 5 full blocks and no partial:
         // `█████░░░░░`. The exact-string assertion catches that.
-        let r = ContextBarSegment::default()
+        let r = bare()
             .render(&ctx(Some(window(47.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
@@ -582,7 +670,7 @@ mod tests {
         // 50.5 rounds to 50 under banker's (matches `format!("{:.0}",
         // 50.5_f32) == "50"`); plain `f32::round` would give 51 and
         // diverge from the textual `context_window` segment.
-        let r = ContextBarSegment::default()
+        let r = bare()
             .render(&ctx(Some(window(50.5, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
@@ -600,7 +688,7 @@ mod tests {
         // that "fixes" empty bars by hiding them doesn't break the
         // contract that color is always set on a rendered bar.
         let extras = BTreeMap::from([("cells".to_string(), toml::Value::Integer(1))]);
-        let seg = ContextBarSegment::from_extras(&extras, &mut |_| {});
+        let seg = strip_decoration(ContextBarSegment::from_extras(&extras, &mut |_| {}));
         let r = seg
             .render(&ctx(Some(window(30.0, 200_000))), &rc())
             .unwrap()
@@ -613,7 +701,7 @@ mod tests {
     fn frac_just_below_half_drops_partial_block() {
         // After rounding, integer pct only: 44 -> 4.4 cells -> 4 full + 0
         // partial. Locks the `>= 0.5` rule against a regression to `> 0.5`.
-        let r = ContextBarSegment::default()
+        let r = bare()
             .render(&ctx(Some(window(44.0, 200_000))), &rc())
             .unwrap()
             .expect("rendered");
@@ -670,7 +758,7 @@ mod tests {
     #[test]
     fn one_cell_width_renders_single_char() {
         let extras = BTreeMap::from([("cells".to_string(), toml::Value::Integer(1))]);
-        let seg = ContextBarSegment::from_extras(&extras, &mut |_| {});
+        let seg = strip_decoration(ContextBarSegment::from_extras(&extras, &mut |_| {}));
         let empty = seg
             .render(&ctx(Some(window(0.0, 200_000))), &rc())
             .unwrap()
@@ -681,5 +769,237 @@ mod tests {
             .unwrap()
             .expect("rendered");
         assert_eq!(full.text(), "█");
+    }
+
+    fn span_pairs(r: &RenderedSegment) -> Vec<(String, Option<Role>)> {
+        r.spans()
+            .expect("context_bar always renders spans")
+            .iter()
+            .map(|s| (s.text().to_string(), s.style().role))
+            .collect()
+    }
+
+    #[test]
+    fn default_renders_brackets_percentage_and_dim_trough() {
+        // The ON-by-default shape: `[████░░░░░░] 42%`, matching the work
+        // statusline / ccstatusline. 42% of 10 = 4 full + 6 empty.
+        let r = ContextBarSegment::default()
+            .render(&ctx(Some(window(42.0, 200_000))), &rc())
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(r.text(), "[████░░░░░░] 42%");
+        assert_eq!(r.style().role, Some(Role::Success));
+    }
+
+    #[test]
+    fn default_spans_color_frame_fill_trough_and_percentage() {
+        // Open bracket (Muted) + filled (Success) + dim trough then close
+        // bracket coalesced (both Muted) + percentage (Success). The
+        // trough+`]` merge because `from_spans` coalesces same-style runs.
+        let r = ContextBarSegment::default()
+            .render(&ctx(Some(window(42.0, 200_000))), &rc())
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(
+            span_pairs(&r),
+            vec![
+                ("[".to_string(), Some(FRAME_ROLE)),
+                ("████".to_string(), Some(Role::Success)),
+                ("░░░░░░]".to_string(), Some(DIM_ROLE)),
+                (" 42%".to_string(), Some(Role::Success)),
+            ]
+        );
+    }
+
+    #[test]
+    fn brackets_false_omits_delimiters() {
+        let mut seg = ContextBarSegment::default();
+        seg.cfg.brackets = false;
+        let r = seg
+            .render(&ctx(Some(window(42.0, 200_000))), &rc())
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(r.text(), "████░░░░░░ 42%");
+    }
+
+    #[test]
+    fn percentage_false_omits_suffix() {
+        let mut seg = ContextBarSegment::default();
+        seg.cfg.percentage = false;
+        let r = seg
+            .render(&ctx(Some(window(42.0, 200_000))), &rc())
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(r.text(), "[████░░░░░░]");
+    }
+
+    #[test]
+    fn dim_empty_false_colors_trough_with_threshold_role() {
+        // With dim_empty off, filled+trough share the threshold role and
+        // coalesce into one span; brackets stay Muted, percentage tracks
+        // fill.
+        let mut seg = ContextBarSegment::default();
+        seg.cfg.dim_empty = false;
+        let r = seg
+            .render(&ctx(Some(window(42.0, 200_000))), &rc())
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(
+            span_pairs(&r),
+            vec![
+                ("[".to_string(), Some(FRAME_ROLE)),
+                ("████░░░░░░".to_string(), Some(Role::Success)),
+                ("]".to_string(), Some(FRAME_ROLE)),
+                (" 42%".to_string(), Some(Role::Success)),
+            ]
+        );
+    }
+
+    #[test]
+    fn all_decoration_off_collapses_to_a_single_styled_run() {
+        // Brackets + percentage + dim all off → every cell shares the
+        // threshold role, so from_spans folds to a single-style segment
+        // (spans None): byte-identical to the pre-qol7 bar.
+        let r = bare()
+            .render(&ctx(Some(window(42.0, 200_000))), &rc())
+            .unwrap()
+            .expect("rendered");
+        assert!(r.spans().is_none(), "single-style bar folds to no spans");
+        assert_eq!(r.text(), "████░░░░░░");
+        assert_eq!(r.style().role, Some(Role::Success));
+    }
+
+    #[test]
+    fn percentage_uses_bankers_rounding_to_match_text() {
+        // 50.5 → "50%" under banker's, matching the textual
+        // `context_window` segment's `{:.0}` formatting.
+        let mut seg = ContextBarSegment::default();
+        seg.cfg.brackets = false;
+        let r = seg
+            .render(&ctx(Some(window(50.5, 200_000))), &rc())
+            .unwrap()
+            .expect("rendered");
+        assert!(r.text().ends_with(" 50%"), "got {:?}", r.text());
+    }
+
+    #[test]
+    fn from_extras_reads_open_close_chars() {
+        let mut c = toml::value::Table::new();
+        c.insert("open".to_string(), toml::Value::String("(".to_string()));
+        c.insert("close".to_string(), toml::Value::String(")".to_string()));
+        let extras = BTreeMap::from([("characters".to_string(), toml::Value::Table(c))]);
+        let seg = ContextBarSegment::from_extras(&extras, &mut |_| {});
+        assert_eq!(seg.cfg.chars.open, "(");
+        assert_eq!(seg.cfg.chars.close, ")");
+        let r = seg
+            .render(&ctx(Some(window(100.0, 200_000))), &rc())
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(r.text(), "(██████████) 100%");
+    }
+
+    #[test]
+    fn from_extras_reads_toggle_bools() {
+        let extras = BTreeMap::from([
+            ("brackets".to_string(), toml::Value::Boolean(false)),
+            ("percentage".to_string(), toml::Value::Boolean(false)),
+            ("dim_empty".to_string(), toml::Value::Boolean(false)),
+        ]);
+        let seg = ContextBarSegment::from_extras(&extras, &mut |_| {});
+        assert!(!seg.cfg.brackets);
+        assert!(!seg.cfg.percentage);
+        assert!(!seg.cfg.dim_empty);
+    }
+
+    #[test]
+    fn from_extras_warns_on_non_bool_toggle() {
+        let extras = BTreeMap::from([("percentage".to_string(), toml::Value::Integer(1))]);
+        let mut warnings = vec![];
+        let seg = ContextBarSegment::from_extras(&extras, &mut |m| warnings.push(m.to_string()));
+        assert!(seg.cfg.percentage);
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("percentage") && w.contains("boolean")));
+    }
+
+    #[test]
+    fn from_extras_rejects_multi_cell_bracket() {
+        let mut c = toml::value::Table::new();
+        c.insert("open".to_string(), toml::Value::String("漢".to_string()));
+        let extras = BTreeMap::from([("characters".to_string(), toml::Value::Table(c))]);
+        let mut warnings = vec![];
+        let seg = ContextBarSegment::from_extras(&extras, &mut |m| warnings.push(m.to_string()));
+        assert_eq!(seg.cfg.chars.open, DEFAULT_OPEN.to_string());
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("open") && w.contains("single-cell")));
+    }
+
+    #[test]
+    fn zero_percent_span_structure_is_all_trough() {
+        // No fill span at 0%, so the open bracket, dim trough, and close
+        // bracket all share FRAME_ROLE/DIM_ROLE (both Muted) and coalesce
+        // into a single run; the percentage tracks the threshold role.
+        let r = ContextBarSegment::default()
+            .render(&ctx(Some(window(0.0, 200_000))), &rc())
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(
+            span_pairs(&r),
+            vec![
+                ("[░░░░░░░░░░]".to_string(), Some(DIM_ROLE)),
+                (" 0%".to_string(), Some(Role::Success)),
+            ]
+        );
+    }
+
+    #[test]
+    fn full_percent_span_structure_has_no_trough() {
+        // No trough span at 100%; the close bracket must not merge into
+        // the fill span (Error vs Muted roles differ).
+        let r = ContextBarSegment::default()
+            .render(&ctx(Some(window(100.0, 200_000))), &rc())
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(
+            span_pairs(&r),
+            vec![
+                ("[".to_string(), Some(FRAME_ROLE)),
+                ("██████████".to_string(), Some(Role::Error)),
+                ("]".to_string(), Some(FRAME_ROLE)),
+                (" 100%".to_string(), Some(Role::Error)),
+            ]
+        );
+    }
+
+    #[test]
+    fn decorated_render_width_matches_text_width() {
+        // Layout trusts width(); the bracket + percentage spans must
+        // contribute to it. "[████░░░░░░] 42%" = 16 cells.
+        let r = ContextBarSegment::default()
+            .render(&ctx(Some(window(42.0, 200_000))), &rc())
+            .unwrap()
+            .expect("rendered");
+        assert_eq!(r.width(), 16);
+        assert_eq!(r.width(), super::super::text_width(r.text()));
+    }
+
+    #[test]
+    fn percentage_rounding_matches_format_at_more_boundaries() {
+        // Banker's rounding: 49.5 → 50 (up to even), 50.4 → 50,
+        // 50.6 → 51. Locks the rule against a swap to plain round().
+        let mut seg = ContextBarSegment::default();
+        seg.cfg.brackets = false;
+        for (used, expected) in [(49.5, " 50%"), (50.4, " 50%"), (50.6, " 51%")] {
+            let r = seg
+                .render(&ctx(Some(window(used, 200_000))), &rc())
+                .unwrap()
+                .expect("rendered");
+            assert!(
+                r.text().ends_with(expected),
+                "{used} → expected suffix {expected:?}, got {:?}",
+                r.text()
+            );
+        }
     }
 }

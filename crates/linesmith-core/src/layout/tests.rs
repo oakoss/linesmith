@@ -346,6 +346,24 @@ fn truncate_to_zero_yields_empty() {
 }
 
 #[test]
+fn truncate_drops_spans_degrading_to_whole_segment_style() {
+    // Truncation rewrites `text` wholesale, so any prior spans no longer
+    // align. The segment degrades to a single run in the fallback
+    // `style` rather than emitting desynced span colors.
+    use crate::theme::{Role, Style, StyledRun};
+    let spanned = RenderedSegment::from_spans([
+        StyledRun::new("ABCD", Style::role(Role::Success)),
+        StyledRun::new("EFGH", Style::role(Role::Muted)),
+    ])
+    .with_role(Role::Success);
+    assert!(spanned.spans().is_some());
+    let out = truncate_to(spanned, 4);
+    assert!(out.spans().is_none(), "spans must drop on truncation");
+    assert_eq!(out.text, "ABC…");
+    assert_eq!(out.style().role, Some(Role::Success));
+}
+
+#[test]
 fn truncate_handles_wide_grapheme_without_splitting() {
     // The middle-dot is 1 cell; truncating "42% · 200k" (10 cells) to
     // 6 cells should yield "42% ·…" (5 cells of content + ellipsis).
@@ -975,6 +993,47 @@ fn render_to_runs_preserves_segment_style() {
     assert_eq!(runs.len(), 3);
     assert_eq!(runs[2].text, "warn");
     assert_eq!(runs[2].style.role, Some(Role::Warning));
+}
+
+#[test]
+fn render_to_runs_fans_a_spanned_segment_into_one_run_per_span() {
+    // A multi-color segment (e.g. context_bar's filled cells vs dim
+    // trough) emits one run per span, each carrying its own style, so
+    // both stdout and the TUI preview render the colors distinctly.
+    use crate::theme::{Role, Style, StyledRun};
+    let spanned = RenderedSegment::from_spans([
+        StyledRun::new("AB", Style::role(Role::Success)),
+        StyledRun::new("CD", Style::role(Role::Muted)),
+    ])
+    .with_role(Role::Success);
+    let items = line_items_spaced(vec![
+        Box::new(StubSegment(Ok(Some(spanned)))),
+        Box::new(StubSegment(Ok(Some(RenderedSegment::new("z"))))),
+    ]);
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
+    // span "AB", span "CD", separator " ", segment "z".
+    assert_eq!(runs.len(), 4);
+    assert_eq!(runs[0].text, "AB");
+    assert_eq!(runs[0].style.role, Some(Role::Success));
+    assert_eq!(runs[1].text, "CD");
+    assert_eq!(runs[1].style.role, Some(Role::Muted));
+    assert_eq!(runs[2].text, " ");
+    assert_eq!(runs[3].text, "z");
+}
+
+#[test]
+fn render_to_runs_skips_empty_text_segment_run() {
+    // A segment that renders empty text (e.g. a zero-budget
+    // `truncate_to`) emits no run, so consumers never see a styled
+    // empty-text run that `runs_to_ansi` would wrap in stray escapes.
+    use crate::theme::Role;
+    let empty = RenderedSegment::new("").with_role(Role::Error);
+    assert_eq!(empty.style().role, Some(Role::Error));
+    let items = line_items_spaced(vec![Box::new(StubSegment(Ok(Some(empty))))]);
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
+    assert!(runs.is_empty(), "empty-text segment must emit no run");
 }
 
 #[test]

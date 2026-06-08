@@ -4,7 +4,7 @@
 //! separator preference, and theme role.
 
 use crate::data_context::{DataContext, DataDep};
-use crate::theme::{Role, Style};
+use crate::theme::{Role, Style, StyledRun};
 use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
 
@@ -39,6 +39,16 @@ pub struct RenderedSegment {
     pub(crate) width: u16,
     pub(crate) right_separator: Option<Separator>,
     pub(crate) style: Style,
+    /// Optional intra-segment color spans. When `Some`, the layout
+    /// engine fans the segment into one [`StyledRun`] per span instead
+    /// of a single run, letting one segment paint multiple colors
+    /// (e.g. a progress bar's filled cells vs its dim trough). `text`
+    /// and `width` stay the authoritative concatenation for layout
+    /// math; the spans must agree with them (the [`Self::from_spans`]
+    /// constructor enforces this). `style` is the whole-segment
+    /// fallback, used when spans is `None` and when a width-bound
+    /// truncation drops the spans (see [`crate::layout::truncate_to`]).
+    pub(crate) spans: Option<Vec<StyledRun>>,
 }
 
 impl RenderedSegment {
@@ -56,6 +66,7 @@ impl RenderedSegment {
             width,
             right_separator: None,
             style: Style::default(),
+            spans: None,
         }
     }
 
@@ -68,6 +79,50 @@ impl RenderedSegment {
             width,
             right_separator: Some(separator),
             style: Style::default(),
+            spans: None,
+        }
+    }
+
+    /// Build a multi-color segment from an ordered list of styled
+    /// spans. Each span's text is sanitized like [`Self::new`]; the
+    /// segment's `text`/`width` become the concatenation, so layout
+    /// math is unaffected by the split. Adjacent spans that share a
+    /// style are merged so the emitted run sequence carries no redundant
+    /// SGR pairs.
+    ///
+    /// `spans` is `Some` only when two or more distinct-style runs
+    /// survive: an empty input or a single effective run folds to `None`
+    /// with that run's style as the whole-segment [`Self::style`]. So
+    /// `Some` always means genuinely multi-color, a single-run segment
+    /// compares equal to the identical bare one, and the width-bound
+    /// truncation fallback (which drops spans) renders the same color it
+    /// would un-truncated.
+    #[must_use]
+    pub fn from_spans(spans: impl IntoIterator<Item = StyledRun>) -> Self {
+        let mut merged: Vec<StyledRun> = Vec::new();
+        for span in spans {
+            let text = sanitize_control_chars(span.text().to_string());
+            if text.is_empty() {
+                continue;
+            }
+            match merged.last_mut() {
+                Some(last) if last.style() == span.style() => last.text.push_str(&text),
+                _ => merged.push(StyledRun::new(text, span.style().clone())),
+            }
+        }
+        let text: String = merged.iter().map(StyledRun::text).collect();
+        let width = text_width(&text);
+        let (style, spans) = match merged.len() {
+            0 => (Style::default(), None),
+            1 => (merged.pop().expect("len == 1").style, None),
+            _ => (Style::default(), Some(merged)),
+        };
+        Self {
+            text,
+            width,
+            right_separator: None,
+            style,
+            spans,
         }
     }
 
@@ -112,6 +167,48 @@ impl RenderedSegment {
         self.width
     }
 
+    /// Intra-segment color spans, if this segment paints more than one
+    /// color. `None` means the whole segment renders in [`Self::style`]
+    /// as a single run.
+    #[must_use]
+    pub fn spans(&self) -> Option<&[StyledRun]> {
+        self.spans.as_deref()
+    }
+
+    /// Drop any intra-segment spans, collapsing the segment back to a
+    /// single run in [`Self::style`]. Used when a user style override
+    /// wins over the segment's own per-span coloring (the override is
+    /// declared "wholesale-replaces", so it flattens the spans too).
+    #[must_use]
+    pub(crate) fn without_spans(mut self) -> Self {
+        self.spans = None;
+        self
+    }
+
+    /// Prepend `icon` plus a separating space to the rendered text,
+    /// recomputing width. When the segment carries spans, the icon
+    /// becomes a leading span in the whole-segment [`Self::style`] so
+    /// the existing spans keep their own colors. `icon` is sanitized
+    /// here because it arrives from untrusted user config.
+    #[must_use]
+    pub(crate) fn with_icon_prefix(mut self, icon: &str) -> Self {
+        let prefix = sanitize_control_chars(format!("{icon} "));
+        if let Some(spans) = self.spans.as_mut() {
+            // Coalesce with the first span when styles match (keeps the
+            // same-style-runs-are-merged invariant `from_spans` upholds),
+            // else prepend a leading icon span in the whole-segment style.
+            match spans.first_mut() {
+                Some(first) if first.style() == &self.style => {
+                    first.text.insert_str(0, &prefix);
+                }
+                _ => spans.insert(0, StyledRun::new(prefix.clone(), self.style.clone())),
+            }
+        }
+        self.text = format!("{prefix}{}", self.text);
+        self.width = text_width(&self.text);
+        self
+    }
+
     /// Separator this render prefers on its right edge, if any. `None`
     /// means "fall back to the segment's default separator."
     #[must_use]
@@ -135,6 +232,7 @@ impl RenderedSegment {
             width,
             right_separator,
             style,
+            spans: None,
         }
     }
 }
@@ -673,20 +771,10 @@ impl OverriddenSegment {
     fn apply_render_overrides(&self, mut rendered: RenderedSegment) -> RenderedSegment {
         if let Some(override_style) = &self.user_style {
             let merged = merge_user_override(rendered.style(), override_style);
-            rendered = rendered.with_style(merged);
+            rendered = rendered.without_spans().with_style(merged);
         }
         if let Some(icon) = self.effective_icon() {
-            // `from_parts` skips the sanitization `RenderedSegment::new`
-            // applies, so strip control chars here — a user-config icon
-            // is untrusted input that must not smuggle terminal escapes.
-            let new_text = sanitize_control_chars(format!("{icon} {}", rendered.text()));
-            let new_width = text_width(&new_text);
-            rendered = RenderedSegment::from_parts(
-                new_text,
-                new_width,
-                rendered.right_separator().cloned(),
-                rendered.style().clone(),
-            );
+            rendered = rendered.with_icon_prefix(icon);
         }
         rendered
     }
@@ -1395,6 +1483,187 @@ mod layout_type_tests {
             RateLimit7dResetSegment::default().defaults().icon,
             Some("\u{21bb}")
         );
+    }
+
+    #[test]
+    fn from_spans_concatenates_text_and_merges_adjacent_same_style() {
+        // Two Primary spans flanking an Accent span: the Primary runs
+        // stay distinct (the Accent breaks the run), and text is the
+        // straight concatenation driving layout width.
+        let seg = RenderedSegment::from_spans([
+            StyledRun::new("ab", Style::role(Role::Primary)),
+            StyledRun::new("cd", Style::role(Role::Primary)),
+            StyledRun::new("ef", Style::role(Role::Accent)),
+        ]);
+        assert_eq!(seg.text(), "abcdef");
+        assert_eq!(seg.width(), 6);
+        let spans = seg.spans().expect("spans present");
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].text(), "abcd");
+        assert_eq!(spans[0].style().role, Some(Role::Primary));
+        assert_eq!(spans[1].text(), "ef");
+        assert_eq!(spans[1].style().role, Some(Role::Accent));
+    }
+
+    #[test]
+    fn from_spans_skips_empty_spans_and_sanitizes_control_chars() {
+        // One span empties out and the other sanitizes to "ab"; a single
+        // effective run folds to None with its style as the whole-segment
+        // style (see from_spans_single_run_folds_to_none).
+        let seg = RenderedSegment::from_spans([
+            StyledRun::new("", Style::role(Role::Primary)),
+            StyledRun::new("a\u{7}b", Style::role(Role::Accent)),
+        ]);
+        assert_eq!(seg.text(), "ab");
+        assert!(seg.spans().is_none());
+        assert_eq!(seg.style().role, Some(Role::Accent));
+    }
+
+    #[test]
+    fn from_spans_single_run_folds_to_none_lifting_its_style() {
+        // A lone effective run isn't "multi-color"; it folds to None so
+        // `Some` always means >=2 distinct-style runs, and the run's
+        // style becomes the whole-segment style (matching what the normal
+        // and truncation render paths both emit).
+        let single =
+            RenderedSegment::from_spans([StyledRun::new("ab", Style::role(Role::Primary))]);
+        assert!(single.spans().is_none());
+        assert_eq!(single.text(), "ab");
+        assert_eq!(single.style().role, Some(Role::Primary));
+
+        // Multiple spans that coalesce to one style also fold.
+        let coalesced = RenderedSegment::from_spans([
+            StyledRun::new("ab", Style::role(Role::Primary)),
+            StyledRun::new("cd", Style::role(Role::Primary)),
+        ]);
+        assert!(coalesced.spans().is_none());
+        assert_eq!(coalesced.text(), "abcd");
+        assert_eq!(coalesced.style().role, Some(Role::Primary));
+    }
+
+    #[test]
+    fn from_spans_empty_input_normalizes_to_none() {
+        // All-empty input → `None`, not `Some(vec![])`, so `Some` always
+        // means multi-color and an empty segment compares equal to a
+        // bare single-run one.
+        let empty = RenderedSegment::from_spans([] as [StyledRun; 0]);
+        assert!(empty.spans().is_none());
+        assert_eq!(empty.text(), "");
+        let all_filtered =
+            RenderedSegment::from_spans([StyledRun::new("", Style::role(Role::Primary))]);
+        assert!(all_filtered.spans().is_none());
+    }
+
+    #[test]
+    fn from_spans_does_not_merge_same_role_different_modifiers() {
+        // Coalescing keys on full `Style` equality, not role alone: two
+        // Primary spans differing by `bold` must stay distinct.
+        let bold = Style {
+            bold: true,
+            ..Style::role(Role::Primary)
+        };
+        let seg = RenderedSegment::from_spans([
+            StyledRun::new("ab", Style::role(Role::Primary)),
+            StyledRun::new("cd", bold),
+        ]);
+        let spans = seg.spans().expect("spans present");
+        assert_eq!(spans.len(), 2);
+        assert!(!spans[0].style().bold);
+        assert!(spans[1].style().bold);
+    }
+
+    #[test]
+    fn with_icon_prefix_prepends_separate_span_when_style_differs() {
+        // First span's style (Muted) differs from the whole-segment
+        // fallback (Success), so the icon prepends as its own span.
+        let seg = RenderedSegment::from_spans([
+            StyledRun::new("AB", Style::role(Role::Muted)),
+            StyledRun::new("CD", Style::role(Role::Success)),
+        ])
+        .with_role(Role::Success)
+        .with_icon_prefix("I");
+        assert_eq!(seg.text(), "I ABCD");
+        let spans = seg.spans().expect("spans present");
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].text(), "I ");
+        assert_eq!(spans[0].style().role, Some(Role::Success));
+        assert_eq!(spans[1].text(), "AB");
+    }
+
+    #[test]
+    fn with_icon_prefix_coalesces_into_first_span_when_style_matches() {
+        // First span shares the whole-segment fallback style (Success),
+        // so the icon merges into it rather than emitting a redundant
+        // same-style run.
+        let seg = RenderedSegment::from_spans([
+            StyledRun::new("AB", Style::role(Role::Success)),
+            StyledRun::new("CD", Style::role(Role::Muted)),
+        ])
+        .with_role(Role::Success)
+        .with_icon_prefix("I");
+        assert_eq!(seg.text(), "I ABCD");
+        let spans = seg.spans().expect("spans present");
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].text(), "I AB");
+        assert_eq!(spans[0].style().role, Some(Role::Success));
+        assert_eq!(spans[1].text(), "CD");
+    }
+
+    #[test]
+    fn icon_prefixed_spanned_segment_degrades_on_truncation() {
+        // After the icon span is inserted, a width-bound truncation must
+        // drop ALL spans (icon included) and keep text/width authoritative.
+        let seg = RenderedSegment::from_spans([
+            StyledRun::new("ABCD", Style::role(Role::Success)),
+            StyledRun::new("EFGH", Style::role(Role::Muted)),
+        ])
+        .with_role(Role::Success)
+        .with_icon_prefix("I");
+        assert!(seg.spans().is_some());
+        let out = crate::layout::truncate_to(seg, 4);
+        assert!(out.spans().is_none());
+        assert_eq!(out.text(), "I A…");
+        assert_eq!(out.style().role, Some(Role::Success));
+    }
+
+    #[test]
+    fn without_spans_collapses_to_single_run() {
+        let seg = RenderedSegment::from_spans([
+            StyledRun::new("AB", Style::role(Role::Success)),
+            StyledRun::new("CD", Style::role(Role::Muted)),
+        ])
+        .without_spans();
+        assert!(seg.spans().is_none());
+        assert_eq!(seg.text(), "ABCD");
+    }
+
+    #[test]
+    fn user_style_override_flattens_spans_then_icon_prepends() {
+        // A spanned segment + a user style override: the override is
+        // "wholesale-replaces", so the per-span coloring collapses to a
+        // single run in the override style. The icon still prepends.
+        struct Spanned;
+        impl Segment for Spanned {
+            fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+                Ok(Some(
+                    RenderedSegment::from_spans([
+                        StyledRun::new("AB", Style::role(Role::Success)),
+                        StyledRun::new("CD", Style::role(Role::Muted)),
+                    ])
+                    .with_role(Role::Success),
+                ))
+            }
+        }
+        let wrapped = OverriddenSegment::new(Box::new(Spanned))
+            .with_user_style(Style::role(Role::Accent))
+            .with_icon("I".to_string());
+        let r = wrapped
+            .render(&stub_ctx(), &stub_rc())
+            .unwrap()
+            .expect("visible");
+        assert_eq!(r.text(), "I ABCD");
+        assert!(r.spans().is_none(), "user override must flatten spans");
+        assert_eq!(r.style().role, Some(Role::Accent));
     }
 
     fn stub_ctx() -> DataContext {

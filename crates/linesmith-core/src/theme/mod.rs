@@ -193,9 +193,10 @@ impl Style {
 }
 
 /// Text + style emitted by the layout engine. The flat run sequence is
-/// what [`crate::layout::render_to_runs`] returns: one run per segment
-/// plus one run per non-empty inter-segment separator. Consumers map
-/// runs to their target surface — ANSI SGR for terminal stdout,
+/// what [`crate::layout::render_to_runs`] returns: one or more runs per
+/// segment (a multi-color segment fans into one run per intra-segment
+/// span) plus one run per non-empty inter-segment separator. Consumers
+/// map runs to their target surface — ANSI SGR for terminal stdout,
 /// ratatui `Span` for the TUI preview pane — without re-parsing
 /// escape sequences.
 ///
