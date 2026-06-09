@@ -369,7 +369,7 @@ The return value of `render(ctx)` must be either `()` (hide) or a map with these
     runs: [
         #{
             text: "my text",          // string, required
-            role: "success",          // one of: foreground | muted | primary | accent |
+            role: "success",          // one of: foreground | background | muted | primary | accent |
                                       //   success | warning | error | info |
                                       //   success_dim | warning_dim | error_dim |
                                       //   primary_dim | accent_dim | surface | border | timer
