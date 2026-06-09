@@ -65,15 +65,16 @@ The canonical role list for v0.1. Themes map every role to a color; segments ref
 
 **Extended roles** (optional; themes without these fall back to sensible base-role defaults):
 
-| Role          | Falls back to | Intent                                               |
-| ------------- | ------------- | ---------------------------------------------------- |
-| `success_dim` | `success`     | Quiet variant for backgrounds / fills                |
-| `warning_dim` | `warning`     | Same                                                 |
-| `error_dim`   | `error`       | Same                                                 |
-| `primary_dim` | `primary`     | Same                                                 |
-| `accent_dim`  | `accent`      | Same                                                 |
-| `surface`     | `background`  | Elevated surface (used by capsule / powerline fills) |
-| `border`      | `muted`       | Subtle dividers                                      |
+| Role          | Falls back to | Intent                                                                                                                                                                                                                                          |
+| ------------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `success_dim` | `success`     | Quiet variant for backgrounds / fills                                                                                                                                                                                                           |
+| `warning_dim` | `warning`     | Same                                                                                                                                                                                                                                            |
+| `error_dim`   | `error`       | Same                                                                                                                                                                                                                                            |
+| `primary_dim` | `primary`     | Same                                                                                                                                                                                                                                            |
+| `accent_dim`  | `accent`      | Same                                                                                                                                                                                                                                            |
+| `surface`     | `background`  | Elevated surface (used by capsule / powerline fills)                                                                                                                                                                                            |
+| `border`      | `muted`       | Subtle dividers                                                                                                                                                                                                                                 |
+| `timer`       | `muted`       | Duration / countdown displays — a distinct hue so timer segments don't blend into `muted` grey ([ADR-0028](../adrs/0028-group-lead-coloring-and-role-vocabulary.md)). `session_duration` uses it today; rate-limit reset countdowns are planned |
 
 Roles are stored as a small enum in the binary (not strings at runtime) to avoid per-render allocation.
 
@@ -96,6 +97,7 @@ pub enum Role {
     AccentDim,
     Surface,
     Border,
+    Timer,
 }
 ```
 
@@ -130,6 +132,7 @@ primary_dim = "#8a6ba7"
 accent_dim  = "#5b7a9e"
 surface     = "#313244"
 border      = "#45475a"
+timer       = "#f5c2e7"  # mocha pink
 
 # Optional separator styling
 [separators]

@@ -27,8 +27,14 @@ pub use user::{RegisteredTheme, ThemeRegistry, ThemeSource};
 
 /// Semantic color slot a segment targets. Themes map every role to a
 /// concrete color; segments never reference hex values directly.
-/// Variants are ordered to match the 16-slot role array themes store.
+/// Variants are ordered to match the 17-slot role array themes store.
+///
+/// `#[non_exhaustive]`: the vocabulary grows over time (ADR-0028 and
+/// successors), so downstream crates must not match it exhaustively —
+/// adding a role stays non-breaking for them. The defining crate still
+/// matches exhaustively (see [`Role::fallback`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Role {
     // Base roles — always present in every theme.
     Foreground = 0,
@@ -49,23 +55,40 @@ pub enum Role {
     AccentDim = 13,
     Surface = 14,
     Border = 15,
+    /// Distinct hue for duration / countdown displays so they don't
+    /// blend into `Muted` grey (ADR-0028). `session_duration` targets
+    /// this today; rate-limit reset countdowns planned (lsm-ywk9).
+    Timer = 16,
 }
 
 // Compile-time guard: the last variant's discriminant must equal
 // `COUNT - 1` so theme color arrays stay in lockstep with the enum.
 // If a new variant is added without bumping `COUNT`, this trips.
-const _: () = assert!(Role::Border as usize == Role::COUNT - 1);
+const _: () = assert!(Role::Timer as usize == Role::COUNT - 1);
 
 impl Role {
     /// Role count; the discriminants cover `0..ROLE_COUNT` densely so
     /// themes store colors in a fixed-size array.
-    pub const COUNT: usize = 16;
+    pub const COUNT: usize = 17;
 
     /// The base role this role falls back to when a theme leaves the
     /// extended slot unset. Base roles fall back to themselves.
+    ///
+    /// Matched exhaustively (no catch-all): a new extended role then
+    /// fails to compile until it gets a deliberate fallback, instead of
+    /// silently self-falling-back to `NoColor` in themes that omit it.
     #[must_use]
     pub fn fallback(self) -> Role {
         match self {
+            Self::Foreground
+            | Self::Background
+            | Self::Muted
+            | Self::Primary
+            | Self::Accent
+            | Self::Success
+            | Self::Warning
+            | Self::Error
+            | Self::Info => self,
             Self::SuccessDim => Self::Success,
             Self::WarningDim => Self::Warning,
             Self::ErrorDim => Self::Error,
@@ -73,7 +96,7 @@ impl Role {
             Self::AccentDim => Self::Accent,
             Self::Surface => Self::Background,
             Self::Border => Self::Muted,
-            other => other,
+            Self::Timer => Self::Muted,
         }
     }
 }
@@ -669,7 +692,7 @@ mod tests {
     #[test]
     fn role_count_matches_enum_discriminant_range() {
         assert_eq!(Role::Foreground as usize, 0);
-        assert_eq!(Role::Border as usize, Role::COUNT - 1);
+        assert_eq!(Role::Timer as usize, Role::COUNT - 1);
     }
 
     #[test]
@@ -681,6 +704,7 @@ mod tests {
         assert_eq!(Role::AccentDim.fallback(), Role::Accent);
         assert_eq!(Role::Surface.fallback(), Role::Background);
         assert_eq!(Role::Border.fallback(), Role::Muted);
+        assert_eq!(Role::Timer.fallback(), Role::Muted);
     }
 
     #[test]

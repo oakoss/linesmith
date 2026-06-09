@@ -90,6 +90,14 @@ mod tests {
     }
 
     #[test]
+    fn unmapped_timer_falls_through_to_muted() {
+        // Only Catppuccin maps Timer today; every other theme should
+        // resolve it to Muted via the fallback chain (ADR-0028).
+        let t = built_in("tokyo-night").expect("tokyo-night present");
+        assert_eq!(t.color(Role::Timer), t.color(Role::Muted));
+    }
+
+    #[test]
     fn truecolor_downgrades_to_palette16_without_panicking() {
         let t = built_in("tokyo-night").expect("tokyo-night present");
         for role in [Role::Primary, Role::Success, Role::Error, Role::Info] {

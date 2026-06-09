@@ -153,6 +153,7 @@ fn parse_role(name: &str, id: &str) -> Result<Role, PluginError> {
         "accent_dim" => Ok(Role::AccentDim),
         "surface" => Ok(Role::Surface),
         "border" => Ok(Role::Border),
+        "timer" => Ok(Role::Timer),
         other => Err(malformed(
             id,
             &format!("unknown role `{other}`; see plugin-api.md §Plugin return shape"),
@@ -443,9 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn all_16_roles_parse_via_snake_case_token() {
-        // Regression guard: if a Role variant is added and
-        // `parse_role` isn't updated, this table test fails.
+    fn every_role_parses_via_snake_case_token() {
         let cases: &[(&str, Role)] = &[
             ("foreground", Role::Foreground),
             ("background", Role::Background),
@@ -463,7 +462,11 @@ mod tests {
             ("accent_dim", Role::AccentDim),
             ("surface", Role::Surface),
             ("border", Role::Border),
+            ("timer", Role::Timer),
         ];
+        // Ties cases.len() to Role::COUNT so a new variant must get a row
+        // and a parse_role arm; a literal count silently misses additions.
+        assert_eq!(cases.len(), Role::COUNT, "every Role must have a token row");
         for (token, expected) in cases {
             let script = format!(r#"#{{ runs: [#{{ text: "x", role: "{token}" }}] }}"#);
             let rendered = eval_and_validate(&script, "t")
@@ -577,10 +580,9 @@ mod tests {
     #[test]
     fn empty_hyperlink_string_does_not_set_link() {
         // `hyperlink: ""` folds to None so the emitter doesn't wrap
-        // text in a link-to-nothing OSC 8 pair. Empty URL `\x1b]8;;\x1b\\`
-        // is the canonical OSC 8 close sequence per ECMA-48 — using it
-        // as a link target would semantically tell the terminal "no
-        // link," which is just absence with extra bytes.
+        // text in a link-to-nothing OSC 8 pair. The empty-URL form
+        // `\x1b]8;;\x1b\\` is the canonical OSC 8 close sequence —
+        // using it as a target would signal "no link" with extra bytes.
         let rendered = eval_and_validate(r#"#{ runs: [#{ text: "x", hyperlink: "" }] }"#, "t")
             .unwrap()
             .expect("rendered");

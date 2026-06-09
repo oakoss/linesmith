@@ -212,6 +212,7 @@ const KNOWN_ROLES_EXTENDED: &[&str] = &[
     "accent_dim",
     "surface",
     "border",
+    "timer",
 ];
 const KNOWN_SEPARATORS: &[&str] = &["default", "powerline", "ellipsis"];
 
@@ -321,6 +322,7 @@ struct ExtendedRoles {
     accent_dim: Option<String>,
     surface: Option<String>,
     border: Option<String>,
+    timer: Option<String>,
 }
 
 fn theme_file_to_theme(file: ThemeFile) -> Result<Theme, ThemeParseError> {
@@ -385,6 +387,7 @@ fn theme_file_to_theme(file: ThemeFile) -> Result<Theme, ThemeParseError> {
             ext.surface.as_deref(),
         )?;
         set_opt(&mut colors, Role::Border, "border", ext.border.as_deref())?;
+        set_opt(&mut colors, Role::Timer, "timer", ext.timer.as_deref())?;
     }
 
     Ok(Theme::from_user_parts(name, colors))
@@ -680,6 +683,64 @@ mod tests {
                 g: 32,
                 b: 32,
             }
+        );
+    }
+
+    #[test]
+    fn theme_file_timer_role_populates_when_present() {
+        let src = format!("{MIN_THEME_TOML}\n[roles.extended]\ntimer = \"#f5c2e7\"\n");
+        let file: ThemeFile = toml::from_str(&src).expect("parse");
+        let theme = theme_file_to_theme(file).expect("convert");
+        assert_eq!(
+            theme.color(Role::Timer),
+            Color::TrueColor {
+                r: 245,
+                g: 194,
+                b: 231,
+            }
+        );
+    }
+
+    #[test]
+    fn theme_file_omitting_timer_falls_back_to_muted() {
+        let file: ThemeFile = toml::from_str(MIN_THEME_TOML).expect("parse");
+        let theme = theme_file_to_theme(file).expect("convert");
+        assert_eq!(theme.color(Role::Timer), theme.color(Role::Muted));
+    }
+
+    #[test]
+    fn theme_file_timer_invalid_color_surfaces_role_label() {
+        let src = format!("{MIN_THEME_TOML}\n[roles.extended]\ntimer = \"#zzz\"\n");
+        let file: ThemeFile = toml::from_str(&src).expect("still parses as TOML");
+        match theme_file_to_theme(file).unwrap_err() {
+            ThemeParseError::InvalidColor { role, value } => {
+                assert_eq!(role, "timer");
+                assert_eq!(value, "#zzz");
+            }
+            other => panic!("expected InvalidColor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn valid_timer_extended_key_emits_no_warning() {
+        // The allowlist (KNOWN_ROLES_EXTENDED) and the struct field must
+        // stay in sync; the populate test bypasses validation, so cover
+        // the full load path here — a valid `timer` must not warn.
+        let dir = tempdir();
+        std::fs::write(
+            dir.path().join("t.toml"),
+            format!(
+                "{}\n[roles.extended]\ntimer = \"#f5c2e7\"\n",
+                MIN_THEME_TOML.trim()
+            ),
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        let _ = ThemeRegistry::with_built_ins()
+            .with_user_themes(dir.path(), |m| warnings.push(m.to_string()));
+        assert!(
+            !warnings.iter().any(|w| w.contains("timer")),
+            "valid timer key should not warn: {warnings:?}",
         );
     }
 

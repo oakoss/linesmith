@@ -137,6 +137,7 @@ fn parse_role(s: &str) -> Result<Role, StyleParseError> {
         "accent_dim" | "accent-dim" => Role::AccentDim,
         "surface" => Role::Surface,
         "border" => Role::Border,
+        "timer" => Role::Timer,
         _ => return Err(StyleParseError::UnknownRole(s.to_string())),
     };
     Ok(role)
@@ -160,6 +161,11 @@ mod tests {
     #[test]
     fn role_directive_sets_role() {
         assert_eq!(parse_style("role:primary"), Ok(Style::role(Role::Primary)));
+    }
+
+    #[test]
+    fn role_directive_parses_timer() {
+        assert_eq!(parse_style("role:timer"), Ok(Style::role(Role::Timer)));
     }
 
     #[test]
