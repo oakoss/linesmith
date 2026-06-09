@@ -25,7 +25,7 @@ impl Segment for SessionDurationSegment {
             return Ok(None);
         };
         Ok(Some(
-            RenderedSegment::new(format_duration(ms)).with_role(Role::Muted),
+            RenderedSegment::new(format_duration(ms)).with_role(Role::Timer),
         ))
     }
 
@@ -108,7 +108,7 @@ mod tests {
     fn renders_zero_seconds() {
         assert_eq!(
             render_for(0),
-            Some(RenderedSegment::new("0s").with_role(Role::Muted))
+            Some(RenderedSegment::new("0s").with_role(Role::Timer))
         );
     }
 
@@ -164,8 +164,8 @@ mod tests {
     }
 
     #[test]
-    fn renders_with_muted_role() {
-        assert_eq!(render_for(5_000).unwrap().style().role, Some(Role::Muted));
+    fn renders_with_timer_role() {
+        assert_eq!(render_for(5_000).unwrap().style().role, Some(Role::Timer));
     }
 
     #[test]

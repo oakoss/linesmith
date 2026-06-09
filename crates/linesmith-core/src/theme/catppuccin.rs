@@ -18,9 +18,9 @@ const fn rgb(c: catppuccin::Rgb) -> Color {
     }
 }
 
-/// Map one Catppuccin flavor's palette into a 16-slot role array.
-/// Every flavor shares the same role→palette-name mapping; only the
-/// concrete RGB values differ.
+/// Map one Catppuccin flavor's palette into a `Role::COUNT`-slot role
+/// array. Every flavor shares the same role→palette-name mapping; only
+/// the concrete RGB values differ.
 const fn flavor_to_theme_colors(p: &catppuccin::FlavorColors) -> [Option<Color>; Role::COUNT] {
     let mut c = [None; Role::COUNT];
     c[Role::Foreground as usize] = Some(rgb(p.text.rgb));
@@ -38,6 +38,9 @@ const fn flavor_to_theme_colors(p: &catppuccin::FlavorColors) -> [Option<Color>;
     c[Role::Info as usize] = Some(rgb(p.teal.rgb));
     c[Role::Surface as usize] = Some(rgb(p.surface0.rgb));
     c[Role::Border as usize] = Some(rgb(p.surface2.rgb));
+    // Timer → pink; no other base role claims pink, so duration displays
+    // read distinct from `Muted` grey without introducing a new hue.
+    c[Role::Timer as usize] = Some(rgb(p.pink.rgb));
     // SuccessDim / WarningDim / ErrorDim / PrimaryDim / AccentDim stay
     // None; `Theme::color`'s fallback chain resolves them to the base
     // role, which matches Catppuccin's single-shade-per-hue palette.
@@ -112,6 +115,31 @@ mod tests {
                 t.color(Role::Primary),
                 Color::TrueColor { r, g, b },
                 "mauve drift in {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_flavor_maps_timer_to_its_canonical_pink_distinct_from_muted() {
+        // ADR-0028: the duration family reads as its own quiet hue, not
+        // anonymous Muted grey. Per-flavor drift alarm against the
+        // canonical Catppuccin pink, plus the semantic distinctness check.
+        for (name, r, g, b) in [
+            ("catppuccin-latte", 234, 118, 203),
+            ("catppuccin-frappe", 244, 184, 228),
+            ("catppuccin-macchiato", 245, 189, 230),
+            ("catppuccin-mocha", 245, 194, 231),
+        ] {
+            let t = built_in(name).expect(name);
+            assert_eq!(
+                t.color(Role::Timer),
+                Color::TrueColor { r, g, b },
+                "pink drift in {name}"
+            );
+            assert_ne!(
+                t.color(Role::Timer),
+                t.color(Role::Muted),
+                "Timer must not collapse to the grey it was promoted off of in {name}"
             );
         }
     }

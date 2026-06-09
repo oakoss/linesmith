@@ -372,7 +372,7 @@ The return value of `render(ctx)` must be either `()` (hide) or a map with these
             role: "success",          // one of: foreground | muted | primary | accent |
                                       //   success | warning | error | info |
                                       //   success_dim | warning_dim | error_dim |
-                                      //   primary_dim | accent_dim | surface | border
+                                      //   primary_dim | accent_dim | surface | border | timer
                                       // (see specs/theming.md for the full list)
             fg: "#ff00ff",            // optional absolute color (hex)
             bg: "#000000",            // optional
