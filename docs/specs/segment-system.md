@@ -1,9 +1,9 @@
 # Segment System
 
 - Status: draft
-- Version: 0.9
-- Last updated: 2026-05-13
-- Driving ADRs: [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0004](../adrs/0004-rhai-for-plugins.md), [ADR-0005](../adrs/0005-role-based-themes.md), [ADR-0008](../adrs/0008-canonical-type-refinements.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md), [ADR-0024](../adrs/0024-per-boundary-separator-toml.md), [ADR-0026](../adrs/0026-layout-decision-observability.md)
+- Version: 0.12
+- Last updated: 2026-06-09
+- Driving ADRs: [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0004](../adrs/0004-rhai-for-plugins.md), [ADR-0005](../adrs/0005-role-based-themes.md), [ADR-0008](../adrs/0008-canonical-type-refinements.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md), [ADR-0024](../adrs/0024-per-boundary-separator-toml.md), [ADR-0026](../adrs/0026-layout-decision-observability.md), [ADR-0029](../adrs/0029-group-boundary-marker-and-merge-reconciliation.md)
 
 ## Overview
 
@@ -314,6 +314,24 @@ The `id` field routes layout-decision events (see [Layout decision contract](#la
 - When a segment drops under width pressure, the adjacent separator drops with it: the right-edge separator first, falling back to the left-edge when the dropped segment was the last in the line.
 
 **Override precedence.** `RenderedSegment::right_separator` is a plugin-facing per-render override (set via `RenderedSegment::with_separator`). When a segment's render returns it, the layout engine replaces the inline separator immediately to the segment's right with the override value. If the segment is the last in the line, or its right-edge separator has already been pruned for adjacency reasons, there is no boundary to apply to and the override is silently discarded. Built-in segments don't set runtime overrides; plugins use this slot to vary their right edge per render.
+
+### Color-group boundaries (`group` flag)
+
+Per [ADR-0029](../adrs/0029-group-boundary-marker-and-merge-reconciliation.md), `LineEntryItem` gains a `group: Option<bool>` flag that marks **color** grouping, orthogonal to `merge`'s **spacing**. This section is the contract; the config-parse + builder implementation is tracked in **lsm-v6f0** and the render-side color pass in **lsm-p0p2**. Until lsm-v6f0 lands, `group` deserializes into the forward-compat `extra` bag and has no effect. The two flags are independent right-boundary intents on a segment entry:
+
+- `merge` (spacing): `merge = true` abuts — suppresses the boundary's separator (implicit interleave _and_ any adjacent explicit separator). Shipped behavior, unchanged.
+- `group` (color): `group = true` fuses the segment with its right neighbor into one **color group**. The leftmost member is the lead; the group renders in the lead's resolved color (per [ADR-0028](../adrs/0028-group-lead-coloring-and-role-vocabulary.md)). The separator between members is untouched — a `group`-fused boundary keeps whatever separator it would otherwise render.
+
+The builder tracks `group_pending` alongside the existing `merge_pending`, set from the just-pushed segment's `group()` and persisting across an explicit separator entry exactly as `merge_pending` does. A maximal run of `group`-fused boundaries forms one color group led by its leftmost member. `merge = true` **implies** `group = true` (an abutted pair is one visual unit, so one color) unless the entry sets `group = false`. The four reachable `(merge, group)` states:
+
+| `merge` | `group`          | spacing   | color group |
+| ------- | ---------------- | --------- | ----------- |
+| absent  | absent           | separator | divides     |
+| absent  | `true`           | separator | fuses       |
+| `true`  | absent (implied) | abut      | fuses       |
+| `true`  | `false`          | abut      | divides     |
+
+`group` is honored only on segment entries; on a separator entry it warns and is ignored (it is a segment-side flag, like `merge`). How group membership threads into the rendered `LineItem` sequence for the color pass is the group-color render layer's contract (lsm-p0p2); this section fixes only the config marker and the builder's grouping semantics.
 
 ### Cache policy
 
@@ -671,3 +689,4 @@ Fixtures: lists of `(SegmentId, width, priority)` tuples.
 - 2026-05-13: v0.9. Per [ADR-0026](../adrs/0026-layout-decision-observability.md), the layout engine surfaces typed events at five decision sites. SemVer-breaking variant shape change: `LineItem::Segment(Box<dyn Segment>)` → `LineItem::Segment { id: Cow<'static, str>, segment: Box<dyn Segment> }` — migration recipe `LineItem::Segment(seg)` → `LineItem::Segment { id, segment: seg }` at every construction and pattern-match site. New `pub struct LayoutObservers<'a>` bundles `warn` (required) and `on_decision` (optional); engine entry points take `&mut LayoutObservers<'_>` instead of a bare `warn` callback. New `pub enum LayoutDecision` with five variants (`PriorityDrop`, `ShrinkApplied`, `ReflowApplied`, `WidthBoundUnderMinDrop`, `WidthBoundOverMaxTruncate`) — per-variant struct bodies are `#[non_exhaustive]` for field-additive forward-compat, the enum itself is NOT (so a future variant breaks every consumer's `match` at compile time, by design). Engine-only `pub(crate)` constructors `debug_assert!` width-relation invariants. The engine emits via `observers.emit_with(|| LayoutDecision::shrink_applied(id.clone(), from, to, target))` — lazy construction means the production-stdout path pays only one `Option::is_none()` check per decision site, zero allocations even when segment ids are `Cow::Owned`.
 - 2026-06-06: v0.10. `RenderedSegment` gains an optional `spans: Option<Vec<StyledRun>>` for intra-segment color. When set, the layout engine's `items_to_runs` fan-out emits one run per span (both the stdout ANSI path and the TUI preview flow through it); `text`/`width` stay the authoritative concatenation, so layout math is unchanged. `from_spans` builds and coalesces adjacent same-style spans; truncation drops spans and degrades to the whole-segment `style`. The wrapper composes: a per-segment `icon` prepends as a leading span, a user `style` override flattens spans. First consumer is `context_bar`, which now renders `[████░░░░░░] 42%` by default (bracket delimiters + inline percentage + dim trough, each toggleable via `[segments.context_bar]` `brackets`/`percentage`/`dim_empty` and `characters.open`/`characters.close`).
 - 2026-06-07: v0.11. Extracts a shared `segments::progress_bar` renderer (lsm-s0vw) consumed by both `context_bar` and the rate-limit `format = "progress"` bars, replacing the two independent implementations. It owns `Thresholds`/`role_for`, the `BarStyle`/`BarChars` config projection, `bar_cells` geometry, `render_bar` (→ spans) and `bar_text` (→ flat string for the reset timer), plus `FillMode` (`half`/`whole`/`eighth`/`braille`); the eighth-block `▏▎▍▌▋▊▉` and braille ramps are opt-in sub-cell smoothness. Each segment keeps its own defaults (context_bar: `cells` 10, `half` fill, brackets+%, `.0`; rate-limit: `progress_width` 20, `whole` fill, no brackets, `.1`). Rate-limit percent/progress segments now escalate color green→yellow→red by usage (`threshold_color`, default on, closes lsm-bak3); JSONL/error/reset renders stay flat `Info`.
+- 2026-06-09: v0.12. Per [ADR-0029](../adrs/0029-group-boundary-marker-and-merge-reconciliation.md), the spec adds a `group: Option<bool>` marker on `LineEntryItem` — the color-group marker [ADR-0028](../adrs/0028-group-lead-coloring-and-role-vocabulary.md) deferred. It is orthogonal to `merge`: `merge` is spacing (abut vs separated), `group` is color (fuse vs divide). The builder is to track `group_pending` parallel to `merge_pending`; a maximal run of `group`-fused boundaries is one color group led by its leftmost member, and `merge = true` implies `group = true` unless `group = false` overrides. Honored on segment entries only; ignored (with warning) on separator entries. Reconciles ADR-0024 by retiring its reserved `Merge { Bool(bool), NoPadding }` enum — `merge` stays `Option<bool>` with shipped abut semantics. See §Color-group boundaries. Spec contract only: the config/builder implementation is tracked in lsm-v6f0 and the render-side carrier (how grouping reaches the color pass) in lsm-p0p2; until lsm-v6f0 lands, `group` parses into `extra` with no effect.
