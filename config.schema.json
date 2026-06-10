@@ -180,6 +180,14 @@
           ],
           "default": null
         },
+        "group": {
+          "description": "Color-grouping flag (ADR-0029), orthogonal to [`merge`](Self::merge)\nspacing: when `true` on a segment entry, the segment fuses with its\nright neighbor into one color group (rendered in the group lead's\ncolor). `None` inherits from `merge` (an abutted pair is one visual\nunit, so `merge = true` implies grouping); `Some(false)` opts out\neven when merged. Ignored (with warning) on separator entries.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
         "merge": {
           "description": "When `true` on a segment entry, the boundary to its right\nrenders without a separator (suppresses the implicit\ninterleave AND any explicit [`LineEntry::Item`] separator at\nthat boundary). Ignored (with warning) on separator entries.",
           "type": [

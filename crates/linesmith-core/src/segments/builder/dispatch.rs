@@ -45,7 +45,11 @@ fn interleave_separators(
     // n=0 saturates to 0; n>=1 gives 2n-1 slots (n segments + n-1 separators).
     let mut items = Vec::with_capacity(n.saturating_mul(2).saturating_sub(1));
     for (i, (id, segment)) in segs.into_iter().enumerate() {
-        items.push(LineItem::Segment { id, segment });
+        items.push(LineItem::Segment {
+            id,
+            segment,
+            fuses_left: false,
+        });
         if i + 1 < n {
             items.push(LineItem::Separator(sep.clone()));
         }
@@ -274,11 +278,21 @@ fn build_one_line(
     // explicit separator entry (so `seg(merge), |, seg` drops the
     // explicit separator AND the implicit interleave).
     let mut merge_pending = false;
+    // True when the most-recently-pushed segment opted to fuse its
+    // right neighbor into one color group (ADR-0029). Orthogonal to
+    // `merge_pending`: it never affects separators, only the next
+    // segment's `fuses_left`. Persists across an explicit separator so
+    // `seg(group), <space>, seg` fuses while keeping the space.
+    let mut group_pending = false;
 
     for entry in entries {
         if matches!(entry, config::LineEntry::Item(item) if item.kind.as_deref() == Some("separator") && item.merge.is_some())
         {
             warn("[line].segments separator entry has `merge = ...`; ignoring (merge is for segment entries)");
+        }
+        if matches!(entry, config::LineEntry::Item(item) if item.kind.as_deref() == Some("separator") && item.group.is_some())
+        {
+            warn("[line].segments separator entry has `group = ...`; ignoring (group is for segment entries)");
         }
         if matches!(entry, config::LineEntry::Item(item) if item.kind.as_deref() != Some("separator") && item.character.is_some())
         {
@@ -367,8 +381,12 @@ fn build_one_line(
                 items.push(LineItem::Segment {
                     id: resolve_segment_id(id),
                     segment: seg,
+                    fuses_left: group_pending,
                 });
                 merge_pending = entry.merge();
+                // `merge = true` implies grouping unless `group = false`
+                // overrides — an abutted pair reads as one visual unit.
+                group_pending = entry.group().unwrap_or(merge_pending);
             }
         }
     }

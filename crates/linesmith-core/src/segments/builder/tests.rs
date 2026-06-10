@@ -260,15 +260,9 @@ fn plugin_runtime_separator_override_replaces_inline_separator() {
         }
     }
     let items: Vec<LineItem> = vec![
-        LineItem::Segment {
-            id: Cow::Borrowed("a"),
-            segment: Box::new(OverrideNoneSeg("a")),
-        },
+        LineItem::seg(Cow::Borrowed("a"), Box::new(OverrideNoneSeg("a"))),
         LineItem::Separator(Separator::powerline()),
-        LineItem::Segment {
-            id: Cow::Borrowed("b"),
-            segment: Box::new(OverrideNoneSeg("b")),
-        },
+        LineItem::seg(Cow::Borrowed("b"), Box::new(OverrideNoneSeg("b"))),
     ];
     let mut warn = |_: &str| {};
     let mut observers = crate::layout::LayoutObservers::new(&mut warn);
@@ -311,15 +305,9 @@ fn plugin_runtime_literal_override_replaces_inline_powerline() {
         }
     }
     let items: Vec<LineItem> = vec![
-        LineItem::Segment {
-            id: Cow::Borrowed("a"),
-            segment: Box::new(OverrideLiteralSeg("a")),
-        },
+        LineItem::seg(Cow::Borrowed("a"), Box::new(OverrideLiteralSeg("a"))),
         LineItem::Separator(Separator::powerline()),
-        LineItem::Segment {
-            id: Cow::Borrowed("b"),
-            segment: Box::new(OverrideLiteralSeg("b")),
-        },
+        LineItem::seg(Cow::Borrowed("b"), Box::new(OverrideLiteralSeg("b"))),
     ];
     let mut warn = |_: &str| {};
     let mut observers = crate::layout::LayoutObservers::new(&mut warn);
@@ -358,10 +346,10 @@ fn plugin_runtime_override_on_last_segment_is_silently_discarded() {
         }
     }
     // Single-segment line — no inline-separator slot to the right.
-    let items: Vec<LineItem> = vec![LineItem::Segment {
-        id: Cow::Borrowed("a"),
-        segment: Box::new(OverrideNoneSeg("a")),
-    }];
+    let items: Vec<LineItem> = vec![LineItem::seg(
+        Cow::Borrowed("a"),
+        Box::new(OverrideNoneSeg("a")),
+    )];
     let mut warn = |_: &str| {};
     let mut observers = crate::layout::LayoutObservers::new(&mut warn);
     let line = crate::layout::render_with_observers(
@@ -428,15 +416,9 @@ fn plugin_compact_form_separator_override_wins_over_pre_shrink_inline() {
         }
     }
     let items: Vec<LineItem> = vec![
-        LineItem::Segment {
-            id: Cow::Borrowed("chevron"),
-            segment: Box::new(ChevronUnlessCompactSeg),
-        },
+        LineItem::seg(Cow::Borrowed("chevron"), Box::new(ChevronUnlessCompactSeg)),
         LineItem::Separator(Separator::powerline()),
-        LineItem::Segment {
-            id: Cow::Borrowed("anchor"),
-            segment: Box::new(AnchorSeg),
-        },
+        LineItem::seg(Cow::Borrowed("anchor"), Box::new(AnchorSeg)),
     ];
     // Full assembly: 20 + 3 + 1 = 24 cells. Budget 11 forces shrink.
     // Compact: 7 cells; with the override propagated, the
@@ -483,16 +465,10 @@ fn user_constructed_adjacent_separators_drop_second() {
         }
     }
     let items: Vec<LineItem> = vec![
-        LineItem::Segment {
-            id: Cow::Borrowed("a"),
-            segment: Box::new(RawSeg("a")),
-        },
+        LineItem::seg(Cow::Borrowed("a"), Box::new(RawSeg("a"))),
         LineItem::Separator(Separator::Literal(std::borrow::Cow::Borrowed(" | "))),
         LineItem::Separator(Separator::Literal(std::borrow::Cow::Borrowed(" - "))),
-        LineItem::Segment {
-            id: Cow::Borrowed("b"),
-            segment: Box::new(RawSeg("b")),
-        },
+        LineItem::seg(Cow::Borrowed("b"), Box::new(RawSeg("b"))),
     ];
     let mut warn = |_: &str| {};
     let mut observers = crate::layout::LayoutObservers::new(&mut warn);
@@ -2176,6 +2152,282 @@ fn back_to_back_merge_chains_drop_every_intermediate_separator() {
     let items = built(Some(&cfg));
     assert_eq!(segment_count(&items), 3);
     assert_eq!(separators_in_order(&items).len(), 0);
+}
+
+/// `fuses_left` per `LineItem::Segment` in order (ADR-0029); separators
+/// skipped. `true` marks a segment grouped with the segment to its left.
+fn fuses_flags(items: &[LineItem]) -> Vec<bool> {
+    items
+        .iter()
+        .filter_map(|i| match i {
+            LineItem::Segment { fuses_left, .. } => Some(*fuses_left),
+            LineItem::Separator(_) => None,
+        })
+        .collect()
+}
+
+#[test]
+fn group_absent_divides_with_separator() {
+    // (merge absent, group absent) — the default: a separator renders
+    // and the right segment opens its own color group.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model", "workspace"]
+            [layout_options]
+            separator = " | "
+        "#,
+    )
+    .expect("parse");
+    let items = built(Some(&cfg));
+    assert_eq!(
+        separators_in_order(&items).len(),
+        1,
+        "no merge → separator stays"
+    );
+    assert_eq!(
+        fuses_flags(&items),
+        vec![false, false],
+        "no group → divides"
+    );
+}
+
+#[test]
+fn group_true_fuses_while_keeping_the_separator() {
+    // (merge absent, group = true) — the dogfood case: color fuses
+    // rightward, the separator between the members is untouched.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = [{ type = "model", group = true }, "workspace"]
+            [layout_options]
+            separator = " | "
+        "#,
+    )
+    .expect("parse");
+    let items = built(Some(&cfg));
+    assert_eq!(
+        separators_in_order(&items).len(),
+        1,
+        "group must NOT suppress the separator (that is merge's job)"
+    );
+    assert_eq!(
+        fuses_flags(&items),
+        vec![false, true],
+        "right member fuses into the lead"
+    );
+}
+
+#[test]
+fn merge_implies_group_when_group_unset() {
+    // (merge = true, group absent) — an abutted pair is one visual
+    // unit, so it fuses for color without an explicit `group`.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = [{ type = "model", merge = true }, "workspace"]
+            [layout_options]
+            separator = " | "
+        "#,
+    )
+    .expect("parse");
+    let items = built(Some(&cfg));
+    assert_eq!(separators_in_order(&items).len(), 0, "merge abuts");
+    assert_eq!(
+        fuses_flags(&items),
+        vec![false, true],
+        "merge implies grouping"
+    );
+}
+
+#[test]
+fn group_false_overrides_the_merge_implication() {
+    // (merge = true, group = false) — abut for spacing but keep two
+    // colors; the explicit opt-out beats merge's implied grouping.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = [{ type = "model", merge = true, group = false }, "workspace"]
+            [layout_options]
+            separator = " | "
+        "#,
+    )
+    .expect("parse");
+    let items = built(Some(&cfg));
+    assert_eq!(separators_in_order(&items).len(), 0, "merge still abuts");
+    assert_eq!(
+        fuses_flags(&items),
+        vec![false, false],
+        "group = false divides despite merge"
+    );
+}
+
+#[test]
+fn group_persists_across_an_explicit_separator() {
+    // The canonical ADR-0028 line: a window fuses its reset across a
+    // literal space separator. group_pending must survive the explicit
+    // separator entry, mirroring merge_pending.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = [
+                { type = "model", group = true },
+                { type = "separator", character = " " },
+                "workspace",
+            ]
+        "#,
+    )
+    .expect("parse");
+    let items = built(Some(&cfg));
+    assert_eq!(
+        separators_in_order(&items).len(),
+        1,
+        "the space separator stays"
+    );
+    assert_eq!(
+        fuses_flags(&items),
+        vec![false, true],
+        "fusion carries across the explicit separator"
+    );
+}
+
+#[test]
+fn group_on_separator_entry_warns_and_is_ignored() {
+    // `group` is a segment-side flag; on a separator entry it warns
+    // (like `merge`) and does not affect grouping.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = [
+                "model",
+                { type = "separator", character = " | ", group = true },
+                "workspace",
+            ]
+        "#,
+    )
+    .expect("parse");
+    let (items, warns) = built_with_warns(Some(&cfg));
+    assert_eq!(
+        fuses_flags(&items),
+        vec![false, false],
+        "separator `group` has no effect"
+    );
+    assert!(
+        warns
+            .iter()
+            .any(|w| w.contains("separator entry has `group")),
+        "expected a group-on-separator warning, got {warns:?}"
+    );
+}
+
+#[test]
+fn group_chains_across_three_segments() {
+    // ADR-0029 defines a color group as a MAXIMAL run: two grouping
+    // segments in a row plus their lead form one three-member group.
+    // This is the case the group-lead color pass (lsm-p0p2) leans on.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = [
+                { type = "model", group = true },
+                { type = "workspace", group = true },
+                "cost",
+            ]
+            [layout_options]
+            separator = " | "
+        "#,
+    )
+    .expect("parse");
+    let items = built(Some(&cfg));
+    assert_eq!(
+        separators_in_order(&items).len(),
+        2,
+        "grouping keeps both separators"
+    );
+    assert_eq!(
+        fuses_flags(&items),
+        vec![false, true, true],
+        "one three-member group led by the leftmost"
+    );
+}
+
+#[test]
+fn merge_and_group_true_together_abut_and_fuse() {
+    // Explicit `merge = true, group = true` (redundant but legal):
+    // abut for spacing AND fuse for color — `unwrap_or` returns the
+    // explicit Some(true), same outcome as the merge-implied case.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = [{ type = "model", merge = true, group = true }, "workspace"]
+            [layout_options]
+            separator = " | "
+        "#,
+    )
+    .expect("parse");
+    let items = built(Some(&cfg));
+    assert_eq!(separators_in_order(&items).len(), 0, "merge abuts");
+    assert_eq!(fuses_flags(&items), vec![false, true], "group fuses");
+}
+
+#[test]
+fn group_pending_carries_to_the_next_surviving_segment() {
+    // A dropped segment (unknown id) leaves no hole in the OUTPUT, so
+    // the surviving neighbors are genuinely adjacent and the fusion
+    // carries — identical to `merge_pending` across a drop. Pin it so a
+    // future change to either flag's drop semantics is deliberate.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = [{ type = "model", group = true }, "nonexistent_seg", "workspace"]
+            [layout_options]
+            separator = " | "
+        "#,
+    )
+    .expect("parse");
+    let (items, warns) = built_with_warns(Some(&cfg));
+    assert_eq!(segment_count(&items), 2, "the unknown segment is dropped");
+    assert!(warns.iter().any(|w| w.contains("nonexistent_seg")));
+    assert_eq!(
+        fuses_flags(&items),
+        vec![false, true],
+        "fusion carries to the next surviving segment, like merge"
+    );
+}
+
+#[test]
+fn group_true_on_trailing_segment_is_inert() {
+    // `group = true` on the last segment arms group_pending with no
+    // following segment to consume it: a harmless no-op, symmetric with
+    // a trailing `merge`.
+    let cfg = config::Config::from_str(
+        r#"
+            [line]
+            segments = ["model", { type = "workspace", group = true }]
+            [layout_options]
+            separator = " | "
+        "#,
+    )
+    .expect("parse");
+    let items = built(Some(&cfg));
+    assert_eq!(
+        fuses_flags(&items),
+        vec![false, false],
+        "trailing group fuses nothing"
+    );
+}
+
+#[test]
+fn default_line_fuses_nothing() {
+    // The default-order line (interleave_separators) never groups:
+    // every segment is its own color context. Guards against a future
+    // change that wires grouping into the default path.
+    let items = built(None);
+    assert!(
+        fuses_flags(&items).iter().all(|&f| !f),
+        "default line must fuse nothing: {:?}",
+        fuses_flags(&items)
+    );
 }
 
 #[test]
