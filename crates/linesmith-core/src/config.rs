@@ -197,6 +197,13 @@ pub struct LineEntryItem {
     /// interleave AND any explicit [`LineEntry::Item`] separator at
     /// that boundary). Ignored (with warning) on separator entries.
     pub merge: Option<bool>,
+    /// Color-grouping flag (ADR-0029), orthogonal to [`merge`](Self::merge)
+    /// spacing: when `true` on a segment entry, the segment fuses with its
+    /// right neighbor into one color group (rendered in the group lead's
+    /// color). `None` inherits from `merge` (an abutted pair is one visual
+    /// unit, so `merge = true` implies grouping); `Some(false)` opts out
+    /// even when merged. Ignored (with warning) on separator entries.
+    pub group: Option<bool>,
     /// Forward-compat bag: keys outside the typed fields land here
     /// per the `toml::Value` flatten pattern. The builder
     /// warn-and-drops unknown keys today; future ADRs may consume.
@@ -264,6 +271,20 @@ impl LineEntry {
             _ => false,
         }
     }
+
+    /// The raw `group` flag (ADR-0029) on a segment entry, or `None` when
+    /// unset. `None` means "inherit from `merge`" at build time (an
+    /// abutted pair is one visual unit, so `merge = true` implies
+    /// grouping); `Some(false)` opts out even when merged. Always `None`
+    /// for separators and bare-string entries; a separator entry carrying
+    /// `group` warns at build time and is not honored here.
+    #[must_use]
+    pub fn group(&self) -> Option<bool> {
+        match self {
+            Self::Item(item) if item.kind.as_deref() != Some("separator") => item.group,
+            _ => None,
+        }
+    }
 }
 
 impl From<&str> for LineEntry {
@@ -325,6 +346,7 @@ fn value_to_line_entry(value: toml::Value) -> LineEntry {
         kind: None,
         character: None,
         merge: None,
+        group: None,
         extra,
     })
 }

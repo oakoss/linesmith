@@ -871,6 +871,16 @@ pub enum LineItem {
     Segment {
         id: std::borrow::Cow<'static, str>,
         segment: Box<dyn Segment>,
+        /// True when this segment shares a color group with the segment
+        /// immediately to its left ([ADR-0029]): a maximal run of
+        /// `fuses_left` segments plus their leftmost lead form one color
+        /// group, rendered in the lead's resolved color. The builder sets
+        /// it from the entry's `group` flag (and `merge`'s implied
+        /// grouping); the group-lead color pass consumes it. `false` for
+        /// an ungrouped segment and for a group's lead.
+        ///
+        /// [ADR-0029]: https://github.com/oakoss/linesmith/blob/main/docs/adrs/0029-group-boundary-marker-and-merge-reconciliation.md
+        fuses_left: bool,
     },
     Separator(Separator),
 }
@@ -881,12 +891,33 @@ impl std::fmt::Debug for LineItem {
             // The trait has no `Debug` bound, so surface the id +
             // layout intent (priority, width hints) — that's what's
             // load-bearing in panic dumps and `dbg!` output anyway.
-            Self::Segment { id, segment } => f
+            Self::Segment {
+                id,
+                segment,
+                fuses_left,
+            } => f
                 .debug_struct("Segment")
                 .field("id", id)
                 .field("defaults", &segment.defaults())
+                .field("fuses_left", fuses_left)
                 .finish(),
             Self::Separator(sep) => f.debug_tuple("Separator").field(sep).finish(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl LineItem {
+    /// Centralizes the `LineItem::Segment { .. }` fixture literal so a
+    /// new field on the variant touches this one site, not every test.
+    pub(crate) fn seg(
+        id: impl Into<std::borrow::Cow<'static, str>>,
+        segment: Box<dyn Segment>,
+    ) -> Self {
+        Self::Segment {
+            id: id.into(),
+            segment,
+            fuses_left: false,
         }
     }
 }
@@ -1018,10 +1049,7 @@ mod layout_type_tests {
                 Ok(None)
             }
         }
-        let seg = LineItem::Segment {
-            id: std::borrow::Cow::Borrowed("stub"),
-            segment: Box::new(StubSeg),
-        };
+        let seg = LineItem::seg(std::borrow::Cow::Borrowed("stub"), Box::new(StubSeg));
         let sep = LineItem::Separator(Separator::powerline());
         let seg_dbg = format!("{seg:?}");
         let sep_dbg = format!("{sep:?}");
@@ -1035,6 +1063,7 @@ mod layout_type_tests {
         assert!(seg_dbg.contains("defaults:"), "got {seg_dbg:?}");
         assert!(seg_dbg.contains("stub"), "got {seg_dbg:?}");
         assert!(seg_dbg.contains("priority"), "got {seg_dbg:?}");
+        assert!(seg_dbg.contains("fuses_left"), "got {seg_dbg:?}");
     }
 
     #[test]

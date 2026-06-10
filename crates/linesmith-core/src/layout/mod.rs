@@ -265,7 +265,7 @@ fn collect_items_with<'a>(
     let mut out: Vec<LayoutItem<'a>> = Vec::with_capacity(items.len());
     for item in items {
         match item {
-            LineItem::Segment { id, segment } => {
+            LineItem::Segment { id, segment, .. } => {
                 let defaults = segment.defaults();
                 let rendered = match segment.render(ctx, rc) {
                     Ok(Some(r)) => r,

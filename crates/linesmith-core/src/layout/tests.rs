@@ -124,10 +124,10 @@ fn line_items_with(segments: Vec<Box<dyn Segment>>, sep: Separator) -> Vec<LineI
     let n = segments.len();
     let mut out = Vec::with_capacity(n.saturating_mul(2));
     for (i, segment) in segments.into_iter().enumerate() {
-        out.push(LineItem::Segment {
-            id: std::borrow::Cow::Owned(format!("seg{i}")),
+        out.push(LineItem::seg(
+            std::borrow::Cow::Owned(format!("seg{i}")),
             segment,
-        });
+        ));
         if i + 1 < n {
             out.push(LineItem::Separator(sep.clone()));
         }
@@ -1557,15 +1557,15 @@ fn emit_priority_drop_when_segment_dropped_under_pressure() {
     // High-priority `DroppableStub` (priority 200) next to a
     // priority-0 anchor; budget forces a drop.
     let items: Vec<LineItem> = vec![
-        LineItem::Segment {
-            id: Cow::Borrowed("anchor"),
-            segment: Box::new(StubSegment(Ok(Some(RenderedSegment::new("a"))))),
-        },
+        LineItem::seg(
+            Cow::Borrowed("anchor"),
+            Box::new(StubSegment(Ok(Some(RenderedSegment::new("a"))))),
+        ),
         LineItem::Separator(Separator::Space),
-        LineItem::Segment {
-            id: Cow::Borrowed("droppable"),
-            segment: Box::new(DroppableStub("zzzzzz")),
-        },
+        LineItem::seg(
+            Cow::Borrowed("droppable"),
+            Box::new(DroppableStub("zzzzzz")),
+        ),
     ];
     // Total 1+1+6 = 8. Budget 1 drops droppable; anchor survives.
     let_capturing_observers!(observers, decisions);
@@ -1595,18 +1595,15 @@ fn emit_shrink_applied_when_shrink_to_fit_succeeds() {
     // Segment offers a shrink_to_fit form. Layout pressure forces it
     // before drop.
     let items: Vec<LineItem> = vec![
-        LineItem::Segment {
-            id: Cow::Borrowed("shrinkable"),
-            segment: Box::new(ShrinkableSegment {
+        LineItem::seg(
+            Cow::Borrowed("shrinkable"),
+            Box::new(ShrinkableSegment {
                 full: "longbranch * ↑2 ↓1",
                 compact: "longbranch",
             }),
-        },
+        ),
         LineItem::Separator(Separator::Space),
-        LineItem::Segment {
-            id: Cow::Borrowed("anchor"),
-            segment: Box::new(AnchorSegment("KEEP")),
-        },
+        LineItem::seg(Cow::Borrowed("anchor"), Box::new(AnchorSegment("KEEP"))),
     ];
     // Full: 18 + 1 + 4 = 23. Budget 17 → overflow 6 → target 12.
     // Compact 10 cells fits → shrink applied; line = "longbranch KEEP" (15).
@@ -1644,15 +1641,12 @@ fn emit_reflow_applied_when_truncatable_segment_end_ellipsis_fits() {
         }
     }
     let items: Vec<LineItem> = vec![
-        LineItem::Segment {
-            id: Cow::Borrowed("reflowed"),
-            segment: Box::new(TruncatableStub("workspace-very-long-name")),
-        },
+        LineItem::seg(
+            Cow::Borrowed("reflowed"),
+            Box::new(TruncatableStub("workspace-very-long-name")),
+        ),
         LineItem::Separator(Separator::Space),
-        LineItem::Segment {
-            id: Cow::Borrowed("anchor"),
-            segment: Box::new(AnchorSegment("X")),
-        },
+        LineItem::seg(Cow::Borrowed("anchor"), Box::new(AnchorSegment("X"))),
     ];
     // Full: 24 + 1 + 1 = 26. Budget 10 → overflow 16 → target 8.
     // try_reflow truncates to 8 cells ("workspa…" or similar).
@@ -1690,10 +1684,10 @@ fn emit_width_bound_under_min_drop_when_render_below_min_floor() {
                 .with_width(WidthBounds::new(10, u16::MAX).expect("valid"))
         }
     }
-    let items: Vec<LineItem> = vec![LineItem::Segment {
-        id: Cow::Borrowed("narrow"),
-        segment: Box::new(NarrowSegment),
-    }];
+    let items: Vec<LineItem> = vec![LineItem::seg(
+        Cow::Borrowed("narrow"),
+        Box::new(NarrowSegment),
+    )];
     let_capturing_observers!(observers, decisions);
     let _ = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
     assert_eq!(decisions.len(), 1, "exactly one decision: {decisions:?}");
@@ -1725,10 +1719,7 @@ fn emit_width_bound_over_max_truncate_when_render_above_max() {
             SegmentDefaults::with_priority(10).with_width(WidthBounds::new(0, 5).expect("valid"))
         }
     }
-    let items: Vec<LineItem> = vec![LineItem::Segment {
-        id: Cow::Borrowed("wide"),
-        segment: Box::new(WideSegment),
-    }];
+    let items: Vec<LineItem> = vec![LineItem::seg(Cow::Borrowed("wide"), Box::new(WideSegment))];
     let_capturing_observers!(observers, decisions);
     let _ = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
     assert_eq!(decisions.len(), 1, "exactly one decision: {decisions:?}");
@@ -1783,15 +1774,15 @@ fn emit_priority_drop_via_truncatable_path_when_reflow_target_below_floor() {
         }
     }
     let items: Vec<LineItem> = vec![
-        LineItem::Segment {
-            id: Cow::Borrowed("anchor"),
-            segment: Box::new(StubSegment(Ok(Some(RenderedSegment::new("a"))))),
-        },
+        LineItem::seg(
+            Cow::Borrowed("anchor"),
+            Box::new(StubSegment(Ok(Some(RenderedSegment::new("a"))))),
+        ),
         LineItem::Separator(Separator::Space),
-        LineItem::Segment {
-            id: Cow::Borrowed("floor-bound"),
-            segment: Box::new(FloorBoundTruncatable),
-        },
+        LineItem::seg(
+            Cow::Borrowed("floor-bound"),
+            Box::new(FloorBoundTruncatable),
+        ),
     ];
     // Total: 1 + 1 + 10 = 12. Budget 6 → overflow 6 → target 4.
     // Reflow floor max(8, 2) = 8 rejects target 4 → drop via the
@@ -1836,23 +1827,20 @@ fn emit_multiple_decisions_in_iteration_order_under_compound_pressure() {
         }
     }
     let items: Vec<LineItem> = vec![
-        LineItem::Segment {
-            id: Cow::Borrowed("anchor"),
-            segment: Box::new(AnchorSegment("A")),
-        },
+        LineItem::seg(Cow::Borrowed("anchor"), Box::new(AnchorSegment("A"))),
         LineItem::Separator(Separator::Space),
-        LineItem::Segment {
-            id: Cow::Borrowed("shrinkable"),
-            segment: Box::new(ShrinkableSegment {
+        LineItem::seg(
+            Cow::Borrowed("shrinkable"),
+            Box::new(ShrinkableSegment {
                 full: "longbranch * ↑2 ↓1",
                 compact: "longbranch",
             }),
-        },
+        ),
         LineItem::Separator(Separator::Space),
-        LineItem::Segment {
-            id: Cow::Borrowed("droppable"),
-            segment: Box::new(DroppableP150("midpriority")),
-        },
+        LineItem::seg(
+            Cow::Borrowed("droppable"),
+            Box::new(DroppableP150("midpriority")),
+        ),
     ];
     // Full: 1 + 1 + 18 + 1 + 11 = 32. Budget 11.
     // Iter 1: priority 200 (shrinkable) fires. try_shrink target =
@@ -1912,20 +1900,11 @@ fn emit_priority_drop_does_not_panic_on_zero_width_segment() {
     // Two anchors flanking an empty priority-200 segment so the
     // separators on either side give the engine overflow to chase.
     let items: Vec<LineItem> = vec![
-        LineItem::Segment {
-            id: Cow::Borrowed("anchor-l"),
-            segment: Box::new(AnchorSegment("L")),
-        },
+        LineItem::seg(Cow::Borrowed("anchor-l"), Box::new(AnchorSegment("L"))),
         LineItem::Separator(Separator::Space),
-        LineItem::Segment {
-            id: Cow::Borrowed("empty"),
-            segment: Box::new(EmptySegment),
-        },
+        LineItem::seg(Cow::Borrowed("empty"), Box::new(EmptySegment)),
         LineItem::Separator(Separator::Space),
-        LineItem::Segment {
-            id: Cow::Borrowed("anchor-r"),
-            segment: Box::new(AnchorSegment("R")),
-        },
+        LineItem::seg(Cow::Borrowed("anchor-r"), Box::new(AnchorSegment("R"))),
     ];
     // Total widths: 1 + 1 + 0 + 1 + 1 = 4. Budget 2 forces drop;
     // empty (priority 200) is the only droppable target.

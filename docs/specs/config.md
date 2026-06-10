@@ -1,8 +1,8 @@
 # Config
 
 - Status: draft
-- Version: 0.1.5
-- Last updated: 2026-06-09
+- Version: 0.1.6
+- Last updated: 2026-06-10
 - Driving ADRs: [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0005](../adrs/0005-role-based-themes.md), [ADR-0006](../adrs/0006-tool-agnostic-json-schema.md), [ADR-0010](../adrs/0010-data-fetching-architecture.md), [ADR-0011](../adrs/0011-rate-limit-data-source.md), [ADR-0024](../adrs/0024-per-boundary-separator-toml.md), [ADR-0029](../adrs/0029-group-boundary-marker-and-merge-reconciliation.md)
 
 ## Overview
@@ -108,8 +108,9 @@ segments = [
 # `group` flag (ADR-0029) — color-grouping, orthogonal to `merge`
 # spacing: a group renders in its lead's color (per ADR-0028) while the
 # separator between members stays. Full rules in validation rule 7.
-# Specified but not yet implemented (tracked in lsm-v6f0); until then
-# `group` parses into the forward-compat extra bag with no effect.
+# `group` is parsed and produces grouping; the group-lead color
+# rendering that consumes it is still pending (lsm-p0p2), so no
+# visible color effect yet.
 # segments = [
 #   { type = "rate_limit_5h", group = true }, # fuse color rightward
 #   { type = "separator", character = " " },
@@ -270,7 +271,7 @@ At parse time:
 4. **Duplicate IDs**: same segment ID listed twice in a line warns; first occurrence wins. Separator entries are positionally distinct and are not deduplicated.
 5. **Cross-line duplicates**: same segment in multiple lines allowed (rare but legal)
 6. **Inline-table entry shape** (ADR-0024): inline-table entries in `segments` warn-and-drop when missing `type`. `character` on a non-separator entry warns and is ignored. `merge` and `group` on a separator entry warn and are ignored (both are segment-side right-boundary flags). Unknown keys inside the inline table land in the entry's `extra` bag and are silently retained for forward compatibility (matches the global "unknown keys are warnings, not errors" rule).
-7. **`group` flag** (ADR-0029): `group = true` on a segment entry fuses it with its right neighbor into one color group, orthogonal to `merge` spacing (`merge` controls whether a separator renders; `group` controls whether the boundary's members share the lead's color). `merge = true` implies `group = true` unless `group = false` is explicit. Honored only on segment entries; ignored (with warning) on separator entries per rule 6. Specified but not yet implemented (tracked in lsm-v6f0); until then `group` lands in the entry's `extra` bag per rule 6 and has no effect.
+7. **`group` flag** (ADR-0029): `group = true` on a segment entry fuses it with its right neighbor into one color group, orthogonal to `merge` spacing (`merge` controls whether a separator renders; `group` controls whether the boundary's members share the lead's color). `merge = true` implies `group = true` unless `group = false` is explicit. Honored only on segment entries; ignored (with warning) on separator entries per rule 6. Implemented as of lsm-v6f0 (typed field + builder grouping); the group-lead color rendering that consumes it is pending in lsm-p0p2, so `group` is parsed and grouped but not yet colored.
 8. **Per-segment override keys**: each segment declares its accepted override keys; unknown keys in `[segments.<id>]` warn and are ignored
 9. **`visible_if` expression syntax**: parse as rhai expression; invalid expressions warn and are treated as always-visible
 
@@ -445,3 +446,4 @@ Parse and validate; print errors/warnings to stderr; exit non-zero on errors. Us
 - 2026-04-29: v0.1.3 update for multi-line layout (lsm-bvu) shipping. Top-level `layout = "single-line" | "multi-line"` selector and `[line.N]` numbered sub-tables are now implemented end-to-end. The `power-user` preset is now a two-line layout (line 1: model + context_window + workspace; line 2: rate limits + cost + effort + tokens_total). Edge-case warnings — missing `[line.N]` under multi-line, non-numeric numbered keys, single-line with `[line.N]` present — surface through both render and `--check-config`. Numbered tables sort by parsed integer key (so `[line.10]` follows `[line.2]`, not lexicographic). No breaking changes.
 - 2026-04-29: v0.1.4 follow-up to v0.1.3 multi-line, addressing two review-found regressions. Forward-compat: typo'd or future scalar keys under `[line]` (e.g. `[line] segmnts = [...]`) now warn and drop, matching the spec's existing "unknown keys are warnings" rule for top-level keys, instead of failing the config load. Auto-promote: when `[line.N]` sub-tables are present but `layout` is omitted AND `[line].segments` is empty, the builder treats the config as multi-line with a hint pointing at the missing `layout = "multi-line"` key, instead of silently rendering blank. Both behaviors are documented in §Edge cases. No schema changes.
 - 2026-06-09: v0.1.5 spec-contract addition. Per [ADR-0029](../adrs/0029-group-boundary-marker-and-merge-reconciliation.md), documents the `group` color-grouping flag on segment entries (validation rule 7), orthogonal to `merge` spacing, with a mixed-array example. Adds ADR-0024 and ADR-0029 to the Driving ADRs list (ADR-0024 already governed the mixed string/inline-table `segments` array but was unlisted). Implementation is tracked in lsm-v6f0; until it lands, `group` parses into the forward-compat `extra` bag and has no effect. No behavior change in shipped code.
+- 2026-06-10: v0.1.6. lsm-v6f0 implements the `group` flag: it is now a typed `Option<bool>` field on segment entries (no longer the `extra` bag), the builder fuses grouped segments (`merge = true` implying `group = true` unless overridden), and `group` on a separator entry warns. The group-lead color rendering that uses the grouping is still pending (lsm-p0p2), so `group` is parsed and grouped but not yet colored.
