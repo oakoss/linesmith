@@ -1,6 +1,7 @@
 # Per-boundary separator TOML uses a mixed string-or-table segment array
 
 - Status: accepted
+- Amended by: [ADR-0029](0029-group-boundary-marker-and-merge-reconciliation.md) (retires the reserved `Merge { Bool(bool), NoPadding }` enum; `merge` stays `Option<bool>` with shipped abut semantics, and color-grouping moves to a separate `group` flag)
 - Date: 2026-05-08
 - Deciders: Jace
 - Surfacing bead: lsm-herx.7
