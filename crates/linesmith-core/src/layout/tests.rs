@@ -61,6 +61,7 @@ fn item(text: &str, priority: u8) -> LayoutItem<'static> {
         rendered: RenderedSegment::new(text),
         defaults: SegmentDefaults::with_priority(priority),
         segment: noop_segment(),
+        group_id: 0,
     })
 }
 
@@ -169,6 +170,9 @@ fn render_items_wraps_each_styled_segment_under_palette16() {
             rendered: RenderedSegment::new("b").with_role(Role::Warning),
             defaults: SegmentDefaults::with_priority(10),
             segment: noop_segment(),
+            // Distinct group so the colored segment is its own lead, not
+            // a satellite of the plain `a` to its left.
+            group_id: 1,
         }),
         space(),
         item("c", 10),
@@ -446,6 +450,7 @@ fn total_width_returns_u32_beyond_u16_range() {
             rendered: RenderedSegment::new(text),
             defaults: SegmentDefaults::with_priority(10),
             segment: noop_segment(),
+            group_id: 0,
         })
     }
     let items = vec![
@@ -577,6 +582,7 @@ fn truncatable_item(text: &str, priority: u8) -> LayoutItem<'static> {
         rendered: RenderedSegment::new(text),
         defaults: SegmentDefaults::with_priority(priority).with_truncatable(true),
         segment: noop_segment(),
+        group_id: 0,
     })
 }
 
@@ -632,6 +638,7 @@ fn truncatable_with_bounds(text: &str, priority: u8, bounds: WidthBounds) -> Lay
             .with_truncatable(true)
             .with_width(bounds),
         segment: noop_segment(),
+        group_id: 0,
     })
 }
 
@@ -704,6 +711,7 @@ fn reflow_does_not_touch_priority_zero_even_when_truncatable() {
             rendered: RenderedSegment::new("untouchable-long-name"),
             defaults: SegmentDefaults::with_priority(0).with_truncatable(true),
             segment: noop_segment(),
+            group_id: 0,
         }),
         space(),
         item("Sonnet", 0),
@@ -1523,6 +1531,7 @@ fn try_reflow_preserves_segment_id_reference() {
         rendered: RenderedSegment::new("workspace-with-extra-content"),
         defaults: SegmentDefaults::with_priority(100).with_truncatable(true),
         segment: noop_segment(),
+        group_id: 0,
     };
     let original_id_ptr = std::ptr::from_ref(entry.id);
     let reflowed =
@@ -1920,4 +1929,453 @@ fn emit_priority_drop_does_not_panic_on_zero_width_segment() {
         }
         other => panic!("expected PriorityDrop, got {other:?}"),
     }
+}
+
+// --- group-lead coloring (ADR-0028 / ADR-0029) ---
+
+use crate::theme::{Color, Role};
+
+/// Test segment carrying a fixed render so group-color cases can pin a
+/// role, decorations, or droppable priority per slot.
+struct FixedSeg {
+    rendered: RenderedSegment,
+    priority: u8,
+}
+
+impl Segment for FixedSeg {
+    fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+        Ok(Some(self.rendered.clone()))
+    }
+    fn defaults(&self) -> SegmentDefaults {
+        SegmentDefaults::with_priority(self.priority)
+    }
+}
+
+fn grp_seg(id: &'static str, rendered: RenderedSegment, fuses_left: bool) -> LineItem {
+    grp_seg_pri(id, rendered, fuses_left, 0)
+}
+
+fn grp_seg_pri(
+    id: &'static str,
+    rendered: RenderedSegment,
+    fuses_left: bool,
+    priority: u8,
+) -> LineItem {
+    LineItem::Segment {
+        id: Cow::Borrowed(id),
+        segment: Box::new(FixedSeg { rendered, priority }),
+        fuses_left,
+    }
+}
+
+#[test]
+fn group_satellite_inherits_lead_color() {
+    // `5h: 35% ↻ 34m`: the reset satellite (Info on its own) fuses left
+    // into the rate-limit lead (Primary) and renders in Primary.
+    let items = vec![
+        grp_seg(
+            "lead",
+            RenderedSegment::new("5h: 35%").with_role(Role::Primary),
+            false,
+        ),
+        LineItem::Separator(Separator::Space),
+        grp_seg(
+            "reset",
+            RenderedSegment::new("34m").with_role(Role::Info),
+            true,
+        ),
+    ];
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
+    assert_eq!(runs.len(), 3, "lead, separator, satellite: {runs:?}");
+    assert_eq!(
+        runs[0].style.role,
+        Some(Role::Primary),
+        "lead keeps its own role"
+    );
+    assert_eq!(
+        runs[2].style.role,
+        Some(Role::Primary),
+        "satellite takes the lead's color, not its own Info"
+    );
+}
+
+#[test]
+fn group_satellite_keeps_its_own_decorations() {
+    // Color follows the lead; bold/italic are the satellite's own and
+    // survive (role drives only color in this codebase).
+    let sat_style = Style {
+        role: Some(Role::Info),
+        bold: true,
+        italic: true,
+        ..Style::default()
+    };
+    let items = vec![
+        grp_seg(
+            "lead",
+            RenderedSegment::new("lead").with_role(Role::Primary),
+            false,
+        ),
+        LineItem::Separator(Separator::Space),
+        grp_seg(
+            "sat",
+            RenderedSegment::new("sat").with_style(sat_style),
+            true,
+        ),
+    ];
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
+    assert_eq!(runs[2].style.role, Some(Role::Primary));
+    assert!(runs[2].style.bold, "bold decoration preserved");
+    assert!(runs[2].style.italic, "italic decoration preserved");
+}
+
+#[test]
+fn ungrouped_segment_keeps_its_own_color() {
+    // No fuse: the right segment is its own lead and resolves on its own.
+    let items = vec![
+        grp_seg(
+            "a",
+            RenderedSegment::new("a").with_role(Role::Primary),
+            false,
+        ),
+        LineItem::Separator(Separator::Space),
+        grp_seg("b", RenderedSegment::new("b").with_role(Role::Info), false),
+    ];
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
+    assert_eq!(runs[0].style.role, Some(Role::Primary));
+    assert_eq!(
+        runs[2].style.role,
+        Some(Role::Info),
+        "ungrouped segment untouched"
+    );
+}
+
+#[test]
+fn user_pinned_satellite_keeps_its_color_over_group() {
+    // Resolution-precedence step 1: a `[segments.x] style` override wins
+    // over the group color. The satellite is wrapped with a user style.
+    let inner = Box::new(FixedSeg {
+        rendered: RenderedSegment::new("sat").with_role(Role::Warning),
+        priority: 0,
+    });
+    let pinned = Box::new(
+        crate::segments::OverriddenSegment::new(inner).with_user_style(Style::role(Role::Info)),
+    );
+    let items = vec![
+        grp_seg(
+            "lead",
+            RenderedSegment::new("lead").with_role(Role::Primary),
+            false,
+        ),
+        LineItem::Separator(Separator::Space),
+        LineItem::Segment {
+            id: Cow::Borrowed("sat"),
+            segment: pinned,
+            fuses_left: true,
+        },
+    ];
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
+    assert_eq!(
+        runs[2].style.role,
+        Some(Role::Info),
+        "user color override beats the group color"
+    );
+}
+
+#[test]
+fn plugin_declared_fg_satellite_yields_to_group() {
+    // A non-user declared color (a plugin's own `fg`, here a raw Color)
+    // is step-3 declared style and yields to the group lead.
+    let declared = Style {
+        fg: Some(Color::Palette256(5)),
+        ..Style::default()
+    };
+    let items = vec![
+        grp_seg(
+            "lead",
+            RenderedSegment::new("lead").with_role(Role::Primary),
+            false,
+        ),
+        LineItem::Separator(Separator::Space),
+        grp_seg(
+            "sat",
+            RenderedSegment::new("sat").with_style(declared),
+            true,
+        ),
+    ];
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
+    assert_eq!(
+        runs[2].style.role,
+        Some(Role::Primary),
+        "declared fg yields to the lead role"
+    );
+    assert_eq!(
+        runs[2].style.fg, None,
+        "the satellite's own fg is replaced by the lead's color"
+    );
+}
+
+#[test]
+fn leading_fuses_left_segment_is_its_own_lead() {
+    // Defensive (lsm-v6f0 review): a leading `fuses_left = true` — which
+    // the builder never emits but external/plugin code could construct —
+    // starts a fresh group as its own lead rather than reaching for a
+    // left neighbor that does not exist.
+    let items = vec![
+        grp_seg(
+            "first",
+            RenderedSegment::new("first").with_role(Role::Info),
+            true,
+        ),
+        LineItem::Separator(Separator::Space),
+        grp_seg(
+            "second",
+            RenderedSegment::new("second").with_role(Role::Warning),
+            true,
+        ),
+    ];
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
+    assert_eq!(
+        runs[0].style.role,
+        Some(Role::Info),
+        "leading satellite keeps its own color"
+    );
+    assert_eq!(
+        runs[2].style.role,
+        Some(Role::Info),
+        "the next member fuses into the leading segment's fresh group"
+    );
+}
+
+#[test]
+fn dropped_lead_satellite_does_not_inherit_neighbor_group_color() {
+    // A (its own group) | B (lead of the next group) ` ` C (B's
+    // satellite). Budget drops B; C must re-lead from its own color, not
+    // inherit A's color across the now-vanished group boundary.
+    let items = vec![
+        grp_seg_pri(
+            "a",
+            RenderedSegment::new("a").with_role(Role::Primary),
+            false,
+            0,
+        ),
+        LineItem::Separator(Separator::Space),
+        grp_seg_pri(
+            "b",
+            RenderedSegment::new("BBBB").with_role(Role::Info),
+            false,
+            200,
+        ),
+        LineItem::Separator(Separator::Space),
+        grp_seg_pri(
+            "c",
+            RenderedSegment::new("c").with_role(Role::Warning),
+            true,
+            0,
+        ),
+    ];
+    let_noop_observers!(observers);
+    // total 1+1+4+1+1 = 8; budget 4 drops B (priority 200) + its right
+    // separator, leaving A ` ` C = 3.
+    let runs = render_to_runs(&items, &empty_ctx(), 4, &mut observers);
+    assert_eq!(runs.len(), 3, "B dropped with one separator: {runs:?}");
+    assert_eq!(runs[0].style.role, Some(Role::Primary));
+    assert_eq!(
+        runs[2].style.role,
+        Some(Role::Warning),
+        "C re-leads its orphaned group instead of inheriting A's Primary"
+    );
+}
+
+#[test]
+fn multi_span_satellite_recolors_every_span() {
+    // A satellite that paints multiple colors collapses to the lead's
+    // color across all its spans (the emit path reads spans, not the
+    // whole-segment style).
+    let sat = RenderedSegment::from_spans([
+        StyledRun::new("ab", Style::role(Role::Success)),
+        StyledRun::new("cd", Style::role(Role::Muted)),
+    ])
+    .with_role(Role::Info);
+    let items = vec![
+        grp_seg(
+            "lead",
+            RenderedSegment::new("lead").with_role(Role::Primary),
+            false,
+        ),
+        LineItem::Separator(Separator::Space),
+        grp_seg("sat", sat, true),
+    ];
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
+    // lead, separator, then the satellite's two spans.
+    assert_eq!(
+        runs.len(),
+        4,
+        "two satellite spans survive as runs: {runs:?}"
+    );
+    assert_eq!(
+        runs[2].style.role,
+        Some(Role::Primary),
+        "first span recolored"
+    );
+    assert_eq!(
+        runs[3].style.role,
+        Some(Role::Primary),
+        "second span recolored"
+    );
+}
+
+#[test]
+fn group_with_three_members_all_inherit_lead() {
+    // The same-group arm must fire for the second and third satellite,
+    // not just the first — pins the maximal-run semantics.
+    let items = vec![
+        grp_seg(
+            "lead",
+            RenderedSegment::new("L").with_role(Role::Primary),
+            false,
+        ),
+        LineItem::Separator(Separator::Space),
+        grp_seg("s1", RenderedSegment::new("s1").with_role(Role::Info), true),
+        LineItem::Separator(Separator::Space),
+        grp_seg(
+            "s2",
+            RenderedSegment::new("s2").with_role(Role::Warning),
+            true,
+        ),
+    ];
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
+    assert_eq!(
+        runs.len(),
+        5,
+        "lead + 2 satellites + 2 separators: {runs:?}"
+    );
+    assert_eq!(runs[0].style.role, Some(Role::Primary));
+    assert_eq!(runs[2].style.role, Some(Role::Primary), "first satellite");
+    assert_eq!(runs[4].style.role, Some(Role::Primary), "second satellite");
+}
+
+#[test]
+fn group_scan_steps_over_powerline_separator() {
+    // The scan treats separators as transparent regardless of kind: a
+    // powerline chevron carries its own Muted style and sits between
+    // fused members without breaking the group or being mistaken for a
+    // lead.
+    let items = vec![
+        grp_seg(
+            "lead",
+            RenderedSegment::new("L").with_role(Role::Primary),
+            false,
+        ),
+        LineItem::Separator(Separator::powerline()),
+        grp_seg("sat", RenderedSegment::new("s").with_role(Role::Info), true),
+    ];
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
+    assert_eq!(runs[0].style.role, Some(Role::Primary));
+    assert_eq!(
+        runs[1].style.role,
+        Some(Role::Muted),
+        "powerline separator keeps its own style"
+    );
+    assert_eq!(
+        runs[2].style.role,
+        Some(Role::Primary),
+        "satellite inherits the lead across a powerline separator"
+    );
+}
+
+#[test]
+fn hidden_lead_satellite_re_leads_and_keeps_own_color() {
+    // A (own group) | B (next group's lead, renders Ok(None) → hidden)
+    // ` ` C (B's satellite). B never materializes; group ids assigned
+    // over config order keep C in B's group, so C re-leads from its own
+    // color rather than inheriting A's across the vanished boundary.
+    let items = vec![
+        grp_seg(
+            "a",
+            RenderedSegment::new("a").with_role(Role::Primary),
+            false,
+        ),
+        LineItem::Separator(Separator::Space),
+        LineItem::Segment {
+            id: Cow::Borrowed("b"),
+            segment: Box::new(NoopSegment),
+            fuses_left: false,
+        },
+        LineItem::Separator(Separator::Space),
+        grp_seg(
+            "c",
+            RenderedSegment::new("c").with_role(Role::Warning),
+            true,
+        ),
+    ];
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
+    assert_eq!(runs.len(), 3, "hidden B leaves a, separator, c: {runs:?}");
+    assert_eq!(runs[0].style.role, Some(Role::Primary));
+    assert_eq!(
+        runs[2].style.role,
+        Some(Role::Warning),
+        "C re-leads its orphaned group instead of inheriting A's Primary"
+    );
+}
+
+#[test]
+fn satellite_inherits_lead_color_after_lead_is_shrunk() {
+    // The pass runs after layout, so a satellite tracks the lead's
+    // *post-shrink* color. The lead's `shrink_to_fit` deliberately
+    // returns a different role than its full render; under width
+    // pressure the satellite must inherit the shrunk role, not the
+    // pre-shrink one.
+    struct ShrinkRecolorSeg;
+    impl Segment for ShrinkRecolorSeg {
+        fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+            Ok(Some(
+                RenderedSegment::new("FULL-LEAD").with_role(Role::Primary),
+            ))
+        }
+        fn shrink_to_fit(
+            &self,
+            _: &DataContext,
+            _: &RenderContext,
+            target: u16,
+        ) -> Option<RenderedSegment> {
+            let shrunk = RenderedSegment::new("LD").with_role(Role::Error);
+            (shrunk.width() <= target).then_some(shrunk)
+        }
+        fn defaults(&self) -> SegmentDefaults {
+            SegmentDefaults::with_priority(10)
+        }
+    }
+    let items = vec![
+        LineItem::Segment {
+            id: Cow::Borrowed("lead"),
+            segment: Box::new(ShrinkRecolorSeg),
+            fuses_left: false,
+        },
+        LineItem::Separator(Separator::Space),
+        grp_seg("sat", RenderedSegment::new("s").with_role(Role::Info), true),
+    ];
+    let_noop_observers!(observers);
+    // total 9 + 1 + 1 = 11; budget 4 shrinks the lead to "LD" (Error).
+    let runs = render_to_runs(&items, &empty_ctx(), 4, &mut observers);
+    assert_eq!(runs[0].text, "LD", "lead shrank rather than dropped");
+    assert_eq!(
+        runs[0].style.role,
+        Some(Role::Error),
+        "lead's post-shrink role"
+    );
+    assert_eq!(
+        runs[2].style.role,
+        Some(Role::Error),
+        "satellite inherits the lead's post-shrink color, not its pre-shrink Primary"
+    );
 }

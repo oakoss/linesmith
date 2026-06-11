@@ -4,7 +4,7 @@
 //! separator preference, and theme role.
 
 use crate::data_context::{DataContext, DataDep};
-use crate::theme::{Role, Style, StyledRun};
+use crate::theme::{Color, Role, Style, StyledRun};
 use std::borrow::Cow;
 use unicode_width::UnicodeWidthStr;
 
@@ -26,6 +26,19 @@ pub mod tokens;
 pub mod version;
 pub mod vim;
 pub mod workspace;
+
+/// The color a group satellite inherits from its lead ([ADR-0028]): the
+/// `role` and `fg` projection of a [`Style`]. Named so the
+/// [`RenderedSegment::group_lead_color`] /
+/// [`RenderedSegment::recolor_for_group`] pair has a typed contract
+/// instead of a positional `(role, fg)` tuple.
+///
+/// [ADR-0028]: https://github.com/oakoss/linesmith/blob/main/docs/adrs/0028-group-lead-coloring-and-role-vocabulary.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GroupColor {
+    pub(crate) role: Option<Role>,
+    pub(crate) fg: Option<Color>,
+}
 
 /// Output of a successful segment render.
 ///
@@ -184,6 +197,39 @@ impl RenderedSegment {
     pub(crate) fn without_spans(mut self) -> Self {
         self.spans = None;
         self
+    }
+
+    /// Reads the whole-segment [`Self::style`], not the per-span colors:
+    /// a multi-color segment sets a canonical whole-segment role
+    /// (`with_role` after `from_spans`) that is its group color ([ADR-0028]).
+    ///
+    /// [ADR-0028]: https://github.com/oakoss/linesmith/blob/main/docs/adrs/0028-group-lead-coloring-and-role-vocabulary.md
+    #[must_use]
+    pub(crate) fn group_lead_color(&self) -> GroupColor {
+        GroupColor {
+            role: self.style.role,
+            fg: self.style.fg,
+        }
+    }
+
+    /// Repaint this satellite in its group lead's resolved color
+    /// ([ADR-0028]). Decorations (bold/italic/underline/dim) and hyperlinks
+    /// are preserved. Spans are repainted too: the emit path reads spans
+    /// in preference to the whole-segment style.
+    ///
+    /// [ADR-0028]: https://github.com/oakoss/linesmith/blob/main/docs/adrs/0028-group-lead-coloring-and-role-vocabulary.md
+    pub(crate) fn recolor_for_group(&mut self, color: GroupColor) {
+        // Whole-segment style is the color source when spans is None and
+        // for `group_lead_color`; keep it coherent even though spans, when
+        // present, win on the emit path and are repainted below.
+        self.style.role = color.role;
+        self.style.fg = color.fg;
+        if let Some(spans) = self.spans.as_mut() {
+            for span in spans {
+                span.style.role = color.role;
+                span.style.fg = color.fg;
+            }
+        }
     }
 
     /// Prepend `icon` plus a separating space to the rendered text,
@@ -594,6 +640,18 @@ pub trait Segment: Send {
     fn defaults(&self) -> SegmentDefaults {
         SegmentDefaults::default()
     }
+
+    /// True when user config pinned this segment's color via a
+    /// `[segments.<id>] style` override that sets a role or `fg`.
+    /// Group-lead coloring ([ADR-0028]) checks this to honor resolution
+    /// precedence: user override (step 1) beats the group color (step 2).
+    /// A plugin's own declared `fg` is step-3 and still yields to the group.
+    ///
+    /// [ADR-0028]: https://github.com/oakoss/linesmith/blob/main/docs/adrs/0028-group-lead-coloring-and-role-vocabulary.md
+    #[must_use]
+    fn user_color_pinned(&self) -> bool {
+        false
+    }
 }
 
 // --- Built-in registry + config-driven override wrapper ----------------
@@ -815,6 +873,12 @@ impl Segment for OverriddenSegment {
             d.width = Some(w);
         }
         d
+    }
+
+    fn user_color_pinned(&self) -> bool {
+        self.user_style
+            .as_ref()
+            .is_some_and(|s| s.role.is_some() || s.fg.is_some())
     }
 }
 
@@ -1273,6 +1337,74 @@ mod layout_type_tests {
             .unwrap()
             .expect("rendered");
         assert_eq!(rendered.style, override_style);
+    }
+
+    #[test]
+    fn user_color_pinned_reflects_color_bearing_override_only() {
+        struct Plain;
+        impl Segment for Plain {
+            fn render(&self, _: &DataContext, _: &RenderContext) -> RenderResult {
+                Ok(Some(RenderedSegment::new("x")))
+            }
+        }
+        assert!(!Plain.user_color_pinned());
+        let by_role =
+            OverriddenSegment::new(Box::new(Plain)).with_user_style(Style::role(Role::Info));
+        assert!(by_role.user_color_pinned());
+        let by_fg = OverriddenSegment::new(Box::new(Plain)).with_user_style(Style {
+            fg: Some(Color::Palette256(5)),
+            ..Style::default()
+        });
+        assert!(by_fg.user_color_pinned());
+        // Decorations without color don't pin, so the group color still
+        // applies and keeps those decorations.
+        let bold_only = OverriddenSegment::new(Box::new(Plain)).with_user_style(Style {
+            bold: true,
+            ..Style::default()
+        });
+        assert!(!bold_only.user_color_pinned());
+        // An icon override is not a color pin.
+        let icon_only = OverriddenSegment::new(Box::new(Plain)).with_icon("⎇".to_string());
+        assert!(!icon_only.user_color_pinned());
+    }
+
+    #[test]
+    fn recolor_for_group_repaints_style_and_spans_keeping_decorations() {
+        let mut multi = RenderedSegment::from_spans([
+            StyledRun::new(
+                "a",
+                Style {
+                    role: Some(Role::Success),
+                    bold: true,
+                    ..Style::default()
+                }
+                .with_hyperlink("https://example.com/a"),
+            ),
+            StyledRun::new("b", Style::role(Role::Muted)),
+        ]);
+        multi.recolor_for_group(GroupColor {
+            role: Some(Role::Primary),
+            fg: None,
+        });
+        let spans = multi.spans().expect("multi-color render keeps spans");
+        assert_eq!(spans[0].style().role, Some(Role::Primary));
+        assert!(
+            spans[0].style().bold,
+            "per-span decoration survives recolor"
+        );
+        assert_eq!(
+            spans[0].style().hyperlink.as_deref(),
+            Some("https://example.com/a"),
+            "hyperlink (link behavior, not color) survives recolor"
+        );
+        assert_eq!(spans[1].style().role, Some(Role::Primary));
+        assert_eq!(
+            multi.group_lead_color(),
+            GroupColor {
+                role: Some(Role::Primary),
+                fg: None,
+            }
+        );
     }
 
     #[test]

@@ -9,8 +9,8 @@
 
 use crate::data_context::DataContext;
 use crate::segments::{
-    text_width, LineItem, RenderContext, RenderedSegment, Segment, SegmentDefaults, Separator,
-    WidthBounds,
+    text_width, GroupColor, LineItem, RenderContext, RenderedSegment, Segment, SegmentDefaults,
+    Separator, WidthBounds,
 };
 use crate::theme::{self, Capability, Style, StyledRun, Theme};
 use unicode_segmentation::UnicodeSegmentation;
@@ -156,7 +156,7 @@ pub fn render_to_runs(
 ) -> Vec<StyledRun> {
     let rc = RenderContext::new(terminal_width);
     let layout_items = collect_items_with(items, ctx, &rc, observers);
-    let laid_out = apply_layout(layout_items, ctx, &rc, terminal_width, observers);
+    let laid_out = layout_and_color(layout_items, ctx, &rc, terminal_width, observers);
     items_to_runs(&laid_out)
 }
 
@@ -241,6 +241,14 @@ struct SegmentEntry<'a> {
     rendered: RenderedSegment,
     defaults: SegmentDefaults,
     segment: &'a dyn Segment,
+    /// Color-group identity ([ADR-0029]): a lead (`fuses_left = false`) and
+    /// its `fuses_left = true` satellites share one id. Assigned over the
+    /// original `LineItem` order (including hidden/dropped segments) so a
+    /// group boundary survives layout drops — a satellite never inherits a
+    /// neighbor group's color when its own lead is dropped.
+    ///
+    /// [ADR-0029]: https://github.com/oakoss/linesmith/blob/main/docs/adrs/0029-group-boundary-marker-and-merge-reconciliation.md
+    group_id: u32,
 }
 
 /// Walk the raw [`LineItem`] list, render each segment, and emit a
@@ -263,9 +271,22 @@ fn collect_items_with<'a>(
     observers: &mut LayoutObservers<'_>,
 ) -> Vec<LayoutItem<'a>> {
     let mut out: Vec<LayoutItem<'a>> = Vec::with_capacity(items.len());
+    // The first segment always starts group 0 regardless of its flag —
+    // defensive against a leading `fuses_left = true`, which no built-in
+    // emits but plugin code could construct.
+    let mut group_id: u32 = 0;
+    let mut seen_segment = false;
     for item in items {
         match item {
-            LineItem::Segment { id, segment, .. } => {
+            LineItem::Segment {
+                id,
+                segment,
+                fuses_left,
+            } => {
+                if seen_segment && !fuses_left {
+                    group_id = group_id.saturating_add(1);
+                }
+                seen_segment = true;
                 let defaults = segment.defaults();
                 let rendered = match segment.render(ctx, rc) {
                     Ok(Some(r)) => r,
@@ -289,6 +310,7 @@ fn collect_items_with<'a>(
                     rendered,
                     defaults,
                     segment: segment.as_ref(),
+                    group_id,
                 }));
             }
             LineItem::Separator(sep) => {
@@ -480,7 +502,7 @@ fn render_items(
 ) -> String {
     let mut warn: fn(&str) = |_: &str| {};
     let mut observers = LayoutObservers::new(&mut warn);
-    let laid_out = apply_layout(items, ctx, rc, terminal_width, &mut observers);
+    let laid_out = layout_and_color(items, ctx, rc, terminal_width, &mut observers);
     let runs = items_to_runs(&laid_out);
     runs_to_ansi(&runs, theme, capability, false)
 }
@@ -512,6 +534,56 @@ fn items_to_runs(items: &[LayoutItem<'_>]) -> Vec<StyledRun> {
         }
     }
     runs
+}
+
+/// Repaint group satellites in their lead's resolved color (ADR-0028).
+/// Runs after layout so the lead color reflects any shrink/reflow rewrite.
+///
+/// A color group is a maximal run of segments sharing a `group_id`
+/// (assigned in config order by [`collect_items_with`]); the leftmost
+/// surviving member leads. Later members with no user color override
+/// inherit the lead's `(role, fg)`; a pinned satellite keeps its own
+/// (resolution-precedence step 1 beats the group color). Separators are
+/// transparent to the scan.
+///
+/// Keying on `group_id` rather than survivor adjacency gives two
+/// properties:
+/// - A hidden or dropped lead causes the next same-`group_id` survivor
+///   to re-lead, so satellites never inherit a neighbor group's color.
+/// - A leading `fuses_left = true` (plugin-constructible, never the
+///   builder) lands in group 0 as its own lead and keeps its color.
+fn apply_group_lead_colors(items: &mut [LayoutItem<'_>]) {
+    let mut lead: Option<(u32, GroupColor)> = None;
+    for item in items {
+        let LayoutItem::Segment(seg) = item else {
+            continue;
+        };
+        match lead {
+            Some((gid, color)) if gid == seg.group_id => {
+                if !seg.segment.user_color_pinned() {
+                    seg.rendered.recolor_for_group(color);
+                }
+            }
+            _ => {
+                lead = Some((seg.group_id, seg.rendered.group_lead_color()));
+            }
+        }
+    }
+}
+
+/// Layout then group-lead coloring, which must run after layout (see
+/// [`apply_group_lead_colors`]). Extracted so [`render_to_runs`] and the
+/// test `render_items` can't drift on compose order.
+fn layout_and_color<'a>(
+    items: Vec<LayoutItem<'a>>,
+    ctx: &DataContext,
+    rc: &RenderContext,
+    terminal_width: u16,
+    observers: &mut LayoutObservers<'_>,
+) -> Vec<LayoutItem<'a>> {
+    let mut laid_out = apply_layout(items, ctx, rc, terminal_width, observers);
+    apply_group_lead_colors(&mut laid_out);
+    laid_out
 }
 
 /// Style for an inter-segment separator run. Plain separators carry
@@ -602,6 +674,7 @@ fn try_reflow<'a>(item: &SegmentEntry<'a>, overflow: u32) -> Option<SegmentEntry
         rendered: truncated,
         defaults: item.defaults,
         segment: item.segment,
+        group_id: item.group_id,
     })
 }
 
