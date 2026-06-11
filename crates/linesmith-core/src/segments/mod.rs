@@ -212,23 +212,31 @@ impl RenderedSegment {
         }
     }
 
-    /// Repaint this satellite in its group lead's resolved color
-    /// ([ADR-0028]). Decorations (bold/italic/underline/dim) and hyperlinks
-    /// are preserved. Spans are repainted too: the emit path reads spans
-    /// in preference to the whole-segment style.
+    /// Repaint this satellite in its group lead's color ([ADR-0028]),
+    /// keeping its own decorations and hyperlinks. Spans are repainted too
+    /// (the emit path prefers spans over the whole-segment style), then
+    /// re-normalized — adjacent runs that became identical merge, a lone
+    /// survivor lifts into [`Self::style`] — to uphold the
+    /// [`Self::from_spans`] invariant (`spans: Some` ⟹ multi-style) and
+    /// avoid redundant SGR pairs.
     ///
     /// [ADR-0028]: https://github.com/oakoss/linesmith/blob/main/docs/adrs/0028-group-lead-coloring-and-role-vocabulary.md
     pub(crate) fn recolor_for_group(&mut self, color: GroupColor) {
-        // Whole-segment style is the color source when spans is None and
-        // for `group_lead_color`; keep it coherent even though spans, when
-        // present, win on the emit path and are repainted below.
+        // Keep the whole-segment style coherent: it's the color source
+        // when spans is None and for `group_lead_color`.
         self.style.role = color.role;
         self.style.fg = color.fg;
-        if let Some(spans) = self.spans.as_mut() {
-            for span in spans {
-                span.style.role = color.role;
-                span.style.fg = color.fg;
-            }
+        let Some(mut spans) = self.spans.take() else {
+            return;
+        };
+        for span in &mut spans {
+            span.style.role = color.role;
+            span.style.fg = color.fg;
+        }
+        let mut merged = merge_adjacent_same_style(spans);
+        match merged.len() {
+            1 => self.style = merged.pop().expect("len == 1").style,
+            _ => self.spans = Some(merged),
         }
     }
 
@@ -306,6 +314,21 @@ pub(crate) fn sanitize_control_chars(s: String) -> String {
         return s;
     }
     s.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Re-coalesce adjacent same-style runs the way [`RenderedSegment::from_spans`]
+/// does at construction, for callers that mutate span styles afterward
+/// (e.g. [`RenderedSegment::recolor_for_group`]). Text is unchanged, so
+/// width is unaffected.
+fn merge_adjacent_same_style(spans: Vec<StyledRun>) -> Vec<StyledRun> {
+    let mut merged: Vec<StyledRun> = Vec::with_capacity(spans.len());
+    for span in spans {
+        match merged.last_mut() {
+            Some(last) if last.style() == span.style() => last.text.push_str(span.text()),
+            _ => merged.push(span),
+        }
+    }
+    merged
 }
 
 /// Separator between adjacent segments. Chosen by the segment to its

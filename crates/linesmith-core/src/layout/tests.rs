@@ -2194,9 +2194,54 @@ fn dropped_lead_satellite_does_not_inherit_neighbor_group_color() {
 
 #[test]
 fn multi_span_satellite_recolors_every_span() {
-    // A satellite that paints multiple colors collapses to the lead's
-    // color across all its spans (the emit path reads spans, not the
-    // whole-segment style).
+    // Spans that stay distinct after recolor (here by a bold decoration)
+    // each take the lead's color while keeping their own decoration.
+    let sat = RenderedSegment::from_spans([
+        StyledRun::new(
+            "ab",
+            Style {
+                role: Some(Role::Success),
+                bold: true,
+                ..Style::default()
+            },
+        ),
+        StyledRun::new("cd", Style::role(Role::Muted)),
+    ])
+    .with_role(Role::Info);
+    let items = vec![
+        grp_seg(
+            "lead",
+            RenderedSegment::new("lead").with_role(Role::Primary),
+            false,
+        ),
+        LineItem::Separator(Separator::Space),
+        grp_seg("sat", sat, true),
+    ];
+    let_noop_observers!(observers);
+    let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
+    assert_eq!(
+        runs.len(),
+        4,
+        "two distinct satellite spans survive as runs: {runs:?}"
+    );
+    assert_eq!(
+        runs[2].style.role,
+        Some(Role::Primary),
+        "first span recolored"
+    );
+    assert!(runs[2].style.bold, "first span keeps its bold decoration");
+    assert_eq!(
+        runs[3].style.role,
+        Some(Role::Primary),
+        "second span recolored"
+    );
+}
+
+#[test]
+fn recolored_satellite_merges_spans_that_become_identical() {
+    // Spans differing only in color collapse to one run after recolor —
+    // upholds the `from_spans` invariant (no adjacent same-style spans)
+    // and avoids redundant SGR pairs.
     let sat = RenderedSegment::from_spans([
         StyledRun::new("ab", Style::role(Role::Success)),
         StyledRun::new("cd", Style::role(Role::Muted)),
@@ -2213,28 +2258,23 @@ fn multi_span_satellite_recolors_every_span() {
     ];
     let_noop_observers!(observers);
     let runs = render_to_runs(&items, &empty_ctx(), 100, &mut observers);
-    // lead, separator, then the satellite's two spans.
     assert_eq!(
         runs.len(),
-        4,
-        "two satellite spans survive as runs: {runs:?}"
+        3,
+        "satellite collapses to a single run: {runs:?}"
     );
+    assert_eq!(runs[2].text, "abcd", "span texts concatenated");
     assert_eq!(
         runs[2].style.role,
         Some(Role::Primary),
-        "first span recolored"
-    );
-    assert_eq!(
-        runs[3].style.role,
-        Some(Role::Primary),
-        "second span recolored"
+        "recolored to the lead"
     );
 }
 
 #[test]
 fn group_with_three_members_all_inherit_lead() {
     // The same-group arm must fire for the second and third satellite,
-    // not just the first — pins the maximal-run semantics.
+    // not only the first — pins the maximal-run semantics.
     let items = vec![
         grp_seg(
             "lead",
