@@ -7,7 +7,7 @@ description = "Internal core engine for linesmith. No SemVer guarantee for direc
 # pattern as serde_derive / tokio-macros / clap_derive: the crate
 # exists on the registry to satisfy cargo's transitive-dep rule, not
 # to advertise a stable API.
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
