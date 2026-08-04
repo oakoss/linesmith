@@ -2,30 +2,50 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended",
-    "group:allNonMajor",
-    "helpers:pinGitHubActionDigests",
-    "schedule:earlyMondays",
+    "helpers:pinGitHubActionDigestsToSemver",
+    "schedule:monthly",
     ":maintainLockFilesMonthly",
     ":semanticCommits",
     ":semanticCommitTypeAll(chore)"
   ],
-  "labels": ["dependencies"],
-  "cargo": {
-    "enabled": true
-  },
-  "rangeStrategy": "bump",
-  "automerge": true,
-  "platformAutomerge": false,
-  "platformCommit": true,
-  "prConcurrentLimit": 5,
-  "vulnerabilityAlerts": {
-    "schedule": ["at any time"],
-    "labels": ["security"]
-  },
   "packageRules": [
     {
+      "description": "Reimplements group:allNonMajor plus digest updates, since the preset's minor/patch match misses digests",
+      "matchUpdateTypes": ["minor", "patch", "digest", "pinDigest"],
+      "groupName": "all non-major dependencies",
+      "groupSlug": "all-minor-patch",
+      "matchPackageNames": ["*"]
+    },
+    {
+      "matchUpdateTypes": ["major"],
+      "automerge": false
+    },
+    {
+      "description": "A minor bump on a 0.x cargo dep is a breaking change under semver, so it gets its own PR and a human reviewer. Must stay ordered after the grouping rule above, since later packageRules win.",
       "matchManagers": ["cargo"],
-      "groupName": null
+      "matchCurrentVersion": "<1.0.0",
+      "matchUpdateTypes": ["minor"],
+      "groupName": null,
+      "automerge": false
     }
-  ]
+  ],
+  "customManagers": [
+    {
+      "description": "cargo-dist regenerates release.yml from these pins, so they must track the digests the github-actions manager writes into the workflow. Same depName + datasource means both files move in one PR.",
+      "customType": "regex",
+      "managerFilePatterns": ["/^dist-workspace\\.toml$/"],
+      "matchStrings": [
+        "\"(?<depName>[^\"]+)\"[ \\t]*=[ \\t]*\"(?<currentDigest>[a-f0-9]{40})\"[ \\t]*#[ \\t]*(?<currentValue>v\\S+)"
+      ],
+      "datasourceTemplate": "github-tags"
+    }
+  ],
+  "labels": ["dependencies"],
+  "automerge": true,
+  "platformAutomerge": false,
+  "platformCommit": "enabled",
+  "prConcurrentLimit": 5,
+  "vulnerabilityAlerts": {
+    "labels": ["security"]
+  }
 }
