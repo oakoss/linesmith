@@ -197,7 +197,17 @@ gh pr checks --watch
 gh pr checks --json name,state |
   jq -e 'any(.[]; .name == "CodeRabbit" and .state == "SUCCESS")'
 
-gh pr view --comments              # read CodeRabbit's findings
+# CodeRabbit's findings are inline review comments, which `gh pr view
+# --comments` doesn't print; it only shows the walkthrough and review
+# bodies. The API call below is what surfaces the findings themselves.
+gh pr view --comments
+gh api --paginate "repos/{owner}/{repo}/pulls/$(gh pr view --json number -q .number)/comments" \
+  --jq '.[] | "\(.path):\(.line // .original_line)\n\(.body)\n"'
+
+# Act on the findings, then resolve their threads: the repo ruleset sets
+# `required_review_thread_resolution`, so an unresolved thread blocks the
+# merge. A PR with zero findings resolves trivially, which is why the
+# assertion above still carries the "did the review run" half.
 gh pr merge --squash               # remote branch auto-deletes (delete_branch_on_merge=true); local cleanup below
 ```
 
@@ -213,11 +223,11 @@ git worktree remove .claude/worktrees/lsm-xyz
 git branch -D worktree-lsm-xyz
 ```
 
-The PR path honors the repo's branch protection (`Changes must be made through a pull request`) and required `CI Summary` check — pushing straight to main bypasses both. Squash collapses any review-cycle iter-commits into one clean main commit; the squash commit body is built from concatenated commit messages (`squash_merge_commit_message: COMMIT_MESSAGES`), so the `lsm-xyz` footer in your worktree commit lands in the squash commit naturally — no PR-body workaround needed.
+The PR path honors the repo's branch protection (`Changes must be made through a pull request`), the required `CI Summary` check, and `required_review_thread_resolution` — pushing straight to main bypasses all three. Thread resolution is set on the repo ruleset while the org ruleset leaves it off; GitHub applies the stricter of the two, so an unresolved review thread blocks merge here even though the org rule alone wouldn't. Squash collapses any review-cycle iter-commits into one clean main commit; the squash commit body is built from concatenated commit messages (`squash_merge_commit_message: COMMIT_MESSAGES`), so the `lsm-xyz` footer in your worktree commit lands in the squash commit naturally — no PR-body workaround needed.
 
 **AI review on PRs is CodeRabbit.** It reviews automatically on PR open and on each push, reads this file as review guidance, and reports a `CodeRabbit` commit status alongside the CI checks. `@coderabbitai review` re-runs it on demand. Local pre-push review (`/review-cycle:review`, `/code-review`) is separate and still the first line — CodeRabbit is the backstop for what reaches a PR unreviewed.
 
-**Don't pass `--auto` to `gh pr merge`.** Native auto-merge waits only on _required_ status checks, and the repo requires just `CI Summary`. CodeRabbit's status isn't required, so `--auto` can land a PR while the review is still queued. `gh pr checks --watch` blocks on every reported check including that status, which is why the manual sequence above waits on it and then merges.
+**Don't pass `--auto` to `gh pr merge`.** Native auto-merge waits only on _required_ status checks, and the repo requires just `CI Summary`. CodeRabbit's status isn't required, so `--auto` can land a PR while the review is still queued. `gh pr checks --watch` blocks on every reported check including that status, which is why the manual sequence above waits on it and then merges. That stays true until CodeRabbit's status becomes a required check (tracked in `lsm-qhg5`); once it does, `--auto` becomes safe and this entry can go.
 
 If main moves while CI is running, the `strict_required_status_checks_policy` blocks merge until the PR branch is updated; run `gh pr update-branch` to refresh.
 
@@ -241,7 +251,7 @@ Spawned agents with `isolation: worktree` can drift onto main-repo files. Audit 
 - **`--auto` merge while an AI reviewer is non-required.** `gh pr merge --auto` waits only on required checks, so it can land a PR before CodeRabbit's review posts. Use `gh pr checks --watch`, then a manual `gh pr merge --squash`.
 - **Trusting subagent `isolation: worktree` alone.** It's been observed to be silently ignored; combine with session-level `bgIsolation` and `git status` audits.
 - **Pre-commit / lefthook hooks that assume single working dir.** Hooks that write to `./tmp`, hardcode paths, or share lock files collide across worktrees. Audit `lefthook.yml` when adding hooks.
-- **Auto-merging external contributor PRs based on AI review alone.** Spoofed git identity has fooled AI reviewers into approving malicious PRs (manifold.security). Keep human approval for contributor PRs even if CodeRabbit signs off; `--auto` is only safe on your own branches.
+- **Auto-merging external contributor PRs based on AI review alone.** Spoofed git identity has fooled AI reviewers into approving malicious PRs (manifold.security). Keep human approval for contributor PRs even if CodeRabbit signs off. This holds regardless of whether CodeRabbit's status later becomes a required check: requiring it gates _timing_, not identity, so it does nothing to stop a spoofed-identity PR from collecting an AI approval.
 
 ## Rules
 
