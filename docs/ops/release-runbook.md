@@ -322,17 +322,24 @@ Everyone else is rejected — including any workflow using the default
 
 That makes every manual tag operation in this runbook admin-only:
 cutting an RC tag, deleting tags during rollback, and the one-time
-migration-tag push. A rejected push means the ruleset caught it —
-check bypass eligibility before assuming the credential is broken.
+migration-tag push. A rejected push is not automatically this ruleset,
+though — an under-scoped credential or a wrong-repository push looks
+much the same from the client. The query below is what tells them
+apart: a row for your ref means the ruleset acted; no row means look
+at the credential.
 
 To confirm the ruleset evaluated a push (bypasses are logged, so this
 works even when you bypass it):
 
 ```sh
-gh api repos/oakoss/linesmith/rulesets/rule-suites \
+gh api --paginate repos/oakoss/linesmith/rulesets/rule-suites \
   --jq '.[] | select(.ref | startswith("refs/tags/"))
         | "\(.result) \(.ref) actor=\(.actor_name)"'
 ```
+
+`--paginate` matters: without it you get only the first page, which
+branch pushes dominate. Narrow to a single tag by appending
+`| grep linesmith/v0.3.0-rc.1`.
 
 ## Knope migration tags (one-time, for the first Knope release)
 
