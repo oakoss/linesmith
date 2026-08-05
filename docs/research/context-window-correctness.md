@@ -51,13 +51,13 @@ To be filled in by running linesmith against a live Claude Code session in each 
 3. Compare `context_window.used_percentage` to what Claude Code's own `/context` command reports.
 4. Record the delta and any rendering anomaly in the linesmith output.
 
-| #   | Scenario                                    | `used_percentage` (stdin) | `/context` truth | `context_window_size` correct?          | Render anomaly?                                                              | Pass/Fail |
-| --- | ------------------------------------------- | ------------------------- | ---------------- | --------------------------------------- | ---------------------------------------------------------------------------- | --------- |
-| 1   | 200k-context session, low fill, pre-compact | 21                        | 21%              | yes — `200_000`                         | none                                                                         | **Pass**  |
-| 2   | Same session after `/compact`               | 28                        | 28%              | yes — `200_000`                         | none                                                                         | **Pass**  |
-| 3   | Session resumed via `/resume`               | 24                        | 24%              | yes — `200_000`                         | none                                                                         | **Pass**  |
-| 4   | During a 429 rate-limit response            | N/A                       | N/A              | N/A                                     | N/A — statusline not invoked during 429 retry                                | **N/A**   |
-| 5   | 1M-context variant (Opus 4.7 1M)            | 34                        | 34%              | yes — `1_000_000`, not stuck at 200_000 | none once [lsm-ts7k](../../.beads/issues.jsonl) (effort parser) is installed | **Pass**  |
+| #   | Scenario                                    | `used_percentage` (stdin) | `/context` truth | `context_window_size` correct?          | Render anomaly?                                   | Pass/Fail |
+| --- | ------------------------------------------- | ------------------------- | ---------------- | --------------------------------------- | ------------------------------------------------- | --------- |
+| 1   | 200k-context session, low fill, pre-compact | 21                        | 21%              | yes — `200_000`                         | none                                              | **Pass**  |
+| 2   | Same session after `/compact`               | 28                        | 28%              | yes — `200_000`                         | none                                              | **Pass**  |
+| 3   | Session resumed via `/resume`               | 24                        | 24%              | yes — `200_000`                         | none                                              | **Pass**  |
+| 4   | During a 429 rate-limit response            | N/A                       | N/A              | N/A                                     | N/A — statusline not invoked during 429 retry     | **N/A**   |
+| 5   | 1M-context variant (Opus 4.7 1M)            | 34                        | 34%              | yes — `1_000_000`, not stuck at 200_000 | none once `lsm-ts7k` (effort parser) is installed | **Pass**  |
 
 Row 5 notes:
 

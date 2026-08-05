@@ -135,7 +135,7 @@ Either way every change ships through a PR (`main` is protected); the only choic
 On the plain-branch path:
 
 - **Name** the branch after the bead (`git switch -c lsm-xyz main`) for beaded work, or a short kebab descriptor (`git switch -c docs-branch-policy main`) for ad-hoc work. Unlike `EnterWorktree`, `git switch -c` takes your name verbatim — no `worktree-` prefix is added.
-- **Claim** the bead _after_ switching to the branch (`bd update lsm-xyz --claim`), so the `.beads/issues.jsonl` write lands on the branch, not `main`. Non-beaded changes (most doc fixes) skip the claim.
+- **Claim** the bead once you're on the branch (`bd update lsm-xyz --claim`). Issue state lives in the bd database rather than a tracked file, so the claim isn't tied to a branch and needs no staging. Non-beaded changes (most doc fixes) skip the claim.
 - **Cleanup** is `git switch main && git branch -D <branch>` once the PR merges — no `git worktree remove`, so the plain-branch path skips this workflow's most dangerous step and its data-loss footguns.
 
 ### When the bgIsolation guard fires
@@ -160,19 +160,14 @@ From the shell, `claude --worktree <bd-id>` is the user-driven equivalent of `En
 
 ### Bd flow inside the worktree
 
-The bd database auto-shares across worktrees via git-common-dir discovery — every worktree sees the same DB as main without manual setup. The `.beads/issues.jsonl` file is per-checkout (it tracks per-branch on-disk state), so the close-then-commit pattern still produces clean diffs at merge time.
-
-Claim **inside** the worktree, not in main — keeps main's `.beads/issues.jsonl` clean and avoids a stale-staged-jsonl conflict at sync time. The atomic close-then-commit pattern from `## Task Tracking` applies; the worktree adds a push + PR step at the end.
+The bd database auto-shares across worktrees via git-common-dir discovery — every worktree sees the same DB as main without manual setup. Issue state lives in the database and replicates through the Dolt remote, not through any file in the tree, so claiming and closing produce no diff to stage.
 
 ```bash
 # Inside the worktree:
 bd update lsm-xyz --claim
 # ... edit, test, review-cycle ...
 bd close lsm-xyz --reason="<one-line summary of what shipped>"
-# If `git status` shows .beads/issues.jsonl unchanged after bd close
-# (60s auto-export throttle hit), force the write:
-#   bd export -o .beads/issues.jsonl
-git add <files> .beads/issues.jsonl
+git add <files>
 git commit -m "feat(scope): subject
 
 lsm-xyz"
@@ -304,31 +299,26 @@ bd close lsm-aql --reason="Shipped in ca91f3a"
 
 ### Closing beads issues
 
-Close the bead **before** staging so the feat/fix commit captures the
-code AND the close atomically. The pre-commit hook (`bd hooks run
-pre-commit`) flushes any pending jsonl export into the same commit.
+Close the bead when the work is done. Issue state lives in the bd
+database and reaches the remote via `bd dolt push`, so there is nothing
+to stage and no ordering constraint against the commit.
 
 ```text
 # 1. Finish the work, then:
 bd close lsm-xyz --reason="<one-line summary of what shipped>"
 
-# 2. Stage code + the jsonl bd just updated:
-git add <files> .beads/issues.jsonl
-
-# 3. Commit with lsm-xyz as the bare footer (see above):
+# 2. Stage and commit the code, with lsm-xyz as the bare footer:
+git add <files>
 git commit -m "feat(scope): ..."
 ```
 
-If `git status` shows `.beads/issues.jsonl` unchanged after `bd close`
-(60s auto-export throttle hit), force the write before staging:
+`bd dolt push` replicates issue state to the remote, and it does so
+explicitly — the `pre-push` hook does not (verified 2026-08-05: a hook
+run left `refs/dolt/data` unchanged; an explicit push advanced it). Run
+it when you want the close visible to other checkouts.
 
-```text
-bd export -o .beads/issues.jsonl
-git add .beads/issues.jsonl
-```
-
-Do NOT make a separate `chore(beads):` commit just to record the close;
-the pre-commit hook keeps code and issue state in the same commit.
+Do NOT make a separate `chore(beads):` commit to record the close. Issue
+state never enters git, so there is nothing for such a commit to carry.
 
 ## Session Completion
 
@@ -337,9 +327,46 @@ When ending a work session:
 1. **File issues for remaining work.** Run `bd create ...` for anything that needs follow-up.
 2. **Run quality gates** if code changed: `mise run check` or a relevant subset.
 3. **Update issue status.** Close finished work with `bd close <id>`; update in-progress items.
-4. **Commit if the user asks.** Do not commit proactively.
+4. **Offer to sync beads.** `bd dolt push` publishes issue state to the remote, so `## Rules`' "never push unless explicitly asked" governs it the same way it governs `git push`. Say what is unpushed and let the user decide — issue state lives in the database rather than the tree, so an unpushed database exists only on this machine and won't surface on its own.
+5. **Commit if the user asks.** Do not commit proactively.
 
-Note: beads state syncs via the git-tracked `.beads/issues.jsonl` (no Dolt remote). After committing, `git push` to `origin` (`git@github.com:oakoss/linesmith.git`) is the only sync step — only push when the user asks.
+Beads replicates through a Dolt remote (`origin` → `git+ssh://git@github.com/oakoss/linesmith.git`), configured as `sync.remote` in `.beads/config.yaml`. It stores the database in `refs/dolt/data` and a `__dolt_remote_info__` branch inside this repo; `.beads/issues.jsonl` is a local export and is not tracked. Code and issue state push separately: `git push` for one, `bd dolt push` for the other.
+
+Pull the other direction at session start, or after a `git pull` that
+brought in someone else's work — nothing delivers it automatically:
+
+```bash
+bd dolt pull
+```
+
+To hydrate a fresh clone or a new machine, `bd init` alone is enough: it reads
+`sync.remote` from `.beads/config.yaml` and pulls from the Dolt remote itself.
+
+```bash
+bd init --prefix lsm
+```
+
+**`bd init` rewrites the repo, and its damage needs undoing.** It appends a
+managed block to both `AGENTS.md` and `CLAUDE.md` (violating the rule that
+`CLAUDE.md` holds only `@AGENTS.md`), overwrites `.claude/settings.json`,
+`.gitignore`, and `.beads/hooks/*`, sets `core.hooksPath` to `.beads/hooks` —
+which disables lefthook, silently dropping `cargo fmt`, `markdownlint`,
+`prettier`, and `cog` commit-msg validation — and commits all of it. On a
+throwaway clone:
+
+```bash
+git reset --hard HEAD~1              # drop bd init's commit
+git config --unset-all --local core.hooksPath
+lefthook install                     # restore the real hooks
+```
+
+Only if `sync.remote` is missing from the config does the remote need adding by
+hand, followed by a pull:
+
+```bash
+bd dolt remote add origin git+ssh://git@github.com/oakoss/linesmith.git
+bd dolt pull                         # errors with "no beads database found" if bd init hasn't run
+```
 
 ## Comment policy
 
