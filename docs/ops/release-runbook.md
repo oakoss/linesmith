@@ -91,6 +91,9 @@ method). On merge, `knope-release.yml` fires and:
    package as `<crate>/v<version>` (e.g. `linesmith/v0.3.0`,
    `linesmith-core/v0.3.0`). Creates a GitHub Release per tag with
    CHANGELOG-derived notes.
+
+Those tag pushes then fire a **second** `knope-release.yml` run:
+
 2. **`publish` job** — mints a crates.io OIDC token via
    `rust-lang/crates-io-auth-action`, installs `cargo-release`, runs
    `cargo release publish --workspace --execute --no-confirm`.
@@ -101,8 +104,24 @@ method). On merge, `knope-release.yml` fires and:
    where only one crate bumped — bare `cargo publish --workspace`
    would error on the unchanged siblings.
 
-The `linesmith/v<version>` tag push (from step 1) is what triggers
-`release.yml` (cargo-dist).
+Publish runs in its own tag-triggered run rather than alongside the
+`release` job because crates.io rejects OIDC token requests from
+`pull_request_target`. A multi-package release pushes several tags and
+so starts several publish runs; the dedicated `knope-publish`
+concurrency group holds one running plus one pending and evicts anything
+queued in between, which is safe because each run publishes the whole
+workspace.
+
+**Expect one run per bumped crate's tag, plus the merge run** — so two
+for a single-package cycle, four for a full three-crate release. Of
+those three tag runs, expect one **cancelled** (evicted from the
+concurrency queue, not a failure) and two green — the first publishes
+everything and the second no-ops, because `cargo-release` skips
+already-published members. If you only see the merge run, publish never
+fired; recover with `gh workflow run "Knope Release" -f mode=publish`.
+
+The `linesmith/v<version>` tag push (from step 1) also triggers
+`release.yml` (cargo-dist), independently of the publish run.
 
 ### 4. Watch the cargo-dist workflow
 

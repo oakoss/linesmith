@@ -7,11 +7,22 @@ name: Knope Release
 # could read tag state BEFORE knope-release had created the new tag, then
 # re-claim already-released commits into a phantom follow-on release PR.
 #
-# Combined shape: one `pull_request_target: closed` trigger, three
-# mutually-exclusive jobs that switch on the merged PR's head ref. No
-# race possible — only one path runs per merge. `workflow_dispatch`
-# provides operator escape hatches for recovery and the edge case where
-# a commit lands on main without going through a PR.
+# Combined shape: a `pull_request_target: closed` trigger driving
+# prepare + release, mutually-exclusive on the merged PR's head ref, and
+# a `push: tags` trigger driving publish. Only one path runs per merge.
+# `workflow_dispatch` provides operator escape hatches for recovery and
+# the edge case where a commit lands on main without going through a PR;
+# a `mode=release` dispatch is the one case where release and publish
+# both run, and its tags then fire further publish runs on top.
+#
+# Publish is split onto the tag trigger because crates.io refuses to
+# exchange the OIDC token for a publish token on `pull_request_target`
+# and `workflow_run` — rust-lang/crates.io#12219, 2025-10-29. (GitHub
+# still mints the JWT; the 400 comes back from crates.io, which is where
+# to look when this breaks.) Those two are the whole denylist, not an
+# allowlist of three: both are triggerable from forks while running in
+# the target repo's security context. Full rationale lives in
+# docs/specs/release-process.md §Crates.io publishing.
 
 # `pull_request_target` (not `pull_request`) so the workflow can mint
 # the bot's GitHub App token on merged fork PRs. `pull_request` strips
@@ -24,6 +35,18 @@ on:
   pull_request_target:
     types: [closed]
     branches: [main]
+  # Knope's per-package tag format (`<crate>/v<ver>`). `*` doesn't cross
+  # `/`, so this matches exactly one package segment.
+  #
+  # No trailing `*`, unlike `release.yml`'s `linesmith/v…*`: that one
+  # keeps it so cargo-dist builds prereleases, but a crates.io publish
+  # is irreversible and the runbook's hand-cut RC tags are documented as
+  # not publishing (release-runbook.md §Pre-release, release-process.md
+  # §Pre-release). Knope emits only plain `<pkg>/vX.Y.Z`, so matching
+  # exact versions loses nothing.
+  push:
+    tags:
+      - '*/v[0-9]+.[0-9]+.[0-9]+'
   workflow_dispatch:
     inputs:
       mode:
@@ -65,7 +88,7 @@ jobs:
     permissions:
       contents: write # push the release branch
       pull-requests: write # open and update the release PR
-    # Shares the `knope-release` group with the release + publish jobs.
+    # Shares the `knope-release` group with the release job.
     # If a fix/feat PR merges while a release PR's release job is
     # mid-tagging, the prepare job for the fix PR queues behind the
     # release-job's tag creation — without the shared lock, prepare
@@ -237,27 +260,31 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
         run: knope release --verbose
 
-  # crates.io publish runs only after Knope has tagged (or when an
-  # operator dispatches mode=publish to recover from a partial-publish
-  # failure where tags already exist). cargo's leaf-first publish order
-  # (since 1.90) sequences linesmith-plugin → linesmith-core → linesmith
-  # automatically; ADR-0019's "linesmith-core as scaffolding" posture
-  # depends on this.
+  # crates.io publish runs off the tags Knope created, or on a
+  # `mode=release` / `mode=publish` dispatch — the latter recovering a
+  # partial run where tags already exist. cargo's leaf-first publish
+  # order (since 1.90) sequences linesmith-plugin → linesmith-core →
+  # linesmith automatically; ADR-0019's "linesmith-core as scaffolding"
+  # posture depends on this.
   publish:
     name: Publish to crates.io
     needs: [release]
-    # `always() && (success || skipped)` keeps publish running on a
-    # `mode=publish` dispatch (publish-only recovery, where release is
-    # deliberately skipped) while still blocking on a genuine `release`
-    # job failure — never publish to crates.io after Knope crashed
-    # mid-tag.
+    # The `needs.release` clause does its real work only on a
+    # `mode=release` dispatch, where it blocks publishing after Knope
+    # crashed mid-tag. On `push` and on a `mode=publish` recovery
+    # dispatch `release` is always skipped, so the clause is satisfied
+    # trivially — it is not a safety property of those paths. If
+    # `release` is ever made runnable on `push`, revisit this: as
+    # written it would degrade to "publish regardless".
+    # `!cancelled()` rather than `always()`: cancellation is load-bearing
+    # here. The `knope-publish` group's safety story is that evicted runs
+    # get cancelled, and cancelling a tag-triggered run is the only kill
+    # switch for an in-flight crates.io push, which is irreversible.
+    # `always()` would run through both.
     if: |
-      always() &&
+      !cancelled() &&
       (needs.release.result == 'success' || needs.release.result == 'skipped') &&
-      ((github.event_name == 'pull_request_target' &&
-        github.event.pull_request.merged == true &&
-        github.event.pull_request.head.ref == 'release' &&
-        github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'push' ||
        (github.event_name == 'workflow_dispatch' &&
         (inputs.mode == 'release' || inputs.mode == 'publish')))
     runs-on: ubuntu-latest
@@ -269,14 +296,26 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    # Shares the `knope-release` group with the `release` job so a
-    # `mode=publish` recovery dispatch fired mid-PR-merge can't run
-    # `cargo release publish --workspace` against partially-tagged
-    # state. Skipped jobs (publish's `if:` false on prepare-mode
-    # dispatches, release's `if:` false on publish-mode dispatches)
-    # don't acquire the group lock, so the normal flows aren't slowed.
+    # Deliberately NOT the `knope-release` group that prepare + release
+    # share. Under the default `queue`, a group holds one running plus
+    # one pending — "By default, any existing pending job or workflow in
+    # the same concurrency group will be canceled and the new queued job
+    # or workflow will take its place". Eviction is governed by `queue`,
+    # not by `cancel-in-progress`, which only additionally cancels
+    # running jobs. On a shared group, a `prepare` run from an unrelated
+    # PR merge landing while publish sits pending would evict it, and the
+    # release would silently never reach crates.io: exactly the failure
+    # this trigger split exists to fix.
+    #
+    # A dedicated group still serialises publish against publish (two
+    # concurrent `cargo release publish --workspace` runs would race on
+    # the same versions), and every run in it is a publish run, so
+    # whichever survives eviction does the work. That last part holds
+    # only because Knope bumps every package in one release commit, so
+    # all of a cycle's tags point at the same SHA and any one of them
+    # checks out the full set of new versions.
     concurrency:
-      group: knope-release
+      group: knope-publish
       cancel-in-progress: false
     steps:
       - name: Harden Runner
@@ -286,9 +325,8 @@ jobs:
 
       # Dispatch-ref guard runs before the expensive setup steps below
       # so a `gh workflow run --ref <branch>` mistake fails fast instead
-      # of burning a runner on checkout + cargo-install. The
-      # `pull_request_target: closed` path is gated separately by
-      # `head.ref == 'release'` in the job-level `if:`.
+      # of burning a runner on checkout + cargo-install. The `push` path
+      # has its own provenance guard after checkout.
       - name: Reject non-main dispatch
         if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
         run: |
@@ -298,11 +336,45 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          # See prepare job's checkout for the rationale: pin to the
-          # PR's merge commit on `pull_request_target` events,
-          # falling back to `main` for `workflow_dispatch`.
-          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.merge_commit_sha || 'main' }}
+          # Publish the exact tagged commit on `push`; `main` on
+          # dispatch. Reading `main` on a tag event would publish
+          # whatever landed since the tag rather than the reviewed
+          # release state. The dispatch branch does read `main` and so
+          # carries exactly that risk: if main has moved past the
+          # release, a `mode=publish` recovery finds every version
+          # already published and exits green having published nothing.
+          # Accepted for now as operator-driven; lsm-7ihh tracks giving
+          # dispatch a tag input.
+          ref: ${{ github.event_name == 'push' && github.ref || 'main' }}
+          # Ancestry check below needs history on both sides.
+          fetch-depth: 0
           persist-credentials: false
+
+      # The old `pull_request_target` gate required a merged `release`
+      # PR, so only commits that reached main could publish. A tag
+      # trigger alone is weaker — any tag matching the filter would do,
+      # including one pointing at an unreviewed commit. Re-establish the
+      # property explicitly rather than relying on tag-push permissions.
+      - name: Verify tag is an ancestor of main
+        if: github.event_name == 'push'
+        # `shell: bash` adds `-o pipefail`; the default `bash -e {0}` doesn't.
+        shell: bash
+        run: |
+          # Compare against FETCH_HEAD, not `origin/main`: a bare
+          # `git fetch origin main` always writes FETCH_HEAD, but only
+          # updates the remote-tracking ref when the remote's configured
+          # refspec covers it, so `origin/main` can be stale here.
+          git fetch --quiet origin main
+          tag_sha="$(git rev-parse HEAD)"
+          main_sha="$(git rev-parse FETCH_HEAD)"
+          # Log both sides so a future failure is diagnosable from the
+          # run alone, without re-resolving refs that may have moved.
+          echo "tag ${{ github.ref }} -> ${tag_sha}"
+          echo "origin/main          -> ${main_sha}"
+          if ! git merge-base --is-ancestor "$tag_sha" "$main_sha"; then
+            echo "::error::${{ github.ref }} points at a commit that is not on main; refusing to publish" >&2
+            exit 1
+          fi
 
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
@@ -317,8 +389,9 @@ jobs:
       # and publishes the rest leaf-first (same pattern as Knope's own
       # publish_crates.yml). Version is pinned so a future upstream
       # behavior change in the skip path surfaces in PR review rather
-      # than breaking partial-publish recovery silently. Renovate keeps
-      # the pin current.
+      # than breaking partial-publish recovery silently. Bump it by hand:
+      # nothing updates it automatically, since Renovate's managers read
+      # `uses:`, never `run:` bodies.
       - name: Install cargo-release
         run: cargo install cargo-release --version 1.1.2 --locked
 
@@ -331,12 +404,11 @@ jobs:
         run: cargo metadata --locked --format-version 1 > /dev/null
 
       # `--allow-branch 'main,HEAD'`: both entries are load-bearing.
-      # `actions/checkout` with `ref: <SHA>` (the `pull_request_target`
-      # path of the ternary above — `merge_commit_sha` is a SHA, not a
-      # ref name) detaches HEAD, and cargo-release 1.1.2 reads that as
-      # branch `HEAD`. The `workflow_dispatch` path passes the literal
-      # `'main'` ref name, so the checkout lands on the `main` branch.
-      # Allowing both keeps cargo-release happy on either trigger.
+      # The `push` path checks out `refs/tags/<pkg>/v<ver>`, which
+      # detaches HEAD, and cargo-release 1.1.2 reads that as branch
+      # `HEAD`. The `workflow_dispatch` path passes the literal `'main'`
+      # ref name, so the checkout lands on the `main` branch. Dropping
+      # `HEAD` would break every tag-triggered publish.
       - name: Publish bumped crates to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
