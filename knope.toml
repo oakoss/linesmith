@@ -49,14 +49,10 @@ scopes = [
 owner = "oakoss"
 repo = "linesmith"
 
-# Two knope workflows per the preview-release-PR recipe:
-# `prepare-release` stages bumps + CHANGELOG entries; `publish-release-pr`
-# commits/pushes/opens the PR. They run back-to-back in the `prepare` job
-# of `.github/workflows/knope-release.yml` with a `git diff --quiet` gate
-# between them — no-op merges land green instead of erroring with "no
-# commits between main and release". All three GitHub Actions jobs
-# (prepare + release + publish) live in knope-release.yml so the prepare
-# and release paths can't race on the same merge event.
+# `prepare-release` stages bumps into the working tree;
+# `peter-evans/create-pull-request` in knope-release.yml commits and
+# opens the PR (signed — see that file). All three GitHub Actions jobs
+# live in knope-release.yml so prepare and release can't race.
 
 [[workflows]]
 name = "prepare-release"
@@ -64,34 +60,6 @@ name = "prepare-release"
 [[workflows.steps]]
 type = "PrepareRelease"
 allow_empty = true
-
-[[workflows]]
-name = "publish-release-pr"
-
-[[workflows.steps]]
-type = "Command"
-command = "git switch -c release"
-
-[[workflows.steps]]
-type = "Command"
-command = "git commit -m \"chore: prepare release\""
-
-[[workflows.steps]]
-type = "Command"
-command = "git push --force --set-upstream origin release"
-
-[[workflows.steps]]
-type = "CreatePullRequest"
-base = "main"
-
-# `$version` / `$changelog` template variables are rejected in
-# multi-package mode (Knope errors with `variables::too_many_packages`),
-# so the templates stay static — reviewers read the PR diff for shape.
-[workflows.steps.title]
-template = "chore: prepare release"
-
-[workflows.steps.body]
-template = "Automated release PR by Knope. Merging tags each bumped package and triggers cargo-dist's binary build for `linesmith`. Review the per-package CHANGELOG entries in the diff to confirm the bump shape is correct."
 
 [[workflows]]
 name = "release"

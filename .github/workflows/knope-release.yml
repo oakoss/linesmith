@@ -86,7 +86,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: write # push the release branch
+      contents: write # create the release branch's blobs/trees/commit via the API
       pull-requests: write # open and update the release PR
     # Shares the `knope-release` group with the release job.
     # If a fix/feat PR merges while a release PR's release job is
@@ -137,11 +137,6 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.app-token.outputs.token }}
 
-      - name: Configure Git
-        run: |
-          git config user.name "linesmith-bot[bot]"
-          git config user.email "linesmith-bot[bot]@users.noreply.github.com"
-
       - name: Install Knope
         uses: knope-dev/action@19617851f9f13ab2f27a05989c55efb18aca3675 # v2.1.2
         with:
@@ -166,25 +161,60 @@ jobs:
             exit 1
           fi
 
-      # Two-step invocation mirrors knope.toml's workflow split:
-      # `prepare-release` stages bumps with `allow_empty = true`, then a
-      # `git diff --quiet` gate decides whether `publish-release-pr` runs.
-      # No-op pushes land as green runs without a spurious PR; real Knope
-      # errors still fail the job loudly.
+      # `PrepareRelease` has no commit step, so the version bumps,
+      # CHANGELOG entries, and consumed changeset deletions land in the
+      # working tree uncommitted; the action below turns them into the
+      # PR. Separately, `allow_empty = true` stops Knope erroring when
+      # nothing is releasable, which is what keeps every non-release
+      # merge green — the two are unrelated, don't fold them together.
       - name: Run knope prepare-release
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
         run: knope prepare-release --verbose
 
-      - name: Publish release PR (skip on no-op)
-        env:
-          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+      # Knope's own publish step could only commit through shell `git`,
+      # and git-pushed commits are unsigned whatever the token — which
+      # `required_signatures` on main then blocks, leaving the release PR
+      # mergeable only by bypassing the rule (lsm-g5xz). This action
+      # commits through the GitHub API so the commit is signed as the
+      # bot, and builds real tree objects, so file modes and deletions
+      # survive (the `createCommitOnBranch` mutation has no mode field).
+      # It is idempotent: it updates the existing `release` PR as further
+      # changes accumulate, and exits silently when there is nothing to
+      # release, which is what the old `git diff --quiet` gate did.
+      - name: Open or update the release PR
+        id: release-pr
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          sign-commits: true
+          branch: release
+          base: main
+          commit-message: 'chore: prepare release'
+          title: 'chore: prepare release'
+          body: |
+            Automated release PR. Merging tags each bumped package and triggers cargo-dist's binary build for `linesmith`. Review the per-package CHANGELOG entries in the diff to confirm the bump shape is correct.
+
+      # Signing is the entire point of using the action, and it is the
+      # kind of thing that fails quietly: an unsigned release PR looks
+      # normal until the merge button is red. Assert it instead.
+      #
+      # Gate on the operation, not on `pull-request-number` or on the
+      # verified output being non-empty. When a run leaves the branch
+      # untouched (an open release PR, nothing new to bump — any docs or
+      # ci merge), the action still reports a PR number and falls back to
+      # reading `%G?` off the *local* commit. Under `sign-commits` that
+      # commit is never GPG-signed, since the signature exists only on
+      # the API-created object, so the output reads `false` and this step
+      # would call a perfectly good release PR unmergeable.
+      - name: Verify the release commit is signed
+        if: contains(fromJSON('["created","updated"]'), steps.release-pr.outputs.pull-request-operation)
         run: |
-          if git diff --quiet HEAD; then
-            echo "PrepareRelease found no releasable changes; skipping PR publish."
-            exit 0
+          if [ "${{ steps.release-pr.outputs.pull-request-commits-verified }}" != "true" ]; then
+            echo "::error::release PR #${{ steps.release-pr.outputs.pull-request-number }} has unverified commits; it will not be mergeable without bypassing required_signatures" >&2
+            exit 1
           fi
-          knope publish-release-pr --verbose
+          echo "release PR #${{ steps.release-pr.outputs.pull-request-number }} commits verified"
 
   # `knope release` tags each bumped package and creates per-package
   # GitHub Releases. The `linesmith/v*` tag push triggers cargo-dist's
