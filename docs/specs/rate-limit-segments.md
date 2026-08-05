@@ -10,7 +10,7 @@
 
 Rate-limit visibility is the single most-requested feature across the Claude Code statusline community (44+ reactions on anthropics/claude-code#8412). This spec defines the six user-facing segments that surface rate-limit data sourced by [ADR-0011](../adrs/0011-rate-limit-data-source.md): the 5-hour rolling window, the 7-day rolling window, their reset timers, `extra_usage` credit tracking, and the model-scoped weekly bucket.
 
-The spec translates the ADR's data contract (`UsageData` struct, fallback cascade, error taxonomy) into concrete segment IDs, config schemas, render formats, and error-display rules. The model-scoped weekly bucket is covered here as `rate_limit_7d_model`; tier-aware behavior is deferred to a follow-up spec.
+The spec translates the ADR's data contract (the `UsageData` enum, fallback cascade, error taxonomy) into concrete segment IDs, config schemas, render formats, and error-display rules. The model-scoped weekly bucket is covered here as `rate_limit_7d_model`; tier-aware behavior is deferred to a follow-up spec.
 
 This spec does NOT cover: how `UsageData` is fetched ([data-fetching.md](data-fetching.md)), where OAuth credentials come from ([credentials.md](credentials.md)), or the general segment plugin contract ([segment-system.md](segment-system.md)).
 

@@ -335,7 +335,12 @@ a struct change, which is the intended cost.
 
 `limits` appears on all three of `UsageApiResponse`, `EndpointUsage`, and
 `CachedData`; only the first is deserialized from the wire, so that is where the
-tolerant deserializer lives. It reads `serde_json::Value` first, yields `None`
+tolerant deserializer lives, as
+`#[serde(default, deserialize_with = "deserialize_limits")]`. Both halves are
+required: `deserialize_with` does not imply `default`, so without it an omitted
+`limits` key fails the whole response with "missing field" before any per-item
+tolerance runs — the exact failure the tolerant deserializer exists to prevent,
+triggered by the most ordinary case there is. It reads `serde_json::Value` first, yields `None`
 when that value is not an array, and otherwise deserializes each element
 independently — warning and dropping the ones that fail. A single malformed entry
 must not fail the response and drop the whole endpoint to the JSONL fallback.
