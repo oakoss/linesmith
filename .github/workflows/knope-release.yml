@@ -54,6 +54,11 @@ on:
         type: choice
         options: [prepare, release, publish]
         default: release
+      tag:
+        description: 'Tag to publish, e.g. linesmith/v0.3.0. Required for mode=publish; rejected with mode=release.'
+        type: string
+        required: false
+        default: ''
 
 # Zero default permissions; each job declares the minimum it needs.
 permissions: {}
@@ -356,16 +361,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          # Plain `main`, not the PR's `merge_commit_sha` that prepare and
-          # release pin to. Those two need the exact SHA so Knope can't
-          # walk commits from a PR that merged in between; this job only
-          # reads version strings, and nothing but a release PR changes
-          # them, so `main` is equivalent in practice. It also keeps a
+          # Mirrors what `publish` checked out, so this job verifies the
+          # release that ran rather than whatever main happens to hold. On
+          # a `mode=publish` recovery those differ: publish targets the
+          # operator's tag while main may already carry a newer release,
+          # and reading main would either go green having asserted nothing
+          # about the recovery or fail red naming versions it never
+          # touched.
+          #
+          # On every other path this resolves to plain `main`, not the
+          # PR's `merge_commit_sha` that prepare and release pin to. Those
+          # two need the exact SHA so Knope can't walk commits from a PR
+          # that merged in between; this job only reads version strings,
+          # and nothing but a release PR changes them. It also keeps a
           # `pull_request_target` job from checking out a PR-derived ref
           # and then running cargo over it — CodeQL's untrusted-checkout
           # rule, and a fair objection even though the job's `if:` already
-          # restricts it to our own `release` branch.
-          ref: main
+          # restricts it to our own `release` branch. The tag arm is
+          # dispatch-only and `cargo metadata --no-deps` runs no build
+          # scripts, so that rule is not in play there.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'publish' && format('refs/tags/{0}', inputs.tag) || 'main' }}
           persist-credentials: false
 
       - name: Setup Rust
@@ -515,7 +530,7 @@ jobs:
               if [ "$transient" -eq 1 ]; then
                 echo "::error::gave up waiting on crates.io for: ${missing[*]}. At least one probe failed at the transport level, so this may be a registry or network outage rather than a publish failure — confirm against the index before running any recovery." >&2
               else
-                echo "::error::crates.io is still missing: ${missing[*]}. The tags and GitHub Release exist, so this release is half-shipped — check the publish run, then recover with: gh workflow run \"Knope Release\" -f mode=publish" >&2
+                echo "::error::crates.io is still missing: ${missing[*]}. The tags and GitHub Release exist, so this release is half-shipped — check the publish run, then recover with: gh workflow run \"Knope Release\" -f mode=publish -f tag=<crate>/v<version> (the tag input is required; recovery publishes that tag's commit, not main)" >&2
               fi
               exit 1
             fi
@@ -573,11 +588,15 @@ jobs:
     #
     # A dedicated group still serialises publish against publish (two
     # concurrent `cargo release publish --workspace` runs would race on
-    # the same versions), and every run in it is a publish run, so
-    # whichever survives eviction does the work. That last part holds
-    # only because Knope bumps every package in one release commit, so
-    # all of a cycle's tags point at the same SHA and any one of them
-    # checks out the full set of new versions.
+    # the same versions). "Whichever survives eviction does the work"
+    # used to follow from every run in the group publishing the same
+    # SHA — Knope bumps every package in one release commit, so all of a
+    # cycle's tags point at it. The `tag` input breaks that premise: a
+    # recovery dispatch is a run in this group pinned to an arbitrary
+    # commit, so it can evict a pending tag-push publish for the current
+    # release and then publish something older. `lsm-rurz` tracks the
+    # effect assertion that turns the surviving run red; until it lands,
+    # avoid dispatching a recovery while a release is in flight.
     concurrency:
       group: knope-publish
       cancel-in-progress: false
@@ -597,19 +616,84 @@ jobs:
           echo "::error::knope-release.yml dispatch must target refs/heads/main; got ${{ github.ref }}" >&2
           exit 1
 
+      # One step decides what this run publishes; the checkout and the
+      # ancestry guard both read its output. The bug this fixes came from
+      # the ref decision living in an inline expression while the guard
+      # that validated it carried a separate condition — they drifted, and
+      # the dispatch path ended up checked out from `main` with no guard
+      # running at all. Resolving once removes the class.
+      #
+      # Every arm is explicit and the fallthrough denies: a `mode` added
+      # to the dispatch surface later fails here instead of silently
+      # inheriting `main`.
+      - name: Resolve publish ref
+        id: publish-ref
+        env:
+          EVENT: ${{ github.event_name }}
+          PUSHED_REF: ${{ github.ref }}
+          MODE: ${{ inputs.mode }}
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          case "$EVENT" in
+            push)
+              resolved="$PUSHED_REF"
+              ;;
+            workflow_dispatch)
+              case "$MODE" in
+                publish)
+                  # Recovery has to name the tag it is recovering.
+                  # Falling back to `main` is what made this path
+                  # dangerous: if main moved past the release, `cargo
+                  # release publish` finds every version already
+                  # published and exits 0 — green having published
+                  # nothing, on the exact dispatch an operator reaches
+                  # for *because* crates.io looked stale.
+                  if [ -z "$TAG" ]; then
+                    echo "::error::mode=publish requires the tag input (e.g. linesmith/v0.3.0). Refusing to publish whatever main currently points at." >&2
+                    exit 1
+                  fi
+                  # Same shape the push trigger's glob accepts. That glob
+                  # deliberately omits a trailing `*` so hand-cut RC tags
+                  # cannot drive an irreversible publish; without this
+                  # check the dispatch input would be a way around it.
+                  if ! printf '%s' "$TAG" | grep -Eq '^[^/]+/v[0-9]+\.[0-9]+\.[0-9]+$'; then
+                    echo "::error::tag must be <crate>/vX.Y.Z, matching the push trigger's glob; got '${TAG}'. Prerelease tags deliberately do not publish." >&2
+                    exit 1
+                  fi
+                  resolved="refs/tags/${TAG}"
+                  ;;
+                release)
+                  # `mode=release` rejects a tag rather than ignoring
+                  # one: it mints its tags from main in this same run, so
+                  # honouring an operator's tag would publish a different
+                  # commit than the one it tagged, and ignoring it
+                  # silently would leave them believing they had
+                  # recovered a specific release.
+                  if [ -n "$TAG" ]; then
+                    echo "::error::the tag input is only valid with mode=publish; got mode=${MODE} tag=${TAG}. Re-run with mode=publish to recover that tag." >&2
+                    exit 1
+                  fi
+                  resolved="main"
+                  ;;
+                *)
+                  echo "::error::publish reached with unsupported mode '${MODE}'; refusing to guess a ref" >&2
+                  exit 1
+                  ;;
+              esac
+              ;;
+            *)
+              echo "::error::publish reached on unsupported event '${EVENT}'; refusing to guess a ref" >&2
+              exit 1
+              ;;
+          esac
+          echo "ref=${resolved}" >>"$GITHUB_OUTPUT"
+          echo "publishing from ${resolved}"
+
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          # Publish the exact tagged commit on `push`; `main` on
-          # dispatch. Reading `main` on a tag event would publish
-          # whatever landed since the tag rather than the reviewed
-          # release state. The dispatch branch does read `main` and so
-          # carries exactly that risk: if main has moved past the
-          # release, a `mode=publish` recovery finds every version
-          # already published and exits green having published nothing.
-          # Accepted for now as operator-driven; lsm-7ihh tracks giving
-          # dispatch a tag input.
-          ref: ${{ github.event_name == 'push' && github.ref || 'main' }}
+          ref: ${{ steps.publish-ref.outputs.ref }}
           # Ancestry check below needs history on both sides.
           fetch-depth: 0
           persist-credentials: false
@@ -619,8 +703,14 @@ jobs:
       # trigger alone is weaker — any tag matching the filter would do,
       # including one pointing at an unreviewed commit. Re-establish the
       # property explicitly rather than relying on tag-push permissions.
-      - name: Verify tag is an ancestor of main
-        if: github.event_name == 'push'
+      # Runs on every publish path, including the recovery dispatch that
+      # previously had no provenance check at all. Deliberately carries
+      # no `if:`: it is vacuous when the ref is `main`, and a guard that
+      # opts out of running is a guard whose condition has to be kept in
+      # sync with the checkout by hand.
+      - name: Verify publish ref is an ancestor of main
+        env:
+          PUBLISH_REF: ${{ steps.publish-ref.outputs.ref }}
         # `shell: bash` adds `-o pipefail`; the default `bash -e {0}` doesn't.
         shell: bash
         run: |
@@ -633,10 +723,10 @@ jobs:
           main_sha="$(git rev-parse FETCH_HEAD)"
           # Log both sides so a future failure is diagnosable from the
           # run alone, without re-resolving refs that may have moved.
-          echo "tag ${{ github.ref }} -> ${tag_sha}"
+          echo "tag ${PUBLISH_REF} -> ${tag_sha}"
           echo "origin/main          -> ${main_sha}"
           if ! git merge-base --is-ancestor "$tag_sha" "$main_sha"; then
-            echo "::error::${{ github.ref }} points at a commit that is not on main; refusing to publish" >&2
+            echo "::error::${PUBLISH_REF} points at a commit that is not on main; refusing to publish" >&2
             exit 1
           fi
 
@@ -668,11 +758,12 @@ jobs:
         run: cargo metadata --locked --format-version 1 > /dev/null
 
       # `--allow-branch 'main,HEAD'`: both entries are load-bearing.
-      # The `push` path checks out `refs/tags/<pkg>/v<ver>`, which
-      # detaches HEAD, and cargo-release 1.1.2 reads that as branch
-      # `HEAD`. The `workflow_dispatch` path passes the literal `'main'`
-      # ref name, so the checkout lands on the `main` branch. Dropping
-      # `HEAD` would break every tag-triggered publish.
+      # The `push` path and a `mode=publish` recovery both check out a
+      # `refs/tags/<pkg>/v<ver>` ref, which detaches HEAD, and
+      # cargo-release 1.1.2 reads that as branch `HEAD`. Only a
+      # `mode=release` dispatch resolves to the literal `'main'` and
+      # lands on the branch. Dropping `HEAD` would break every
+      # tag-triggered publish.
       - name: Publish bumped crates to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

@@ -118,7 +118,10 @@ those three tag runs, expect one **cancelled** (evicted from the
 concurrency queue, not a failure) and two green — the first publishes
 everything and the second no-ops, because `cargo-release` skips
 already-published members. If you only see the merge run, publish never
-fired; recover with `gh workflow run "Knope Release" -f mode=publish`.
+fired; recover with `gh workflow run "Knope Release" -f mode=publish -f
+tag=<crate>/v<version>`. The `tag` input is required — recovery publishes
+that tag's commit, and without it the run would read `main`, which after
+any later merge means publishing something the release never contained.
 
 The `linesmith/v<version>` tag push (from step 1) also triggers
 `release.yml` (cargo-dist), independently of the publish run.
