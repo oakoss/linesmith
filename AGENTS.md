@@ -185,23 +185,19 @@ gh pr create --title "feat(scope): subject" --body "$(cat <<'EOF'
 EOF
 )"
 
-# Wait for CI, then confirm Copilot has posted before merging:
-gh pr checks --watch               # blocks until CI Summary completes; does NOT wait for Copilot
+# CodeRabbit posts a commit status as well as a PR review; `--watch`
+# blocks on that status alongside CI.
+gh pr checks --watch
 
-# Copilot review is async — poll up to 10m, or open the PR in a browser
-# to confirm visually. No GNU `timeout` dependency; exits 1 on timeout.
-deadline=$(($(date +%s) + 600))
-until gh pr view --json reviews \
-    -q '.reviews[] | select(.author.login | test("copilot"; "i"))' \
-    | grep -q .; do
-  (($(date +%s) < deadline)) || {
-    echo "Copilot review not detected within 10m; open the PR page to check before merging" >&2
-    exit 1
-  }
-  sleep 15
-done
+# `--watch` only waits on checks present when it starts, and CodeRabbit's
+# status lands ~20s after the push, so absence must fail rather than read
+# as approval. `jq -e` exits 1 when the status is missing or not yet
+# green. A green status can still mean "review skipped" — read the
+# findings below before trusting it.
+gh pr checks --json name,state |
+  jq -e 'any(.[]; .name == "CodeRabbit" and .state == "SUCCESS")'
 
-gh pr view --comments              # read Copilot's review notes
+gh pr view --comments              # read CodeRabbit's findings
 gh pr merge --squash               # remote branch auto-deletes (delete_branch_on_merge=true); local cleanup below
 ```
 
@@ -219,7 +215,9 @@ git branch -D worktree-lsm-xyz
 
 The PR path honors the repo's branch protection (`Changes must be made through a pull request`) and required `CI Summary` check — pushing straight to main bypasses both. Squash collapses any review-cycle iter-commits into one clean main commit; the squash commit body is built from concatenated commit messages (`squash_merge_commit_message: COMMIT_MESSAGES`), so the `lsm-xyz` footer in your worktree commit lands in the squash commit naturally — no PR-body workaround needed.
 
-**Don't pass `--auto` to `gh pr merge`** while the org ruleset has `copilot_code_review` enabled: Copilot review is a non-blocking _request_, not a required status check, so `--auto` will fire as soon as CI passes and may land before Copilot has posted its review. Manual merge after `gh pr view --comments` confirms both signals are in.
+**AI review on PRs is CodeRabbit.** It reviews automatically on PR open and on each push, reads this file as review guidance, and reports a `CodeRabbit` commit status alongside the CI checks. `@coderabbitai review` re-runs it on demand. Local pre-push review (`/review-cycle:review`, `/code-review`) is separate and still the first line — CodeRabbit is the backstop for what reaches a PR unreviewed.
+
+**Don't pass `--auto` to `gh pr merge`.** Native auto-merge waits only on _required_ status checks, and the repo requires just `CI Summary`. CodeRabbit's status isn't required, so `--auto` can land a PR while the review is still queued. `gh pr checks --watch` blocks on every reported check including that status, which is why the manual sequence above waits on it and then merges.
 
 If main moves while CI is running, the `strict_required_status_checks_policy` blocks merge until the PR branch is updated; run `gh pr update-branch` to refresh.
 
@@ -240,10 +238,10 @@ Spawned agents with `isolation: worktree` can drift onto main-repo files. Audit 
 ### Anti-patterns
 
 - **Kitchen-sink session.** One worktree, one bead, one PR. Reusing a worktree for unrelated tasks pollutes context and risks the cleanup step nuking work for the wrong reason. `/clear` and a fresh `EnterWorktree` for the next bead.
-- **`--auto` merge while Copilot review is enabled.** Copilot is a non-blocking review request — `gh pr merge --auto` will land the PR before Copilot has posted. Use manual `gh pr merge --squash` after reading `gh pr view --comments`.
+- **`--auto` merge while an AI reviewer is non-required.** `gh pr merge --auto` waits only on required checks, so it can land a PR before CodeRabbit's review posts. Use `gh pr checks --watch`, then a manual `gh pr merge --squash`.
 - **Trusting subagent `isolation: worktree` alone.** It's been observed to be silently ignored; combine with session-level `bgIsolation` and `git status` audits.
 - **Pre-commit / lefthook hooks that assume single working dir.** Hooks that write to `./tmp`, hardcode paths, or share lock files collide across worktrees. Audit `lefthook.yml` when adding hooks.
-- **Auto-merging external contributor PRs based on AI review alone.** Spoofed git identity has fooled AI reviewers into approving malicious PRs (manifold.security). Keep human approval for contributor PRs even if Copilot signs off; `--auto` is only safe on your own branches.
+- **Auto-merging external contributor PRs based on AI review alone.** Spoofed git identity has fooled AI reviewers into approving malicious PRs (manifold.security). Keep human approval for contributor PRs even if CodeRabbit signs off; `--auto` is only safe on your own branches.
 
 ## Rules
 
