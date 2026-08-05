@@ -92,7 +92,7 @@ method). On merge, `knope-release.yml` fires and:
    `linesmith-core/v0.3.0`). Creates a GitHub Release per tag with
    CHANGELOG-derived notes.
 
-Those tag pushes then fire a **second** `knope-release.yml` run:
+Each of those tag pushes then fires its own `knope-release.yml` run:
 
 2. **`publish` job** — mints a crates.io OIDC token via
    `rust-lang/crates-io-auth-action`, installs `cargo-release`, runs

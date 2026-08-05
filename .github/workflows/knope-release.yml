@@ -377,6 +377,12 @@ jobs:
       - name: Wait for crates.io to serve every released version
         shell: bash
         run: |
+          # `shell: bash` supplies -eo pipefail but not -u. This job
+          # passes when every bucket is empty, so an unset or misspelled
+          # array name would expand to nothing and go green — the same
+          # shape as a missed release.
+          set -u
+
           # Its own statement so `set -e` catches a broken toolchain or
           # unparseable manifest directly. Folded into the mapfile,
           # process substitution swallows the status and the failure
@@ -388,6 +394,10 @@ jobs:
           # explicit crates-io entry belong here — a crate restricted to
           # another registry can never appear on this index and would
           # poll to the deadline before firing a spurious red.
+          # Declared before `mapfile` so `set -u` can't turn a zero-match
+          # read into an "unbound variable" abort, which would pre-empt
+          # the empty-set guard below and its diagnostic.
+          packages=()
           mapfile -t packages < <(
             jq -r '.packages[]
                    | select(.publish == null or (.publish | index("crates-io")))
@@ -408,6 +418,7 @@ jobs:
           deadline=$(( $(date +%s) + 20 * 60 ))
           while :; do
             missing=()
+            yanked=()
             transient=0
             for entry in "${packages[@]}"; do
               name="${entry%% *}"
@@ -425,21 +436,49 @@ jobs:
               # under "transient". Without `-f`, curl exits 0 on a 404
               # and the status carries the whole signal.
               #
-              # `|| true` keeps `set -e` out of it; `-w` prints 000 when
-              # the request doesn't complete, and the `:-000` covers curl
-              # failing to execute at all, where the substitution is
-              # empty rather than 000. curl's stderr stays visible in the
-              # run log for diagnosis.
-              http="$(curl -sS --max-time 30 -o "$body_file" -w '%{http_code}' "$url" || true)"
+              # curl only truncates the output file once a response starts
+              # arriving, so a request that never completes leaves the
+              # previous crate's body in place. This file is reused across
+              # crates and polls, and two workspace members can share a
+              # version, so a stale body reads as a plausible wrong
+              # answer. Truncate first.
+              : >"$body_file"
+              # `-w` prints 000 when the request doesn't complete; `:-000`
+              # covers curl failing to execute at all, where the
+              # substitution is empty rather than 000. The exit status is
+              # captured rather than discarded: a transfer can break
+              # mid-body after a 200 (curl 18, PARTIAL_FILE), leaving a
+              # truncated body that must not read as evidence. curl's
+              # stderr stays visible in the log for diagnosis.
+              curl_rc=0
+              http="$(curl -sS --max-time 30 -o "$body_file" -w '%{http_code}' "$url")" || curl_rc=$?
               http="${http:-000}"
               case "$http" in
                 200)
-                  # `yanked == false` too: the index keeps yanked
-                  # versions listed forever, so matching on `vers` alone
-                  # would call a release users cannot install a success.
-                  jq -e --arg v "$version" \
-                    'select(.vers == $v and .yanked == false)' >/dev/null <"$body_file" ||
+                  # The index keeps yanked versions listed forever, so an
+                  # exact `vers` match isn't proof the release installs.
+                  # Yanked gets its own bucket rather than folding into
+                  # missing: the two need opposite recoveries, and the
+                  # publish rerun offered below can't clear a yank.
+                  #
+                  # Both arms test `.yanked` against an explicit literal
+                  # so the fallthrough is red. `.yanked` truthiness or a
+                  # bare `vers` match would pass an entry whose `yanked`
+                  # is null, absent, or non-boolean — turning an
+                  # unreadable index into a green light for the one
+                  # check meant to catch a stale registry.
+                  if [ "$curl_rc" -ne 0 ]; then
+                    # 200 with a broken transfer: incomplete body, so
+                    # treat it as transient, not a failed publish.
+                    transient=1
+                    missing+=("${name} ${version} (truncated response, curl ${curl_rc})")
+                  elif jq -e --arg v "$version" \
+                      'select(.vers == $v and .yanked == true)' >/dev/null <"$body_file"; then
+                    yanked+=("${name} ${version}")
+                  elif ! jq -e --arg v "$version" \
+                      'select(.vers == $v and .yanked == false)' >/dev/null <"$body_file"; then
                     missing+=("${name} ${version}")
+                  fi
                   ;;
                 404)
                   missing+=("${name} ${version}")
@@ -453,6 +492,19 @@ jobs:
                   ;;
               esac
             done
+
+            # Fails immediately instead of polling: a yank is a
+            # deliberate act that no amount of waiting reverses.
+            if [ "${#yanked[@]}" -ne 0 ]; then
+              echo "::error::yanked on crates.io: ${yanked[*]}. These versions exist but cannot be installed, and republishing is not a recovery — crates.io rejects a version it already has. Either restore them with 'cargo yank --undo --version <version> <crate>', or cut a new release." >&2
+              # Report the other buckets before bailing, so a run with
+              # both a yank and an unpublished crate doesn't send the
+              # operator round the loop twice.
+              if [ "${#missing[@]}" -ne 0 ]; then
+                echo "::error::also not yet live on crates.io: ${missing[*]}" >&2
+              fi
+              exit 1
+            fi
 
             if [ "${#missing[@]}" -eq 0 ]; then
               echo "all released versions are live on crates.io"
