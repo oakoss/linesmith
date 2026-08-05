@@ -1,8 +1,8 @@
 # Input Schema
 
 - Status: draft
-- Version: 0.2
-- Last updated: 2026-04-17
+- Version: 0.3
+- Last updated: 2026-08-05
 - Driving ADRs: [ADR-0001](../adrs/0001-use-rust-for-runtime.md), [ADR-0003](../adrs/0003-segment-widget-system.md), [ADR-0008](../adrs/0008-canonical-type-refinements.md) (supersedes [ADR-0006](../adrs/0006-tool-agnostic-json-schema.md))
 
 ## Overview
@@ -126,6 +126,17 @@ impl Percent {
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
     pub display_name: String,   // e.g. "Claude Sonnet 4.6"
+
+    /// Model identifier, e.g. `claude-fable-5`, `claude-opus-5[1m]`,
+    /// `claude-3-5-sonnet-20241022`. Dash-delimited with the family as a
+    /// distinct token, which makes it the reliable key for family matching —
+    /// `display_name` is marketing text carrying version numbers and an
+    /// inconsistently-applied `(1M context)` suffix. The family's position
+    /// varies by generation, so consumers scan rather than index; see
+    /// [rate-limit-segments.md](rate-limit-segments.md) §`rate_limit_7d_model`.
+    /// Degrades to `None` on missing/null/non-string, matching the rest of
+    /// the parser.
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -457,3 +468,17 @@ For each fixture, assert the parsed `StatusContext` matches an `insta` snapshot,
 - 2026-04-17: initial draft (v0.1)
 - 2026-04-17: v0.2 incorporating [ADR-0008](../adrs/0008-canonical-type-refinements.md) refinements (Percent newtype, RateLimits enum collapse, Tool::Other(Cow), JsonType + optional SourcePos, Arc<Value> for raw, flattened VimState/AgentInfo)
 - 2026-04-21: removed `rate_limits` field, `RateLimits` enum, and `RateLimitWindow` struct. Rate-limit data is sourced via `ctx.usage()` (OAuth endpoint + JSONL fallback cascade); the stdin field is no longer parsed. Driven by lsm-7po; see [rate-limit-segments.md](rate-limit-segments.md).
+- 2026-08-05 (v0.3): add `ModelInfo.id`. The raw payload has always carried
+  `model.id`, but `parse_model` read only `display_name` and discarded it.
+  `rate_limit_7d_model` ([rate-limit-segments.md](rate-limit-segments.md))
+  matches a usage bucket's model against the one in use, and display names
+  cannot carry that: stdin reports `Fable 5` where the usage endpoint reports
+  `Fable`, and the `(1M context)` suffix is applied inconsistently — present on
+  `claude-opus-4-7[1m]`, absent on `claude-fable-5[1m]` — so it tracks neither
+  the family nor the `[1m]` marker. Ids are structured
+  (`claude-<family>-<version>[suffix]`) and yield the family as the first
+  dash-delimited token after `claude-` that is not purely numeric — the
+  non-numeric test is what keeps the `claude-3-*` generation working, where
+  the family sits third or fourth. Optional and degrades to `None` like every other
+  field; all tools route through the Claude normalizer, so this is one parse
+  site.

@@ -4,6 +4,7 @@
 - Date: 2026-04-22
 - Deciders: Jace
 - Amends: [ADR-0011](0011-rate-limit-data-source.md) — specifically the "Return JSONL-derived UsageData tagged as estimated" step in [§Fallback cascade](0011-rate-limit-data-source.md#fallback-cascade) and the implicit flat-struct + `UsageSource` tag shape the cascade relied on. ADR-0011's endpoint, auth, cache, and credential-cascade decisions stand unchanged.
+- Amended by: [ADR-0030](0030-model-scoped-usage-arrives-in-a-limits-array.md) — the `EndpointUsage` struct restated here gains a `limits` field. The JSONL-fallback decision this ADR makes is unaffected; per-model data has no JSONL equivalent and the fallback still hides it.
 
 ## Context and Problem Statement
 

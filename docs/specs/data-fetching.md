@@ -205,7 +205,16 @@ pub struct EndpointUsage {
     pub seven_day_opus:       Option<UsageBucket>,
     pub seven_day_sonnet:     Option<UsageBucket>,
     pub seven_day_oauth_apps: Option<UsageBucket>,
+
+    /// Model-scoped and aggregate limits. Per [ADR-0030](../adrs/0030-model-scoped-usage-arrives-in-a-limits-array.md)
+    /// this is where per-model usage now arrives; the `seven_day_*`
+    /// fields above are null in practice.
+    pub limits: Option<Vec<UsageLimit>>,
     pub extra_usage:          Option<ExtraUsage>,
+    /// Landing zone for keys nothing depends on. Per
+    /// [ADR-0030](../adrs/0030-model-scoped-usage-arrives-in-a-limits-array.md),
+    /// a key a segment comes to depend on is promoted out of here
+    /// into a typed field; this is not a supported read path.
     pub unknown_buckets:      HashMap<String, serde_json::Value>,
 }
 
@@ -225,6 +234,124 @@ pub struct SevenDayWindow {
     pub(crate) tokens: TokenCounts,    // no reset_at — rolling window, no hard reset
 }
 ```
+
+`UsageLimit` models one element of the `limits` array:
+
+All five derive `Debug, Clone, Deserialize, Serialize, PartialEq`, matching
+`ExtraUsage`; the two enums add `Copy`, which the structs cannot have because
+`LimitModel` owns `String`s. `Serialize` is load-bearing — these round-trip
+through `usage.json`.
+
+```rust
+#[non_exhaustive]
+pub struct UsageLimit {
+    /// Selection key. `weekly_scoped` is the model-scoped bucket
+    /// `rate_limit_7d_model` renders; `session` / `weekly_all` duplicate
+    /// `five_hour` / `seven_day` and are ignored.
+    pub kind: LimitKind,
+
+    /// Arrives as a JSON integer (`82`) where `UsageBucket::utilization`
+    /// arrives as a float; both route through `deserialize_clamped_percent`,
+    /// which reads either and clamps to `[0, 100]`.
+    #[serde(deserialize_with = "deserialize_clamped_percent")]
+    pub percent: Percent,
+
+    #[serde(default)]
+    pub resets_at: Option<Timestamp>,
+
+    /// Populated only for `kind == WeeklyScoped` in every capture to date.
+    /// The correlation is not enforced by the type.
+    #[serde(default)]
+    pub scope: Option<LimitScope>,
+
+    /// Not consulted when rendering — see [rate-limit-segments.md](rate-limit-segments.md)
+    /// §`rate_limit_7d_model`. Modelled so plugins can reach it.
+    #[serde(default)]
+    pub severity: LimitSeverity,
+}
+
+#[non_exhaustive]
+pub struct LimitScope {
+    #[serde(default)]
+    pub model: Option<LimitModel>,
+}
+
+#[non_exhaustive]
+pub struct LimitModel {
+    /// The family name (`"Fable"`), not the stdin `display_name` (`"Fable 5"`).
+    #[serde(default)]
+    pub display_name: Option<String>,
+
+    /// `null` in every capture to date. If it ever populates, it retires the
+    /// family-token heuristic in rate-limit-segments.md §`rate_limit_7d_model`.
+    #[serde(default)]
+    pub id: Option<String>,
+}
+
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum LimitKind { Session, WeeklyAll, WeeklyScoped, #[serde(other)] Unknown }
+
+#[derive(Default)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum LimitSeverity { Normal, Warning, #[default] #[serde(other)] Unknown }
+
+impl UsageLimit {
+    /// The model family this limit is scoped to, or `None` for any limit
+    /// that does not name one — wrong `kind`, absent `scope`, absent
+    /// `model`, absent `display_name`. Those four cases are
+    /// indistinguishable to every consumer, so the judgement lives here
+    /// rather than being re-derived by the segment and again by each plugin.
+    pub fn scoped_model_name(&self) -> Option<&str>;
+}
+```
+
+`percent` takes the wire's name rather than `UsageBucket`'s `utilization`; they are the same quantity under two names, and matching the wire keeps the serde mapping direct.
+
+`#[non_exhaustive]` sits on both enums as well as the structs: `#[serde(other)]` absorbs unknown values off the wire, but it does nothing for Rust SemVer, and a fifth `LimitKind` would otherwise break every downstream `match`.
+
+Both enums carry `#[serde(other)]` so a new server-side `kind` or `severity`
+degrades to `Unknown` instead of dropping the element — an unrecognized `kind`
+simply never matches the `weekly_scoped` selection.
+
+Three observed fields are deliberately absent. `group` (`session` | `weekly`)
+is derivable from `kind`. `scope.surface` has only ever been `null`, so its
+populated type is unknown; modelling it as `Option<String>` would drop the whole
+element if it turns out to be an object, and nothing reads it. `is_active` is
+omitted so that the "not a visibility signal" rule in
+[rate-limit-segments.md](rate-limit-segments.md) §`rate_limit_7d_model` is
+enforced by the type rather than by prose — it is a server-side judgement made
+without knowledge of the local session's model.
+
+`severity` is modelled while `is_active` is not, though core reads neither. The
+rule is that an unread field is modelled by default, and omitted only when
+exposing it would be actively misleading: `is_active` invites exactly the
+misuse the segment spec forbids, whereas `severity` is merely unused.
+
+Unmodelled fields here are unreachable, including from plugins: `unknown_buckets`
+sits on the response root and does not extend into array elements. Adding one is
+a struct change, which is the intended cost.
+
+`limits` appears on all three of `UsageApiResponse`, `EndpointUsage`, and
+`CachedData`; only the first is deserialized from the wire, so that is where the
+tolerant deserializer lives. It reads `serde_json::Value` first, yields `None`
+when that value is not an array, and otherwise deserializes each element
+independently — warning and dropping the ones that fail. A single malformed entry
+must not fail the response and drop the whole endpoint to the JSONL fallback.
+A non-array value warns as well, with one exception: `null` yields `None`
+silently, because null is this endpoint's own idiom for an absent bucket
+(`seven_day_opus`, `iguana_necktie`, and others are null on every response) and
+warning on it would fire on every render for accounts that have no limits.
+`deserialize_line_entries` in
+`crates/linesmith-core/src/config.rs` is the closest precedent, but it opens with
+`Vec::<toml::Value>::deserialize(deserializer)?` and so still fails the parse on a
+non-array; this one goes a step further. Per [ADR-0030](../adrs/0030-model-scoped-usage-arrives-in-a-limits-array.md).
+
+The field stays `Option<Vec<UsageLimit>>` rather than `#[serde(default)] Vec<_>`.
+The two render identically, but "the endpoint stopped sending `limits`" is the
+exact drift that produced this ADR, and collapsing it into an empty vec would
+leave `doctor` no way to say so.
 
 `JsonlUsage` and the two window types expose `pub(crate)` fields plus smart constructors (`JsonlUsage::new`, `FiveHourWindow::new`, `SevenDayWindow::new`) so the aggregator owns the invariants. `#[non_exhaustive]` sits on `UsageData` (SemVer room for a future variant) and on `EndpointUsage` (upstream Anthropic can ship new bucket categories — `unknown_buckets` is evidence of prior churn); the JSONL-side structs don't need it because their fields are locked by the aggregator contract.
 
@@ -247,7 +374,10 @@ Cache file shape:
   "data": {
     "five_hour":  { "utilization": 22.0, "resets_at": "..." },
     "seven_day":  { "utilization": 33.0, "resets_at": "..." },
-    "seven_day_sonnet": { "utilization": 0.0, "resets_at": "..." },
+    "seven_day_sonnet": null,
+    "limits": [{ "kind": "weekly_scoped", "percent": 82.0,
+                 "resets_at": "...", "severity": "warning",
+                 "scope": { "model": { "display_name": "Fable", "id": null } } }],
     "extra_usage": { "is_enabled": false, ... },
     "unknown_buckets": { "omelette_promotional": null, ... }
   },
@@ -256,6 +386,8 @@ Cache file shape:
 ```
 
 `data` and `error` are mutually exclusive (one or the other is non-null). Error cache uses a shorter TTL (30s default) so transient failures recover quickly.
+
+The `limits` entries are what the writer produces, not raw wire JSON: `group`, `is_active`, and `scope.surface` are gone because `UsageLimit` does not model them, an unrecognized `kind` or `severity` has already become `"unknown"`, and `percent` round-trips through `Percent` as a float even though the wire sends an integer. For every field it validates, the cache is a lossy view of the response it came from.
 
 Lock file shape:
 
@@ -369,6 +501,8 @@ Rename-based locking avoids platform-specific `flock`/`LockFileEx` gymnastics an
   - `atomic_write_json`: happy path, then verify with concurrent reader seeing either old or new content (never partial)
   - Schema-version mismatch: explicitly set `schema_version = 999`, assert cache-miss behavior
   - Lock file: stale (expired), active, malformed
+  - `limits` deserializer: integer `percent` (`82`) as well as float, since the wire sends an integer and the existing `utilization_clamps_*` tests cover only floats; one malformed element drops that element and keeps the rest; a non-array `limits` yields `None` and warns; an unrecognized `kind` / `severity` degrades to `Unknown` rather than failing the element
+  - `limits` cache round-trip: an entry written and re-read is stable, and an entry whose `kind` was `Unknown` on the wire re-reads as `Unknown` (the lossiness is intended, but it should not compound)
 
 - **Integration tests:**
   - `DataContext` with every combination of enabled/disabled sources, assert only declared sources are read (use a fake filesystem that errors on undeclared access)
