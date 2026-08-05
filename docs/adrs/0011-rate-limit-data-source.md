@@ -2,6 +2,7 @@
 
 - Status: accepted
 - Amended by: [ADR-0013](0013-jsonl-fallback-carries-token-counts.md) — §Fallback cascade step 5 and the implicit `UsageData` shape. Endpoint, auth, cache, and credential-cascade decisions stand.
+- Amended by: [ADR-0030](0030-model-scoped-usage-arrives-in-a-limits-array.md) — the `UsageApiResponse` shape in §Endpoint contract, the Decision Outcome's clause (b), and the §Consequences bullet naming `seven_day_sonnet` / `seven_day_opus`. Those fields are null (two of them already were at capture time); the data arrives in a `limits` array. Endpoint, auth, cache, and credential-cascade decisions stand.
 - Date: 2026-04-18
 - Deciders: Jace
 

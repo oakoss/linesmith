@@ -224,6 +224,8 @@ Transport-level errors (no network, captive portal, corporate proxy refusal) are
 
 The "Endpoint returns expected shape" WARN row excludes codenamed forward-compat buckets that the live endpoint already ships on every response (`iguana_*`, `omelette_*`, `seven_day_cowork`, `seven_day_omelette`, `tangelo`, etc. — see `docs/research/claude-data-files.md` §Raw data). Those buckets are documented research baseline, not new keys; gating the WARN on the _truly-new_ set (anything outside `KNOWN_BUCKETS ∪ RESEARCH_DOCUMENTED_BUCKETS` in `data_context::usage`) keeps healthy doctor runs quiet while still alerting maintainers to genuinely-unrecognized keys. Refresh `RESEARCH_DOCUMENTED_BUCKETS` whenever the research capture is updated.
 
+`limits` leaves the WARN row's candidates through `KNOWN_BUCKETS`, the first half of that union: per [ADR-0030](../adrs/0030-model-scoped-usage-arrives-in-a-limits-array.md) it is a modelled field, not a forward-compat bucket, so it is excluded as a _recognized_ key rather than as documented research baseline. Warning on a key `rate_limit_7d_model` reads would train the operator to ignore this check.
+
 ### Plugins
 
 | Check                  | PASS                                                    | WARN | FAIL                                | Hint on non-PASS                                         |

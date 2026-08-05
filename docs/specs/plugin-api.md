@@ -174,6 +174,9 @@ ctx.usage = #{
         five_hour: #{ utilization: 22.0, resets_at: "2026-04-19T05:00:00Z" },
         seven_day: #{ utilization: 33.0, resets_at: "..." },
         seven_day_sonnet: ...,
+        limits: [ #{ kind: "weekly_scoped", percent: 82.0,
+                     resets_at: "...", severity: "warning",
+                     scope: #{ model: #{ display_name: "Fable", id: () } } } ],
         extra_usage: ...,
     },
 };
@@ -184,6 +187,8 @@ ctx.usage = #{
     error: "NoCredentials",   // short error code string
 };
 ```
+
+`limits` is a server-controlled array, so its mirror is capped at `MAX_ARRAY_SIZE` with a truncation warning — the same guard `unknown_buckets` gets as a server-controlled map.
 
 Plugins check `kind` before accessing `data` or `error`:
 
@@ -243,6 +248,7 @@ if ctx.status.tool.kind == "other" { ctx.status.tool.name }
 // that go `()` when missing or malformed; check before reading leaves.
 if ctx.status.model != () {
     ctx.status.model.display_name   // string; non-empty (parser-side invariant)
+    ctx.status.model.id             // string or (); `claude-fable-5`, `claude-opus-5[1m]`
 }
 if ctx.status.workspace != () {
     ctx.status.workspace.project_dir    // string; preserves platform-native separators
@@ -325,16 +331,32 @@ if ctx.usage.kind == "ok" {
             ctx.usage.data.five_hour.utilization   // f64 in 0.0..=100.0
             ctx.usage.data.five_hour.resets_at     // RFC 3339 string or ()
         }
-        // Same shape for seven_day, seven_day_opus, seven_day_sonnet, seven_day_oauth_apps
+        // Same shape for seven_day, seven_day_opus, seven_day_sonnet, seven_day_oauth_apps.
+        // `limits` is NOT that shape — it is an array, with its own fields:
+        if ctx.usage.data.limits != () {   // () when the endpoint sent no `limits`
+            for lim in ctx.usage.data.limits {
+                lim.kind        // "session" | "weekly_all" | "weekly_scoped" | "unknown"
+                lim.percent     // f64 in 0.0..=100.0 (wire sends an integer; Percent normalizes)
+                lim.severity    // "normal" | "warning" | "unknown"
+                lim.resets_at   // RFC 3339 string or ()
+                if lim.scope != () && lim.scope.model != () {
+                    lim.scope.model.display_name  // family name ("Fable"), string or ()
+                    lim.scope.model.id            // string or (); null in every capture to date
+                }
+            }
+        }
         if ctx.usage.data.extra_usage != () {
             ctx.usage.data.extra_usage.is_enabled     // bool or ()
             ctx.usage.data.extra_usage.monthly_limit  // f64 or ()
             ctx.usage.data.extra_usage.used_credits   // f64 or ()
             ctx.usage.data.extra_usage.currency       // ISO 4217 string or ()
         }
-        // ctx.usage.data.unknown_buckets is a map of any codenamed
-        // buckets Anthropic shipped that the core segments don't
-        // recognize — plugins may inspect it, core segments ignore it.
+        // ctx.usage.data.unknown_buckets is a map of codenamed buckets
+        // Anthropic shipped that nothing yet depends on — plugins may
+        // inspect it, core segments ignore it. Per ADR-0030, a key the
+        // core comes to depend on is promoted out of this map into a
+        // typed field and mirrored here; `limits` moved that way, so
+        // read ctx.usage.data.limits rather than unknown_buckets.
     } else if ctx.usage.data.kind == "jsonl" {
         // JSONL fallback: raw token counts, no utilization percentage.
         // `seven_day` is always populated (zero-valued on an empty
