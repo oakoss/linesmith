@@ -69,7 +69,7 @@ Git hooks installed via `lefthook install`. `pre-commit` runs fmt/lint on staged
 
 ### Releases
 
-Knope drives release automation per [ADR-0027](docs/adrs/0027-knope-for-release-automation.md) — per-crate versioning, per-crate CHANGELOG, cross-manifest dep-pin updates by name. Release-PR merge fires `knope-release.yml` (tags + crates.io publish); the `linesmith/v*` tag push then fires cargo-dist's `release.yml` for binary builds. Full contract in `docs/specs/release-process.md`; day-of-release steps in `docs/ops/release-runbook.md`.
+Knope drives release automation per [ADR-0027](docs/adrs/0027-knope-for-release-automation.md) — per-crate versioning, per-crate CHANGELOG, cross-manifest dep-pin updates by name. Release-PR merge fires `knope-release.yml`, which tags each bumped package and creates its GitHub Release; those `<crate>/v*` tag pushes then fire a second `knope-release.yml` run that publishes to crates.io (it can't ride the merge run — crates.io rejects `pull_request_target`) and cargo-dist's `release.yml` for binary builds. Expect more than one run per release, and a `verify-published` job that fails if the registry doesn't catch up. Full contract in `docs/specs/release-process.md`; day-of-release steps in `docs/ops/release-runbook.md`.
 
 Drop a changeset file via `knope document-change` when the conventional-commit subject doesn't fully capture release impact (e.g. a `refactor:` that's actually breaking, or a `feat:` whose per-package effect isn't obvious from the scope). Conventional commits remain the primary signal; changesets supplement.
 

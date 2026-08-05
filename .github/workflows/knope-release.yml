@@ -290,6 +290,179 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
         run: knope release --verbose
 
+  # Asserts the registry received the release. Deliberately a sibling of
+  # `publish` rather than a step inside it: publish runs in a
+  # separate tag-triggered run, and every way that run can fail to happen
+  # at all — evicted from its concurrency group, tag glob stopped
+  # matching, App token lost push-triggers-workflows semantics — would
+  # take a step inside it down too. This job rides the
+  # `pull_request_target` merge run, which fires whenever a release PR
+  # merges, so it survives the failures it exists to catch.
+  #
+  # Before this existed the pipeline was green, the GitHub Release said
+  # "Latest", and crates.io stayed on the previous version for two months
+  # (lsm-9wrv). That is the shape of failure this turns red.
+  verify-published:
+    name: Verify crates.io received the release
+    # `needs` for ordering only — deliberately no `needs.*.result` gate,
+    # unlike publish. `release` shares the `knope-release` group, so a
+    # `prepare` run queuing while `release` is itself still pending
+    # evicts it, and that lands as a cancelled job: gray, not red.
+    # Gating on success-or-skipped would skip this job exactly then, and
+    # again when `release` dies after creating only some tags — which is
+    # half-shipped by definition and precisely when the per-crate missing
+    # list earns its keep. The job only reads manifests and the registry,
+    # so it is correct however its dependencies ended.
+    #
+    # `always()` rather than `!cancelled()`: `cancelled()` is documented
+    # against the *workflow*, and whether an evicted job flips that is
+    # ambiguous enough that relying on it could skip the one job whose
+    # entire purpose is not being skippable. The event conditions below
+    # already scope this precisely.
+    needs: [release, publish]
+    if: |
+      always() &&
+      ((github.event_name == 'pull_request_target' &&
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.head.ref == 'release' &&
+        github.event.pull_request.head.repo.full_name == github.repository) ||
+       (github.event_name == 'workflow_dispatch' &&
+        (inputs.mode == 'release' || inputs.mode == 'publish')))
+    runs-on: ubuntu-latest
+    # 20-minute poll plus headroom for checkout and toolchain setup;
+    # the script self-terminates at its own deadline, so this never binds.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    # No concurrency group on purpose. This job only reads, and parking
+    # it in `knope-release` would block prepare runs for the length of
+    # the poll.
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        with:
+          egress-policy: audit
+
+      # Same dispatch-ref guard the other jobs carry. Without it, a
+      # `--ref some-branch -f mode=publish` dispatch has publish exit 1
+      # while this job reads main's manifests — already on crates.io —
+      # and reports success, which is the misreading it exists to stop.
+      - name: Reject non-main dispatch
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::knope-release.yml dispatch must target refs/heads/main; got ${{ github.ref }}" >&2
+          exit 1
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.merge_commit_sha || 'main' }}
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+
+      # Versions come from the manifests at the released commit, not from
+      # the tag names, so a tag that disagrees with what was built is
+      # caught rather than trusted.
+      - name: Wait for crates.io to serve every released version
+        shell: bash
+        run: |
+          # Its own statement so `set -e` catches a broken toolchain or
+          # unparseable manifest directly. Folded into the mapfile,
+          # process substitution swallows the status and the failure
+          # resurfaces only as the vaguer empty-array error below.
+          metadata="$(cargo metadata --no-deps --format-version 1)"
+
+          # `publish` is null when publishable, [] for `publish = false`,
+          # and a registry list when restricted. Only the first and an
+          # explicit crates-io entry belong here — a crate restricted to
+          # another registry can never appear on this index and would
+          # poll to the deadline before firing a spurious red.
+          mapfile -t packages < <(
+            jq -r '.packages[]
+                   | select(.publish == null or (.publish | index("crates-io")))
+                   | "\(.name) \(.version)"' <<<"$metadata"
+          )
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "::error::cargo metadata reported no crates-io-publishable workspace members; the check would pass vacuously" >&2
+            exit 1
+          fi
+          printf 'expecting on crates.io:\n'
+          printf '  %s\n' "${packages[@]}"
+
+          body_file="$(mktemp)"
+          trap 'rm -f "$body_file"' EXIT
+
+          # 20 minutes: publish runs asynchronously and took ~4.5min on
+          # the 0.3.0 release, plus sparse-index propagation.
+          deadline=$(( $(date +%s) + 20 * 60 ))
+          while :; do
+            missing=()
+            transient=0
+            for entry in "${packages[@]}"; do
+              name="${entry%% *}"
+              version="${entry##* }"
+              # Sparse-index layout for names of 4+ chars, and the index
+              # lowercases names. Every crate here is long and already
+              # lowercase; one that wasn't would 404, then burn the full
+              # poll and be misreported as half-shipped.
+              url="https://index.crates.io/${name:0:2}/${name:2:2}/${name}"
+              # Branch on `%{http_code}` rather than adding `-f` and
+              # reading curl's exit code: under `-f` a 404 surfaces as an
+              # HTTP-error exit whose value depends on the negotiated
+              # protocol (22 on HTTP/1.1, 56 on HTTP/2, and the index
+              # serves h2), which would file a genuinely missing crate
+              # under "transient". Without `-f`, curl exits 0 on a 404
+              # and the status carries the whole signal.
+              #
+              # `|| true` keeps `set -e` out of it; `-w` prints 000 when
+              # the request doesn't complete, and the `:-000` covers curl
+              # failing to execute at all, where the substitution is
+              # empty rather than 000. curl's stderr stays visible in the
+              # run log for diagnosis.
+              http="$(curl -sS --max-time 30 -o "$body_file" -w '%{http_code}' "$url" || true)"
+              http="${http:-000}"
+              case "$http" in
+                200)
+                  # `yanked == false` too: the index keeps yanked
+                  # versions listed forever, so matching on `vers` alone
+                  # would call a release users cannot install a success.
+                  jq -e --arg v "$version" \
+                    'select(.vers == $v and .yanked == false)' >/dev/null <"$body_file" ||
+                    missing+=("${name} ${version}")
+                  ;;
+                404)
+                  missing+=("${name} ${version}")
+                  ;;
+                *)
+                  # 5xx, 429, or no response at all: not evidence of a
+                  # failed publish, so don't let the deadline message
+                  # claim the release is half-shipped.
+                  transient=1
+                  missing+=("${name} ${version} (http ${http})")
+                  ;;
+              esac
+            done
+
+            if [ "${#missing[@]}" -eq 0 ]; then
+              echo "all released versions are live on crates.io"
+              exit 0
+            fi
+
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              if [ "$transient" -eq 1 ]; then
+                echo "::error::gave up waiting on crates.io for: ${missing[*]}. At least one probe failed at the transport level, so this may be a registry or network outage rather than a publish failure — confirm against the index before running any recovery." >&2
+              else
+                echo "::error::crates.io is still missing: ${missing[*]}. The tags and GitHub Release exist, so this release is half-shipped — check the publish run, then recover with: gh workflow run \"Knope Release\" -f mode=publish" >&2
+              fi
+              exit 1
+            fi
+
+            echo "waiting on: ${missing[*]}"
+            sleep 30
+          done
+
   # crates.io publish runs off the tags Knope created, or on a
   # `mode=release` / `mode=publish` dispatch — the latter recovering a
   # partial run where tags already exist. cargo's leaf-first publish

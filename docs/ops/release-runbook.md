@@ -148,9 +148,19 @@ gh run watch --exit-status
 
 Total runtime: typically 10-15 min.
 
-### 5. Verify (10-min budget)
+### 5. Verify
 
-Spot-check from a machine that doesn't have the repo cloned:
+A green **`verify-published` job** means crates.io serves every version in
+the manifests at the released commit, unyanked. It asserts the manifest
+versions are live, not that this particular run shipped something — if
+Knope found nothing releasable, the manifests still hold already-published
+versions and the job goes green. Read it as "the registry matches what
+main says it should be."
+
+The checks below cover what nothing automated does: installers, the tap,
+provenance, and the doctor probe.
+
+Run these from a machine that doesn't have the repo cloned:
 
 ```sh
 # crates.io (works for all three crates; the user-facing one is `linesmith`)
