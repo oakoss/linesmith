@@ -151,7 +151,7 @@ Total runtime: typically 10-15 min.
 ### 5. Verify
 
 A green **`verify-published` job** means crates.io serves every version in
-the manifests at the released commit, unyanked. It asserts the manifest
+the manifests on `main`, unyanked. It asserts the manifest
 versions are live, not that this particular run shipped something — if
 Knope found nothing releasable, the manifests still hold already-published
 versions and the job goes green. Read it as "the registry matches what

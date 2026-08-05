@@ -356,15 +356,24 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.merge_commit_sha || 'main' }}
+          # Plain `main`, not the PR's `merge_commit_sha` that prepare and
+          # release pin to. Those two need the exact SHA so Knope can't
+          # walk commits from a PR that merged in between; this job only
+          # reads version strings, and nothing but a release PR changes
+          # them, so `main` is equivalent in practice. It also keeps a
+          # `pull_request_target` job from checking out a PR-derived ref
+          # and then running cargo over it — CodeQL's untrusted-checkout
+          # rule, and a fair objection even though the job's `if:` already
+          # restricts it to our own `release` branch.
+          ref: main
           persist-credentials: false
 
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
 
-      # Versions come from the manifests at the released commit, not from
-      # the tag names, so a tag that disagrees with what was built is
-      # caught rather than trusted.
+      # Versions come from the manifests on `main`, not from the tag
+      # names, so a tag that disagrees with what was built is caught
+      # rather than trusted.
       - name: Wait for crates.io to serve every released version
         shell: bash
         run: |
