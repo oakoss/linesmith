@@ -49,7 +49,7 @@ See `docs/README.md` for the full pipeline description and promotion rules.
 
 **Accepted ADRs are immutable.** If the decision changes, write a new ADR with status `accepted` and update the old one's status to `superseded by [ADR-NNNN]`. This preserves the reasoning trail. Do not rewrite an accepted ADR in place.
 
-**Supersede vs. amend.** Supersession replaces a whole decision. When a later ADR revises only part of one — a struct shape, a single clause — while the rest stands, it **amends** instead: the new ADR carries an `Amends: [ADR-NNNN] — <what changed, what stands>` line and the old one gains a matching `Amended by:` line. Adding that pointer is the only edit an accepted ADR ever takes, and it is the same kind of edit supersession already requires; the body stays untouched. ADR-0011 carries pointers from both ADR-0013 and ADR-0030 this way. AI reviewers reliably flag these backlinks as immutability violations — they are not.
+**Supersede vs. amend.** Supersession replaces a whole decision. When a later ADR revises only part of one — a struct shape, a single clause — while the rest stands, it **amends** instead: the new ADR carries an `Amends: [ADR-NNNN] — <what changed, what stands>` line and the old one gains a matching `Amended by:` line. Adding that pointer is the only edit an accepted ADR ever takes, and it is the same kind of edit supersession already requires; the body stays untouched. A backlink is permitted metadata, not a rewrite, and does not violate immutability. ADR-0011 carries pointers from both ADR-0013 and ADR-0030 this way.
 
 ## Tooling
 
