@@ -2,12 +2,12 @@
 
 - Status: draft
 - Version: 0.2
-- Last updated: 2026-05-26
+- Last updated: 2026-08-04
 - Driving ADRs: [ADR-0001](../adrs/0001-use-rust-for-runtime.md), [ADR-0007](../adrs/0007-cargo-dist-distribution.md), [ADR-0019](../adrs/0019-publish-linesmith-core-as-scaffolding-from-v0-1.md), [ADR-0027](../adrs/0027-knope-for-release-automation.md)
 
 ## Overview
 
-This spec defines how linesmith versions are cut, built, packaged, signed (or deliberately not), and distributed. The release pipeline is `cargo-dist` (binaries, installers, Homebrew formula) + `Knope` (per-package version bumps, per-crate CHANGELOG, internal dep-pin updates, GitHub Release creation) + `cargo release publish` (crates.io publish, leaf-first ordering, skips already-published versions). It runs as two workflow files but three chained runs: `knope-release.yml` hosts three jobs — `prepare` opens the release PR when a feature/fix PR merges to main, `release` tags bumped packages when the release PR merges, and `publish` pushes to crates.io in a **second** run off those tags (it cannot ride the merge run, because crates.io rejects `pull_request_target`; see §Crates.io publishing). `release.yml` (cargo-dist) fires separately on the `linesmith/v*` tag push to build binaries and upload them to the existing release. A maintainer cuts a release by merging the release PR; everything after is automation.
+This spec defines how linesmith versions are cut, built, packaged, signed (or deliberately not), and distributed. The release pipeline is `cargo-dist` (binaries, installers, Homebrew formula) + `Knope` (per-package version bumps, per-crate CHANGELOG, internal dep-pin updates, GitHub Release creation) + `cargo release publish` (crates.io publish, leaf-first ordering, skips already-published versions). It runs as two workflow files across a chain of runs: `knope-release.yml` hosts four jobs — `prepare` opens the release PR when a feature/fix PR merges to main, `release` tags bumped packages when the release PR merges, `publish` pushes to crates.io from a tag-triggered run (one per `<crate>/v<version>` tag, so a multi-crate release starts more than one; it cannot ride the merge run, because crates.io rejects `pull_request_target` — see §Crates.io publishing), and `verify-published` asserts from the merge run that the registry actually caught up. `release.yml` (cargo-dist) fires separately on the `linesmith/v*` tag push to build binaries and upload them to the existing release. A maintainer cuts a release by merging the release PR; everything after is automation.
 
 > **Naming note.** Upstream renamed `cargo-dist` to `dist` (see [ADR-0007](../adrs/0007-cargo-dist-distribution.md)); this spec says `cargo-dist` throughout to match widely-referenced ecosystem documentation. They're the same tool. When the rename lands everywhere in third-party tutorials, the spec will revise.
 
@@ -182,13 +182,14 @@ Two GitHub Actions workflows are required because Knope creates the release PR +
 | Git tags `<crate>/v<version>`       | Knope         | `knope-release.yml`                 | Release PR merge                 |
 | Per-package GitHub Releases         | Knope         | `knope-release.yml`                 | Release PR merge                 |
 | `cargo release publish --workspace` | cargo-release | `knope-release.yml`                 | `<crate>/v*` tag push            |
+| crates.io publication verified      | sparse index  | `knope-release.yml`                 | Release PR merge                 |
 | Multi-platform binary builds        | cargo-dist    | `release.yml`                       | `linesmith/v*` tag push          |
 | Upload binaries to existing release | cargo-dist    | `release.yml`                       | Same                             |
 | Shell / PowerShell installers       | cargo-dist    | `release.yml`                       | Same                             |
 | Homebrew formula update + push      | cargo-dist    | `release.yml`                       | Same                             |
 | Build attestations (SLSA)           | cargo-dist    | `release.yml`                       | Same                             |
 
-Knope is the conductor (lives in `knope-release.yml` — three jobs: `prepare`, `release`, `publish`); cargo-dist is the binary specialist (lives in `release.yml`). The handoff is the `linesmith/v<ver>` git tag: `knope-release.yml` pushes it via `knope release`, that tag push triggers `release.yml`, and the cargo-dist `host` job uploads binaries to the GitHub Release Knope already created (`gh release upload` + `gh release edit --draft=false --latest`).
+Knope is the conductor (lives in `knope-release.yml` — four jobs: `prepare`, `release`, `publish`, `verify-published`); cargo-dist is the binary specialist (lives in `release.yml`). The handoff is the `linesmith/v<ver>` git tag: `knope-release.yml` pushes it via `knope release`, that tag push triggers `release.yml`, and the cargo-dist `host` job uploads binaries to the GitHub Release Knope already created (`gh release upload` + `gh release edit --draft=false --latest`).
 
 If `knope release` fails before tagging, `release.yml` never starts and no binaries ship. If `cargo release publish` fails (transient registry error, dependency-ordering issue), it can be re-run via `knope-release.yml`'s `workflow_dispatch` trigger with `mode=publish` (the default `mode=release` would attempt to re-tag) — the tagged release on GitHub stays as-is; `cargo-release` skips already-published versions on retry.
 
@@ -254,7 +255,9 @@ The trusted-publisher entry is unaffected by the split. crates.io matches on rep
 
 Because a tag trigger is weaker than the old "merged release PR" gate, the job re-establishes that property itself: `Verify tag is an ancestor of main` refuses to publish a tag pointing at a commit that never landed on `main`.
 
-`publish` sits in its own `knope-publish` concurrency group rather than the `knope-release` group shared by `prepare` and `release`. A concurrency group retains only one pending run: a newly queued run cancels whatever was already pending. On a shared group, a `prepare` run from an unrelated merge could therefore evict a pending publish, and the release would never reach crates.io.
+A separate `verify-published` job asserts the registry matches what `main` says it should hold. Two scoping notes: it asserts the manifest versions on `main` are live and unyanked, not that this particular run shipped anything — a run where Knope found nothing releasable goes green because the manifests already match. And it does not cover a hand-pushed `<crate>/v*` tag, which triggers `publish` without a merge run to verify it. In detail: it reads every publishable member's version from the manifests on `main` — not from the tag names, so a tag disagreeing with what was built is caught — and polls the crates.io sparse index for up to 20 minutes, failing with a recovery command if any version is still absent. It is a sibling of `publish`, not a step inside it, and rides the `pull_request_target` merge run instead of the tag run. That placement is the whole point: every way the tag-triggered publish run can fail to start at all would take a step inside it down too, and those are precisely the failures that produced a green pipeline over a stale registry for two months.
+
+`publish` sits in its own `knope-publish` concurrency group rather than the `knope-release` group shared by `prepare` and `release`. A concurrency group retains only one pending run: a newly queued run cancels whatever was already pending. On a shared group, a `prepare` run from an unrelated merge could therefore evict a pending publish, and the release would never reach crates.io. Within the dedicated group, eviction is harmless when it happens at all: a multi-crate release starts one publish run per tag, and only at three or more tags does the surplus get cancelled — with two, one runs and one pends. Because Knope bumps every package in a single commit, each run checks out the same full set of versions and publishes the whole workspace, so whichever survives does the work. `docs/ops/release-runbook.md` gives the per-crate-count expectations.
 
 Knope creates each tag through the GitHub Releases API (one `POST /releases` per package) rather than pushing them with git, so tags arrive as independent single-ref events. Two consequences follow. API-authored events created with an App installation token do start workflow runs, whereas a `GITHUB_TOKEN` push deliberately does not. And GitHub's rule that no tag push events are created when more than three tags land _at once_ can never be triggered, at any crate count. If the release path ever moves to local `git tag` + `git push --tags`, that ceiling becomes live and caps the workspace at three publishable crates.
 
@@ -317,75 +320,28 @@ Day-of-release steps for a maintainer:
    - Verify `cargo install linesmith` from a fresh Rust install.
 6. **Announce.** The GitHub Release body is auto-populated by Knope (CHANGELOG-derived) + cargo-dist (install snippets + download table). Optionally add a narrative post to the README "Release Log" section.
 
-If step 3 or 4 fails partway through, see §Edge cases §Rollback. `knope-release.yml`'s `workflow_dispatch` trigger lets you re-run any of the three jobs via the `mode` input — `mode=release` (default) reruns tag + crates.io publish; `mode=publish` skips tagging and reruns crates.io only (recovery when tags already exist); `mode=prepare` reruns the release-PR open/update step.
+If step 3 or 4 fails partway through, see §Edge cases §Rollback. `knope-release.yml`'s `workflow_dispatch` trigger lets you re-run the pipeline via the `mode` input — `mode=release` (default) reruns tag + crates.io publish; `mode=publish` skips tagging and reruns crates.io only (recovery when tags already exist); `mode=prepare` reruns the release-PR open/update step. `verify-published` runs alongside the `release` and `publish` modes rather than having a mode of its own.
 
 ### Workflow structure
 
 Two workflow files, chained via release-PR merge + git-tag events:
 
-**`.github/workflows/knope-release.yml`** — single combined workflow. `prepare` and `release` are mutually exclusive, gated on the merged PR's head ref under `pull_request_target: closed`; `publish` runs off the tags `release` creates, under `push: tags` (see §Crates.io publishing for why it cannot ride the merge run). `workflow_dispatch` remains the operator escape hatch for all three. Combined into one file in 2026-05 to eliminate a race where two split-file workflows could both fire on the release-PR squash, with the prepare path reading tag state before the release path had created the new tag (see Change log entry):
+**`.github/workflows/knope-release.yml`** — single combined workflow. `prepare` and `release` are mutually exclusive, gated on the merged PR's head ref under `pull_request_target: closed`; `publish` runs off the tags `release` creates, under `push: tags` (see §Crates.io publishing for why it cannot ride the merge run); `verify-published` rides the merge run and asserts the registry caught up. `workflow_dispatch` remains the operator escape hatch for all three modes. Combined into one file in 2026-05 to eliminate a race where two split-file workflows could both fire on the release-PR squash, with the prepare path reading tag state before the release path had created the new tag (see Change log entry):
 
-```text
-on:
-  pull_request_target:
-    types: [closed]
-    branches: [main]
-  push:
-    tags:
-      - '*/v[0-9]+.[0-9]+.[0-9]+'
-  workflow_dispatch:
-    inputs:
-      mode:
-        type: choice
-        options: [prepare, release, publish]
-        default: release
+Triggers: `pull_request_target: closed` on `main`, `push` on `*/v<X.Y.Z>` tags, and `workflow_dispatch` with a `mode` of `prepare` | `release` | `publish` (default `release`).
 
-jobs:
-  prepare:
-    if: |
-      (github.event_name == 'pull_request_target' && github.event.pull_request.merged == true &&
-       !(github.event.pull_request.head.ref == 'release' &&
-         github.event.pull_request.head.repo.full_name == github.repository)) ||
-      (github.event_name == 'workflow_dispatch' && inputs.mode == 'prepare')
-    concurrency: { group: knope-release, cancel-in-progress: false }
-    # Mints a GitHub App installation token (BOT_CLIENT_ID / BOT_PRIVATE_KEY)
-    # and runs:
-    #   1. `knope prepare-release --verbose` (allow_empty = true) —
-    #      stages version bumps, dep-pin rewrites, CHANGELOG entries,
-    #      and deletes consumed changesets. No-op when nothing's due.
-    #   2. `peter-evans/create-pull-request` (sign-commits) — commits
-    #      through the GitHub API so the commit is signed as the bot,
-    #      then opens/updates the `release` PR. Idempotent; silent no-op
-    #      when nothing is due. A follow-up step fails the run if the
-    #      resulting commits are not verified.
-  release:
-    if: |
-      (github.event_name == 'pull_request_target' && github.event.pull_request.merged == true &&
-       github.event.pull_request.head.ref == 'release' &&
-       github.event.pull_request.head.repo.full_name == github.repository) ||
-      (github.event_name == 'workflow_dispatch' && inputs.mode == 'release')
-    concurrency: { group: knope-release, cancel-in-progress: false }
-    # `knope release --verbose` tags each bumped package as
-    # `<crate>/v<version>` and creates per-package GitHub Releases
-    # with CHANGELOG-derived notes.
-  publish:
-    needs: [release]
-    if: |
-      !cancelled() && (needs.release.result == 'success' || needs.release.result == 'skipped') &&
-      (github.event_name == 'push' ||
-       (github.event_name == 'workflow_dispatch' && (inputs.mode == 'release' || inputs.mode == 'publish')))
-    concurrency: { group: knope-publish, cancel-in-progress: false }
-    permissions:
-      id-token: write
-      contents: read
-    # OIDC crates.io token via rust-lang/crates-io-auth-action, then
-    # `cargo release publish --workspace --execute --no-confirm`
-    # (skips already-published members; leaf-first ordering).
-```
+| Job                | Runs when                                                            | Does                                                                                                                                                                                                                                                                                                     |
+| ------------------ | -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `prepare`          | any merged PR whose head **isn't** our own `release`; `mode=prepare` | Mints the App token, runs `knope prepare-release` (stages bumps, dep-pin rewrites, CHANGELOG entries, deletes consumed changesets), then `peter-evans/create-pull-request` with `sign-commits` opens or updates the release PR. A follow-up step fails the run if the resulting commits aren't verified. |
+| `release`          | merged PR whose head **is** our own `release`; `mode=release`        | `knope release` tags each bumped package `<crate>/v<version>` and creates per-package GitHub Releases from the CHANGELOG.                                                                                                                                                                                |
+| `publish`          | `*/v<X.Y.Z>` tag push; `mode=release` or `mode=publish`              | Mints an OIDC crates.io token, then `cargo release publish --workspace` (skips already-published members, leaf-first).                                                                                                                                                                                   |
+| `verify-published` | same as `release`, plus `mode=publish`                               | Polls the crates.io sparse index until every publishable member's manifest version is live and unyanked, or its deadline passes.                                                                                                                                                                         |
+
+Job conditions, `needs` edges, concurrency groups, and permissions live in the workflow file rather than being mirrored here — this section previously carried verbatim copies and they went stale twice in one day, each time needing a reviewer to catch it. The reasoning behind the non-obvious ones is in the workflow's own comments, and the properties that matter to the contract are below.
 
 The `head.repo.full_name == github.repository` guard on the release job is load-bearing under `pull_request_target`: a fork can name its source branch `release`, so the `head.ref == 'release'` check alone would match a coincidentally-named fork branch and mint the bot's token to tag commits the maintainer didn't intend to release. (`publish` no longer needs the guard — it runs off tags, and `Verify tag is an ancestor of main` enforces the equivalent property.) The prepare job intentionally omits this guard so fork PRs CAN drive release prep (the bot still has to merge the resulting release PR — human review remains in the loop).
 
-`prepare` and `release` share the `knope-release` concurrency group with `cancel-in-progress: false` so a fix/feat PR merging while a release PR is mid-tagging queues its prepare run behind the in-flight release-job, preventing prepare from reading stale tag state. `publish` deliberately sits outside that group — see §Crates.io publishing.
+`prepare` and `release` share the `knope-release` concurrency group with `cancel-in-progress: false` so a fix/feat PR merging while a release PR is mid-tagging queues its prepare run behind the in-flight release-job, preventing prepare from reading stale tag state. `publish` deliberately sits outside that group — see §Crates.io publishing. `verify-published` has no group at all: it only reads, and parking it in `knope-release` would block prepare runs for the length of its poll.
 
 **`.github/workflows/release.yml`** — runs on `linesmith/v*` tag push (from `knope-release.yml`), via `workflow_dispatch` for manual dry-runs, and via path-filtered `pull_request:` for auto-validation of release-infra changes (per [ADR-0017](../adrs/0017-release-workflow-pr-validation.md)):
 
@@ -540,6 +496,7 @@ Criterion benchmarks run pre-release (`mise run bench`). A >10% regression again
 
 - 2026-04-19: initial draft (v0.1). Defines semver posture (pre-1.0 minor-for-breaking), the 7-target platform matrix (macOS/Linux/Windows × x86_64/aarch64 + linux-musl), four installer methods (shell, PowerShell, Homebrew, cargo install), release-plz/cargo-dist responsibility split, release profile settings (matches ADR-0007), supply-chain posture (OIDC trusted publishing, SLSA attestations, pinned action SHAs, `cargo-auditable`), unsigned-binary posture for v0.1, day-of-release runbook, rollback steps, and edge cases. Closes lsm-9sa under epic lsm-c2i.
 - 2026-04-19: license changed from `MIT OR Apache-2.0` to `MIT` to match the repo `LICENSE` swap (MPL-2.0 → MIT). Closes lsm-c2c.
+- 2026-08-04: Add the `verify-published` job (`lsm-q0iu`). Nothing in the pipeline asserted that crates.io received a release, so every failure mode looked identical from the outside: green checks, tags created, GitHub Release marked "Latest", registry unchanged. That is how `lsm-9wrv` hid from 2026-06-06 to 2026-08-04. The job reads each publishable member's version from the manifests on `main` and polls the crates.io sparse index for up to 20 minutes, failing with the `mode=publish` recovery command if any is missing. A version present but yanked is reported separately and fails immediately rather than polling: the index lists yanked versions forever, no amount of waiting reverses a yank, and `mode=publish` cannot recover one because crates.io rejects a version it already holds — the fix is `cargo yank --undo` or a new release. Sourcing versions from manifests rather than tag names also catches a tag that disagrees with what was built. It is a sibling of `publish` on the `pull_request_target` merge run rather than a step inside `publish`, because publish executes in a separate tag-triggered run and every way that run can fail to start would take an inner step down with it. No ADR change — ADR-0027's decision (use Knope) stands; only the Actions wiring is refined.
 - 2026-08-04: Replace Knope's `publish-release-pr` workflow with `peter-evans/create-pull-request` using `sign-commits` (`lsm-g5xz`). Knope's only mechanism for the release commit was shell `git commit` + `git push --force`, and commits pushed over git are unsigned whatever the token, so `required_signatures` on main left the release PR mergeable only by bypassing the rule — PR #22 sat unmergeable from 2026-06-06 to 2026-08-04 for exactly this reason. The action commits through the GitHub API, which signs as the token's App identity (`oakoss[bot]`); its REST `createCommit` call deliberately sends no `author`/`committer`, since GitHub only signs for a bot when the request carries no custom identity. That is also why the `Configure Git` step is gone: it set a fabricated `linesmith-bot[bot]` identity matching no real account. The action builds blobs and tree objects rather than using the `createCommitOnBranch` mutation, so file modes and deletions survive. It is idempotent and silently no-ops when nothing is releasable, which retires the `git diff --quiet` gate; a follow-up step asserts `pull-request-commits-verified`, scoped to runs that created or updated the branch because an untouched branch reports `false` from a local `%G?` check that signed commits can never satisfy. Supersedes [ADR-0027](../adrs/0027-knope-for-release-automation.md)'s description of the `publish-release-pr` workflow and its rationale for bare `--force` over `--force-with-lease`. No ADR change — ADR-0027's decision (use Knope) stands; only the Actions wiring is refined.
 - 2026-08-04: Move the `publish` job off the `pull_request_target` run onto a `push: tags` trigger (`lsm-9wrv`). crates.io began rejecting OIDC token exchanges from `pull_request_target` and `workflow_run` on 2025-10-29 ([rust-lang/crates.io#12219](https://github.com/rust-lang/crates.io/pull/12219)) — both are triggerable from forks while running in the target repo's security context. This workflow was written 2026-05-24, after that block, so crates.io publishing never once succeeded through a release-PR merge; the failure was invisible because the `release` job still tagged and created a GitHub Release marked "Latest". Discovered when `linesmith-core` 0.3.0 shipped to GitHub but not to the registry, and recovered with a `mode=publish` dispatch. Publish also moved to its own `knope-publish` concurrency group: a group holds one running plus one pending, so on the shared group an unrelated `prepare` run could evict a pending publish and silently drop the release. Added `Verify tag is an ancestor of main` to replace the provenance the merged-PR gate used to provide, and tightened the tag glob to exact versions so hand-cut RC tags cannot trigger an irreversible publish. No ADR change — ADR-0027's decision (use Knope) stands; only the Actions wiring is refined, consistent with the 2026-05-26 entry's framing.
 - 2026-05-26: Combine `knope-prepare.yml` and `knope-release.yml` into a single `knope-release.yml` with three mutually-exclusive jobs (`prepare`, `release`, `publish`) gated on the merged PR's head ref (`lsm-aqdk`). The 2026-05-23 split caused a race when a release PR merged: the squash-merge emitted both a `push: main` event (which fired `knope-prepare.yml`) and a `pull_request: closed` event (which fired `knope-release.yml`), and `knope-prepare` won the queue ahead of `knope-release` creating the new `<pkg>/v*` tag, so prepare's tag-walk saw the previous release as the latest tag and re-claimed the just-released commits into a phantom follow-on release PR (hit during the 0.2.1 ship). Combined shape eliminates the race architecturally — one workflow file, `pull_request_target: closed` trigger, jobs differentiated by `head.ref == 'release'` vs `head.ref != 'release'`. `pull_request_target` (not plain `pull_request`) so the workflow can mint the bot's GitHub App token on merged fork PRs — `pull_request` strips secrets when the PR head is on a fork, which the old `push: main` trigger sidestepped because `push` events run post-merge with secrets available. Safe to use `pull_request_target` here because we only react to `closed + merged == true` (maintainer-approved merge) and check out the base branch (main), never the PR head — no untrusted-contributor code runs with elevated perms. The `workflow_dispatch` input changed from boolean `skip_release` to a `mode` choice (`prepare` | `release` | `publish`); operator escape hatches for all three jobs explicitly accessible. crates.io Trusted Publisher allowlist unaffected (filename `knope-release.yml` retained). No ADR change — ADR-0027's decision (use Knope) stands; only the GitHub Actions wiring is refined.
