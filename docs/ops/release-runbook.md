@@ -231,6 +231,8 @@ git tag -a linesmith/v0.3.0-rc.1 -m "v0.3.0-rc.1"
 git push origin linesmith/v0.3.0-rc.1
 ```
 
+Cutting one requires bypass on the org tag ruleset — see §Tag protection.
+
 `release.yml` fires on the tag, cargo-dist auto-detects the prerelease
 suffix and:
 
@@ -287,8 +289,50 @@ If a release ships broken artifacts:
 **Never force-push over a tag that made it to crates.io.** Users may have
 `Cargo.lock`ed against that version.
 
+Step 1's tag deletion needs bypass on the org tag ruleset — see
+§Tag protection.
+
 See [`docs/specs/release-process.md`](../specs/release-process.md)
 §Edge cases for the full recovery matrix.
+
+## Tag protection
+
+A `<pkg>/vX.Y.Z` tag push mints a crates.io publishing token, so tag
+creation is a privileged operation. The ruleset deliberately covers a
+wider glob than that publish trigger, so prerelease and legacy tags are
+protected too. The org ruleset `Release Tags - Org` (id 14384235,
+target `tag`, applies to every oakoss repo) enforces `creation`,
+`deletion`, `non_fast_forward`, and `update` over:
+
+```text
+refs/tags/v*        refs/tags/*/v*
+refs/tags/@*        refs/tags/*-v*
+```
+
+`*/v*` covers Knope's per-package format; `*-v*` covers the legacy
+release-plz tags so history stays protected.
+
+Only two actors bypass it: the `oakoss` App (`Integration:3174795`),
+which is what the release workflow tags as, and `OrganizationAdmin`.
+Both ids are re-derivable if the ruleset is ever recreated:
+`gh api orgs/oakoss/rulesets --jq '.[] | select(.target=="tag") | "\(.id) \(.name)"'`
+and `gh api apps/oakoss --jq .id`.
+Everyone else is rejected — including any workflow using the default
+`GITHUB_TOKEN`, which is `github-actions[bot]` and holds no bypass.
+
+That makes every manual tag operation in this runbook admin-only:
+cutting an RC tag, deleting tags during rollback, and the one-time
+migration-tag push. A rejected push means the ruleset caught it —
+check bypass eligibility before assuming the credential is broken.
+
+To confirm the ruleset evaluated a push (bypasses are logged, so this
+works even when you bypass it):
+
+```sh
+gh api repos/oakoss/linesmith/rulesets/rule-suites \
+  --jq '.[] | select(.ref | startswith("refs/tags/"))
+        | "\(.result) \(.ref) actor=\(.actor_name)"'
+```
 
 ## Knope migration tags (one-time, for the first Knope release)
 
@@ -312,8 +356,9 @@ git tag linesmith-plugin/v0.1.3 linesmith-plugin-v0.1.3
 git push origin linesmith/v0.2.0 linesmith-core/v0.2.0 linesmith-plugin/v0.1.3
 ```
 
-These commands are safe to re-run (tag creation is idempotent if you delete
-locally first). After the first Knope release, the legacy `<crate>-v*` and
+These commands are spent — the migration is done. Re-running them now
+needs bypass on the org tag ruleset (both the delete and the re-push);
+see §Tag protection. After the first Knope release, the legacy `<crate>-v*` and
 bare `v*` tags can stay in place — `release.yml`'s tag filter still matches
 the bare form for backward compatibility, and doctor's self-update probe
 normalizes all four formats.
