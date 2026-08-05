@@ -2,8 +2,9 @@ title = "linesmith gitleaks config"
 
 [allowlist]
 description = """
-Suppress generic-api-key false positives on bead memory keys (e.g.
-'lsm-9zvh-warn-dedupe' in .beads/issues.jsonl). regexTarget = 'match'
+Suppress generic-api-key false positives on bead ids and memory keys
+(e.g. 'lsm-9zvh-warn-dedupe') wherever they appear — commit messages,
+docs, and code comments. regexTarget = 'match'
 narrows the suppression to the matching SUBSTRING, so a real secret
 pasted into a bead description (which wouldn't match this shape)
 still trips the scan.
