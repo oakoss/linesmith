@@ -78,10 +78,13 @@ JSONL aggregation, git), so a release build is not worth the compile
 wait while iterating. Back up the file first — it is outside the repo and
 nothing else records what it pointed at.
 
-**Isolate the cache.** `XDG_CACHE_HOME=/tmp/lsm-test ./target/debug/linesmith`
-keeps test runs off `~/.cache/linesmith/usage.json`, which the real
-statusline is reading. Editing or deleting that file to force a code path
-perturbs the thing you are trying to observe.
+**Isolate the cache for manual runs.**
+`XDG_CACHE_HOME=/tmp/lsm-test ./target/debug/linesmith` keeps them off
+`~/.cache/linesmith/usage.json`. Editing or deleting that file to force a
+code path perturbs the thing you are trying to observe. The live
+statusline still uses the real cache — the variable only covers processes
+you launch yourself, so expect the two to interleave, and read `cached_at`
+rather than assuming which one wrote it.
 
 **Do not loop renders against `/api/oauth/usage`.** It rate-limits
 aggressively, and its cooldown outlasts the 30s lock file, so every retry
@@ -284,7 +287,7 @@ Spawned agents with `isolation: worktree` can drift onto main-repo files. Audit 
 ## Rules
 
 - **Never commit proactively.** Wait for the user's go-ahead.
-- **Never push** unless explicitly asked.
+- **Never push** unless explicitly asked. This governs `git push` — code, and everything it triggers. It does not govern `bd dolt push`, which publishes issue metadata to a Dolt remote, starts no CI or release, and is versioned; the `pre-push` hook runs it automatically.
 - **Read before writing.** Understand existing docs/code before modifying.
 - **Conventions are law.** Follow `docs/README.md` for the docs pipeline, MADR v4.0 for ADRs, per-folder templates for new docs.
 - **No empty docs.** Every idea needs a problem statement, every ADR needs considered options + rationale, every spec needs interface + behavior.
@@ -345,10 +348,12 @@ git add <files>
 git commit -m "feat(scope): ..."
 ```
 
-`bd dolt push` replicates issue state to the remote, and it does so
-explicitly — the `pre-push` hook does not (verified 2026-08-05: a hook
-run left `refs/dolt/data` unchanged; an explicit push advanced it). Run
-it when you want the close visible to other checkouts.
+`bd dolt push` replicates issue state to the remote. The `pre-push`
+hook runs it for you when pushing to `origin` (bd's own hook chain does
+not — verified 2026-08-05: a chain run left `refs/dolt/data` unchanged;
+an explicit push advanced it). Run it by hand when you want a close
+visible to other checkouts without pushing code, or after pushing to a
+remote other than `origin`, which the hook skips.
 
 Do NOT make a separate `chore(beads):` commit to record the close. Issue
 state never enters git, so there is nothing for such a commit to carry.

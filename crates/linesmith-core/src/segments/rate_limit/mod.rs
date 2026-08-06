@@ -3,7 +3,7 @@
 //!
 //! See `format` for the shared render helpers, and the per-window
 //! files (`five_hour`, `seven_day`, `model_scoped`)
-//! for the four `Segment` impls. The dispatcher in `segments::mod.rs`
+//! for the five `Segment` impls. The dispatcher in `segments::mod.rs`
 //! wires the user-facing `[segments.rate_limit_*]` config keys to the
 //! segment structs re-exported below.
 

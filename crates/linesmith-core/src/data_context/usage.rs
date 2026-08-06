@@ -567,6 +567,11 @@ mod tests {
         }))
         .expect("parse");
         let limits = r.limits.expect("limits");
+        // Distinguishes "degraded to Unknown" from "element dropped":
+        // if `#[serde(other)]` failed to match, the element would fail to
+        // deserialize and the tolerant reader would drop it, leaving an
+        // empty vec rather than an `Unknown` variant.
+        assert_eq!(limits.len(), 1, "element was dropped, not degraded");
         assert_eq!(limits[0].kind, LimitKind::Unknown);
         assert_eq!(limits[0].severity, LimitSeverity::Unknown);
     }

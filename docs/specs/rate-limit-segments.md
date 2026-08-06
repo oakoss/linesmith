@@ -327,7 +327,7 @@ require a multi-value contract this segment family does not have.
 **Render template.** Follows the file's `label: value` convention — `Fable: 82.0%`,
 not `82% Fable`. The one-decimal form is the shared percent renderer's, matching
 `5h: 22.0%` and `7d: 33.0%`. `label` defaults to `UsageLimit::scoped_model_name()`;
-setting it replaces that (`label = "7dm"` → `7dm: 82%`). Unlike its siblings,
+setting it replaces that (`label = "7dm"` → `7dm: 82.0%`). Unlike its siblings,
 `label = ""` cannot mean "hide the label", because an unlabelled percentage is
 indistinguishable from `rate_limit_7d`; `""` falls back to the model name.
 
