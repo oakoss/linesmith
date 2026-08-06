@@ -75,4 +75,20 @@ pre-push:
       env:
         BD_GIT_HOOK: '1'
         TERM: dumb
-      run: .lefthook/bd-hook.sh pre-push {1} {2}
+      # The `bd dolt push` is chained here rather than run as a sibling
+      # command: `parallel: true` would race it against the hook chain
+      # above on the same Dolt database, and the lock contention would
+      # surface as an intermittent sync failure that the `||` below then
+      # swallows.
+      #
+      # bd's own pre-push chain does not replicate the database (verified
+      # 2026-08-05: a hook run left the remote's refs/dolt/data unchanged;
+      # an explicit push advanced it), so issue state only ever reached
+      # the remote by hand. The push never fails the git push — shipping
+      # code must not depend on the issue tracker being reachable — but it
+      # reports, because a silent sync failure looks exactly like a
+      # working one.
+      #
+      # Only fires on `git push`, so a session that changes issues without
+      # committing code still needs `bd dolt push`.
+      run: '.lefthook/bd-hook.sh pre-push {1} {2} && { bd dolt push || echo "beads — dolt push failed; run bd dolt push manually" >&2; }'

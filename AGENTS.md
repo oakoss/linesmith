@@ -69,6 +69,37 @@ Managed by [mise](https://mise.jdx.dev/). Run `mise install` to get all tools.
 
 Git hooks installed via `lefthook install`. `pre-commit` runs fmt/lint on staged files; `commit-msg` verifies conventional commit format via `cog`.
 
+### Testing against a live statusline
+
+Point `~/.claude/settings.json`'s `statusLine.command` at
+`target/debug/linesmith` and rebuild with `cargo build -p linesmith`.
+Debug costs ~15ms per render against ~150ms dominated by I/O (endpoint,
+JSONL aggregation, git), so a release build is not worth the compile
+wait while iterating. Back up the file first — it is outside the repo and
+nothing else records what it pointed at.
+
+**Isolate the cache.** `XDG_CACHE_HOME=/tmp/lsm-test ./target/debug/linesmith`
+keeps test runs off `~/.cache/linesmith/usage.json`, which the real
+statusline is reading. Editing or deleting that file to force a code path
+perturbs the thing you are trying to observe.
+
+**Do not loop renders against `/api/oauth/usage`.** It rate-limits
+aggressively, and its cooldown outlasts the 30s lock file, so every retry
+returns 429 and pushes `blocked_until` further out. A handful of rapid
+invocations locks the account out for the better part of an hour; the
+cascade then falls back to JSONL and the whole line switches from
+percentages to raw token counts (`~5h: 384M`), with the reset segments
+hiding because a rolling window has no hard reset. That is spec'd
+behavior, not breakage — see [ADR-0013](docs/adrs/0013-jsonl-fallback-carries-token-counts.md).
+
+**Segment not appearing after a change? Read `cached_at` first.** A cache
+written by an older binary deserializes new typed fields to `None`, so the
+segment hides until the 180s TTL expires
+([ADR-0030](docs/adrs/0030-model-scoped-usage-arrives-in-a-limits-array.md)
+§Decision Outcome). Two separate debugging detours during `lsm-zgju`
+started by mistaking this for a defect. `LINESMITH_LOG=debug` prints the
+hide reason per segment and is the fastest way to tell these apart.
+
 ### Releases
 
 Knope drives release automation per [ADR-0027](docs/adrs/0027-knope-for-release-automation.md) — per-crate versioning, per-crate CHANGELOG, cross-manifest dep-pin updates by name. Release-PR merge fires `knope-release.yml`, which tags each bumped package and creates its GitHub Release; each `<crate>/v*` tag push then fires its own `knope-release.yml` run that publishes to crates.io (it can't ride the merge run — crates.io rejects `pull_request_target`); the `linesmith/v*` tag additionally fires cargo-dist's `release.yml` for binary builds, which the library tags deliberately don't. Expect several runs per release — one publish run per bumped crate, some of which may report as cancelled rather than failed once three or more tags land, since each run publishes the whole workspace and the `knope-publish` group keeps only one pending. Exact counts are in `docs/ops/release-runbook.md`. A `verify-published` job fails the release if the registry doesn't catch up. Full contract in `docs/specs/release-process.md`; day-of-release steps in `docs/ops/release-runbook.md`.
@@ -329,7 +360,7 @@ When ending a work session:
 1. **File issues for remaining work.** Run `bd create ...` for anything that needs follow-up.
 2. **Run quality gates** if code changed: `mise run check` or a relevant subset.
 3. **Update issue status.** Close finished work with `bd close <id>`; update in-progress items.
-4. **Offer to sync beads.** `bd dolt push` publishes issue state to the remote, so `## Rules`' "never push unless explicitly asked" governs it the same way it governs `git push`. Say what is unpushed and let the user decide — issue state lives in the database rather than the tree, so an unpushed database exists only on this machine and won't surface on its own.
+4. **Sync beads.** Run `bd dolt push` — it does not need the go-ahead `git push` does. It publishes issue metadata, triggers no CI or release, and Dolt is versioned, so the blast radius is nothing like a code push. The `pre-push` hook covers the common case, but it only fires when code is pushed; a session that only changes issues still needs the explicit command, and an unpushed database exists on one machine and won't surface on its own.
 5. **Commit if the user asks.** Do not commit proactively.
 
 Beads replicates through a Dolt remote (`origin` → `git+ssh://git@github.com/oakoss/linesmith.git`), configured as `sync.remote` in `.beads/config.yaml`. It stores the database in `refs/dolt/data` and a `__dolt_remote_info__` branch inside this repo; `.beads/issues.jsonl` is a local export and is not tracked. Code and issue state push separately: `git push` for one, `bd dolt push` for the other.
