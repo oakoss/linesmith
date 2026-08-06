@@ -493,6 +493,7 @@ fn stub_ctx() -> crate::data_context::DataContext {
         tool: Tool::ClaudeCode,
         model: Some(ModelInfo {
             display_name: "X".into(),
+            id: None,
         }),
         workspace: Some(WorkspaceInfo {
             project_dir: PathBuf::from("/r"),
@@ -856,6 +857,7 @@ fn model_ctx(display_name: &str) -> crate::data_context::DataContext {
         tool: Tool::ClaudeCode,
         model: Some(ModelInfo {
             display_name: display_name.into(),
+            id: None,
         }),
         workspace: Some(WorkspaceInfo {
             project_dir: PathBuf::from("/repo"),

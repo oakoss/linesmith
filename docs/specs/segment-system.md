@@ -610,6 +610,7 @@ Shipped defaults:
 | `session_duration`                           | `\u{f252}`     |
 | `rate_limit_5h`                              | `\u{f017}`     |
 | `rate_limit_7d`                              | `\u{f073}`     |
+| `rate_limit_7d_model`                        | `\u{2727}`     |
 | `rate_limit_5h_reset`, `rate_limit_7d_reset` | `\u{21bb}`     |
 
 `cost`, `effort`, `tokens_*`, `vim`, `agent`, `output_style`, `context_window`, and `extra_usage` ship without default icons.

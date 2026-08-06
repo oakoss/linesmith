@@ -20,8 +20,8 @@ use serde_json::Value as JsonValue;
 
 use crate::data_context::{
     DataContext, DataDep, DirtyCounts, DirtyState, EndpointUsage, ExtraUsage, FiveHourWindow,
-    GitContext, Head, JsonlUsage, RepoKind, SevenDayWindow, TokenCounts, UpstreamState,
-    UsageBucket, UsageData,
+    GitContext, Head, JsonlUsage, LimitKind, LimitModel, LimitScope, LimitSeverity, RepoKind,
+    SevenDayWindow, TokenCounts, UpstreamState, UsageBucket, UsageData, UsageLimit,
 };
 use crate::input::{
     ContextWindow, CostMetrics, GitWorktree, ModelInfo, OutputStyle, StatusContext, Tool,
@@ -279,8 +279,16 @@ fn build_tool(t: &Tool) -> Dynamic {
 }
 
 fn build_model(m: &ModelInfo) -> Dynamic {
+    // Destructure so adding a field to ModelInfo surfaces as a compile
+    // error rather than silently dropping from the rhai mirror.
+    let ModelInfo { display_name, id } = m;
     let mut out = Map::new();
-    out.insert("display_name".into(), Dynamic::from(m.display_name.clone()));
+    out.insert("display_name".into(), Dynamic::from(display_name.clone()));
+    out.insert(
+        "id".into(),
+        id.as_ref()
+            .map_or(Dynamic::UNIT, |v: &String| Dynamic::from(v.clone())),
+    );
     Dynamic::from_map(out)
 }
 
@@ -418,6 +426,7 @@ fn build_endpoint_usage(e: &EndpointUsage) -> Dynamic {
         seven_day_sonnet,
         seven_day_oauth_apps,
         extra_usage,
+        limits,
         unknown_buckets,
     } = e;
     let mut m = Map::new();
@@ -455,10 +464,110 @@ fn build_endpoint_usage(e: &EndpointUsage) -> Dynamic {
             .map_or(Dynamic::UNIT, build_extra_usage),
     );
     m.insert(
+        "limits".into(),
+        limits.as_deref().map_or(Dynamic::UNIT, build_limits),
+    );
+    m.insert(
         "unknown_buckets".into(),
         build_unknown_buckets(unknown_buckets),
     );
     Dynamic::from_map(m)
+}
+
+/// Server-controlled array, so it gets the same breadth cap
+/// `unknown_buckets` gets as a server-controlled map — rhai's
+/// script-side limits don't apply to host-constructed values.
+fn build_limits(limits: &[UsageLimit]) -> Dynamic {
+    let mut out = rhai::Array::new();
+    for lim in limits.iter().take(MAX_ARRAY_SIZE) {
+        out.push(build_usage_limit(lim));
+    }
+    if limits.len() > MAX_ARRAY_SIZE {
+        crate::lsm_warn!(
+            "ctx.usage.data.limits: truncated to {MAX_ARRAY_SIZE} entries (source had {})",
+            limits.len(),
+        );
+    }
+    Dynamic::from_array(out)
+}
+
+fn build_usage_limit(l: &UsageLimit) -> Dynamic {
+    // Destructure so adding a field to UsageLimit forces a mirror update.
+    let UsageLimit {
+        kind,
+        percent,
+        resets_at,
+        scope,
+        severity,
+    } = l;
+    let mut m = Map::new();
+    m.insert(
+        "kind".into(),
+        Dynamic::from(limit_kind_str(*kind).to_string()),
+    );
+    m.insert("percent".into(), Dynamic::from(f64::from(percent.value())));
+    m.insert(
+        "resets_at".into(),
+        resets_at.map_or(Dynamic::UNIT, |t: jiff::Timestamp| {
+            Dynamic::from(t.to_string())
+        }),
+    );
+    m.insert(
+        "scope".into(),
+        scope.as_ref().map_or(Dynamic::UNIT, build_limit_scope),
+    );
+    m.insert(
+        "severity".into(),
+        Dynamic::from(limit_severity_str(*severity).to_string()),
+    );
+    Dynamic::from_map(m)
+}
+
+fn build_limit_scope(s: &LimitScope) -> Dynamic {
+    let LimitScope { model } = s;
+    let mut m = Map::new();
+    m.insert(
+        "model".into(),
+        model.as_ref().map_or(Dynamic::UNIT, build_limit_model),
+    );
+    Dynamic::from_map(m)
+}
+
+fn build_limit_model(lm: &LimitModel) -> Dynamic {
+    let LimitModel { display_name, id } = lm;
+    let mut m = Map::new();
+    m.insert(
+        "display_name".into(),
+        display_name
+            .as_ref()
+            .map_or(Dynamic::UNIT, |v: &String| Dynamic::from(v.clone())),
+    );
+    m.insert(
+        "id".into(),
+        id.as_ref()
+            .map_or(Dynamic::UNIT, |v: &String| Dynamic::from(v.clone())),
+    );
+    Dynamic::from_map(m)
+}
+
+/// Mirrored as strings rather than the Rust enum: rhai has no enum
+/// type, and the wire spelling is what a plugin author reads in the
+/// endpoint docs.
+fn limit_kind_str(k: LimitKind) -> &'static str {
+    match k {
+        LimitKind::Session => "session",
+        LimitKind::WeeklyAll => "weekly_all",
+        LimitKind::WeeklyScoped => "weekly_scoped",
+        _ => "unknown",
+    }
+}
+
+fn limit_severity_str(s: LimitSeverity) -> &'static str {
+    match s {
+        LimitSeverity::Normal => "normal",
+        LimitSeverity::Warning => "warning",
+        _ => "unknown",
+    }
 }
 
 fn build_jsonl_usage(j: &JsonlUsage) -> Dynamic {
@@ -886,6 +995,7 @@ mod tests {
             tool: Tool::ClaudeCode,
             model: Some(ModelInfo {
                 display_name: "Sonnet".to_string(),
+                id: None,
             }),
             workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from("/repo"),
@@ -970,6 +1080,18 @@ mod tests {
                 used_credits: Some(40.0),
                 currency: Some("EUR".into()),
             }),
+            limits: Some(vec![UsageLimit {
+                kind: LimitKind::WeeklyScoped,
+                percent: Percent::new(82.0).unwrap(),
+                resets_at: None,
+                scope: Some(LimitScope {
+                    model: Some(LimitModel {
+                        display_name: Some("Fable".into()),
+                        id: None,
+                    }),
+                }),
+                severity: LimitSeverity::Warning,
+            }]),
             unknown_buckets,
         });
 
@@ -1712,6 +1834,7 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
+            limits: None,
             unknown_buckets: unknown,
         });
         let dc = DataContext::new(minimal_status());
@@ -1913,6 +2036,7 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
+            limits: None,
             unknown_buckets: unknown,
         });
         let dc = DataContext::new(minimal_status());
@@ -1957,6 +2081,7 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
+            limits: None,
             unknown_buckets: unknown,
         });
         let dc = DataContext::new(minimal_status());
@@ -2002,6 +2127,7 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
+            limits: None,
             unknown_buckets: unknown,
         });
         let dc = DataContext::new(minimal_status());
@@ -2056,6 +2182,7 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
+            limits: None,
             unknown_buckets: unknown,
         });
         let dc = DataContext::new(minimal_status());
@@ -2114,6 +2241,7 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
+            limits: None,
             unknown_buckets: unknown,
         });
         let dc = DataContext::new(minimal_status());
@@ -2154,6 +2282,7 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
+            limits: None,
             unknown_buckets: unknown,
         });
         let dc = DataContext::new(minimal_status());
@@ -2196,6 +2325,7 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
+            limits: None,
             unknown_buckets: unknown,
         });
         let dc = DataContext::new(minimal_status());
@@ -2256,6 +2386,7 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
+            limits: None,
             unknown_buckets: unknown,
         });
         let dc = DataContext::new(minimal_status());

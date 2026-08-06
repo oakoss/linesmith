@@ -87,7 +87,27 @@ fn parse_model(root: &serde_json::Map<String, serde_json::Value>) -> Option<Mode
     };
     Some(ModelInfo {
         display_name: display_name.to_owned(),
+        id: parse_model_id(model),
     })
+}
+
+/// `model.id` degrades to `None` independently of `display_name`: an
+/// absent or malformed id costs only the family-matching that
+/// `rate_limit_7d_model` needs, and hiding the whole model wrapper over
+/// it would take unrelated segments down too.
+fn parse_model_id(model: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let value = model.get("id")?;
+    if value.is_null() {
+        return None;
+    }
+    let Some(id) = value.as_str() else {
+        crate::lsm_warn!(
+            "model.id: expected string, got {:?}; degrading to None",
+            JsonType::of(value)
+        );
+        return None;
+    };
+    (!id.is_empty()).then(|| id.to_owned())
 }
 
 /// ADR-0014: any sub-field failure downgrades to `None` + warn.

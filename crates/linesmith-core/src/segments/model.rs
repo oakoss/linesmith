@@ -125,6 +125,7 @@ mod tests {
             tool,
             model: Some(ModelInfo {
                 display_name: display_name.into(),
+                id: None,
             }),
             workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from("/repo"),

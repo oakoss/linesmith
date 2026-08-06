@@ -202,6 +202,7 @@ mod tests {
             tool: Tool::ClaudeCode,
             model: Some(ModelInfo {
                 display_name: "X".into(),
+                id: None,
             }),
             workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from("/repo"),
@@ -231,6 +232,7 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
+            limits: None,
             unknown_buckets: std::collections::HashMap::new(),
         })
     }
@@ -258,6 +260,7 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
+            limits: None,
             unknown_buckets: std::collections::HashMap::new(),
         })
     }
@@ -271,6 +274,7 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
+            limits: None,
             unknown_buckets: std::collections::HashMap::new(),
         });
         assert_eq!(
@@ -401,6 +405,7 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
+            limits: None,
             unknown_buckets: std::collections::HashMap::new(),
         });
         assert_eq!(
@@ -478,6 +483,7 @@ mod tests {
             seven_day_sonnet: None,
             seven_day_oauth_apps: None,
             extra_usage: None,
+            limits: None,
             unknown_buckets: std::collections::HashMap::new(),
         });
         assert_eq!(

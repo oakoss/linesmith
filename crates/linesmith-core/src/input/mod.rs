@@ -77,6 +77,53 @@ impl std::fmt::Display for Tool {
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
     pub display_name: String,
+
+    /// Model identifier, e.g. `claude-fable-5`, `claude-opus-5[1m]`,
+    /// `claude-3-5-sonnet-20241022`. Dash-delimited with the family as
+    /// a distinct token, which makes it the reliable key for family
+    /// matching — `display_name` is marketing text carrying version
+    /// numbers and an inconsistently-applied `(1M context)` suffix. The
+    /// family's position varies by generation, so consumers scan rather
+    /// than index; see `rate-limit-segments.md` §`rate_limit_7d_model`.
+    /// Degrades to `None` on missing/null/non-string, like every other
+    /// leaf.
+    pub id: Option<String>,
+}
+
+impl ModelInfo {
+    /// The model family: the first dash-delimited token after the
+    /// vendor prefix that is not purely numeric. Returned in the id's
+    /// own case; callers compare case-insensitively, because folding is
+    /// a property of the comparison rather than of the family.
+    ///
+    /// The non-numeric test keeps the `claude-3-*` generation working,
+    /// where the family sits third or fourth
+    /// (`claude-3-5-sonnet-20241022` → `sonnet`). Taking the second
+    /// token unconditionally would yield `3`, matching no API
+    /// `display_name`.
+    ///
+    /// The prefix is matched on the token *ending* in `claude` rather
+    /// than on the id starting with it: bare Claude Code sends
+    /// `claude-…`, but Bedrock and Vertex send
+    /// `us.anthropic.claude-sonnet-4-20250514-v1:0`. Requiring a leading
+    /// `claude-` would return `None` for every Bedrock user. An id with
+    /// no such token is not an Anthropic model, so it yields `None`
+    /// rather than a guess — hiding is the safe direction.
+    #[must_use]
+    pub fn family(&self) -> Option<&str> {
+        let mut tokens = self.id.as_deref()?.split('-');
+        tokens.find(|tok| {
+            tok.rsplit('.')
+                .next()
+                .is_some_and(|last| last.eq_ignore_ascii_case("claude"))
+        })?;
+        tokens
+            // Strip a `[1m]`-style variant marker before testing the
+            // token, so an id whose token is nothing else (`claude-[1m]`)
+            // is rejected rather than yielding an empty family.
+            .map(|tok| tok.split('[').next().unwrap_or(tok))
+            .find(|tok| !tok.is_empty() && !tok.chars().all(|c| c.is_ascii_digit()))
+    }
 }
 
 #[derive(Debug, Clone)]

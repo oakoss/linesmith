@@ -89,6 +89,7 @@ mod tests {
             tool: Tool::ClaudeCode,
             model: Some(ModelInfo {
                 display_name: "X".into(),
+                id: None,
             }),
             workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from("/repo"),

@@ -717,6 +717,7 @@ pub const BUILT_IN_SEGMENT_IDS: &[&str] = &[
     "rate_limit_7d",
     "rate_limit_5h_reset",
     "rate_limit_7d_reset",
+    "rate_limit_7d_model",
     "extra_usage",
     "session_duration",
     "tokens_input",
@@ -765,6 +766,9 @@ pub fn built_in_by_id(
         )),
         "rate_limit_7d" => Some(Box::new(
             rate_limit::seven_day::RateLimit7dSegment::from_extras(e, warn),
+        )),
+        "rate_limit_7d_model" => Some(Box::new(
+            rate_limit::model_scoped::RateLimit7dModelSegment::from_extras(e, warn),
         )),
         "rate_limit_5h_reset" => Some(Box::new(
             rate_limit::five_hour::RateLimit5hResetSegment::from_extras(e, warn),
@@ -1277,6 +1281,7 @@ mod layout_type_tests {
             tool: Tool::ClaudeCode,
             model: Some(ModelInfo {
                 display_name: "X".into(),
+                id: None,
             }),
             workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from("/r"),
@@ -1859,6 +1864,7 @@ mod layout_type_tests {
             tool: Tool::ClaudeCode,
             model: Some(ModelInfo {
                 display_name: "Claude".into(),
+                id: None,
             }),
             workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from("/repo/linesmith"),

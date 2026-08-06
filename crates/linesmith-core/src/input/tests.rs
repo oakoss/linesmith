@@ -1273,3 +1273,151 @@ fn parse_error_invalid_value_display_includes_tool_path_and_reason() {
         "reason in message, got {msg:?}"
     );
 }
+
+/// `ModelInfo::family` feeds the `rate_limit_7d_model` match against
+/// Anthropic's own model names, so a wrong answer would render one
+/// model's number under another's label.
+mod model_family {
+    use crate::input::ModelInfo;
+
+    fn family(id: Option<&str>) -> Option<String> {
+        ModelInfo {
+            display_name: "irrelevant".into(),
+            id: id.map(str::to_owned),
+        }
+        .family()
+        .map(str::to_owned)
+    }
+
+    #[test]
+    fn takes_the_first_non_numeric_token() {
+        assert_eq!(family(Some("claude-fable-5")).as_deref(), Some("fable"));
+        assert_eq!(family(Some("claude-opus-5")).as_deref(), Some("opus"));
+    }
+
+    /// The `claude-3-*` generation puts the family third or fourth.
+    /// Taking the second token unconditionally would yield `3`.
+    #[test]
+    fn skips_purely_numeric_tokens() {
+        assert_eq!(
+            family(Some("claude-3-5-sonnet-20241022")).as_deref(),
+            Some("sonnet")
+        );
+        assert_eq!(
+            family(Some("claude-3-opus-20240229")).as_deref(),
+            Some("opus")
+        );
+    }
+
+    #[test]
+    fn strips_the_variant_marker() {
+        assert_eq!(family(Some("claude-fable-5[1m]")).as_deref(), Some("fable"));
+        assert_eq!(family(Some("claude-opus-5[1m]")).as_deref(), Some("opus"));
+    }
+
+    /// A token that is nothing but a variant marker must not survive as
+    /// an empty family.
+    #[test]
+    fn rejects_a_token_that_is_only_a_variant_marker() {
+        assert_eq!(family(Some("claude-[1m]")), None);
+    }
+
+    /// Not an Anthropic id, so there is nothing to match against
+    /// Anthropic's model names — guessing would be worse than hiding.
+    #[test]
+    fn rejects_ids_with_no_claude_token() {
+        assert_eq!(family(Some("gpt-4o")), None);
+        assert_eq!(family(Some("sonnet")), None);
+        assert_eq!(family(Some("gpt-5-codex")), None);
+    }
+
+    /// Bedrock and Vertex prefix the id with a dotted vendor path.
+    /// Matching on a leading `claude-` would return `None` for every
+    /// one of those users, so the prefix is matched on the token
+    /// *ending* in `claude`.
+    #[test]
+    fn handles_bedrock_and_vertex_vendor_prefixes() {
+        assert_eq!(
+            family(Some("us.anthropic.claude-sonnet-4-20250514-v1:0")).as_deref(),
+            Some("sonnet")
+        );
+        assert_eq!(
+            family(Some("eu.anthropic.claude-3-5-sonnet-20241022-v2:0")).as_deref(),
+            Some("sonnet")
+        );
+    }
+
+    /// The "everything numeric ⇒ hide" half of the non-numeric rule.
+    #[test]
+    fn rejects_an_all_numeric_tail() {
+        assert_eq!(family(Some("claude-3-5")), None);
+        assert_eq!(family(Some("claude-3-5-20241022")), None);
+    }
+
+    #[test]
+    fn handles_degenerate_ids() {
+        assert_eq!(family(None), None);
+        assert_eq!(family(Some("")), None);
+        assert_eq!(family(Some("claude")), None);
+        assert_eq!(family(Some("claude-")), None);
+        assert_eq!(family(Some("claude-5")), None);
+        assert_eq!(family(Some("claude--sonnet")).as_deref(), Some("sonnet"));
+    }
+
+    /// The prefix match folds case; the family itself is returned as the
+    /// id spells it, and the caller compares case-insensitively.
+    #[test]
+    fn folds_case_on_the_prefix_but_preserves_the_family() {
+        assert_eq!(family(Some("CLAUDE-FABLE-5")).as_deref(), Some("FABLE"));
+    }
+}
+
+/// `parse_model_id` is the only thing that populates `ModelInfo.id`.
+/// If it stops working, `family()` returns `None` for everyone and
+/// `rate_limit_7d_model` hides for 100% of users under the default
+/// `smart` — while every segment test keeps passing, because they
+/// construct `ModelInfo` directly and never touch the normalizer.
+mod model_id {
+    fn id_of(model: serde_json::Value) -> Option<String> {
+        let json = serde_json::json!({ "model": model }).to_string();
+        crate::input::parse(json.as_bytes())
+            .expect("parse")
+            .model
+            .and_then(|m| m.id)
+    }
+
+    #[test]
+    fn reads_a_string_id() {
+        assert_eq!(
+            id_of(serde_json::json!({"display_name": "Fable 5", "id": "claude-fable-5"}))
+                .as_deref(),
+            Some("claude-fable-5")
+        );
+    }
+
+    #[test]
+    fn degrades_on_missing_null_and_empty() {
+        assert_eq!(id_of(serde_json::json!({"display_name": "X"})), None);
+        assert_eq!(
+            id_of(serde_json::json!({"display_name": "X", "id": null})),
+            None
+        );
+        assert_eq!(
+            id_of(serde_json::json!({"display_name": "X", "id": ""})),
+            None
+        );
+    }
+
+    /// Degrades independently of `display_name`: a bad id costs the
+    /// family match, not the whole model wrapper.
+    #[test]
+    fn a_non_string_id_warns_and_leaves_display_name_intact() {
+        let json = serde_json::json!({"model": {"display_name": "X", "id": 5}}).to_string();
+        let (ctx, warns) =
+            crate::logging::_test_capture_warns(|| crate::input::parse(json.as_bytes()));
+        let model = ctx.expect("parse").model.expect("model survives");
+        assert_eq!(model.display_name, "X");
+        assert_eq!(model.id, None);
+        assert!(warns.iter().any(|w| w.contains("model.id")), "{warns:?}");
+    }
+}
