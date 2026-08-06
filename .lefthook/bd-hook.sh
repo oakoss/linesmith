@@ -7,9 +7,10 @@
 # beads hook that errors mid-write has touched the database and silently
 # continuing would leave it inconsistent.
 #
-# Honors BEADS_HOOK_TIMEOUT (default 300s) when the `timeout` binary is
-# available (not on default macOS; present on Linux and on macOS via
-# coreutils).
+# Honors BEADS_HOOK_TIMEOUT (default 300s) via `timeout`, or `gtimeout` as
+# Homebrew coreutils installs it. Default macOS has neither, and there the
+# hook runs unbounded — bd-dolt-push.sh carries a portable watchdog for that
+# case because it is the one that reaches the network.
 #
 # Usage: bd-hook.sh <event> [args...]
 
@@ -38,6 +39,8 @@ esac
 
 if command -v timeout >/dev/null 2>&1; then
   timeout "$limit" bd hooks run "$event" "$@"
+elif command -v gtimeout >/dev/null 2>&1; then
+  gtimeout "$limit" bd hooks run "$event" "$@"
 else
   bd hooks run "$event" "$@"
 fi

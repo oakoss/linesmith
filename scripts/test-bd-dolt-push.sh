@@ -272,7 +272,7 @@ teardown
 # after a push that was never attempted.
 setup
 stub_bd_with_config "$SYNC" "exit 0"
-rm "$sandbox/bin/mktemp"
+rm -f "$sandbox/bin/mktemp"
 ( cd "$sandbox" && env PATH="$stub_path" \
   "$SHELL_UNDER_TEST" "$SCRIPT" origin "$CANON" ) >/dev/null 2>"$sandbox/err"
 check "no mktemp -> exit 0" "exit status" "$?" "0"
@@ -285,7 +285,7 @@ teardown
 # the push is never blocked must hold regardless.
 setup
 stub_bd_with_config "$SYNC" "sleep 30"
-rm "$sandbox/bin/pgrep"
+rm -f "$sandbox/bin/pgrep"
 start="$(date +%s)"
 ( cd "$sandbox" && env PATH="$stub_path" BEADS_HOOK_TIMEOUT=2 \
   "$SHELL_UNDER_TEST" "$SCRIPT" origin "$CANON" ) >/dev/null 2>"$sandbox/err"
