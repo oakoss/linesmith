@@ -667,11 +667,32 @@ fn segment_override_schema(id: &str) -> Option<&'static [&'static str]> {
         "dim_empty",
         "fill",
     ];
+    // `PERCENT_SEGMENT` plus the visibility knob only this segment has.
+    const MODEL_SCOPED_SEGMENT: &[&str] = &[
+        "priority",
+        "width",
+        "style",
+        "visible_if",
+        "icon",
+        "label",
+        "stale_marker",
+        "progress_width",
+        "format",
+        "invert",
+        "fill",
+        "brackets",
+        "dim_empty",
+        "threshold_color",
+        "thresholds",
+        "characters",
+        "visibility",
+    ];
     match id {
         "model" => Some(MODEL_SEGMENT),
         "workspace" | "cost" | "effort" | "context_window" => Some(BUILT_IN_COMMON),
         "context_bar" => Some(CONTEXT_BAR_SEGMENT),
         "rate_limit_5h" | "rate_limit_7d" => Some(PERCENT_SEGMENT),
+        "rate_limit_7d_model" => Some(MODEL_SCOPED_SEGMENT),
         "rate_limit_5h_reset" | "rate_limit_7d_reset" => Some(RESET_SEGMENT),
         "extra_usage" => Some(RATE_LIMIT_COMMON),
         "git_branch" => Some(GIT_BRANCH_SEGMENT),

@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use super::usage::{ExtraUsage, UsageApiResponse, UsageBucket};
+use super::usage::{ExtraUsage, UsageApiResponse, UsageBucket, UsageLimit};
 
 /// Cache schema version. Bump when the on-disk shape changes in a
 /// way that can't be read by an older linesmith — readers with a
@@ -151,6 +151,13 @@ pub struct CachedData {
     pub seven_day_oauth_apps: Option<UsageBucket>,
     #[serde(default)]
     pub extra_usage: Option<ExtraUsage>,
+    /// Written by the same typed model the wire is parsed into, so this
+    /// is a lossy view of the response: `group`, `is_active`,
+    /// `scope.surface`, and any unrecognized `kind` / `severity` are
+    /// already gone by the time it lands here. Per ADR-0030 that is the
+    /// cost of promotion, not a cache defect.
+    #[serde(default)]
+    pub limits: Option<Vec<UsageLimit>>,
     #[serde(default)]
     pub unknown_buckets: HashMap<String, serde_json::Value>,
 }
@@ -164,6 +171,7 @@ impl From<UsageApiResponse> for CachedData {
             seven_day_sonnet: r.seven_day_sonnet,
             seven_day_oauth_apps: r.seven_day_oauth_apps,
             extra_usage: r.extra_usage,
+            limits: r.limits,
             unknown_buckets: r.unknown_buckets,
         }
     }
@@ -178,6 +186,7 @@ impl From<CachedData> for UsageApiResponse {
             seven_day_sonnet: c.seven_day_sonnet,
             seven_day_oauth_apps: c.seven_day_oauth_apps,
             extra_usage: c.extra_usage,
+            limits: c.limits,
             unknown_buckets: c.unknown_buckets,
         }
     }
@@ -416,6 +425,49 @@ mod tests {
             "seven_day": { "utilization": 33.0, "resets_at": "2026-04-23T19:00:00Z" }
         }"#;
         serde_json::from_str(json).expect("parse")
+    }
+
+    /// Dropping either `From` direction hides `rate_limit_7d_model` for
+    /// the 180s a cache entry lives — visible to the user, invisible to
+    /// every other test.
+    #[test]
+    fn round_trip_preserves_limits_in_both_directions() {
+        let response: UsageApiResponse = serde_json::from_str(
+            r#"{
+                "limits": [{
+                    "kind": "weekly_scoped",
+                    "percent": 82,
+                    "scope": { "model": { "display_name": "Fable", "id": null } },
+                    "severity": "warning"
+                }]
+            }"#,
+        )
+        .expect("parse");
+
+        let cached = CachedData::from(response);
+        assert_eq!(
+            cached
+                .limits
+                .as_deref()
+                .and_then(|l| l.first())
+                .and_then(super::super::usage::UsageLimit::scoped_model_name),
+            Some("Fable"),
+            "UsageApiResponse -> CachedData dropped limits"
+        );
+
+        // Through the on-disk form, so the `#[serde(default)]` field is
+        // exercised rather than only the in-memory move.
+        let json = serde_json::to_string(&cached).expect("serialize");
+        let reloaded: CachedData = serde_json::from_str(&json).expect("deserialize");
+        let back = UsageApiResponse::from(reloaded);
+        assert_eq!(
+            back.limits
+                .as_deref()
+                .and_then(|l| l.first())
+                .and_then(super::super::usage::UsageLimit::scoped_model_name),
+            Some("Fable"),
+            "CachedData -> UsageApiResponse dropped limits"
+        );
     }
 
     // Path-resolution tests live with the XDG cascade in

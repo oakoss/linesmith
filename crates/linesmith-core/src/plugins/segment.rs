@@ -186,6 +186,7 @@ mod tests {
             tool: Tool::ClaudeCode,
             model: Some(ModelInfo {
                 display_name: "Sonnet".to_string(),
+                id: None,
             }),
             workspace: Some(WorkspaceInfo {
                 project_dir: PathBuf::from("/repo"),

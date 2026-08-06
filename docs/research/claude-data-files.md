@@ -309,6 +309,112 @@ CCometixLine reads `HTTPS_PROXY`/`HTTP_PROXY` from this block as a CC-specific p
 
 Anthropic-internal codename buckets (`omelette`, `cowork`, `iguana_necktie`) appear to be forward-compat fields for unreleased features. linesmith's parser must use `serde(default)` + `Option<T>` everywhere and not error on unknown fields.
 
+### Live `/api/oauth/usage` response (Max-tier user, 2026-08-05)
+
+Two things changed against the 2026-04-18 capture above. The named
+per-model buckets went empty — `seven_day_sonnet` joined
+`seven_day_opus` and `seven_day_oauth_apps` at `null` — and the same
+information reappeared in a `limits` array. [ADR-0030](../adrs/0030-model-scoped-usage-arrives-in-a-limits-array.md)
+promotes that array out of the forward-compat catch-all into the typed
+response model.
+
+The array, verbatim:
+
+```json
+[
+  {
+    "group": "session",
+    "is_active": false,
+    "kind": "session",
+    "percent": 5,
+    "resets_at": "2026-08-05T19:50:00.333776+00:00",
+    "scope": null,
+    "severity": "normal"
+  },
+  {
+    "group": "weekly",
+    "is_active": false,
+    "kind": "weekly_all",
+    "percent": 60,
+    "resets_at": "2026-08-08T13:59:59.333803+00:00",
+    "scope": null,
+    "severity": "normal"
+  },
+  {
+    "group": "weekly",
+    "is_active": true,
+    "kind": "weekly_scoped",
+    "percent": 82,
+    "resets_at": "2026-08-08T14:00:00.334182+00:00",
+    "scope": {
+      "model": { "display_name": "Fable", "id": null },
+      "surface": null
+    },
+    "severity": "warning"
+  }
+]
+```
+
+Note `percent` is an integer here where `utilization` is a float above,
+and `scope.model.id` is null — which is why matching a session's model
+to a bucket goes through the id's family token rather than an id-to-id
+comparison (see [rate-limit-segments.md](../specs/rate-limit-segments.md)
+§`rate_limit_7d_model`).
+
+`session` and `weekly_all` agree with the named `five_hour` /
+`seven_day` buckets exactly — same percentage, and the same `resets_at`
+to the microsecond:
+
+```text
+five_hour  16.0%  resets 2026-08-06T00:50:00.576583Z
+session    16     resets 2026-08-06T00:50:00.576583+00:00
+seven_day  64.0%  resets 2026-08-08T14:00:00.576602Z
+weekly_all 64     resets 2026-08-08T14:00:00.576602+00:00
+```
+
+So the array is additive rather than a replacement, and
+`rate_limit_5h` / `rate_limit_7d` can keep reading the named fields.
+[ADR-0030](../adrs/0030-model-scoped-usage-arrives-in-a-limits-array.md)
+records this as uncaptured; it is captured now.
+
+`is_active` is also worth pinning: the `weekly_scoped` bucket carried
+`true` in one capture and `false` in another, taken hours apart on the
+same account with the same model in use. That is the evidence behind not
+modelling it — it is a server-side judgement about the account, and
+nothing constrains it to agree with the local session.
+
+The same response carried five new root keys alongside the April
+codenames. Values below are normalized — the shapes are verbatim, the
+numbers are not this account's:
+
+```json
+{
+  "amber_ladder": null,
+  "cinder_cove": null,
+  "nimbus_quill": null,
+  "member_dashboard_available": false,
+  "spend": {
+    "auto_reload": null,
+    "balance": null,
+    "can_purchase_credits": false,
+    "can_toggle": false,
+    "cap": { "credits": { "amount_minor": 0, "exponent": 2 }, "money": null },
+    "disabled_reason": null,
+    "disclaimer": "Usage credits cover you when you hit your plan limits. […]",
+    "enabled": true,
+    "limit": { "amount_minor": 0, "currency": "USD", "exponent": 2 },
+    "percent": 0,
+    "severity": "normal",
+    "used": { "amount_minor": 0, "currency": "USD", "exponent": 2 }
+  }
+}
+```
+
+`spend` is the one worth watching: it carries money fields in minor
+units with an explicit `exponent`, and a `percent`/`severity` pair
+mirroring the `limits` entries. Nothing reads it today, so it stays in
+the catch-all under ADR-0030's promote-on-dependency rule.
+
 ### Per-project `lastModelUsage` shape
 
 ```json

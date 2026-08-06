@@ -41,8 +41,8 @@ pub use error::{
 pub use git::{DirtyCounts, DirtyState, GitContext, Head, RepoKind, UpstreamState};
 pub use jsonl::{FiveHourBlock, JsonlAggregate, TokenCounts};
 pub use usage::{
-    EndpointUsage, ExtraUsage, FiveHourWindow, JsonlUsage, SevenDayWindow, UsageApiResponse,
-    UsageBucket, UsageData,
+    EndpointUsage, ExtraUsage, FiveHourWindow, JsonlUsage, LimitKind, LimitModel, LimitScope,
+    LimitSeverity, SevenDayWindow, UsageApiResponse, UsageBucket, UsageData, UsageLimit,
 };
 
 // --- Stub source types ---------------------------------------------------

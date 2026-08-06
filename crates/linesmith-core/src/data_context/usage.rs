@@ -58,6 +58,18 @@ pub struct UsageApiResponse {
     #[serde(default)]
     pub extra_usage: Option<ExtraUsage>,
 
+    /// Model-scoped and aggregate limits. Per
+    /// [ADR-0030](../../../../docs/adrs/0030-model-scoped-usage-arrives-in-a-limits-array.md)
+    /// this is where per-model weekly usage now arrives; the
+    /// `seven_day_*` fields above are null in practice.
+    ///
+    /// `default` is load-bearing alongside `deserialize_with`: the
+    /// latter does not imply the former, so without it an omitted
+    /// `limits` key fails the whole response with "missing field"
+    /// before any per-item tolerance runs.
+    #[serde(default, deserialize_with = "deserialize_limits")]
+    pub limits: Option<Vec<UsageLimit>>,
+
     /// Forward-compat catch-all. Any top-level key not matched above
     /// lands here as raw JSON so we preserve what the endpoint sent
     /// even when we don't yet know what to do with it.
@@ -68,9 +80,9 @@ pub struct UsageApiResponse {
 /// Names of every recognized top-level field on
 /// [`UsageApiResponse`]. Exported so `linesmith doctor` can check
 /// "did the endpoint return any forward-compat keys?" without
-/// duplicating the field list — the [`KNOWN_BUCKETS_PARITY`] test
-/// below pins this against `UsageApiResponse` so the two can't
-/// drift.
+/// duplicating the field list — the
+/// `known_buckets_matches_usage_api_response_fields` test below pins
+/// this against `UsageApiResponse` so the two can't drift.
 pub const KNOWN_BUCKETS: &[&str] = &[
     "five_hour",
     "seven_day",
@@ -78,11 +90,12 @@ pub const KNOWN_BUCKETS: &[&str] = &[
     "seven_day_sonnet",
     "seven_day_oauth_apps",
     "extra_usage",
+    "limits",
 ];
 
 /// Codenamed forward-compat buckets observed in the live endpoint
 /// during research captures (see `docs/research/claude-data-files.md`
-/// §Raw data, 2026-04-18 capture). These are unrecognized by
+/// §Raw data, 2026-04-18 and 2026-08-05 captures). These are unrecognized by
 /// `UsageApiResponse`'s strict struct fields but Anthropic ships
 /// them on every response — gating the doctor's
 /// "endpoint.shape_current" WARN on this list keeps the report quiet
@@ -91,11 +104,18 @@ pub const KNOWN_BUCKETS: &[&str] = &[
 ///
 /// Refresh whenever the research doc captures a new live response.
 pub const RESEARCH_DOCUMENTED_BUCKETS: &[&str] = &[
+    // 2026-04-18 capture
     "iguana_necktie",
     "omelette_promotional",
     "seven_day_cowork",
     "seven_day_omelette",
     "tangelo",
+    // 2026-08-05 capture
+    "amber_ladder",
+    "cinder_cove",
+    "member_dashboard_available",
+    "nimbus_quill",
+    "spend",
 ];
 
 /// Utilization plus reset-time for a single rolling window.
@@ -114,6 +134,121 @@ pub struct UsageBucket {
 
     #[serde(default)]
     pub resets_at: Option<Timestamp>,
+}
+
+/// One element of the endpoint's `limits` array.
+///
+/// Only the fields something consumes are modelled. `group` is
+/// derivable from `kind`; `scope.surface` has only ever been `null`, so
+/// its populated type is unknown and modelling it as `Option<String>`
+/// would drop the whole element under the tolerant deserializer if it
+/// turned out to be an object; `is_active` is omitted so
+/// `rate-limit-segments.md`'s "not a visibility signal" rule holds
+/// structurally rather than by convention — it is a server-side
+/// judgement about the account, and nothing constrains it to agree with
+/// the local session's model.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[non_exhaustive]
+pub struct UsageLimit {
+    /// Selection key. `weekly_scoped` is the model-scoped bucket
+    /// `rate_limit_7d_model` renders; `session` / `weekly_all`
+    /// duplicate `five_hour` / `seven_day` and are ignored.
+    pub kind: LimitKind,
+
+    /// Arrives as a JSON integer (`82`) where [`UsageBucket`]'s
+    /// `utilization` arrives as a float; the shared helper reads either
+    /// and clamps to `[0, 100]`.
+    #[serde(deserialize_with = "deserialize_clamped_percent")]
+    pub percent: Percent,
+
+    #[serde(default)]
+    pub resets_at: Option<Timestamp>,
+
+    /// Populated only for `kind == WeeklyScoped` in every capture to
+    /// date. The correlation is not enforced by the type.
+    #[serde(default)]
+    pub scope: Option<LimitScope>,
+
+    /// Not consulted when rendering — threshold colouring already
+    /// derives from `percent`, and honouring both would let two
+    /// mechanisms disagree about one number. Modelled so plugins can
+    /// reach it.
+    #[serde(default)]
+    pub severity: LimitSeverity,
+}
+
+impl UsageLimit {
+    /// The model family this limit is scoped to, or `None` for any limit
+    /// that does not name one — wrong `kind`, absent `scope`, absent
+    /// `model`, absent or empty `display_name`. Those five are
+    /// indistinguishable to every consumer, so the judgement lives here
+    /// rather than being re-derived by the segment and again by each
+    /// plugin. Empty counts as absent for the same reason it does at the
+    /// stdin boundary: a caller that treats `Some("")` as a name renders
+    /// a label that isn't there.
+    #[must_use]
+    pub fn scoped_model_name(&self) -> Option<&str> {
+        if self.kind != LimitKind::WeeklyScoped {
+            return None;
+        }
+        self.scope
+            .as_ref()?
+            .model
+            .as_ref()?
+            .display_name
+            .as_deref()
+            .filter(|n| !n.is_empty())
+    }
+}
+
+/// What a [`UsageLimit`] is scoped to. `#[non_exhaustive]` leaves room
+/// for `surface`, which the endpoint sends as `null` today.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[non_exhaustive]
+pub struct LimitScope {
+    #[serde(default)]
+    pub model: Option<LimitModel>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[non_exhaustive]
+pub struct LimitModel {
+    /// The family name (`"Fable"`), not the stdin `display_name`
+    /// (`"Fable 5"`).
+    #[serde(default)]
+    pub display_name: Option<String>,
+
+    /// `null` in every capture to date. If it ever populates, it retires
+    /// the family-token heuristic in `rate-limit-segments.md`
+    /// §`rate_limit_7d_model` in favour of an id-to-id comparison.
+    #[serde(default)]
+    pub id: Option<String>,
+}
+
+/// `#[serde(other)]` absorbs a new server-side kind as `Unknown` rather
+/// than failing the element; `#[non_exhaustive]` keeps adding a variant
+/// from breaking downstream matches, which `serde(other)` does nothing
+/// for.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LimitKind {
+    Session,
+    WeeklyAll,
+    WeeklyScoped,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LimitSeverity {
+    Normal,
+    Warning,
+    #[default]
+    #[serde(other)]
+    Unknown,
 }
 
 /// Overage-credit tracking for accounts with extra-usage enabled.
@@ -153,6 +288,14 @@ pub struct ExtraUsage {
 /// leaves room for a future third source without a SemVer break.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
+// `Endpoint` outgrew `Jsonl` by more than clippy's 200-byte threshold
+// when ADR-0030 added `limits`. Boxing it is the usual remedy and is
+// wrong here: exactly one `UsageData` exists per invocation and it is
+// always handed out as `Arc<Result<UsageData, _>>`, so it is already
+// behind one indirection and the disparity costs nothing. Boxing would
+// add a second hop and break every downstream `Endpoint(e)` pattern for
+// no gain.
+#[allow(clippy::large_enum_variant)]
 pub enum UsageData {
     Endpoint(EndpointUsage),
     Jsonl(JsonlUsage),
@@ -170,6 +313,11 @@ pub struct EndpointUsage {
     pub seven_day_sonnet: Option<UsageBucket>,
     pub seven_day_oauth_apps: Option<UsageBucket>,
     pub extra_usage: Option<ExtraUsage>,
+
+    /// Where per-model weekly usage arrives per ADR-0030. The
+    /// `seven_day_*` fields above are null in practice.
+    pub limits: Option<Vec<UsageLimit>>,
+
     pub unknown_buckets: HashMap<String, serde_json::Value>,
 }
 
@@ -259,12 +407,59 @@ impl UsageApiResponse {
             seven_day_sonnet: self.seven_day_sonnet,
             seven_day_oauth_apps: self.seven_day_oauth_apps,
             extra_usage: self.extra_usage,
+            limits: self.limits,
             unknown_buckets: self.unknown_buckets,
         }
     }
 }
 
 // --- Deserializer helpers ----------------------------------------------
+
+/// Per-item-tolerant `limits` reader. One malformed element must not
+/// fail the whole response and drop to the JSONL fallback.
+///
+/// `deserialize_line_entries` in `config.rs` is the closest precedent
+/// but only solves the per-item half — it still fails the parse if the
+/// value isn't an array. This degrades a non-array to `None` instead,
+/// warning unless the value is `null`, which is this endpoint's own
+/// idiom for an absent bucket.
+fn deserialize_limits<'de, D>(de: D) -> Result<Option<Vec<UsageLimit>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = serde_json::Value::deserialize(de)?;
+    let items = match raw {
+        serde_json::Value::Null => return Ok(None),
+        serde_json::Value::Array(items) => items,
+        other => {
+            crate::lsm_warn!(
+                "usage endpoint sent `limits` as {}, expected an array; ignoring",
+                json_kind(&other)
+            );
+            return Ok(None);
+        }
+    };
+
+    let mut out = Vec::with_capacity(items.len());
+    for (idx, item) in items.into_iter().enumerate() {
+        match serde_json::from_value::<UsageLimit>(item) {
+            Ok(limit) => out.push(limit),
+            Err(e) => crate::lsm_warn!("usage endpoint `limits[{idx}]` unusable, dropping: {e}"),
+        }
+    }
+    Ok(Some(out))
+}
+
+fn json_kind(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
 
 fn deserialize_clamped_percent<'de, D>(de: D) -> Result<Percent, D::Error>
 where
@@ -303,6 +498,161 @@ where
 mod tests {
     use super::*;
 
+    /// The wire sends `percent` as an integer while `utilization`
+    /// arrives as a float; the shared clamp helper has to read both.
+    #[test]
+    fn limits_percent_accepts_an_integer() {
+        let r: UsageApiResponse = serde_json::from_value(serde_json::json!({
+            "limits": [{"kind": "weekly_scoped", "percent": 82}]
+        }))
+        .expect("parse");
+        let limits = r.limits.expect("limits");
+        assert_eq!(limits[0].percent.value(), 82.0);
+    }
+
+    #[test]
+    fn limits_percent_clamps_out_of_range() {
+        let r: UsageApiResponse = serde_json::from_value(serde_json::json!({
+            "limits": [{"kind": "session", "percent": 140}]
+        }))
+        .expect("parse");
+        assert_eq!(r.limits.expect("limits")[0].percent.value(), 100.0);
+    }
+
+    /// One bad element must not take the response down to the JSONL
+    /// fallback — that would hide every rate-limit segment, not just
+    /// this one.
+    #[test]
+    fn limits_drops_only_the_malformed_element() {
+        let r: UsageApiResponse = serde_json::from_value(serde_json::json!({
+            "limits": [
+                {"kind": "weekly_scoped", "percent": 82},
+                {"kind": "weekly_scoped"},
+                {"kind": "session", "percent": 5}
+            ]
+        }))
+        .expect("parse");
+        let limits = r.limits.expect("limits");
+        assert_eq!(limits.len(), 2);
+        assert_eq!(limits[0].percent.value(), 82.0);
+        assert_eq!(limits[1].kind, LimitKind::Session);
+    }
+
+    #[test]
+    fn limits_degrades_a_non_array_to_none() {
+        let r: UsageApiResponse = serde_json::from_value(serde_json::json!({
+            "limits": {"kind": "weekly_scoped"}
+        }))
+        .expect("parse");
+        assert!(r.limits.is_none());
+    }
+
+    /// `null` is this endpoint's own idiom for an absent bucket, so it
+    /// degrades silently where other non-array shapes warn.
+    #[test]
+    fn limits_null_and_missing_both_yield_none() {
+        let explicit: UsageApiResponse =
+            serde_json::from_value(serde_json::json!({"limits": null})).expect("parse");
+        assert!(explicit.limits.is_none());
+
+        let absent: UsageApiResponse =
+            serde_json::from_value(serde_json::json!({})).expect("parse");
+        assert!(absent.limits.is_none());
+    }
+
+    #[test]
+    fn unrecognized_kind_and_severity_degrade_rather_than_fail() {
+        let r: UsageApiResponse = serde_json::from_value(serde_json::json!({
+            "limits": [{"kind": "monthly_thing", "percent": 10, "severity": "spicy"}]
+        }))
+        .expect("parse");
+        let limits = r.limits.expect("limits");
+        // Distinguishes "degraded to Unknown" from "element dropped":
+        // if `#[serde(other)]` failed to match, the element would fail to
+        // deserialize and the tolerant reader would drop it, leaving an
+        // empty vec rather than an `Unknown` variant.
+        assert_eq!(limits.len(), 1, "element was dropped, not degraded");
+        assert_eq!(limits[0].kind, LimitKind::Unknown);
+        assert_eq!(limits[0].severity, LimitSeverity::Unknown);
+    }
+
+    /// The five ways a limit can fail to name a model are one case to
+    /// every consumer, so the accessor collapses them.
+    #[test]
+    fn scoped_model_name_collapses_every_absence() {
+        let wire = serde_json::json!([
+            {"kind": "session", "percent": 5,
+             "scope": {"model": {"display_name": "Fable"}}},
+            {"kind": "weekly_scoped", "percent": 1},
+            {"kind": "weekly_scoped", "percent": 1, "scope": {}},
+            {"kind": "weekly_scoped", "percent": 1, "scope": {"model": {}}},
+            {"kind": "weekly_scoped", "percent": 1,
+             "scope": {"model": {"display_name": ""}}},
+            {"kind": "weekly_scoped", "percent": 1,
+             "scope": {"model": {"display_name": "Fable"}}}
+        ]);
+        let limits: Vec<UsageLimit> = serde_json::from_value(wire).expect("parse");
+        let names: Vec<Option<&str>> = limits.iter().map(UsageLimit::scoped_model_name).collect();
+        assert_eq!(names, vec![None, None, None, None, None, Some("Fable")]);
+    }
+
+    /// Round-tripping through the cache is lossy by design, but must be
+    /// stable: an already-`Unknown` kind must not decay further.
+    #[test]
+    fn limits_survive_a_cache_round_trip() {
+        let original: UsageApiResponse = serde_json::from_value(serde_json::json!({
+            "limits": [{"kind": "monthly_thing", "percent": 10}]
+        }))
+        .expect("parse");
+        let json = serde_json::to_value(&original).expect("serialize");
+        let back: UsageApiResponse = serde_json::from_value(json).expect("reparse");
+        assert_eq!(original.limits, back.limits);
+    }
+
+    /// `limits` sits alongside `#[serde(flatten)] unknown_buckets`, so
+    /// it deserializes through serde's content-buffering path rather
+    /// than the direct one. Parse a realistic full body to prove the
+    /// combination works and that `limits` does not also leak into the
+    /// catch-all — a leak would put it back in doctor's unknown-key WARN.
+    #[test]
+    fn limits_parses_alongside_the_flatten_catch_all() {
+        let body = serde_json::json!({
+            "five_hour": {"utilization": 22.0, "resets_at": "2026-08-05T19:50:00Z"},
+            "seven_day": {"utilization": 60.0, "resets_at": "2026-08-08T13:59:59Z"},
+            "seven_day_opus": null,
+            "seven_day_sonnet": null,
+            "seven_day_oauth_apps": null,
+            "extra_usage": {"is_enabled": false},
+            "limits": [{
+                "group": "weekly", "is_active": true, "kind": "weekly_scoped",
+                "percent": 82, "resets_at": "2026-08-08T14:00:00Z",
+                "scope": {"model": {"display_name": "Fable", "id": null}, "surface": null},
+                "severity": "warning"
+            }],
+            "amber_ladder": null,
+            "cinder_cove": null,
+            "nimbus_quill": null,
+            "spend": {"anything": 1},
+            "member_dashboard_available": true
+        });
+        let r: UsageApiResponse = serde_json::from_value(body).expect("full body parses");
+
+        assert_eq!(
+            r.limits
+                .as_deref()
+                .and_then(|l| l.first())
+                .and_then(UsageLimit::scoped_model_name),
+            Some("Fable")
+        );
+        assert!(
+            !r.unknown_buckets.contains_key("limits"),
+            "limits leaked into the catch-all: {:?}",
+            r.unknown_buckets.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(r.five_hour.expect("five_hour").utilization.value(), 22.0);
+        assert_eq!(r.unknown_buckets.len(), 5, "the five 2026-08-05 keys");
+    }
+
     /// Tripwire: `KNOWN_BUCKETS` must list every recognized field
     /// on `UsageApiResponse`. If a new bucket lands here without
     /// the const being updated, `linesmith doctor` would WARN
@@ -339,6 +689,7 @@ mod tests {
                 used_credits: None,
                 currency: None,
             }),
+            limits: None,
             unknown_buckets: HashMap::new(),
         };
         let value = serde_json::to_value(&response).expect("serialize");
