@@ -20,7 +20,7 @@ run = "prettier -uc ."
 
 [tasks.lint]
 description = "Run all linters"
-depends = ["lint:md"]
+depends = ["lint:md", "lint:sh"]
 
 [tasks."lint:md"]
 description = "Lint markdown files"
@@ -29,6 +29,62 @@ run = "markdownlint-cli2 '**/*.md' '#node_modules'"
 [tasks."lint:md:fix"]
 description = "Lint and fix markdown files"
 run = "markdownlint-cli2 --fix '**/*.md' '#node_modules'"
+
+# The pre-commit hook shellchecks *staged* files only, which misses an
+# unstaged edit, a `--no-verify` push, and any tree where hooks aren't
+# installed. `git ls-files` rather than a glob so `target/` and vendored
+# scripts stay out; `.beads/hooks/*` is listed separately because those
+# scripts are shell without carrying a `.sh` extension.
+#
+# `-z` / `xargs -0` rather than word-splitting: `git ls-files` C-escapes
+# non-ASCII paths under the default `core.quotePath`, so splitting on
+# whitespace mangles any accented or CJK filename into arguments that
+# don't exist.
+#
+# `--others` so a script still being iterated on is linted before it is
+# staged; an empty match is a hard error because a repo that registers a
+# shell linter has shell to lint, and a selector that quietly stops
+# matching would keep both `lint` and CI green over unlinted scripts.
+[tasks."lint:sh"]
+description = "Lint shell scripts"
+run = '''
+set -e
+set -- '*.sh' '.beads/hooks/*'
+# A failed `git ls-files` also yields empty output, so the two are separated:
+# blaming the pathspec would send the reader to edit the one thing that is
+# not wrong.
+if ! matches="$(git ls-files --cached --others --exclude-standard -- "$@")"; then
+  echo >&2 "lint:sh: git ls-files failed — not a git repository, or git is unavailable"
+  exit 1
+fi
+if [ -z "$matches" ]; then
+  echo >&2 "lint:sh: no shell scripts matched — the selector is stale"
+  exit 1
+fi
+git ls-files -z --cached --others --exclude-standard -- "$@" | xargs -0 shellcheck --
+'''
+
+# Shell hooks run on every push but are invisible to the Rust suite. The
+# watchdog in bd-dolt-push.sh has shipped a process-leak bug twice, and both
+# times it was a process-table assertion — not code review, not exit codes —
+# that would have caught it.
+#
+# Both shells explicitly, because they take different halves of the watchdog:
+# bash-as-sh grants job control and uses the process-group kill, while dash
+# declines it and falls through to the tree walk. Relying on the OS matrix to
+# cover both would silently drop half the coverage the day a runner image
+# changes its /bin/sh.
+[tasks."test:sh"]
+description = "Run shell hook contract tests"
+run = '''
+set -e
+./scripts/test-bd-dolt-push.sh /bin/sh
+if command -v dash >/dev/null 2>&1; then
+  ./scripts/test-bd-dolt-push.sh "$(command -v dash)"
+else
+  echo "test:sh: dash not installed — process-group-less path not exercised" >&2
+fi
+'''
 
 [tasks."cargo:fmt"]
 description = "Format Rust code"
@@ -104,7 +160,7 @@ description = "Run all tests"
 # Sequential, not parallel-via-depends, so the two cargo invocations
 # don't fight over target/ (cargo's per-target lock serializes them
 # anyway, but parallel here would just be slower with no upside).
-run = ["mise run cargo:test", "mise run cargo:test:doc"]
+run = ["mise run cargo:test", "mise run cargo:test:doc", "mise run test:sh"]
 
 [tasks.bench]
 description = "Run all benchmarks"

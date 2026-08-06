@@ -41,6 +41,9 @@ jobs:
       - name: Lint markdown
         run: mise run lint:md
 
+      - name: Lint shell scripts
+        run: mise run lint:sh
+
       - name: Check Rust formatting
         run: mise run cargo:fmt:check
 
@@ -87,6 +90,13 @@ jobs:
 
       - name: Run doc tests
         run: mise run cargo:test:doc
+
+      # POSIX sh hooks; nothing to exercise on Windows. Running on both
+      # Linux and macOS is deliberate — the watchdog's process handling is
+      # where these scripts have broken before, and it differs between them.
+      - name: Run shell hook tests
+        if: runner.os != 'Windows'
+        run: mise run test:sh
 
   msrv:
     name: MSRV
