@@ -349,11 +349,18 @@ git commit -m "feat(scope): ..."
 ```
 
 `bd dolt push` replicates issue state to the remote. The `pre-push`
-hook runs it for you when pushing to `origin` (bd's own hook chain does
-not — verified 2026-08-05: a chain run left `refs/dolt/data` unchanged;
-an explicit push advanced it). Run it by hand when you want a close
-visible to other checkouts without pushing code, or after pushing to a
-remote other than `origin`, which the hook skips.
+hook runs it for you when the push destination is the beads sync remote
+(bd's own hook chain does not — verified 2026-08-05: a chain run left
+`refs/dolt/data` unchanged; an explicit push advanced it). The guard
+compares the destination URL git is actually pushing to against
+`sync.remote`, not the remote's name, so a fork whose `origin` points
+elsewhere is skipped rather than having issue state published to the
+canonical repo.
+
+Run `bd dolt push` by hand in the cases the hook can't cover: a session
+that changes issues without pushing code, a push to a remote other than
+the sync remote, and tag-only or branch-deletion pushes — lefthook skips
+a `pre-push` command when the push carries no changed files.
 
 Do NOT make a separate `chore(beads):` commit to record the close. Issue
 state never enters git, so there is nothing for such a commit to carry.

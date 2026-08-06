@@ -78,10 +78,14 @@ pre-push:
       # Chained rather than run as a sibling command: `parallel: true`
       # would race the Dolt push against the hook chain above on the same
       # database, and the lock contention would surface as an intermittent
-      # sync failure. The script never fails, so a push it can't complete
-      # reports without blocking `git push`, and it skips remotes other
-      # than origin — see the script for why.
+      # sync failure. `bd-dolt-push.sh` never fails, so a push it can't
+      # complete reports without blocking `git push`, and it skips pushes
+      # aimed anywhere but the beads sync remote — see the script for why.
+      #
+      # `{2}` is git's own destination URL for this push, which already
+      # accounts for pushurl and insteadOf; the script prefers it over
+      # resolving the remote name a second time.
       #
       # Only fires on `git push`, so a session that changes issues without
       # committing code still needs `bd dolt push`.
-      run: '.lefthook/bd-hook.sh pre-push {1} {2} && .lefthook/bd-dolt-push.sh {1}'
+      run: '.lefthook/bd-hook.sh pre-push {1} {2} && .lefthook/bd-dolt-push.sh {1} {2}'
