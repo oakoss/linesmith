@@ -644,11 +644,15 @@ jobs:
                 publish)
                   # Recovery has to name the tag it is recovering.
                   # Falling back to `main` is what made this path
-                  # dangerous: if main moved past the release, `cargo
-                  # release publish` finds every version already
-                  # published and exits 0 — green having published
-                  # nothing, on the exact dispatch an operator reaches
-                  # for *because* crates.io looked stale.
+                  # dangerous: if main moved past the release, every
+                  # version is already published, so the publish step
+                  # skips all of them and reports success — green having
+                  # published nothing, on the exact dispatch an operator
+                  # reaches for *because* crates.io looked stale. That
+                  # green is now produced deliberately by the
+                  # already-published tolerance below, which makes naming
+                  # the tag the only thing standing between a mistyped
+                  # recovery and a false all-clear (lsm-rurz).
                   if [ -z "$TAG" ]; then
                     echo "::error::mode=publish requires the tag input (e.g. linesmith/v0.3.0). Refusing to publish whatever main currently points at." >&2
                     exit 1
@@ -764,7 +768,76 @@ jobs:
       # `mode=release` dispatch resolves to the literal `'main'` and
       # lands on the branch. Dropping `HEAD` would break every
       # tag-triggered publish.
+      #
+      # A release that bumps N crates pushes N tags, and each tag fires its
+      # own publish run against the whole workspace. The first run publishes
+      # everything; the rest find every member already on crates.io, skip
+      # them all, and `cargo release` exits 2 with "no packages selected" —
+      # red for a release that fully succeeded. Observed on 0.4.0, where
+      # linesmith-core/v0.4.0 published both crates and linesmith/v0.4.0
+      # then failed with nothing left to do.
+      #
+      # Counting, rather than testing that the phrase appears at all, is the
+      # load-bearing part. cargo-release 1.1.2 (the pinned version) warns
+      # "disabled due to previous publish" per already-on-crates.io member,
+      # but several routes drop a member from the selection while logging at
+      # `debug`/`trace` — invisible at default verbosity, e.g. a stray
+      # `[package.metadata.release] release = false`. An existence check
+      # would read one crate's warning as covering a sibling that was
+      # silently dropped and never published: the stranded-release failure
+      # this whole tolerance exists to avoid reintroducing. Requiring one
+      # warning per publishable member makes the notice's claim checkable.
+      #
+      # Two properties make the tolerance safe at all, both from the pinned
+      # source. steps/publish.rs returns Err(2) the moment the selected set
+      # is empty — before publishing anything — so this error cannot coexist
+      # with a partially-failed publish. And ops/cargo.rs `is_published`
+      # returns false when the index lookup errors, so a sparse-index outage
+      # makes members look unpublished and get published, rather than
+      # fabricating the skips this guard reads.
+      #
+      # Gating publish to a single tag would be the wrong fix —
+      # linesmith-plugin versions independently, so a plugin-only release
+      # pushes one tag that must still publish.
       - name: Publish bumped crates to crates.io
+        shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: cargo release publish --workspace --execute --no-confirm --allow-branch 'main,HEAD'
+        run: |
+          set +e
+          log="$(mktemp)"
+          # `tee`, not a captured substitution: a cancelled run is the only
+          # kill switch for an in-flight crates.io push, and buffering would
+          # discard the log of the one operation here that cannot be undone.
+          cargo release publish --workspace --execute --no-confirm --allow-branch 'main,HEAD' 2>&1 | tee "$log"
+          status=${PIPESTATUS[0]}
+          [ "$status" -eq 0 ] && exit 0
+
+          # Matched without cargo-release's `error: ` prefix: that is rendered
+          # through anstream, so forcing colour (CARGO_TERM_COLOR=always) would
+          # wrap it in escapes and break the match. The phrase alone is unique.
+          if ! grep -q 'no packages selected' "$log"; then
+            exit "$status"
+          fi
+
+          # Same filter `verify-published` applies, so both jobs agree on
+          # which members are expected to reach crates.io.
+          expected="$(cargo metadata --no-deps --format-version 1 |
+            jq '[.packages[] | select(.publish == null or (.publish | index("crates-io")))] | length')"
+          skipped="$(grep -c 'disabled due to previous publish' "$log")"
+
+          # Checked before it is compared, so a metadata or jq failure reports
+          # itself rather than surfacing as a shortfall — which would send the
+          # reader hunting for a dropped crate that does not exist.
+          if ! [[ "$expected" =~ ^[0-9]+$ ]] || [ "$expected" -eq 0 ]; then
+            echo "::error::Could not determine the publishable member count from cargo metadata; refusing to interpret the empty selection." >&2
+            exit "$status"
+          fi
+
+          if [ "$skipped" -eq "$expected" ]; then
+            echo "::notice::All ${expected} publishable members already carry their manifest version on crates.io; nothing to publish."
+            exit 0
+          fi
+
+          echo "::error::Publish selected nothing, but only ${skipped} of ${expected} publishable members were skipped as already-published. A member may have been dropped from the release." >&2
+          exit "$status"

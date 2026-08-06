@@ -115,9 +115,45 @@ workspace.
 **Expect one run per bumped crate's tag, plus the merge run** — so two
 for a single-package cycle, four for a full three-crate release. Of
 those three tag runs, expect one **cancelled** (evicted from the
-concurrency queue, not a failure) and two green — the first publishes
-everything and the second no-ops, because `cargo-release` skips
-already-published members. If you only see the merge run, publish never
+concurrency queue, not a failure) and the rest green — the first
+publishes everything and the others no-op, because `cargo-release` skips
+already-published members.
+
+A no-op run is green rather than red only because the publish step
+tolerates that one case explicitly: when every member is skipped,
+`cargo release` exits 2 with `no packages selected`, and the step
+converts that to success — but only after counting one
+`disabled due to previous publish` warning for **every** crates.io-publishable
+member, using the same `cargo metadata` filter `verify-published` uses.
+The count matters: a crate can leave the selection silently (cargo-release
+logs several such routes at `debug`/`trace`), and merely checking that the
+phrase appeared somewhere would read one crate's already-published warning
+as covering a sibling that was never published at all. A short count fails
+red and names the shortfall. **So a red publish run means a real failure,
+with one bounded exception the log names outright.** Before this
+tolerance existed, the 0.4.0 release ended with a red run on a release
+that had fully succeeded (`lsm-kma0`).
+
+The exception is a sparse-index hiccup. `cargo-release` treats an index
+lookup error as "not published" — deliberately, so an outage publishes
+rather than skips — and that member therefore stays in the selection, gets
+a real publish attempt, and is rejected by crates.io as already uploaded.
+The run goes red on a release that was already complete. Recognise it by
+the log: a `failed to read metadata for <crate>` warning followed by an
+already-uploaded rejection, and no `no packages selected` line at all.
+Confirm the version on the index and re-run the tag; do not treat it as a
+stranded release.
+
+A **cancelled** publish run is not automatically harmless, despite the
+queue-eviction note above: cancelling a tag run is also the only way to
+stop an in-flight crates.io push. Distinguish them by the log — an evicted
+run never reaches the `Install cargo-release` step, whereas a run killed
+mid-publish streams its progress up to the point it stopped (the step uses
+`tee`, so the log survives cancellation). If a cancelled run got as far as
+publishing, treat it as a partial release and check the registry before
+re-running.
+
+If you only see the merge run, publish never
 fired; recover with `gh workflow run "Knope Release" -f mode=publish -f
 tag=<crate>/v<version>`. The `tag` input is required — recovery publishes
 that tag's commit, and without it the run would read `main`, which after
