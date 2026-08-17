@@ -19,6 +19,15 @@ set -u
 event="$1"
 shift
 
+# lefthook leaves an unfilled positional template as the literal text "{2}"
+# rather than dropping it, and git omits prepare-commit-msg's source and sha
+# on a plain commit. Without this, beads reads "{2}" as git's source argument.
+for arg in "$@"; do
+  shift
+  case "$arg" in '{'[0-9]'}') continue ;; esac
+  set -- "$@" "$arg"
+done
+
 # Contributors clone without beads. Without this, `bd hooks run` exits 127,
 # which the case below propagates — failing the hook and blocking their git
 # operation outright, for a tool they never opted into.
