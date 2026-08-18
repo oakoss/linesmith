@@ -190,6 +190,7 @@ pub(crate) fn render_error(err: &UsageError, cfg: &CommonRateLimitConfig) -> Str
         UsageError::NetworkError => "[Network error]",
         UsageError::ParseError => "[Parse error]",
         UsageError::Unauthorized => "[Unauthorized]",
+        UsageError::Forbidden => "[Forbidden]",
         // JSONL-layer failures only surface when the endpoint path
         // also failed AND JSONL itself couldn't aggregate. Render
         // generically; doctor command carries the detail.
@@ -753,6 +754,7 @@ mod tests {
             (UsageError::NetworkError, "5h: [Network error]"),
             (UsageError::ParseError, "5h: [Parse error]"),
             (UsageError::Unauthorized, "5h: [Unauthorized]"),
+            (UsageError::Forbidden, "5h: [Forbidden]"),
             (UsageError::Jsonl(JsonlError::NoEntries), "5h: [No data]"),
             (
                 UsageError::Jsonl(JsonlError::DirectoryMissing),

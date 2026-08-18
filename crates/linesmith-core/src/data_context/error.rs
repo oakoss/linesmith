@@ -162,6 +162,12 @@ pub enum UsageError {
     /// `[Unauthorized]`.
     Unauthorized,
 
+    /// Endpoint returned `403 Forbidden` — typically a token lacking
+    /// the `user:profile` scope. Unlike `Unauthorized`, a refresh
+    /// won't clear it; the user has to sign in again. Rendered
+    /// `[Forbidden]`.
+    Forbidden,
+
     /// JSONL-fallback-layer failure. Surfaces when the endpoint path
     /// recorded an error AND the JSONL aggregator also yielded
     /// nothing.
@@ -187,6 +193,7 @@ impl UsageError {
             Self::NetworkError => "NetworkError",
             Self::ParseError => "ParseError",
             Self::Unauthorized => "Unauthorized",
+            Self::Forbidden => "Forbidden",
             Self::Jsonl(inner) => inner.code(),
         }
     }
@@ -207,6 +214,7 @@ impl std::fmt::Display for UsageError {
             Self::NetworkError => f.write_str("network error"),
             Self::ParseError => f.write_str("endpoint response failed to parse"),
             Self::Unauthorized => f.write_str("endpoint returned 401 Unauthorized"),
+            Self::Forbidden => f.write_str("endpoint returned 403 Forbidden"),
             Self::Jsonl(inner) => write!(f, "JSONL fallback failed: {inner}"),
         }
     }
@@ -251,6 +259,7 @@ mod usage_error_tests {
                 UsageError::Unauthorized,
                 "endpoint returned 401 Unauthorized",
             ),
+            (UsageError::Forbidden, "endpoint returned 403 Forbidden"),
             (
                 UsageError::Jsonl(JsonlError::NoEntries),
                 "JSONL fallback failed: Claude Code project directory has no JSONL entries",
@@ -275,6 +284,7 @@ mod usage_error_tests {
         assert_eq!(UsageError::NetworkError.code(), "NetworkError");
         assert_eq!(UsageError::ParseError.code(), "ParseError");
         assert_eq!(UsageError::Unauthorized.code(), "Unauthorized");
+        assert_eq!(UsageError::Forbidden.code(), "Forbidden");
 
         // Credentials + Jsonl delegation surfaces real inner codes.
         assert_eq!(

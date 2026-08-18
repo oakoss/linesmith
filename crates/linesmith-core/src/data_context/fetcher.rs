@@ -114,6 +114,13 @@ fn interpret_status(resp: HttpResponse) -> Result<UsageApiResponse, UsageError> 
             UsageError::ParseError
         }),
         401 => Err(UsageError::Unauthorized),
+        403 => {
+            // Body bytes stay out of logs per the arm above; the status
+            // code alone is enough to disambiguate a scope problem from
+            // a network failure.
+            crate::lsm_debug!("fetch_usage: 403; token authenticates but lacks access");
+            Err(UsageError::Forbidden)
+        }
         429 => {
             let retry_after = resp
                 .retry_after
@@ -126,7 +133,8 @@ fn interpret_status(resp: HttpResponse) -> Result<UsageApiResponse, UsageError> 
         // here. ADR-0011 doesn't carve out a distinct variant for
         // server errors; `NetworkError` triggers the stale-cache
         // fallback path in the orchestrator, which is the intended
-        // behavior for transient server failures.
+        // behavior for transient server failures — which is why the
+        // non-transient auth statuses are matched above instead.
         _ => Err(UsageError::NetworkError),
     }
 }
@@ -435,6 +443,22 @@ mod tests {
         let transport = ok_transport(401, "", None);
         let err = fetch_usage(&transport, "https://x", &creds(), DEFAULT_TIMEOUT).unwrap_err();
         assert!(matches!(err, UsageError::Unauthorized));
+    }
+
+    #[test]
+    fn fetch_maps_403_to_forbidden() {
+        let transport = ok_transport(403, "", None);
+        let err = fetch_usage(&transport, "https://x", &creds(), DEFAULT_TIMEOUT).unwrap_err();
+        assert!(matches!(err, UsageError::Forbidden));
+    }
+
+    /// Only 401/403 get auth treatment; 5xx stays on the transient
+    /// `NetworkError` path.
+    #[test]
+    fn fetch_maps_500_to_network_error() {
+        let transport = ok_transport(500, "", None);
+        let err = fetch_usage(&transport, "https://x", &creds(), DEFAULT_TIMEOUT).unwrap_err();
+        assert!(matches!(err, UsageError::NetworkError));
     }
 
     #[test]

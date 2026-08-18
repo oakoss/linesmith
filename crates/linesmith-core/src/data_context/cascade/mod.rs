@@ -39,6 +39,14 @@ pub const DEFAULT_ERROR_TTL: Duration = Duration::from_secs(30);
 /// (300s per ADR-0011 §Cache stack).
 pub const DEFAULT_RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(300);
 
+/// Backoff for auth failures a token refresh can't resolve. Re-probing
+/// only succeeds once the user signs in again, so this trades recovery
+/// latency for endpoint load: a user who re-authenticates early waits
+/// out the rest of the window, because `lock_active` short-circuits
+/// before credentials are re-read. The JSONL fallback renders through
+/// that window, so the cost is estimated-instead-of-exact, not blank.
+pub const DEFAULT_AUTH_BACKOFF: Duration = Duration::from_secs(300);
+
 /// Default endpoint base URL per ADR-0011 §Endpoint contract.
 pub const DEFAULT_API_BASE_URL: &str = "https://api.anthropic.com";
 
@@ -102,15 +110,13 @@ pub fn resolve_usage(
         // Serve whatever we have without touching credentials: another
         // process is in backoff and we must honor it.
         let lock_error = lock_entry.as_ref().and_then(|l| l.error.as_deref());
-        let lock_from_401 = lock_error == Some("Unauthorized");
+        let lock_from_auth = matches!(lock_error, Some("Unauthorized" | "Forbidden"));
         if let Some(entry) = &cache_entry {
-            // A lock from a 401 means the cached `data` was fetched
-            // with a now-revoked token; skip the stale-serve so
-            // invocation B (after A's 401) doesn't return the pre-401
-            // payload through this branch. Other lock errors (429,
-            // timeout) still serve stale — those are transient and
-            // the cached data was legitimately valid when fetched.
-            if !lock_from_401 {
+            // Auth failures have no bounded recovery time, and
+            // stale-serve has no age ceiling — usage would keep
+            // accruing behind numbers that never move. 429 and timeout
+            // still serve stale: those clear on their own.
+            if !lock_from_auth {
                 if let Some(data) = entry.data.clone() {
                     return Ok(cached_to_usage_data(data));
                 }
@@ -119,7 +125,7 @@ pub fn resolve_usage(
                 return jsonl_or(jsonl, now_ts, usage_error_from_code(&cached.code));
             }
         }
-        // No cache content (or a 401-lock bypassed the data entry):
+        // No cache content (or an auth lock bypassed the data entry):
         // try JSONL before surfacing the lock's own error hint.
         // Crucially, we still do NOT reach the endpoint — that would
         // defeat the cross-process spam guard on cold-cache starts.
@@ -164,44 +170,47 @@ pub fn resolve_usage(
             );
             Ok(UsageData::Endpoint(response.into_endpoint_usage()))
         }
-        // 401 is the sole failure-path exception to "serve stale on
-        // error": the cached payload is tied to a no-longer-valid
-        // token, so reusing it would mislead the user. JSONL, however,
-        // is independent of token validity — fall through to it before
-        // surfacing the error so a user with a revoked token still
-        // sees their local transcript totals. We deliberately do NOT
-        // write an "Unauthorized" error into the cache here, because
-        // the cached error would then outlive the lock and mask a
-        // subsequent unrelated lock (e.g. a 429 after token refresh).
-        // Instead, clear the cache file so a peer invocation arriving
-        // after this one (and before the lock expires) reads no cache
-        // entry, can't short-circuit on the fresh-cache check, and
-        // falls through to the `lock_from_401` guard.
+        // Auth failures are the failure-path exception to "serve stale
+        // on error": recovery time is unbounded from here (401 may
+        // clear on Claude Code's next refresh, 403 needs a re-login)
+        // and stale-serve has no age ceiling, so the cached payload
+        // would outlive its accuracy with nothing marking it. JSONL,
+        // however, is independent of token validity — fall through to
+        // it before surfacing the error so a user with broken auth
+        // still sees their local transcript totals. We deliberately
+        // do NOT write the error
+        // into the cache here, because the cached error would then
+        // outlive the lock and mask a subsequent unrelated lock (e.g.
+        // a 429 after token refresh). Instead, clear the cache file so
+        // a peer invocation arriving after this one (and before the
+        // lock expires) reads no cache entry, can't short-circuit on
+        // the fresh-cache check, and falls through to the
+        // `lock_from_auth` guard.
         //
         // This only changes behavior after an invocation has reached
-        // the endpoint and seen the 401. When a token is revoked
-        // while the cache is still fresh, every render returns at
-        // the top-of-cascade `is_fresh` short-circuit until the
-        // entry expires; that single-process first-invocation window
-        // is fundamental at this layer. Closing it would require
+        // the endpoint and seen the failure. When access is lost while
+        // the cache is still fresh, every render returns at the
+        // top-of-cascade `is_fresh` short-circuit until the entry
+        // expires; that single-process first-invocation window is
+        // fundamental at this layer. Closing it would require
         // out-of-band revalidation (background probe, credentials-
         // file watch) and is tracked separately.
-        Err(UsageError::Unauthorized) => {
+        Err(err @ (UsageError::Unauthorized | UsageError::Forbidden)) => {
             if let Some(c) = cache {
                 if let Err(e) = c.clear() {
                     // `lsm_error!` (bypasses `LINESMITH_LOG=off`)
                     // matches the severity this module already uses
                     // for cache-write failures: a clear failure
-                    // leaves peers serving revoked-token data
+                    // leaves peers serving unrefreshable data
                     // through the fresh-cache short-circuit until
                     // the entry's TTL expires.
                     crate::lsm_error!(
-                        "cascade: cache clear after 401 failed; peers may serve revoked-token data until TTL expires: {e}"
+                        "cascade: cache clear after {err} failed; peers may serve unrefreshable data until TTL expires: {e}"
                     );
                 }
             }
-            write_failure_lock(lock, now_ts, &UsageError::Unauthorized);
-            jsonl_or(jsonl, now_ts, UsageError::Unauthorized)
+            write_failure_lock(lock, now_ts, &err);
+            jsonl_or(jsonl, now_ts, err)
         }
         Err(err) => {
             // Persist the backoff so concurrent processes honor it —
@@ -430,6 +439,9 @@ fn backoff_for_error(err: &UsageError) -> Duration {
             retry_after: Some(d),
         } => *d,
         UsageError::RateLimited { retry_after: None } => DEFAULT_RATE_LIMIT_BACKOFF,
+        // A 403 won't clear until the user re-authenticates, so the
+        // 30s transient TTL would re-probe a dead endpoint ~2900x/day.
+        UsageError::Forbidden => DEFAULT_AUTH_BACKOFF,
         _ => DEFAULT_ERROR_TTL,
     }
 }
@@ -464,6 +476,7 @@ fn usage_error_from_code(code: &str) -> UsageError {
         "Timeout" => UsageError::Timeout,
         "RateLimited" => UsageError::RateLimited { retry_after: None },
         "Unauthorized" => UsageError::Unauthorized,
+        "Forbidden" => UsageError::Forbidden,
         "ParseError" => UsageError::ParseError,
         _ => UsageError::NetworkError,
     }

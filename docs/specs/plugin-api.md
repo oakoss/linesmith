@@ -205,7 +205,8 @@ switch ctx.usage.kind {
         // ctx.usage.error is one of:
         //   "NoCredentials" | "SubprocessFailed" | "IoError" | "ParseError" |
         //   "MissingField" | "EmptyToken" | "Timeout" | "RateLimited" |
-        //   "NetworkError" | "Unauthorized" | "NoEntries" | "DirectoryMissing"
+        //   "NetworkError" | "Unauthorized" | "Forbidden" | "NoEntries" |
+        //   "DirectoryMissing"
         // `MissingField` / `EmptyToken` come from the credentials layer;
         // `NoEntries` / `DirectoryMissing` from the JSONL aggregator.
         // `IoError` and `ParseError` can originate from either layer —
@@ -220,7 +221,7 @@ For source-specific data shapes (`ctx.usage.data`, `ctx.git.data`, etc.), plugin
 **Special cases:**
 
 - **`ctx.git`**: the Rust accessor is `Arc<Result<Option<GitContext>, GitError>>` — a nested `Option` distinguishes "no git repo at cwd" from "gix failed." The rhai mirror collapses `Ok(None)` to `kind: "ok"` + `data: ()`. Plugins check `ctx.git.kind == "ok" && ctx.git.data != ()` before accessing fields like `ctx.git.data.head`.
-- **`ctx.usage` error codes** mirror the `UsageError` variants from [rate-limit-segments.md](rate-limit-segments.md) plus the delegated tags from `CredentialError::code()` and `JsonlError::code()`: `"NoCredentials" | "SubprocessFailed" | "IoError" | "ParseError" | "MissingField" | "EmptyToken" | "Timeout" | "RateLimited" | "NetworkError" | "Unauthorized" | "NoEntries" | "DirectoryMissing"`. `MissingField` / `EmptyToken` surface from malformed credentials; `NoEntries` / `DirectoryMissing` from the JSONL aggregator; `IoError` and `ParseError` can originate from either layer (the tag doesn't disambiguate provenance). Plugins can branch on these codes without raw credentials being exposed.
+- **`ctx.usage` error codes** mirror the `UsageError` variants from [rate-limit-segments.md](rate-limit-segments.md) plus the delegated tags from `CredentialError::code()` and `JsonlError::code()`: `"NoCredentials" | "SubprocessFailed" | "IoError" | "ParseError" | "MissingField" | "EmptyToken" | "Timeout" | "RateLimited" | "NetworkError" | "Unauthorized" | "Forbidden" | "NoEntries" | "DirectoryMissing"`. `MissingField` / `EmptyToken` surface from malformed credentials; `NoEntries` / `DirectoryMissing` from the JSONL aggregator; `IoError` and `ParseError` can originate from either layer (the tag doesn't disambiguate provenance). Plugins can branch on these codes without raw credentials being exposed.
 
 **Legacy `ctx.*` access pre-v0.2.** Scripts written against v0.1 accessed stdin fields directly (`ctx.model.display_name`, `ctx.cost`, etc.). v0.2 moves those under `ctx.status.*` to make room for the DataContext sources. Plugin authors updating existing scripts do a one-time rename from `ctx.X` → `ctx.status.X` for every stdin field. `ctx.raw` (escape hatch for tool-specific fields) stays at `ctx.status.raw` in v0.2.
 
