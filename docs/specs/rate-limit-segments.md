@@ -1,8 +1,8 @@
 # Rate-Limit Segments
 
 - Status: draft
-- Version: 0.3
-- Last updated: 2026-08-05
+- Version: 0.3.1
+- Last updated: 2026-08-17
 - Driving ADRs: [ADR-0011](../adrs/0011-rate-limit-data-source.md), [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md), [ADR-0030](../adrs/0030-model-scoped-usage-arrives-in-a-limits-array.md), [ADR-0031](../adrs/0031-auth-failures-are-not-transient-errors.md)
 - Related specs: [input-schema.md](input-schema.md) (`ModelInfo.id`, added for `rate_limit_7d_model` matching)
 
@@ -502,7 +502,7 @@ The data-fetching layer already enforces a 180s default TTL. Segments don't inde
 
 ## Change log
 
-- 2026-08-17: add the `Forbidden` error variant. A 403 previously fell into
+- 2026-08-17 (v0.3.1): add the `Forbidden` error variant. A 403 previously fell into
   `interpret_status`'s catch-all and rendered `[Network error]`, pointing users
   at their connection when the actual fix is signing in again — the endpoint
   returns it for a token missing the `user:profile` scope. Because
