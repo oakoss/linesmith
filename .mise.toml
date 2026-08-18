@@ -209,7 +209,11 @@ run = '''
 set -eu
 link="${LINESMITH_ACTIVE_LINK:-$HOME/.local/bin/linesmith-active}"
 cargo build --locked -p linesmith
-bin="$(pwd)/target/debug/linesmith"
+# `build.target-dir` and CARGO_TARGET_DIR relocate this, so ask cargo
+# rather than assuming ./target.
+target_dir="$(cargo metadata --format-version 1 --no-deps --offline |
+  sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+bin="${target_dir:-$(pwd)/target}/debug/linesmith"
 [ "${OS:-}" = "Windows_NT" ] && bin="${bin}.exe"
 mkdir -p "$(dirname "$link")"
 ln -sfn "$bin" "$link"
@@ -223,7 +227,12 @@ description = "Point the live statusline back at the installed release build"
 run = '''
 set -eu
 link="${LINESMITH_ACTIVE_LINK:-$HOME/.local/bin/linesmith-active}"
-bin="${CARGO_HOME:-$HOME/.cargo}/bin/linesmith"
+# CARGO_INSTALL_ROOT wins over CARGO_HOME for installed binaries. The
+# `install.root` config key can also relocate them, but reading it needs
+# a TOML parser — `use:status` names the path it resolved so a mismatch
+# is visible rather than silent.
+root="${CARGO_INSTALL_ROOT:-${CARGO_HOME:-$HOME/.cargo}}"
+bin="$root/bin/linesmith"
 [ "${OS:-}" = "Windows_NT" ] && bin="${bin}.exe"
 if [ ! -x "$bin" ]; then
   echo "no release binary at $bin — run: mise run install:release" >&2
@@ -245,7 +254,9 @@ set -eu
 link="${LINESMITH_ACTIVE_LINK:-$HOME/.local/bin/linesmith-active}"
 if [ ! -L "$link" ]; then
   echo "unset — statusline is not going through $link"
-  echo "point ~/.claude/settings.json's statusLine.command at it, then run: mise run use:dev"
+  echo "set ~/.claude/settings.json's statusLine.command to:"
+  echo "  $(pwd)/scripts/statusline-tee.sh -- $link"
+  echo "then run: mise run use:dev"
   exit 0
 fi
 target="$(readlink "$link")"
