@@ -301,7 +301,7 @@ Conventional commits: `type(scope): short description`
 
 **Types:** `docs`, `chore`, `feat`, `fix`, `refactor`, `test`, `perf`, `ci`
 
-**Scopes (indicative):** `ideas`, `adr`, `spec`, `docs`, `readme`, `config`, `beads`, `core`, `plugins`, `themes`, `segments`, `cli`, `tui`, `doctor`, `ci`, `repo`. Scopes that bump a published crate are pinned in `knope.toml`'s `[packages.*]` blocks (`core` → linesmith-core, `plugins` → linesmith-plugin, `cli`/`tui`/`segments`/`themes`/`config`/`doctor` → linesmith). Doc / meta scopes (`adr`, `spec`, `docs`, `readme`, `ideas`, `beads`, `ci`, `repo`) pair with non-bumping commit types (`docs`/`chore`/`ci`/`test`) and aren't claimed by any package.
+**Scopes (indicative):** `ideas`, `adr`, `spec`, `docs`, `readme`, `config`, `beads`, `core`, `plugins`, `themes`, `segments`, `cli`, `tui`, `doctor`, `ci`, `repo`. Scopes that bump a published crate are pinned in `knope.toml`'s `[packages.*]` blocks (`core` → linesmith-core **and** linesmith, `plugins` → linesmith-plugin **and** linesmith, `cli`/`tui`/`segments`/`themes`/`config`/`doctor` → linesmith). The library scopes bump the binary too per [ADR-0032](docs/adrs/0032-core-bumps-cascade-to-the-binary.md) — users install a binary, and a library-only bump never tags `linesmith/v*`, so cargo-dist builds nothing and the change reaches nobody. Doc / meta scopes (`adr`, `spec`, `docs`, `readme`, `ideas`, `beads`, `ci`, `repo`) pair with non-bumping commit types (`docs`/`chore`/`ci`/`test`) and aren't claimed by any package.
 
 Beads issue references go in the commit footer as a bare `lsm-xyz`, not in the subject line. Commits not tied to a beads issue (meta / workflow / CI / version bumps) have **no** footer — don't invent one.
 
