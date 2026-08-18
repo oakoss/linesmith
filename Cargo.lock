@@ -2104,7 +2104,7 @@ dependencies = [
 
 [[package]]
 name = "linesmith"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "catppuccin",
  "criterion",
@@ -2135,7 +2135,7 @@ dependencies = [
 
 [[package]]
 name = "linesmith-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "catppuccin",
  "gix",
