@@ -4,6 +4,18 @@ all-features = true
 [advisories]
 yanked = "deny"
 
+# Scoped by advisory ID, never by crate: a real vulnerability in the same
+# dependency gets its own ID and still fails the build. Drop an entry the
+# moment its upstream fix lands — a stale suppression is how a genuine
+# advisory ends up unread.
+ignore = [
+  # smartstring is unmaintained (archived 2026-05-03). It arrives through
+  # rhai, which requires it outright — 1.24.0 and 1.25.1 both declare
+  # `smartstring ^1.0.0` as a non-optional dependency, so there is no
+  # version to upgrade to. Revisit when rhai moves to compact_str/smol_str.
+  "RUSTSEC-2026-0249",
+]
+
 [licenses]
 # Permissive-license allowlist. linesmith ships under MIT/Apache-2.0;
 # all entries here are compatible with that distribution model.
