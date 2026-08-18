@@ -57,7 +57,7 @@ Re-scoping by convention was rejected as the weakest guarantee: it asks every fu
 - Good, because a user-visible library fix now ships in the artifact users install
 - Good, because the binary's changelog lists the changes that are actually in the binary
 - Good, because it is three entries in existing configuration, not new machinery to maintain
-- Bad, because an internal-only `fix(core)` now cuts a binary release nobody needed — cargo-dist builds five targets and pushes a Homebrew formula for it
+- Bad, because an internal-only `fix(core)` now cuts a binary release nobody needed — cargo-dist builds every configured target and pushes a Homebrew formula for it
 - Bad, because severity travels with the commit, not just its presence: a `fix(core)!` breaking the library's Rust API also breaks the binary's version, even when the CLI is unchanged (confirmed, see §Confirmation). A changeset naming the binary's level overrides this, and `AGENTS.md` §Releases already prescribes changesets for exactly the case where the commit subject misstates per-package impact
 - Neutral, because the commit appears in both changelogs; each artifact's notes are complete on their own, which is what a reader of either one wants
 

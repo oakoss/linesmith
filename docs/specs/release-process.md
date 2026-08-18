@@ -154,8 +154,8 @@ Rust-toolchain required. Compiles from source; users pay the ~60-90s compile tim
 - Beads footer (bare `lsm-xyz`) lands in the squash-merge commit and is reachable via `git log`. It is NOT preserved in the CHANGELOG (Knope's PrepareRelease consumes only the commit subject + breaking-change flag).
 - Scope routing per `knope.toml`'s `[packages.<name>] scopes` field:
   - `feat(core): X` / `fix(core): X` → bumps `linesmith-core` **and** `linesmith`
-  - `feat(plugins): X` → bumps `linesmith-plugin` **and** `linesmith`
-  - The library scopes cascade to the binary per [ADR-0032](../adrs/0032-core-bumps-cascade-to-the-binary.md): users install a binary, and only a `linesmith/v*` tag triggers cargo-dist, so a library-only bump reaches nobody
+  - `feat(plugins): X` → bumps all three: `linesmith-plugin`, `linesmith-core`, **and** `linesmith`
+  - A library's scope sits on every crate that pins it, per [ADR-0032](../adrs/0032-core-bumps-cascade-to-the-binary.md). Users install a binary and only a `linesmith/v*` tag triggers cargo-dist, so a library-only bump reaches nobody; and a crate whose pin is rewritten without a bump never publishes that rewrite. `linesmith-core` is in the `plugins` cascade because it hosts the plugin bridge
   - `feat(cli|tui|segments|themes|config|doctor): X` → bumps `linesmith` only
   - `feat: X` (no scope) → bumps every package per Knope's "no scope = all packages" semantics
   - `feat(repo|ci|adr|spec|docs|readme|ideas|beads): X` → routed nowhere (intentional: those scopes pair with non-bumping commit types in normal use)
@@ -309,7 +309,7 @@ Day-of-release steps for a maintainer:
    - `mise run bench` — no >10% regression against the previous release's benches
    - `cargo audit` — no new advisories
    - `linesmith doctor --plain` on a clean checkout — passes
-2. **Review the Knope release PR** that's open against `main` (branch: `release`, label: usually none — Knope doesn't set one by default). Verify each package's bump shape is correct (a `feat(core)` commit bumps `linesmith-core` **and** `linesmith` per [ADR-0032](../adrs/0032-core-bumps-cascade-to-the-binary.md); an unscoped `feat:` bumps all three) and each per-package CHANGELOG entry reads correctly.
+2. **Review the Knope release PR** that's open against `main` (branch: `release`, label: usually none — Knope doesn't set one by default). Verify each package's bump shape is correct per [ADR-0032](../adrs/0032-core-bumps-cascade-to-the-binary.md) — a `feat(core)` commit bumps `linesmith-core` **and** `linesmith`; a `feat(plugins)` commit bumps all three; an unscoped `feat:` bumps all three — and each per-package CHANGELOG entry reads correctly.
 3. **Merge the release PR** with the squash strategy (the repo's only enabled merge method). On merge, `knope-release.yml` fires and:
    1. Runs `knope release` — tags each bumped package as `<crate>/v<version>` and creates a per-package GitHub Release with CHANGELOG-derived notes.
    2. Runs `cargo release publish --workspace --execute --no-confirm --allow-branch 'main,HEAD'` via OIDC trusted publishing — publishes bumped crates in leaf-first order, skipping any whose version is already on crates.io. Both allowlist entries are load-bearing: the `push` path and a `mode=publish` recovery both check out `refs/tags/<crate>/v<version>`, so `actions/checkout` detaches HEAD and cargo-release sees the branch as `HEAD`; only a `mode=release` dispatch resolves to the literal `'main'` and lands on the branch.
