@@ -3,7 +3,7 @@
 - Status: draft
 - Version: 0.3
 - Last updated: 2026-08-05
-- Driving ADRs: [ADR-0011](../adrs/0011-rate-limit-data-source.md), [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md), [ADR-0030](../adrs/0030-model-scoped-usage-arrives-in-a-limits-array.md)
+- Driving ADRs: [ADR-0011](../adrs/0011-rate-limit-data-source.md), [ADR-0013](../adrs/0013-jsonl-fallback-carries-token-counts.md), [ADR-0030](../adrs/0030-model-scoped-usage-arrives-in-a-limits-array.md), [ADR-0031](../adrs/0031-auth-failures-are-not-transient-errors.md)
 - Related specs: [input-schema.md](input-schema.md) (`ModelInfo.id`, added for `rate_limit_7d_model` matching)
 
 ## Overview
@@ -404,6 +404,7 @@ Maps `UsageError` variants to rendered strings:
 | `NetworkError`                         | `[Network error]`          | Connection failed AND no stale cache AND JSONL empty                                                               |
 | `ParseError`                           | `[Parse error]`            | Endpoint returned malformed JSON                                                                                   |
 | `Unauthorized`                         | `[Unauthorized]`           | Endpoint returned 401 (token expired or revoked) AND JSONL empty                                                   |
+| `Forbidden`                            | `[Forbidden]`              | Endpoint returned 403 (token lacks `user:profile` scope) AND JSONL empty                                           |
 | `Jsonl(NoEntries \| DirectoryMissing)` | `[No data]`                | Reserved for future direct-JSONL segments; today only reachable if the endpoint layer wraps a `Jsonl` error itself |
 | `Jsonl(IoError \| ParseError)`         | `[Parse error]`            | Same as above — aggregator systemic failures collapse to `NoEntries` at the cascade boundary with a `warn!` trace  |
 
@@ -500,6 +501,31 @@ The data-fetching layer already enforces a 180s default TTL. Segments don't inde
 - **Accessibility / screen-reader hints.** Status lines are read by screen-reader users. Our output is pure text; no ARIA analog in terminal. Worth checking with accessibility-focused users once linesmith has any users.
 
 ## Change log
+
+- 2026-08-17: add the `Forbidden` error variant. A 403 previously fell into
+  `interpret_status`'s catch-all and rendered `[Network error]`, pointing users
+  at their connection when the actual fix is signing in again — the endpoint
+  returns it for a token missing the `user:profile` scope. Because
+  `NetworkError` is defined as transient, it also carried the 30s error TTL,
+  re-probing an endpoint that can't recover without user action. `Forbidden`
+  takes `DEFAULT_AUTH_BACKOFF` (300s) instead and is matched in
+  `usage_error_from_code` so a peer reading the persisted lock recovers the
+  variant rather than collapsing it back to `NetworkError`. 5xx keeps the
+  transient treatment.
+
+  Per [ADR-0031](../adrs/0031-auth-failures-are-not-transient-errors.md), 403
+  joins 401 as an exception to stale-while-revalidate rather than taking
+  the generic arm's stale-serve. Serving stale looks defensible per-render —
+  the payload was fetched by a token that did have access — but `CacheStore`
+  bounds staleness only against clock skew, so with a warm cache a persistent
+  403 would pin the segment to numbers that never move and `[Forbidden]` would
+  never render at all, which is worse than the `[Network error]` it replaced.
+  Both auth codes therefore clear the cache and fall through to JSONL, and the
+  lock-active guard generalizes from `lock_from_401` to `lock_from_auth`.
+  Consequence of the 300s backoff: a user who re-authenticates early waits out
+  the window, since `lock_active` short-circuits before credentials are
+  re-read. JSONL renders throughout, so the cost is estimated-instead-of-exact
+  rather than a blank segment.
 
 - 2026-08-05 (v0.3): add `rate_limit_7d_model`, the model-scoped weekly bucket
   (`lsm-zgju`). Resolves this spec's deferred per-model open question, whose

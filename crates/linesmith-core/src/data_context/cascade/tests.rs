@@ -729,6 +729,205 @@ fn endpoint_429_writes_lock_with_retry_after_backoff() {
 }
 
 #[test]
+fn endpoint_403_surfaces_forbidden_not_network_error() {
+    let err = resolve_usage(
+        None,
+        None,
+        &FakeTransport::ok(403, "", None),
+        &ok_creds,
+        &jsonl_empty,
+        &now_fn(),
+        &config(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, UsageError::Forbidden));
+}
+
+/// A 403 can only clear once the user signs in again, so it must not
+/// inherit the 30s transient TTL that would re-probe a dead endpoint
+/// on every render.
+#[test]
+fn endpoint_403_writes_lock_with_auth_backoff() {
+    let tmp = TempDir::new().unwrap();
+    let lock = LockStore::new(tmp.path().to_path_buf());
+
+    let _ = resolve_usage(
+        None,
+        Some(&lock),
+        &FakeTransport::ok(403, "", None),
+        &ok_creds,
+        &jsonl_empty,
+        &now_fn(),
+        &config(),
+    );
+
+    let persisted = lock.read().unwrap().expect("lock must be written");
+    let expected = Timestamp::now().as_second() + DEFAULT_AUTH_BACKOFF.as_secs() as i64;
+    assert!(
+        (persisted.blocked_until - expected).abs() < 5,
+        "blocked_until={}, expected near {}",
+        persisted.blocked_until,
+        expected,
+    );
+    assert_eq!(persisted.error.as_deref(), Some("Forbidden"));
+}
+
+/// The lock persists only the error's `code()`, so a peer reading it
+/// back has to recover `Forbidden` rather than the `NetworkError`
+/// that unknown codes collapse to.
+#[test]
+fn forbidden_round_trips_through_the_persisted_lock_code() {
+    let tmp = TempDir::new().unwrap();
+    let lock = LockStore::new(tmp.path().to_path_buf());
+
+    let _ = resolve_usage(
+        None,
+        Some(&lock),
+        &FakeTransport::ok(403, "", None),
+        &ok_creds,
+        &jsonl_empty,
+        &now_fn(),
+        &config(),
+    );
+
+    // Peer process: sees the active lock, never reaches the endpoint.
+    let err = resolve_usage(
+        None,
+        Some(&lock),
+        &FakeTransport::ok(200, SAMPLE_BODY, None),
+        &ok_creds,
+        &jsonl_empty,
+        &now_fn(),
+        &config(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, UsageError::Forbidden), "got {err:?}");
+}
+
+/// Stale-serve has no age ceiling, so a 403 that reused the cache
+/// would pin the segment to numbers that never move for as long as
+/// the scope stays missing — the auth failure would never render.
+#[test]
+fn endpoint_403_does_not_serve_stale_cache() {
+    let tmp = TempDir::new().unwrap();
+    let cache = CacheStore::new(tmp.path().to_path_buf());
+    cache
+        .write(&stale_cache_entry(ChronoDuration::from_mins(10)))
+        .unwrap();
+    let err = resolve_usage(
+        Some(&cache),
+        None,
+        &FakeTransport::ok(403, "", None),
+        &ok_creds,
+        &jsonl_empty,
+        &now_fn(),
+        &config(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, UsageError::Forbidden), "got {err:?}");
+    assert!(
+        cache.read().unwrap().is_none(),
+        "403 must clear the cache so peers skip the fresh short-circuit"
+    );
+}
+
+/// Isolates the `lock_from_auth` guard for `Forbidden`, seeding the
+/// lock and cache directly the way a peer process would leave them.
+#[test]
+fn active_forbidden_lock_rejects_stale_cached_data() {
+    let tmp = TempDir::new().unwrap();
+    let cache = CacheStore::new(tmp.path().to_path_buf());
+    cache
+        .write(&stale_cache_entry(ChronoDuration::from_mins(10)))
+        .unwrap();
+    let lock = LockStore::new(tmp.path().to_path_buf());
+    lock.write(&Lock {
+        blocked_until: Timestamp::now().as_second() + 30,
+        error: Some("Forbidden".into()),
+    })
+    .unwrap();
+
+    let transport = FakeTransport::ok(200, SAMPLE_BODY, None);
+    let err = resolve_usage(
+        Some(&cache),
+        Some(&lock),
+        &transport,
+        &ok_creds,
+        &jsonl_empty,
+        &now_fn(),
+        &config(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, UsageError::Forbidden), "got {err:?}");
+    assert_eq!(transport.calls.get(), 0);
+}
+
+/// The local transcript doesn't depend on endpoint access, so a
+/// missing scope must not cost the user their real numbers.
+#[test]
+fn endpoint_403_falls_through_to_jsonl_when_available() {
+    let transport = FakeTransport::ok(403, "", None);
+    let data = resolve_usage(
+        None,
+        None,
+        &transport,
+        &ok_creds,
+        &jsonl_ok,
+        &now_fn(),
+        &config(),
+    )
+    .expect("ok");
+    assert_jsonl_matches_ok_fixture(&data);
+    assert_eq!(transport.calls.get(), 1);
+}
+
+/// `usage_error_from_code` matches on strings, so no compiler check
+/// ties it to `UsageError`'s variants — a new variant that forgets an
+/// arm degrades to `NetworkError` at the lock boundary instead of
+/// failing to build. The exhaustive match below supplies that missing
+/// check: adding a variant breaks this test's compile until someone
+/// declares whether it can reach a lock.
+#[test]
+fn every_lock_reachable_usage_error_round_trips_through_its_code() {
+    fn reaches_a_lock(err: &UsageError) -> bool {
+        match err {
+            UsageError::NoCredentials
+            | UsageError::Timeout
+            | UsageError::RateLimited { .. }
+            | UsageError::NetworkError
+            | UsageError::ParseError
+            | UsageError::Unauthorized
+            | UsageError::Forbidden => true,
+            // Per the INVARIANT on `usage_error_from_code`: the
+            // credential arm returns before any `write_failure_lock`,
+            // and JSONL errors never enter the cache's error path.
+            UsageError::Credentials(_) | UsageError::Jsonl(_) => false,
+        }
+    }
+
+    let cases = [
+        UsageError::NoCredentials,
+        UsageError::Timeout,
+        UsageError::RateLimited { retry_after: None },
+        UsageError::NetworkError,
+        UsageError::ParseError,
+        UsageError::Unauthorized,
+        UsageError::Forbidden,
+    ];
+    for err in &cases {
+        assert!(
+            reaches_a_lock(err),
+            "fixture must hold lock-reachable errors only"
+        );
+        assert_eq!(
+            usage_error_from_code(err.code()).code(),
+            err.code(),
+            "{err:?} must survive the lock round trip"
+        );
+    }
+}
+
+#[test]
 fn endpoint_timeout_writes_lock_with_error_ttl() {
     let tmp = TempDir::new().unwrap();
     let lock = LockStore::new(tmp.path().to_path_buf());
@@ -810,6 +1009,17 @@ fn endpoint_401_writes_lock_so_peers_skip_the_stale_token() {
 
     let persisted = lock.read().unwrap().expect("lock must be written");
     assert_eq!(persisted.error.as_deref(), Some("Unauthorized"));
+    // 401 stays on the transient TTL because a refresh can resolve it,
+    // unlike 403. `resolve_usage` handles both in one arm, so folding
+    // `backoff_for_error` the same way would silently apply 403's much
+    // longer window here.
+    let expected = Timestamp::now().as_second() + DEFAULT_ERROR_TTL.as_secs() as i64;
+    assert!(
+        (persisted.blocked_until - expected).abs() < 5,
+        "blocked_until={}, expected near {}",
+        persisted.blocked_until,
+        expected,
+    );
 }
 
 #[test]
