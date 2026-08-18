@@ -12,7 +12,10 @@ versioned_files = [
 ]
 changelog = "crates/linesmith-core/CHANGELOG.md"
 # Unscoped feat/fix commits cascade to every package per Knope's default.
-scopes = ["core"]
+# `plugins` is here as well as on its own package per ADR-0032: this crate
+# pins linesmith-plugin, so a plugin bump rewrites this manifest, and a
+# rewritten manifest that never bumps never publishes.
+scopes = ["core", "plugins"]
 
 [packages.linesmith-plugin]
 versioned_files = [
@@ -32,11 +35,14 @@ versioned_files = [
   "Cargo.lock",
 ]
 changelog = "CHANGELOG.md"
-# User-visible scopes that bump the binary. `core` / `plugins` route to
-# their own crates and only refresh the dep-pin here. Doc/meta scopes
-# (`adr`, `spec`, `docs`, `readme`, `ideas`, `beads`, `ci`, `repo`) pair
-# with non-bumping commit types and aren't claimed by any package.
+# Scopes that bump the binary. `core` and `plugins` appear here as well as
+# on their own packages per ADR-0032: users install a binary, so a library
+# bump that doesn't tag `linesmith/v*` builds nothing and reaches nobody.
+# Doc/meta scopes (`adr`, `spec`, `docs`, `readme`, `ideas`, `beads`, `ci`,
+# `repo`) pair with non-bumping commit types and aren't claimed by any package.
 scopes = [
+  "core",
+  "plugins",
   "cli",
   "tui",
   "segments",
