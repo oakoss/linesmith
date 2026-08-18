@@ -49,4 +49,15 @@ if [ $# -eq 0 ]; then
   exit 0
 fi
 
+# Dev and release builds report the same `--version`, so the build tree
+# path is the only tell. Marking here keeps it out of the shipped binary,
+# where `cfg!(debug_assertions)` would also fire under `cargo test`.
+resolved="$(readlink "$1" 2>/dev/null || true)"
+[ -n "$resolved" ] || resolved="$1"
+case "$resolved" in
+*/target/debug/* | */target/release/*)
+  printf '%s' "${LINESMITH_DEV_MARKER-[dev] }"
+  ;;
+esac
+
 printf '%s' "$stdin_buffer" | "$@"
