@@ -178,7 +178,7 @@ depends = ["cargo:bench"]
 [tasks."bench:cold-start"]
 description = "Measure end-to-end cold-start wall-clock via hyperfine"
 run = '''
-set -euo pipefail
+set -eu
 cargo build --release --locked -p linesmith
 bin="$(pwd)/target/release/linesmith"
 [ "${OS:-}" = "Windows_NT" ] && bin="${bin}.exe"
@@ -199,8 +199,72 @@ hyperfine \
 description = "Run all checks (format + lint + Rust + schema)"
 depends = ["fmt:check", "lint", "cargo:fmt:check", "cargo:clippy", "cargo:check", "schema:check"]
 
-# CC's statusline spawns the mise shim (~/.cargo/bin/linesmith), so a
-# successful `install:*` task is live on the next prompt.
+# The statusline resolves whatever `~/.local/bin/linesmith-active` points
+# at, so `use:dev` / `use:release` retarget it without touching
+# `~/.claude/settings.json`, which lives outside the repo and is the one
+# piece of this setup nothing else records.
+[tasks."use:dev"]
+description = "Point the live statusline at this tree's debug build"
+run = '''
+set -eu
+link="${LINESMITH_ACTIVE_LINK:-$HOME/.local/bin/linesmith-active}"
+cargo build --locked -p linesmith
+bin="$(pwd)/target/debug/linesmith"
+[ "${OS:-}" = "Windows_NT" ] && bin="${bin}.exe"
+mkdir -p "$(dirname "$link")"
+ln -sfn "$bin" "$link"
+mise run use:status
+'''
+
+# Deliberately does not build: the point is a known-good binary when the
+# tree is mid-refactor. `install:release` is how it gets there.
+[tasks."use:release"]
+description = "Point the live statusline back at the installed release build"
+run = '''
+set -eu
+link="${LINESMITH_ACTIVE_LINK:-$HOME/.local/bin/linesmith-active}"
+bin="${CARGO_HOME:-$HOME/.cargo}/bin/linesmith"
+[ "${OS:-}" = "Windows_NT" ] && bin="${bin}.exe"
+if [ ! -x "$bin" ]; then
+  echo "no release binary at $bin — run: mise run install:release" >&2
+  exit 1
+fi
+if cargo install --list 2>/dev/null | grep -qE '^linesmith v[^ ]+ \('; then
+  echo "warning: $bin was installed by install:dev, not install:release" >&2
+  echo "         run 'mise run install:release' for a published build" >&2
+fi
+mkdir -p "$(dirname "$link")"
+ln -sfn "$bin" "$link"
+mise run use:status
+'''
+
+[tasks."use:status"]
+description = "Report which linesmith build the live statusline resolves to"
+run = '''
+set -eu
+link="${LINESMITH_ACTIVE_LINK:-$HOME/.local/bin/linesmith-active}"
+if [ ! -L "$link" ]; then
+  echo "unset — statusline is not going through $link"
+  echo "point ~/.claude/settings.json's statusLine.command at it, then run: mise run use:dev"
+  exit 0
+fi
+target="$(readlink "$link")"
+case "$target" in
+*/target/debug/* | */target/release/*) label="dev (build tree)" ;;
+# `install:dev` writes a path build to the same bin dir `install:release`
+# uses, so the path proves nothing. Cargo records the source, and this
+# task is manual — the per-render marker can't afford the same check.
+*)
+  if cargo install --list 2>/dev/null | grep -qE '^linesmith v[^ ]+ \('; then
+    label="dev (install:dev)"
+  else
+    label="release"
+  fi
+  ;;
+esac
+printf '%s  ->  %s\n' "$label" "$target"
+[ -x "$target" ] || echo "WARNING: target is missing or not executable (cargo clean?)" >&2
+'''
 
 [tasks."install:dev"]
 description = "Install linesmith from this source tree (dev iteration loop)"

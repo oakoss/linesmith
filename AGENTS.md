@@ -72,11 +72,55 @@ Git hooks installed via `lefthook install`. `pre-commit` runs fmt/lint on staged
 ### Testing against a live statusline
 
 Point `~/.claude/settings.json`'s `statusLine.command` at
-`target/debug/linesmith` and rebuild with `cargo build -p linesmith`.
+`scripts/statusline-tee.sh -- ~/.local/bin/linesmith-active`, then switch
+builds by retargeting that symlink:
+
+| Command                | Statusline resolves to                              |
+| ---------------------- | --------------------------------------------------- |
+| `mise run use:dev`     | this tree's `target/debug/linesmith` (builds first) |
+| `mise run use:release` | `~/.cargo/bin/linesmith`                            |
+| `mise run use:status`  | prints which of the three states below is live      |
+
+`install:dev` writes a local build to the same `~/.cargo/bin/linesmith`
+that `install:release` does, so the path alone can't tell them apart.
+`use:status` therefore reports three states, settling the ambiguous one
+by asking cargo, which records whether a binary came from a path or the
+registry:
+
+| `use:status` says   | Meaning                                      |
+| ------------------- | -------------------------------------------- |
+| `dev (build tree)`  | a `target/` binary — the `use:dev` case      |
+| `dev (install:dev)` | a local build sitting in the release bin dir |
+| `release`           | installed from the registry                  |
+
+The link is machine-global: one worktree flipping it retargets every
+session on the machine.
+
 Debug costs ~15ms per render against ~150ms dominated by I/O (endpoint,
 JSONL aggregation, git), so a release build is not worth the compile
-wait while iterating. Back up the file first — it is outside the repo and
-nothing else records what it pointed at.
+wait while iterating. Switching is a symlink flip, not a rebuild, so
+`use:release` is also the fastest way to get a working line back when the
+tree is mid-refactor and the debug build is broken.
+
+Set `statusLine.command` once and never edit it again — the symlink is
+what moves. That matters because the file lives outside the repo and
+nothing else records what it pointed at. Back it up before the one-time
+edit.
+
+A statusline running a build tree renders a `[dev]` prefix, added by
+`statusline-tee.sh` (override with `LINESMITH_DEV_MARKER`, empty string
+to disable). Every build reports the same `--version`, so without it a
+build tree is invisible. Its width is outside linesmith's layout budget —
+a long marker eats cells the layout won't account for.
+
+The marker only covers build-tree paths; it can't afford a `cargo`
+subprocess per render. So the `dev (install:dev)` state above renders
+**unmarked**, exactly like a release. Only `use:status` catches that one,
+and only when you run it. Its answer can also lag: the `install:release:fast:*`
+tasks overwrite `~/.cargo/bin/linesmith` via the cargo-dist installer
+without touching cargo's ledger, so a genuine release installed that way
+keeps reporting whatever the last real `cargo install` recorded until the
+next one runs.
 
 **Isolate the cache for manual runs.**
 `XDG_CACHE_HOME=/tmp/lsm-test ./target/debug/linesmith` keeps them off
@@ -252,6 +296,13 @@ git worktree remove .claude/worktrees/lsm-xyz
 # ancestor of it, so `git branch -d` will refuse. Use -D after confirming the
 # PR landed (via `gh pr view <N> --json mergedAt` or the gh output above).
 git branch -D worktree-lsm-xyz
+
+# `use:dev` pointed the statusline at a `target/` path the removal above
+# just deleted. The link is machine-global, so flip it back only when it
+# resolves into THIS worktree — another one may be mid-test on its own.
+case "$(readlink "${LINESMITH_ACTIVE_LINK:-$HOME/.local/bin/linesmith-active}" 2>/dev/null)" in
+*/.claude/worktrees/lsm-xyz/*) mise run use:release ;;
+esac
 ```
 
 The PR path honors the repo's branch protection (`Changes must be made through a pull request`), the required `CI Summary` check, and `required_review_thread_resolution` — pushing straight to main bypasses all three. Thread resolution is set on the repo ruleset while the org ruleset leaves it off; GitHub applies the stricter of the two, so an unresolved review thread blocks merge here even though the org rule alone wouldn't. Squash collapses any review-cycle iter-commits into one clean main commit; the squash commit body is built from concatenated commit messages (`squash_merge_commit_message: COMMIT_MESSAGES`), so the `lsm-xyz` footer in your worktree commit lands in the squash commit naturally — no PR-body workaround needed.
