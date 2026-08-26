@@ -1,6 +1,8 @@
 output:
   - failure
   - execution_out
+  # Without this, a glob matching nothing looks identical to a check that passed.
+  - skips
 
 # Beads integration delegates to .lefthook/bd-hook.sh, which wraps
 # `bd hooks run <event>` with the same exit-code and timeout handling
@@ -14,24 +16,28 @@ pre-commit:
   parallel: true
   commands:
     cargo-fmt:
-      glob: '**/*.rs'
+      glob: '{**/*.rs,*.rs}'
       # rustfmt (not `cargo fmt --all`) to scope to staged files and avoid
       # post-commit drift; edition derived because rustfmt ignores Cargo.toml.
-      run: rustfmt --edition "$(cargo metadata --no-deps --format-version 1 | jq -er '[.packages[].edition] | unique | if length == 1 then .[0] else error("expected exactly one workspace edition") end')" {staged_files}
+      # skip_children is what makes the staged-files claim true: without it
+      # rustfmt follows `mod` declarations and rewrites unstaged siblings.
+      run: rustfmt --config=skip_children=true --edition "$(cargo metadata --no-deps --format-version 1 | jq -er '[.packages[].edition] | unique | if length == 1 then .[0] else error("expected exactly one workspace edition") end')" {staged_files}
       stage_fixed: true
     lint-md:
-      glob: '**/*.md'
-      run: markdownlint-cli2 --fix {staged_files}
+      glob: '{**/*.md,*.md}'
+      # Markdown has one owner. Both tools write and both stage, so splitting
+      # them across two jobs under `parallel: true` let them race for the file
+      # and for the git index; sequenced here, the order is defined and the
+      # staging happens once. prettier honours .prettierignore even for paths
+      # named explicitly, so the Knope-owned CHANGELOGs pass through untouched.
+      run: markdownlint-cli2 --fix {staged_files} && prettier --write {staged_files}
       stage_fixed: true
     format:
-      glob: '**/*.{md,json,yaml,yml}'
-      # Symlinks aren't formattable by prettier (errors on --write).
-      exclude:
-        - crates/linesmith/CHANGELOG.md
+      glob: '{**/*.{json,yaml,yml},*.{json,yaml,yml}}'
       run: prettier --write {staged_files}
       stage_fixed: true
     shellcheck:
-      glob: '**/*.sh'
+      glob: '{**/*.sh,*.sh}'
       run: shellcheck {staged_files}
     beads:
       env:
@@ -42,7 +48,7 @@ pre-commit:
 commit-msg:
   commands:
     conventional-commit:
-      run: cog verify --file {1}
+      run: cog verify --ignore-merge-commits --ignore-fixup-commits --file {1}
 
 prepare-commit-msg:
   commands:
