@@ -25,13 +25,15 @@ pre-commit:
       stage_fixed: true
     lint-md:
       glob: '{**/*.md,*.md}'
-      run: markdownlint-cli2 --fix {staged_files}
+      # Markdown has one owner. Both tools write and both stage, so splitting
+      # them across two jobs under `parallel: true` let them race for the file
+      # and for the git index; sequenced here, the order is defined and the
+      # staging happens once. prettier honours .prettierignore even for paths
+      # named explicitly, so the Knope-owned CHANGELOGs pass through untouched.
+      run: markdownlint-cli2 --fix {staged_files} && prettier --write {staged_files}
       stage_fixed: true
     format:
-      glob: '{**/*.{md,json,yaml,yml},*.{md,json,yaml,yml}}'
-      # Symlinks aren't formattable by prettier (errors on --write).
-      exclude:
-        - crates/linesmith/CHANGELOG.md
+      glob: '{**/*.{json,yaml,yml},*.{json,yaml,yml}}'
       run: prettier --write {staged_files}
       stage_fixed: true
     shellcheck:
