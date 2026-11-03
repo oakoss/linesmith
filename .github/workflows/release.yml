@@ -412,23 +412,19 @@ jobs:
             # (a web edit) reads back CRLF, which would defeat the match below.
             gh release view "$TAG" --json body -q .body | tr -d '\r' \
               > "$RUNNER_TEMP/oakum_notes.txt"
-            # Cut oakum's body at the first non-blank line of cargo-dist's
-            # notes, so a rerun on a published release does not stack a copy.
-            marker=$(grep -m1 -v '^[[:space:]]*$' "$RUNNER_TEMP/notes.txt" || true)
-            if [[ -n "$marker" ]]; then
-              # `ENVIRON`, not `-v`: `-v` expands backslash escapes in the value.
-              changelog=$(marker="$marker" \
-                awk '$0 == ENVIRON["marker"] { exit } { print }' \
-                "$RUNNER_TEMP/oakum_notes.txt")
-              if [[ -n "$changelog" ]]; then
+            body=$(<"$RUNNER_TEMP/oakum_notes.txt")
+            notes=$(<"$RUNNER_TEMP/notes.txt")
+            if [[ -n "${notes//[[:space:]]/}" ]]; then
+              # Everything before cargo-dist's whole notes block, so a rerun
+              # on a published release does not stack a second copy.
+              changelog=$(printf '%s' "${body%%"$notes"*}")
+              if [[ -n "${changelog//[[:space:]]/}" ]]; then
                 printf '%s\n\n' "$changelog" > "$RUNNER_TEMP/combined.txt"
               else
-                if grep -q '[^[:space:]]' "$RUNNER_TEMP/oakum_notes.txt"; then
-                  echo "::warning::oakum's release body starts with cargo-dist's first line, so it was dropped; restore it with gh release edit ${TAG}" >&2
-                fi
+                echo "::warning::the release body for ${TAG} has no CHANGELOG section above cargo-dist's notes; add it with gh release edit ${TAG}" >&2
                 : > "$RUNNER_TEMP/combined.txt"
               fi
-              cat "$RUNNER_TEMP/notes.txt" >> "$RUNNER_TEMP/combined.txt"
+              printf '%s\n' "$notes" >> "$RUNNER_TEMP/combined.txt"
             else
               cp "$RUNNER_TEMP/oakum_notes.txt" "$RUNNER_TEMP/combined.txt"
             fi

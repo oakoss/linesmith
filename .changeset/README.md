@@ -57,9 +57,9 @@ Scoped npm names are the exception and must be quoted, because `@` starts a rese
 
 ## What you do not write
 
-**You never write a bump file for a package that merely depends on what you changed.** Oakum works that out from the dependency graph, including whether the dependent actually needs releasing at all. A library whose published range still covers the new version usually does not; a binary that bakes its dependencies in at build time always does.
+**A dependent releases without being named.** oakum works that out from the dependency graph, including whether the dependent needs releasing at all: a library whose published range still covers the new version does not, and the `linesmith` binary, which bakes its dependencies in at build time, always does, at patch. Name a dependent only to give it more than that: a `linesmith-core` feature users see in the binary names `linesmith: minor` too, so the binary's changelog files it under Added rather than as a patch.
 
-Dependents that will release appear in `oakum status`. If you find yourself adding a bump file because something downstream also needs releasing, that is a bug in oakum. Paste the status table and report it.
+Dependents that will release appear in `oakum status`. If one you expected is missing, paste the status table and report it.
 
 ## Choosing a level
 

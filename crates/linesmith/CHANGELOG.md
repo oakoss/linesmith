@@ -28,7 +28,7 @@ The field carries the model identifier the Claude Code payload has always sent a
 
 Surfaces the weekly usage bucket the OAuth endpoint scopes to a single model — `✧ Fable: 82.0%`. `visibility = "smart"` (default) renders it only while the session is on that model; `visibility = "always"` renders it whenever a scoped bucket exists. Opt in by adding `rate_limit_7d_model` to `[line].segments`.
 
-Per [ADR-0030](docs/adrs/0030-model-scoped-usage-arrives-in-a-limits-array.md), the data now arrives in a `limits` array rather than the `seven_day_opus` / `seven_day_sonnet` / `seven_day_oauth_apps` fields, which are null in the live response. That array is promoted out of the `#[serde(flatten)]` catch-all into typed `UsageLimit` / `LimitScope` / `LimitModel` / `LimitKind` / `LimitSeverity`, threaded through `EndpointUsage` and `CachedData`, and mirrored to rhai plugins as `ctx.usage.data.limits`. Plugins reading it from `ctx.usage.data.unknown_buckets` must move to the typed path; `ctx.status.model.id` is also newly exposed.
+Per [ADR-0030](../../docs/adrs/0030-model-scoped-usage-arrives-in-a-limits-array.md), the data now arrives in a `limits` array rather than the `seven_day_opus` / `seven_day_sonnet` / `seven_day_oauth_apps` fields, which are null in the live response. That array is promoted out of the `#[serde(flatten)]` catch-all into typed `UsageLimit` / `LimitScope` / `LimitModel` / `LimitKind` / `LimitSeverity`, threaded through `EndpointUsage` and `CachedData`, and mirrored to rhai plugins as `ctx.usage.data.limits`. Plugins reading it from `ctx.usage.data.unknown_buckets` must move to the typed path; `ctx.status.model.id` is also newly exposed.
 
 A per-item-tolerant deserializer keeps one malformed element from failing the whole response and dropping the endpoint to the JSONL fallback.
 
@@ -44,7 +44,7 @@ A per-item-tolerant deserializer keeps one malformed element from failing the wh
 
 #### **Not a breaking change — the binary picks up seven features already shipped in `linesmith-core` 0.3.0.**
 
-The CLI surface, the config schema, and the `linesmith` library API are all unchanged. The heading above reflects the version position, not the content: pre-1.0, `0.x+1.0` is where additive releases go per [release-process.md](docs/specs/release-process.md) §Semver posture, and Knope files that position under "Breaking Changes" with no way to distinguish the two cases.
+The CLI surface, the config schema, and the `linesmith` library API are all unchanged. The heading above reflects the version position, not the content: pre-1.0, `0.x+1.0` is where additive releases go per [release-process.md](../../docs/specs/release-process.md) §Semver posture, and Knope files that position under "Breaking Changes" with no way to distinguish the two cases.
 
 `linesmith` 0.2.1 was published against `linesmith-core ^0.2.0`, so everything merged as `feat(core)` since then has been live on crates.io as a library while remaining unreachable to anyone running `cargo install linesmith`. Those scopes bump `linesmith-core` alone and only refresh the binary's dependency pin, so even the binary-crate source those PRs touched went unreleased: the commit scope, not the files touched, decides which package bumps. The version number stayed 0.2.1 while its dependency graph changed underneath it.
 
