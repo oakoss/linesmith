@@ -31,6 +31,10 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          # `oakum check` reads tags and the branch's commits since the
+          # merge-base; a shallow clone makes it exit 2.
+          fetch-depth: 0
 
       - name: Setup
         uses: ./.github/actions/setup
@@ -56,12 +60,19 @@ jobs:
       - name: Schema drift check
         run: mise run schema:check
 
-      # Parses knope.toml + verifies workflow references resolve, so
-      # schema drift (typo'd fields, wrong `dependency` strings, broken
-      # `scopes` arrays) surfaces on the PR rather than crashing the
-      # next push-to-main mid-job.
-      - name: Validate knope.toml
-        run: knope --validate
+      # Fails a pull request whose changed crates no bump file or
+      # releaseless commit covers, so a release cannot be dropped silently.
+      # Skipped only on the version pull request the App opens, which
+      # consumes bump files by design; a fork or a person on that branch
+      # name is still checked.
+      - name: oakum check
+        if: >-
+          github.event_name == 'pull_request'
+          && (github.head_ref != 'oakum/version-packages'
+            || github.event.pull_request.head.repo.full_name != github.repository
+            || github.event.pull_request.user.type != 'Bot'
+            || github.event.sender.type != 'Bot')
+        run: oakum check --strict
 
   tests:
     name: Tests (${{ matrix.os }})
@@ -135,6 +146,40 @@ jobs:
 
       - name: MSRV check
         run: cargo check --locked --workspace --all-targets
+
+  # The release plan as a sticky pull-request comment and job summary.
+  # Presentation only, so it is outside CI Summary: `oakum check` above is
+  # the gate. A fork's read-only token degrades to the job summary.
+  release-plan:
+    name: Release plan
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@8d3c67de8e2fe68ef647c8db1e6a09f647780f40 # v2.19.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install oakum
+        uses: jdx/mise-action@1648a7812b9aeae629881980618f079932869151 # v4
+        with:
+          install_args: github:oakoss/oakum
+          cache: true
+
+      - name: oakum ci pr-status
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: oakum ci pr-status
 
   ci-summary:
     name: CI Summary

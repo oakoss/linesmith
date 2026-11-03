@@ -55,17 +55,18 @@ See `docs/README.md` for the full pipeline description and promotion rules.
 
 Managed by [mise](https://mise.jdx.dev/). Run `mise install` to get all tools.
 
-| Command                           | Purpose                                     |
-| --------------------------------- | ------------------------------------------- |
-| `mise run check`                  | All checks (fmt + lint + Rust)              |
-| `mise run test`                   | All tests                                   |
-| `mise run bench`                  | All benchmarks                              |
-| `mise run fmt`                    | Format non-Rust files (prettier)            |
-| `mise run lint`                   | Lint markdown (markdownlint-cli2)           |
-| `cargo fmt`                       | Format Rust                                 |
-| `cargo clippy`                    | Rust linting                                |
-| `knope document-change`           | Author a changeset file under `.changeset/` |
-| `knope prepare-release --dry-run` | Preview the next release PR's diff locally  |
+| Command                | Purpose                                     |
+| ---------------------- | ------------------------------------------- |
+| `mise run check`       | All checks (fmt + lint + Rust)              |
+| `mise run test`        | All tests                                   |
+| `mise run bench`       | All benchmarks                              |
+| `mise run fmt`         | Format non-Rust files (prettier)            |
+| `mise run lint`        | Lint markdown (markdownlint-cli2)           |
+| `cargo fmt`            | Format Rust                                 |
+| `cargo clippy`         | Rust linting                                |
+| `oakum add`            | Write a bump file under `.changeset/`       |
+| `oakum status`         | Preview the next release plan locally       |
+| `oakum check --strict` | The coverage gate CI runs on a pull request |
 
 Git hooks installed via `lefthook install`. `pre-commit` runs fmt/lint on staged files; `commit-msg` verifies conventional commit format via `cog`.
 
@@ -149,9 +150,9 @@ hide reason per segment and is the fastest way to tell these apart.
 
 ### Releases
 
-Knope drives release automation per [ADR-0027](docs/adrs/0027-knope-for-release-automation.md) — per-crate versioning, per-crate CHANGELOG, cross-manifest dep-pin updates by name. Release-PR merge fires `knope-release.yml`, which tags each bumped package and creates its GitHub Release; each `<crate>/v*` tag push then fires its own `knope-release.yml` run that publishes to crates.io (it can't ride the merge run — crates.io rejects `pull_request_target`); the `linesmith/v*` tag additionally fires cargo-dist's `release.yml` for binary builds, which the library tags deliberately don't. Expect several runs per release — one publish run per bumped crate. Each publishes the whole workspace, so only the first has anything to do and the rest exit green with a `::notice::`. Treat a **red publish run as a real failure**; `docs/ops/release-runbook.md` covers the single exception and how to read a cancelled run. Exact counts are in `docs/ops/release-runbook.md`. A `verify-published` job fails the release if the registry doesn't catch up. Full contract in `docs/specs/release-process.md`; day-of-release steps in `docs/ops/release-runbook.md`.
+[oakum](https://github.com/oakoss/oakum) drives release automation per [ADR-0033](docs/adrs/0033-oakum-for-release-automation.md) — per-crate versioning, per-crate CHANGELOG, dependency pins rewritten, and a library bump cascading to the binary that ships it. Each push to main runs `oakum.yml`: `release` tags every manifest version with no tag yet and creates its GitHub Release, then `version` opens or refreshes the version pull request (`oakum/version-packages`) from pending bump files; merging that pull request is the release. Each `<crate>/v*` tag push then fires its own `oakum.yml` run that publishes to crates.io (it can't ride the main-push run, which keeps the irreversible step separately cancellable); the `linesmith/v*` tag additionally fires cargo-dist's `release.yml` for binary builds, which the library tags deliberately don't. Expect several runs per release — one publish run per bumped crate. Each publishes the whole workspace, so only the first has anything to do and the rest exit green with a `::notice::`. Treat a **red publish run as a real failure**; `docs/ops/release-runbook.md` covers the single exception and how to read a cancelled run. A `verify-published` job fails the release if the registry doesn't catch up. Full contract in `docs/specs/release-process.md`; day-of-release steps in `docs/ops/release-runbook.md`.
 
-Drop a changeset file via `knope document-change` when the conventional-commit subject doesn't fully capture release impact (e.g. a `refactor:` that's actually breaking, or a `feat:` whose per-package effect isn't obvious from the scope). Conventional commits remain the primary signal; changesets supplement.
+**A pull request that changes what a user gets carries a bump file** (`oakum add`, or `oakum generate` to write one from the branch's conventional commits), and CI's `oakum check --strict` refuses a changed crate nothing covers. A branch whose commits to a crate all release nothing (`refactor:`, `test:`, `chore:`, `docs:`) needs none. Name every crate the change should release at the level it should take: a library bump releases the binary that ships it at patch on its own, so a `feat` in `linesmith-core` that users see in the binary names `linesmith: minor` too. Levels follow [release-process.md](docs/specs/release-process.md) §Semver posture.
 
 ## Non-Interactive Shell Commands
 
@@ -352,7 +353,7 @@ Conventional commits: `type(scope): short description`
 
 **Types:** `docs`, `chore`, `feat`, `fix`, `refactor`, `test`, `perf`, `ci`
 
-**Scopes (indicative):** `ideas`, `adr`, `spec`, `docs`, `readme`, `config`, `beads`, `core`, `plugins`, `themes`, `segments`, `cli`, `tui`, `doctor`, `ci`, `repo`. Scopes that bump a published crate are pinned in `knope.toml`'s `[packages.*]` blocks (`core` → linesmith-core **and** linesmith; `plugins` → linesmith-plugin, linesmith-core, **and** linesmith; `cli`/`tui`/`segments`/`themes`/`config`/`doctor` → linesmith). A library's scope sits on every crate that pins it, per [ADR-0032](docs/adrs/0032-core-bumps-cascade-to-the-binary.md) — users install a binary and a library-only bump never tags `linesmith/v*`, so cargo-dist builds nothing and the change reaches nobody. `linesmith-core` joins the `plugins` cascade because it hosts the plugin bridge. Doc / meta scopes (`adr`, `spec`, `docs`, `readme`, `ideas`, `beads`, `ci`, `repo`) pair with non-bumping commit types (`docs`/`chore`/`ci`/`test`) and aren't claimed by any package.
+**Scopes (indicative):** `ideas`, `adr`, `spec`, `docs`, `readme`, `config`, `beads`, `core`, `plugins`, `themes`, `segments`, `cli`, `tui`, `doctor`, `ci`, `repo`. Scopes describe the change; they route nothing to a package. Releases come from bump files (see §Releases), and `oakum generate` attributes a commit by the files it touches. Doc / meta scopes (`adr`, `spec`, `docs`, `readme`, `ideas`, `beads`, `ci`, `repo`) pair with non-bumping commit types (`docs`/`chore`/`ci`/`test`).
 
 Beads issue references go in the commit footer as a bare `lsm-xyz`, not in the subject line. Commits not tied to a beads issue (meta / workflow / CI / version bumps) have **no** footer — don't invent one.
 

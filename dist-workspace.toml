@@ -38,7 +38,9 @@ github-attestations = true
 # Embed dependency tree in binaries for security scanning (cargo audit bin)
 cargo-auditable = true
 # Allow Renovate-style SHA pin updates in the generated release.yml without
-# fighting `dist generate --mode=ci`. Remove temporarily when regenerating.
+# fighting `dist generate --mode=ci`. Hand-edit: host uploads into the
+# oakum-created release and keeps its changelog body above dist's notes.
+# Remove temporarily when regenerating, then re-apply.
 allow-dirty = ["ci"]
 
 # Use ubuntu-latest so Renovate doesn't create PRs for runner updates

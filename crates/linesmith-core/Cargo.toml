@@ -26,7 +26,7 @@ workspace = true
 # Rhai plugin host lives in core (not cli) per ADR-0018 so the
 # `RhaiSegment` adapter + `DataContext` ↔ `rhai::Map` bridge sit
 # alongside the segment system that consumes them. Per-crate pin
-# (not workspace) for the Knope-rewrite rationale in root Cargo.toml.
+# (not workspace) for the rationale in root Cargo.toml.
 linesmith-plugin = { version = "0.1.3", path = "../linesmith-plugin" }
 serde.workspace = true
 serde_json.workspace = true

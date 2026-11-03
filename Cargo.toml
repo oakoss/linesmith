@@ -3,8 +3,8 @@ resolver = "2"
 members = ["crates/linesmith-core", "crates/linesmith-plugin", "crates/linesmith"]
 
 [workspace.package]
-# No shared `version` field — crates version per-package per ADR-0027
-# so siblings don't drag across major boundaries on a Knope bump.
+# No shared `version` field — crates version per-package (ADR-0033) so
+# siblings don't drag across major boundaries on a release.
 edition = "2021"
 rust-version = "1.91"
 license = "MIT"
@@ -18,10 +18,9 @@ categories = ["command-line-utilities", "development-tools"]
 
 [workspace.dependencies]
 # Internal deps (linesmith-core, linesmith-plugin) live in each
-# consumer's per-crate `[dependencies]` rather than here, so Knope can
-# rewrite the pin string in place when the depended-on crate bumps
-# (via `dependency = "<name>"` entries in knope.toml's `versioned_files`).
-# This block stays focused on shared third-party versions.
+# consumer's per-crate `[dependencies]` rather than here; `oakum version`
+# rewrites each pin in place when the depended-on crate bumps. This block
+# stays focused on shared third-party versions.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 catppuccin = "2"
