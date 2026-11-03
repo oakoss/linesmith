@@ -1,6 +1,6 @@
 # Use Knope for release automation, replacing release-plz
 
-- Status: accepted
+- Status: superseded by [ADR-0033](0033-oakum-for-release-automation.md)
 - Amended by: [ADR-0032](0032-core-bumps-cascade-to-the-binary.md) — the §Implementation clause routing `core` and `plugins` to their own crates alone. Those scopes now bump every crate whose manifest they rewrite, because a library-only bump never tags `linesmith/v*` and so ships nothing. The choice of Knope, the workflow layout, and the rest of the configuration stand.
 - Date: 2026-05-23
 - Deciders: Jace Babin
