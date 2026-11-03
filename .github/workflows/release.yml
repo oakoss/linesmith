@@ -41,8 +41,9 @@ permissions:
 on:
   push:
     tags:
-      # Knope's per-package format (`<crate>/v<ver>`) restricted to the
-      # dist-able `linesmith` binary per ADR-0027. Library tags
+      # The per-package tag format (`<crate>/v<ver>`, `tag-format` in
+      # .changeset/_config.toml) restricted to the dist-able `linesmith`
+      # binary. Library tags
       # (`linesmith-core/v*`, `linesmith-plugin/v*`) are excluded because
       # cargo-dist rejects them and would produce noisy red runs with no
       # artifacts. Bare `v*` covers the legacy v0.2.0 manual-unblock tag
@@ -352,14 +353,13 @@ jobs:
         run: |
           # Remove the granular manifests
           rm -f artifacts/*-dist-manifest.json
-      # Knope already created the `linesmith/v<ver>` GitHub Release in
-      # knope-release.yml. cargo-dist uploads artifacts and overwrites
-      # the body with `ANNOUNCEMENT_BODY` (install snippets + download
-      # table Knope's body lacks). `--latest` overrides any auto-latest
-      # assignment GitHub gave to library releases Knope created in the
-      # same workflow.
+      # `oakum release` (oakum.yml) already created the `linesmith/v<ver>`
+      # GitHub Release with the version's changelog section as its body.
+      # This uploads the artifacts and puts that section above cargo-dist's
+      # install snippets and download table. `--latest` overrides any
+      # auto-latest GitHub gave to the library releases created beside it.
       #
-      # Bare `v*` tags (v0.2.0 manual unblock) have no Knope-created
+      # Bare `v*` tags (v0.2.0 manual unblock) have no oakum-created
       # release; the `gh release view` probe falls back to `gh release
       # create` with the asset-verification loop applied symmetrically.
       - name: Upload artifacts to release
@@ -398,7 +398,7 @@ jobs:
             done
           }
 
-          # Probe distinguishes "release exists" (Knope path) from "no
+          # Probe distinguishes "release exists" (oakum path) from "no
           # release yet" (legacy bare-`v*` path). Order matters:
           # `2>&1 >/dev/null` routes stderr to the workflow log first
           # (so auth/network failures surface visibly), then suppresses
@@ -408,17 +408,38 @@ jobs:
             # recovery after a partial upload.
             gh release upload "$TAG" artifacts/* --clobber
             verify_assets_present "$TAG"
-            # Overwrite Knope's CHANGELOG body with cargo-dist's
-            # announcement (install snippets + download table). Diffing
-            # the swap into the log surfaces drift between Knope's and
-            # cargo-dist's CHANGELOG extractors.
-            gh release view "$TAG" --json body -q .body > "$RUNNER_TEMP/knope_notes.txt"
-            diff -u "$RUNNER_TEMP/knope_notes.txt" "$RUNNER_TEMP/notes.txt" || true
+            # `tr -d '\r'`: a body written by anything but `--notes-file`
+            # (a web edit) reads back CRLF, which would defeat the match below.
+            gh release view "$TAG" --json body -q .body | tr -d '\r' \
+              > "$RUNNER_TEMP/oakum_notes.txt"
+            body=$(<"$RUNNER_TEMP/oakum_notes.txt")
+            notes=$(<"$RUNNER_TEMP/notes.txt")
+            if [[ -n "${notes//[[:space:]]/}" ]]; then
+              # Everything before cargo-dist's whole notes block, so a rerun
+              # on a published release does not stack a second copy.
+              changelog=$(printf '%s' "${body%%"$notes"*}")
+              if [[ -n "${changelog//[[:space:]]/}" ]]; then
+                printf '%s\n\n' "$changelog" > "$RUNNER_TEMP/combined.txt"
+              else
+                echo "::warning::the release body for ${TAG} has no CHANGELOG section above cargo-dist's notes; add it with gh release edit ${TAG}" >&2
+                : > "$RUNNER_TEMP/combined.txt"
+              fi
+              printf '%s\n' "$notes" >> "$RUNNER_TEMP/combined.txt"
+            else
+              cp "$RUNNER_TEMP/oakum_notes.txt" "$RUNNER_TEMP/combined.txt"
+            fi
+            echo "::group::release body"
+            cat "$RUNNER_TEMP/combined.txt"
+            echo "::endgroup::"
             # shellcheck disable=SC2086 # flags intentionally word-split
-            gh release edit "$TAG" --draft=false $PRERELEASE_FLAG $LATEST_FLAG --notes-file "$RUNNER_TEMP/notes.txt"
+            gh release edit "$TAG" --draft=false $PRERELEASE_FLAG $LATEST_FLAG --notes-file "$RUNNER_TEMP/combined.txt"
           else
-            # Legacy bare `v*` path — no Knope-created release at this
-            # tag, so create one matching Knope-path semantics.
+            # Legacy bare `v*` path — no oakum-created release at this
+            # tag, so create one matching oakum-path semantics. A package
+            # tag here means `oakum release` failed after pushing it.
+            if [[ "$TAG" != v* ]]; then
+              echo "::warning::no GitHub Release existed for ${TAG}; created one with cargo-dist's notes only. Add the CHANGELOG section with gh release edit ${TAG}" >&2
+            fi
             # shellcheck disable=SC2086
             gh release create "$TAG" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG $LATEST_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
             verify_assets_present "$TAG"

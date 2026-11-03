@@ -4,7 +4,7 @@ Step-by-step playbook for cutting a linesmith release. Assumes the prereqs
 in [`docs/specs/release-process.md`](../specs/release-process.md) are already
 set up (GitHub App on `oakoss/linesmith` + `oakoss/homebrew-tap`, org secrets
 `BOT_CLIENT_ID` / `BOT_PRIVATE_KEY`, crates.io trusted publishing configured
-for each of the three crates with `knope-release.yml` as the workflow and
+for each of the three crates with `oakum.yml` as the workflow and
 no environment requirement).
 
 See the spec for the full contract (target matrix, supply-chain posture,
@@ -19,17 +19,14 @@ mints a GitHub App installation token on the fly.
 
 ## Normal release flow
 
-Every release lands by merging the Knope release PR. `knope-release.yml` (`prepare` job)
-opens / force-updates the PR automatically on each non-`release` PR
-merge to `main` that contains a releasable change (any `feat` / `fix` /
-`perf` matching a package's claimed scopes, or a non-empty changeset
-file under `.changeset/`). PR merges without releasable changes land
-as green no-op runs via the `git diff --quiet HEAD` gate between the
-two Knope invocations.
+Every release lands by merging the version pull request. `oakum.yml`
+(`version` job) opens / force-updates it automatically on each push to
+`main` that leaves a bump file pending under `.changeset/`. Pushes with
+nothing pending land as green no-op runs.
 
 ### 1. Pre-flight (local)
 
-Before merging the release PR, verify main is healthy:
+Before merging the version pull request, verify main is healthy:
 
 ```sh
 mise run check      # fmt + lint + cargo check + clippy + schema:check
@@ -41,58 +38,54 @@ A `cargo audit` step for open advisories against `Cargo.lock` is intended
 here; wiring it into mise is tracked under `lsm-d4z` so the runbook
 doesn't reference an uninstalled tool.
 
-Optionally preview what Knope will produce on the next release:
+Optionally preview the next release:
 
 ```sh
-knope prepare-release --dry-run
+oakum status
 ```
 
-This writes the version bumps + CHANGELOG entries to the working tree
-without committing. Discard with `git restore .` once reviewed.
+It prints the release plan from the pending bump files and writes nothing.
 
-If any check fails, fix on `main` first. The release PR should be mergeable
-against a healthy branch.
+If any check fails, fix on `main` first. The version pull request should be
+mergeable against a healthy branch.
 
-### 2. Review the Knope release PR
+### 2. Review the version pull request
 
-`knope-release.yml` (`prepare` job) opens it against `main` (branch: `release`; no label by
-default). Click in and verify:
+`oakum.yml` (`version` job) opens it against `main` (branch:
+`oakum/version-packages`, author: the `oakoss` App). Click in and verify:
 
-- **Per-package bumps** match the change shapes. Pre-1.0 rules: `feat` on a
-  scope claimed by package X → minor bump for X (treated as breaking per
-  semver posture); `fix` / `perf` → patch bump for X. Unscoped `feat`/`fix`
-  bumps every package per Knope's "no scope = all packages" semantics — flag
-  if that wasn't the intent.
+- **Per-package bumps** match the bump files. Pre-1.0 (`zero-major`): a
+  `minor` or `major` bump file moves `0.x` to `0.x+1.0`, `patch` stays a
+  patch. A library bump carries `linesmith` along at least at patch
+  (`cascade` in the plan); if users see the change in the binary, the bump
+  file should name `linesmith` at that level too.
 - **Internal dep-pin updates** are in lockstep with each bump. A
-  `linesmith-core` 0.2.0 → 0.3.0 bump should rewrite the pin in
-  `crates/linesmith/Cargo.toml`'s `linesmith-core = { version = "0.3.0", path = ... }`.
-  If a pin is stale, the workspace won't compile; investigate
-  `knope.toml`'s `versioned_files` entries.
-- **Per-crate CHANGELOG entries** read cleanly. The root `CHANGELOG.md` (for
-  `linesmith`), `crates/linesmith-core/CHANGELOG.md`, and
-  `crates/linesmith-plugin/CHANGELOG.md` get their own entries. Commit
-  subjects are grouped under Features / Bug Fixes / Performance. `docs`,
-  `chore`, `test`, `ci` commits are omitted (visible only in git log).
-- **Changeset files** under `.changeset/` are deleted (Knope consumed them).
-- **No surprise files** in the diff. Should be `Cargo.toml`, `Cargo.lock`,
-  per-crate `Cargo.toml`s, per-crate `CHANGELOG.md`s, and any deleted
+  `linesmith-core` 0.4.1 → 0.5.0 bump rewrites the pin in
+  `crates/linesmith/Cargo.toml` to `linesmith-core = { version = "^0.5.0", path = ... }`.
+- **Per-crate CHANGELOG entries** read cleanly:
+  `crates/linesmith/CHANGELOG.md`, `crates/linesmith-core/CHANGELOG.md`,
+  and `crates/linesmith-plugin/CHANGELOG.md` each get their own entry, the
+  bump files' bodies under `### Added` / `### Changed` / `### Fixed` by level.
+- **Bump files** under `.changeset/` are deleted (oakum consumed them).
+- **No surprise files** in the diff. Should be `Cargo.lock`, per-crate
+  `Cargo.toml`s, per-crate `CHANGELOG.md`s, and the deleted
   `.changeset/*.md` files. Anything else is a red flag.
 
-If the version, dep-pin, or CHANGELOG is wrong, open a fix PR (or a
-changeset PR via `knope document-change`); when that PR merges to
-`main`, `knope-release.yml`'s `prepare` job updates the release PR.
+If the version, dep-pin, or CHANGELOG is wrong, open a fix PR with a
+corrected or additional bump file (`oakum add`); when that PR merges to
+`main`, the `version` job updates the version pull request.
 
 ### 3. Merge
 
 Merge the PR with the squash strategy (the repo's only enabled merge
-method). On merge, `knope-release.yml` fires and:
+method). The push to main fires `oakum.yml`:
 
-1. **`release` job** — runs `knope release --verbose`. Tags each bumped
-   package as `<crate>/v<version>` (e.g. `linesmith/v0.3.0`,
-   `linesmith-core/v0.3.0`). Creates a GitHub Release per tag with
-   CHANGELOG-derived notes.
+1. **`release` job** — runs `oakum release`. Tags each bumped
+   package as `<crate>/v<version>` (e.g. `linesmith/v0.5.0`,
+   `linesmith-core/v0.5.0`). Creates a GitHub Release per tag whose body is
+   that version's CHANGELOG section.
 
-Each of those tag pushes then fires its own `knope-release.yml` run:
+Each of those tag pushes then fires its own `oakum.yml` run:
 
 2. **`publish` job** — mints a crates.io OIDC token via
    `rust-lang/crates-io-auth-action`, installs `cargo-release`, runs
@@ -105,14 +98,14 @@ Each of those tag pushes then fires its own `knope-release.yml` run:
    would error on the unchanged siblings.
 
 Publish runs in its own tag-triggered run rather than alongside the
-`release` job because crates.io rejects OIDC token requests from
-`pull_request_target`. A multi-package release pushes several tags and
-so starts several publish runs; the dedicated `knope-publish`
+`release` job, so the irreversible step can be cancelled on its own. A
+multi-package release pushes several tags and
+so starts several publish runs; the dedicated `oakum-publish`
 concurrency group holds one running plus one pending and evicts anything
 queued in between, which is safe because each run publishes the whole
 workspace.
 
-**Expect one run per bumped crate's tag, plus the merge run** — so two
+**Expect one run per bumped crate's tag, plus the main-push run** — so two
 for a single-package cycle, four for a full three-crate release. Of
 those three tag runs, expect one **cancelled** (evicted from the
 concurrency queue, not a failure) and the rest green — the first
@@ -153,11 +146,14 @@ mid-publish streams its progress up to the point it stopped (the step uses
 publishing, treat it as a partial release and check the registry before
 re-running.
 
-If you only see the merge run, publish never
-fired; recover with `gh workflow run "Knope Release" -f mode=publish -f
-tag=<crate>/v<version>`. The `tag` input is required — recovery publishes
-that tag's commit, and without it the run would read `main`, which after
-any later merge means publishing something the release never contained.
+If you only see the main-push run, publish never fired; recover with
+`gh workflow run oakum.yml -f tag=<crate>/v<version>`. The `tag` input is
+required — recovery publishes that tag's commit, never `main`, which after
+any later merge would hold something the release never contained.
+
+If the main-push run's `release` job failed, rerun that run's failed jobs:
+`oakum release` tags whatever main declares that has no tag yet, and resumes
+a tag that already exists rather than recreating it.
 
 The `linesmith/v<version>` tag push (from step 1) also triggers
 `release.yml` (cargo-dist), independently of the publish run.
@@ -179,8 +175,8 @@ gh run watch --exit-status
 3. `build-global-artifacts` — generates shell/PowerShell installer scripts
    and aggregate `sha256.sum`.
 4. `host` — uploads all artifacts to the existing `linesmith/v<version>`
-   GitHub Release (`gh release upload`), then marks it
-   `--draft=false --latest`.
+   GitHub Release (`gh release upload`), puts oakum's CHANGELOG section
+   above cargo-dist's install notes, and marks it `--draft=false --latest`.
 5. `publish-homebrew-formula` — pushes `Formula/linesmith.rb` to
    `oakoss/homebrew-tap` (skipped automatically on prereleases).
 6. `announce` — completion signal.
@@ -190,9 +186,9 @@ Total runtime: typically 10-15 min.
 ### 5. Verify
 
 A green **`verify-published` job** means crates.io serves every version in
-the manifests on `main`, unyanked. It asserts the manifest
-versions are live, not that this particular run shipped something — if
-Knope found nothing releasable, the manifests still hold already-published
+the manifests at the pushed commit, unyanked. It asserts the manifest
+versions are live, not that this particular run shipped something — on a
+push that released nothing, the manifests still hold already-published
 versions and the job goes green. Read it as "the registry matches what
 main says it should be."
 
@@ -222,48 +218,48 @@ linesmith doctor --plain | grep -A2 "Self update"
 ### 6. Announce (optional)
 
 Draft a short post summarizing the user-visible changes. The GitHub Release
-body for the `linesmith/v<version>` tag is auto-populated by Knope
-(CHANGELOG-derived) + cargo-dist (install snippets + download table);
+body for the `linesmith/v<version>` tag is auto-populated by oakum
+(the CHANGELOG section) + cargo-dist (install snippets + download table);
 narrative context can live in a separate social post or pinned issue.
 
 ## Documenting a change (contributor flow)
 
-When the conventional-commit subject doesn't fully capture release impact
-(e.g. a `refactor:` commit that's actually breaking, or a `feat:` whose
-effect on individual packages isn't obvious from the scope), author a
-changeset file:
+A pull request that changes what a user gets carries a bump file. CI's
+`oakum check --strict` fails a pull request whose changed crate nothing
+covers, naming the commands that cover it. A branch whose commits to a
+crate all release nothing (`refactor:`, `test:`, `chore:`, `docs:`) needs
+none.
 
 ```sh
-knope document-change
+oakum add --packages "linesmith-core:minor,linesmith:minor" --message "…"
+oakum add --interactive              # guided prompts
+oakum generate --from main           # from the branch's conventional commits
+oakum add --none --packages "linesmith:none" --message "…"  # covered, no release
 ```
-
-Knope prompts interactively for:
-
-1. **Which packages this affects** (multi-select from `linesmith-core`,
-   `linesmith-plugin`, `linesmith`).
-2. **Bump level per package** (`major`, `minor`, `patch`).
-3. **A description** (free-form markdown — what changed, why, migration
-   notes if breaking).
 
 The result is a markdown file under `.changeset/` like:
 
 ```markdown
 ---
 linesmith-core: minor
+linesmith: minor
 ---
 
 Rename Segment trait's render() method to compose(). Existing plugin
 scripts continue to work via a deprecation shim that emits a
-linesmith-warn on load; the shim is removed in linesmith-core 0.3.
+linesmith-warn on load; the shim is removed in linesmith-core 0.6.
 ```
 
-Commit the changeset file alongside your code change. `knope prepare-release`
-consumes it on the next release cycle and deletes it.
+Name every crate the change should release, at the level it should take:
+a library bump releases the binary that ships it at patch on its own. The
+body is the CHANGELOG entry, written for someone deciding whether to
+upgrade. Commit the bump file alongside your code change; the next version
+pull request consumes it and deletes it.
 
 ## Pre-release (RC) flow
 
 Pre-release tags (`linesmith/vX.Y.Z-rc.N`, `-alpha.N`, `-beta.N`) are cut
-manually, bypassing the Knope release-PR flow:
+manually, bypassing the version pull request flow:
 
 ```sh
 git tag -a linesmith/v0.3.0-rc.1 -m "v0.3.0-rc.1"
@@ -276,12 +272,12 @@ Cutting one requires bypass on the org tag ruleset — see §Tag protection.
 suffix and:
 
 - Creates a GitHub pre-release (the `host` job's fallback `gh release create`
-  path covers this — no Knope-created release exists).
+  path covers this — no oakum-created release exists).
 - Uploads all 6 target binaries.
 - **Skips** the Homebrew formula push.
 - **Skips** the `--latest` flag on the release edit.
-- Does NOT publish to crates.io (Knope's release/publish workflow isn't
-  involved).
+- Does NOT publish to crates.io (`oakum.yml`'s publish trigger matches
+  exact `<crate>/vX.Y.Z` tags only).
 
 Testers install via the shell installer or
 `cargo install linesmith --git <url> --tag linesmith/v0.3.0-rc.1`.
@@ -296,15 +292,8 @@ PR touches `release.yml`, `dist-workspace.toml`, `Cargo.toml`,
 `crates/*/Cargo.toml`, or `Cargo.lock` — catches cross-compile breakage from
 dependency bumps before merge.
 
-For Knope-side dry-runs (preview the next release PR's content):
-
-```sh
-knope prepare-release --dry-run
-```
-
-Knope writes the version bumps + CHANGELOG entries to the working tree but
-skips the commit / push / PR steps. Discard with `git restore .` once
-reviewed.
+To preview the next version pull request's plan, run `oakum status`
+locally, or read the Release plan comment CI posts on every pull request.
 
 ## Rollback
 
@@ -319,7 +308,7 @@ If a release ships broken artifacts:
    per crate. Do not republish the same version — crates.io rejects it.
 3. If Homebrew formula already pushed: revert the formula commit on
    `oakoss/homebrew-tap`.
-4. Delete each GitHub Release Knope created (per-package release pages
+4. Delete each GitHub Release oakum created (per-package release pages
    exist when more than one package bumped in a cycle).
 5. Fix the issue, cut a new patch release (`linesmith/v{VERSION+1}` if
    crates.io published; re-use `linesmith/v{VERSION}` otherwise — fine if
@@ -348,7 +337,7 @@ refs/tags/v*        refs/tags/*/v*
 refs/tags/@*        refs/tags/*-v*
 ```
 
-`*/v*` covers Knope's per-package format; `*-v*` covers the legacy
+`*/v*` covers the per-package format oakum tags; `*-v*` covers the legacy
 release-plz tags so history stays protected.
 
 Only two actors bypass it: the `oakoss` App (`Integration:3174795`),
@@ -380,7 +369,29 @@ gh api --paginate repos/oakoss/linesmith/rulesets/rule-suites \
 branch pushes dominate. Narrow to a single tag by appending
 `| grep linesmith/v0.3.0-rc.1`.
 
-## Knope migration tags (one-time, for the first Knope release)
+## Package tags for the bare v0.1.x tags (one-time, for oakum)
+
+The bare `v0.1.0` and `v0.1.1` tags released the `linesmith` crate alone,
+before per-package tagging. With several packages tagged, oakum cannot tell
+which package a bare tag released, and every oakum command exits 2 until a
+package tag names the same commit. Done 2026-11-02:
+
+```sh
+gh workflow disable release.yml
+git tag -s linesmith/v0.1.0 1ab79e1 -m "linesmith 0.1.0"
+git tag -s linesmith/v0.1.1 c219174 -m "linesmith 0.1.1"
+git push origin linesmith/v0.1.0 linesmith/v0.1.1
+gh workflow enable release.yml
+```
+
+`release.yml` is disabled around the push because a tag push runs the
+workflow file at the tagged commit: at `1ab79e1` and `c219174` that is the
+v0.1 `release.yml`, whose `**[0-9]+.[0-9]+.[0-9]+*` trigger matches these
+tags and would create 0.1.x GitHub Releases and push a 0.1.x Homebrew
+formula. The bare tags and their GitHub Releases stay. Creating these needs
+bypass on the org tag ruleset; see §Tag protection.
+
+## Knope migration tags (one-time, done for the first Knope release)
 
 The release-plz era used `<crate>-v<version>` per-package tags
 (`linesmith-v0.1.3`, `linesmith-core-v0.2.0`, `linesmith-plugin-v0.1.3`)
@@ -418,12 +429,12 @@ chicken-and-egg story with crates.io trusted publishing isn't obvious.
    (24h expiration; scopes `publish-new` + `publish-update`, crate pattern
    matches the new crate name).
 2. Go to `https://crates.io/crates/<name>/settings/new-trusted-publisher`
-   and wire up `oakoss/<repo>` + `knope-release.yml` as the trusted
+   and wire up `oakoss/<repo>` + `oakum.yml` as the trusted
    publisher's workflow. Leave the environment field empty — this repo
    doesn't provision GitHub Environments, so the workflow ID alone
    identifies the dispatcher.
 3. Delete the local token (`cargo logout`).
-4. `knope-release.yml`'s `publish` job from that point forward publishes
+4. `oakum.yml`'s `publish` job from that point forward publishes
    token-free via OIDC.
 
 The tap repo also needs an initial commit on `main` before `cargo-dist`

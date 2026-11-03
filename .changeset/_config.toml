@@ -1,0 +1,8 @@
+#:schema ./_schema.json
+change-files = true
+conventional-commits = true
+versioning = "zero-major"
+# The shape knope tagged since 0.2.0 and cargo-dist's release.yml and
+# `linesmith doctor` read. Older release-plz tags (`<package>-v<version>`)
+# stay as history.
+tag-format = "{{ package }}/v{{ version }}"

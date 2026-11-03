@@ -1,6 +1,6 @@
 # Cascade library bumps to the binary by sharing commit scopes
 
-- Status: accepted
+- Status: superseded by [ADR-0033](0033-oakum-for-release-automation.md)
 - Date: 2026-08-17
 - Deciders: Jace
 - Amends: [ADR-0027](0027-knope-for-release-automation.md) — the §Implementation clause "`scopes` restrict commit routing: `core` → `linesmith-core`, `plugins` → `linesmith-plugin`". Those scopes now route to the binary as well. ADR-0027's choice of Knope, its workflow layout, and the rest of its configuration stand unchanged.

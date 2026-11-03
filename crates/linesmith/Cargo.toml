@@ -17,9 +17,8 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-# Internal pins live per-crate (not in [workspace.dependencies]) so
-# Knope can rewrite the version string in place on sibling bumps —
-# see root Cargo.toml for the rationale.
+# Internal pins live per-crate (not in [workspace.dependencies]); see
+# root Cargo.toml for the rationale.
 linesmith-core = { version = "0.4.1", path = "../linesmith-core" }
 # Direct plugin import per ADR-0020 (bypasses linesmith-core's bridge facade).
 linesmith-plugin = { version = "0.1.3", path = "../linesmith-plugin" }
