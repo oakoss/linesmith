@@ -426,6 +426,16 @@ jobs:
                 : > "$RUNNER_TEMP/combined.txt"
               fi
               printf '%s\n' "$notes" >> "$RUNNER_TEMP/combined.txt"
+              # Text a person added below dist's notes stays below them. After
+              # the last copy, so a body stacked twice heals; only leading
+              # newlines go, so an indented first line keeps its indent.
+              if [[ "$body" == *"$notes"* ]]; then
+                suffix="${body##*"$notes"}"
+                suffix="${suffix#"${suffix%%[!$'\n']*}"}"
+                if [[ -n "${suffix//[[:space:]]/}" ]]; then
+                  printf '\n%s\n' "$suffix" >> "$RUNNER_TEMP/combined.txt"
+                fi
+              fi
             else
               cp "$RUNNER_TEMP/oakum_notes.txt" "$RUNNER_TEMP/combined.txt"
             fi
